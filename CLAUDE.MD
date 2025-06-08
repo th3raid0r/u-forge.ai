@@ -2,7 +2,28 @@
 
 ## Project Overview
 
-**u-forge.ai** (Universe Forge) is a local-first, cross-platform TTRPG worldbuilding application that combines object-oriented note-taking with AI-powered knowledge graphs. It fills a critical market gap by providing deep LLM integration, semantic search over massive datasets (1B+ tokens), and real-time session capture—all while keeping user data completely local.
+**u-forge.ai** (Universe Forge) is a local-first, cross-platform TTRPG worldbuilding application that combines object-oriented note-taking with AI-powered knowledge graphs. The core application is open source (MIT) and provides essential worldbuilding tools for pen-and-paper GMs, while premium integrations for VTT platforms are offered as separate commercial products.
+
+## Business Model & Feature Separation
+
+**Core Philosophy**: Free for pen-and-paper, premium for digital tools.
+
+### Core Application (MIT License - Always Free)
+- Local-first data storage and privacy
+- Basic AI integration (user's own API keys)
+- Visual knowledge graph with TTRPG schemas
+- Semantic search over large datasets
+- Local session recording and transcription for in-person table games
+- Speaker identification and smart note promotion from session audio
+- Import/export capabilities
+- Cross-platform desktop application
+
+### Premium Products (Separate Commercial Licenses)
+- **Virtual Session Recording**: Enhanced transcription for online games with multi-platform support (Discord voice + FoundryVTT text + Roll20 dice, etc.)
+- **Multi-Platform Integration**: Unified session capture that correlates voice chat, text messages, dice rolls, and character actions across different platforms
+- **Cloud Sync Service**: Multi-device access, collaboration, shared campaigns
+- **U-Store**: Official licensed content marketplace where publishers can offer pre-built knowledge graphs for their copyrighted IP (D&D modules, Pathfinder APs, etc.)
+- **Mobile Companion App**: Session notes, quick lookups during games
 
 ### Core Value Proposition
 - **Local-first**: No servers, user owns their data and API keys
@@ -80,11 +101,13 @@ UI Event -> Write Queue (tokio::mpsc) -> {
 - [ ] CRUD operations for TTRPG objects
 - [ ] Keyboard navigation and accessibility
 
-### Sprint 4: AI Integration & Session Capture
+### Sprint 4: AI Integration & Local Session Capture
 - [ ] Multi-provider LLM client (OpenAI, Anthropic, local)
 - [ ] OS keystore integration for API keys
-- [ ] Whisper-cpp audio transcription
-- [ ] Entity detection and node promotion workflow
+- [ ] Whisper-cpp audio transcription for local table recording
+- [ ] Speaker identification and diarization for in-person sessions
+- [ ] Entity detection and automatic note promotion from transcripts
+- [ ] Session-to-graph linking (characters mentioned, locations visited, etc.)
 
 ## Key Design Decisions & Rationale
 
@@ -116,6 +139,8 @@ UI Event -> Write Queue (tokio::mpsc) -> {
 - **Code Signing**: Required for modern OS compatibility
 - **Auto-update**: GitHub Releases + Tauri updater
 
+**Note**: Premium integrations will use separate distribution channels (FoundryVTT marketplace, Discord bot directory, etc.)
+
 ## AI Integration Architecture
 
 ### Multi-Provider Support
@@ -131,8 +156,10 @@ trait LLMProvider {
 
 ### Local Fallback Strategy
 - Bundle optional 3-4GB GGUF model for offline "explain node" functionality
+- Local Whisper model for session transcription without internet dependency
 - Graceful degradation when API keys unavailable
 - Clear UX indication of online vs offline capabilities
+- Session recording works completely offline for maximum privacy
 
 ## Performance Requirements & Testing
 
@@ -162,16 +189,28 @@ trait LLMProvider {
 
 ## Future Roadmap Considerations
 
-### v0.2 Enhancements
+### v0.2 Core Enhancements (Open Source)
 - WebGL graph canvas for >5K node visualizations
-- Advanced prompt templating system
 - Git integration for version control
-- Mobile companion app for session notes
+- Enhanced import/export capabilities
+- Performance optimizations for massive datasets
 
-### v0.3 Collaboration Features
-- CRDT-based multi-user sync
-- Read-only sharing links for players
-- Collaborative session editing
+### v0.3 Premium Ecosystem (Commercial Products)
+- Virtual session recording with multi-platform support (Discord + FoundryVTT + Roll20 + others)
+- Cross-platform integration for mixed voice/text/dice streams with temporal correlation
+- Cloud sync and collaboration features for distributed teams
+- U-Store marketplace launch with partnerships for licensed publisher content
+- Mobile companion app for session notes and quick lookups
+
+### U-Store Business Model
+The U-Store represents a revenue-sharing marketplace where major publishers can offer official, pre-built knowledge graphs for their copyrighted content:
+
+- **Publishers**: Upload comprehensive knowledge graphs for their settings (Forgotten Realms, Golarion, etc.)
+- **Content**: Pre-populated characters, locations, lore, relationships, and canonical information
+- **Revenue Split**: Publishers receive majority share, u-forge.ai takes platform fee
+- **Integration**: Seamless import into user's local worldbuilding environment
+- **Examples**: Official D&D Curse of Strahd knowledge graph, Pathfinder Kingmaker campaign setting, etc.
+- **Value Proposition**: Drop-in play for existing IP without hours of manual data entry
 
 ## Implementation Notes for LLM Assistant
 
@@ -183,5 +222,8 @@ When helping implement this system:
 4. **Memory Management**: Profile regularly on 8GB systems
 5. **Cross-Platform Testing**: Linux/macOS/Windows compatibility from start
 6. **Documentation**: Inline code documentation for complex graph algorithms
+7. **Feature Boundaries**: Keep premium features (VTT integrations, cloud sync, advanced AI) out of core codebase
 
-The goal is a professional-grade local-first application that feels as fast as native tools while providing AI capabilities that rival cloud services—all without compromising user data sovereignty.
+**Core Product Goal**: A professional-grade local-first application that feels as fast as native tools while providing essential AI-assisted worldbuilding capabilities and comprehensive session recording for in-person tabletop groups—all without compromising user data sovereignty.
+
+**Premium Products Goal**: Seamless multi-platform integrations for online gaming, enhanced virtual session recording that combines voice and text streams, and the U-Store marketplace for official licensed content that enhances the core experience for digital gaming groups while maintaining clear value separation from the free tier.
