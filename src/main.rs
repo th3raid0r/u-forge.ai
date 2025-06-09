@@ -3,9 +3,10 @@
 //! A demonstration of the core knowledge graph functionality including vector search
 
 use anyhow::Result;
+use std::env;
 use u_forge_ai::{
     KnowledgeGraph, ObjectBuilder, EdgeType, ChunkType, ObjectType,
-    VectorSearchEngine, VectorSearchConfig,
+    VectorSearchEngine, VectorSearchConfig, SchemaIngestion,
     ForgeUuid, // Use the re-exported Uuid
 };
 
@@ -14,8 +15,21 @@ async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
     
+    // Parse command line arguments
+    let args: Vec<String> = env::args().collect();
+    let schema_dir = if args.len() > 1 {
+        Some(args[1].clone())
+    } else {
+        None
+    };
+    
     println!("🌟 Welcome to u-forge.ai (Universe Forge) 🌟");
-    println!("Creating a sample Middle-earth knowledge graph with semantic search...\n");
+    if let Some(ref dir) = schema_dir {
+        println!("Loading schemas from directory: {}", dir);
+    } else {
+        println!("Using default schemas (no schema directory specified)");
+    }
+    println!("Creating a sample knowledge graph with semantic search...\n");
 
     // Create a temporary knowledge graph for demonstration
     let temp_dir = tempfile::TempDir::new()?;
@@ -37,6 +51,29 @@ async fn main() -> Result<()> {
         }
     };
     println!("KnowledgeGraph initialized successfully.");
+
+    // Load custom schemas if directory is provided
+    if let Some(schema_dir) = schema_dir {
+        println!("\n📚 Loading Custom Schemas");
+        println!("=========================");
+        
+        match SchemaIngestion::load_schemas_from_directory(&schema_dir, "loaded_schemas", "1.0.0") {
+            Ok(schema_definition) => {
+                let schema_manager = graph.get_schema_manager();
+                schema_manager.save_schema(&schema_definition).await?;
+                
+                println!("✅ Successfully loaded schema with {} object types:", schema_definition.object_types.len());
+                for (type_name, _) in &schema_definition.object_types {
+                    println!("   • {}", type_name);
+                }
+                println!();
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to load schemas from directory: {}", e);
+                eprintln!("Continuing with default schemas...\n");
+            }
+        }
+    }
 
     // Use the embedding provider from KnowledgeGraph for the VectorSearchEngine
     let embedding_provider = graph.get_embedding_provider();

@@ -1,0 +1,31 @@
+{
+  "name": "add_system_reference",
+  "description": "An RPG System Definition, Rule, or SRD content.",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "The name or subject of the system reference document",
+      "required": true
+    },
+    "type": {
+      "type": "string",
+      "description": "The type of System reference - e.g. Rule, Lore, System Modification, Monster, NPC Template,etc.",
+      "required": true
+    },
+    "content": {
+      "type": "string",
+      "description": "The content of the system reference",
+      "required": true
+    },
+    "appliesTo": {
+      "type": "array",
+      "description": "The entity to which this reference applies or is modified by",
+      "required": true,
+      "relationship": {
+        "edgeType": "applies_to",
+        "description": "The entity to which this reference applies or is modified by"
+      }
+    }
+  },
+  "additionalProperties": true
+}

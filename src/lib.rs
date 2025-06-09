@@ -13,6 +13,7 @@ pub mod vector_search; // Added vector_search module
 pub mod embedding_queue; // Added embedding_queue module
 pub mod schema; // Added schema module
 pub mod schema_manager; // Added schema_manager module
+pub mod schema_ingestion; // Added schema_ingestion module
 
 pub use types::*;
 pub use storage::KnowledgeGraphStorage;
@@ -21,6 +22,7 @@ pub use vector_search::{VectorSearchEngine, VectorSearchConfig, HybridSearchResu
 pub use embedding_queue::{EmbeddingQueue, EmbeddingQueueBuilder, EmbeddingProgress, RequestStatus}; // Re-export key embedding_queue types
 pub use schema::{SchemaDefinition, ObjectTypeSchema, PropertySchema, EdgeTypeSchema, ValidationResult}; // Re-export key schema types
 pub use schema_manager::{SchemaManager, SchemaStats}; // Re-export key schema_manager types
+pub use schema_ingestion::SchemaIngestion; // Re-export schema ingestion functionality
 
 use anyhow::Result;
 use std::path::Path;

@@ -1,0 +1,31 @@
+{
+  "name": "add_currency",
+  "description": "Represents a type of currency in the game world.",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "The name of the currency.",
+      "required": true
+    },
+    "description": {
+      "type": "string",
+      "description": "A brief description of the currency.",
+      "required": false
+    },
+    "owner": {
+      "type": "string",
+      "description": "The entity or character that owns this currency.",
+      "required": false,
+      "relationship": {
+        "edgeType": "owned_by",
+        "description": "The relationship between the currency and its owner."
+      }
+    },
+    "quantity": {
+      "type": "string",
+      "description": "The amount of this currency owned.",
+      "required": false
+    }
+  },
+  "additionalProperties": true
+}
