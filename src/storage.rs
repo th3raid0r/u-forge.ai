@@ -529,14 +529,14 @@ mod tests {
         storage.upsert_node(frodo.clone()).unwrap();
 
         // Create edge
-        let edge = Edge::new(gandalf.id, frodo.id, EdgeType::Knows);
+        let edge = Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows"));
         storage.upsert_edge(edge.clone()).unwrap();
 
         // Retrieve edges
         let gandalf_edges = storage.get_edges(gandalf.id).unwrap();
         assert_eq!(gandalf_edges.len(), 1);
         assert_eq!(gandalf_edges[0].to, frodo.id);
-        assert_eq!(gandalf_edges[0].edge_type, EdgeType::Knows);
+        assert_eq!(gandalf_edges[0].edge_type, EdgeType::from_str("knows"));
 
         let frodo_edges = storage.get_edges(frodo.id).unwrap();
         assert_eq!(frodo_edges.len(), 1);
@@ -582,10 +582,10 @@ mod tests {
         storage.upsert_node(sam.clone()).unwrap();
 
         storage
-            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::Knows))
+            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows")))
             .unwrap();
         storage
-            .upsert_edge(Edge::new(frodo.id, sam.id, EdgeType::AllyOf))
+            .upsert_edge(Edge::new(frodo.id, sam.id, EdgeType::from_str("ally_of")))
             .unwrap();
 
         // Query subgraph starting from Gandalf with max 2 hops
@@ -605,7 +605,7 @@ mod tests {
         storage.upsert_node(gandalf.clone()).unwrap();
         storage.upsert_node(frodo.clone()).unwrap();
         storage
-            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::Knows))
+            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows")))
             .unwrap();
 
         // Delete Gandalf
@@ -629,7 +629,7 @@ mod tests {
         storage.upsert_node(gandalf.clone()).unwrap();
         storage.upsert_node(frodo.clone()).unwrap();
         storage
-            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::Knows))
+            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows")))
             .unwrap();
 
         let chunk = TextChunk::new(

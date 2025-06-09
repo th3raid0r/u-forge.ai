@@ -468,14 +468,14 @@ mod tests {
         let character1 = ObjectMetadata::new("character".to_string(), "Frodo".to_string());
         let character2 = ObjectMetadata::new("character".to_string(), "Sam".to_string());
 
-        let edge = Edge::new(character1.id, character2.id, EdgeType::Knows);
+        let edge = Edge::new(character1.id, character2.id, EdgeType::from_str("knows"));
 
         let result = manager.validate_edge(&edge, &character1, &character2).await.unwrap();
         assert!(result.valid);
 
         // Test invalid edge (location knows character - not typically allowed)
         let location = ObjectMetadata::new("location".to_string(), "Shire".to_string());
-        let invalid_edge = Edge::new(location.id, character1.id, EdgeType::Knows);
+        let invalid_edge = Edge::new(location.id, character1.id, EdgeType::from_str("knows"));
 
         let result = manager.validate_edge(&invalid_edge, &location, &character1).await.unwrap();
         // This should generate an error or warning depending on schema constraints

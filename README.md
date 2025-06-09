@@ -122,19 +122,61 @@ cd u-forge.ai
 # Build (first build takes ~10 minutes due to RocksDB compilation)
 cargo build
 
-# Run the demo
+# Run the demo with default schemas
 cargo run --bin u-forge-ai
+
+# Or load a specific JSON dataset
+cargo run --bin u-forge-ai -- ./examples/data/memory.json
+```
+
+### Loading JSON Data
+
+The main application can now load structured JSON datasets instead of the hardcoded demo data:
+
+**JSON Format:**
+```json
+{"type":"node","name":"Object Name","nodeType":"location","metadata":["Key: Value","Description: Object description"]}
+{"type":"edge","from":"Source Object","to":"Target Object","edgeType":"relationship_type"}
+```
+
+**Supported Node Types:**
+- `location` - Places, planets, systems
+- `npc` - Non-player characters  
+- `player_character` - Player characters
+- `faction` - Organizations, governments
+- `quest` - Missions, events, storylines
+- `artifact` - Items, equipment, vehicles
+- `currency` - Money, resources
+- `skills` - Abilities, spells, powers
+- `temporal` - Events, timelines
+- `setting_reference` - Rules, lore
+- `system_reference` - Game mechanics
+
+**Edge Types (Relationships):**
+All edge types are now string-based for maximum schema flexibility:
+- Use any descriptive relationship name: `"led_by"`, `"governs"`, `"trades_with"`
+- No need to map to predefined enums - just use meaningful names
+- Schema system can define valid edge types and constraints
+
+**Example Usage:**
+```bash
+# Load Foundation universe data (included)
+cargo run -- ./examples/data/memory.json
+
+# Load your own dataset
+cargo run -- /path/to/your/data.json
 ```
 
 ### What the Demo Shows
 
-The current demo creates a small Middle-earth knowledge graph and demonstrates:
-1. Object creation (characters, locations, items)
-2. Relationship mapping
-3. Text chunk storage with embeddings
-4. Basic semantic search
-5. Exact name matching with FST
-6. Hybrid search combining both approaches
+The current demo loads structured worldbuilding data and demonstrates:
+1. JSON parsing and object creation from metadata
+2. **Flexible string-based relationship types** (no enum constraints)
+3. Schema-based object validation
+4. Text embedding generation for all content
+5. Semantic search across the knowledge graph
+6. Exact name matching with FST
+7. Hybrid search combining both approaches
 
 **Note: This is a single-shot CLI demo, not an interactive application.**
 

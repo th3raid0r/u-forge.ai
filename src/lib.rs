@@ -88,7 +88,13 @@ impl KnowledgeGraph {
         self.storage.upsert_edge(edge)
     }
 
-    /// Create a weighted relationship between two objects
+    /// Create a relationship between two objects using a string edge type
+    pub fn connect_objects_str(&self, from: ObjectId, to: ObjectId, edge_type: &str) -> Result<()> {
+        let edge = Edge::new(from, to, EdgeType::from_str(edge_type));
+        self.storage.upsert_edge(edge)
+    }
+
+    /// Create a weighted relationship between two objects  
     pub fn connect_objects_weighted(
         &self,
         from: ObjectId,
@@ -97,6 +103,18 @@ impl KnowledgeGraph {
         weight: f32,
     ) -> Result<()> {
         let edge = Edge::new(from, to, edge_type).with_weight(weight);
+        self.storage.upsert_edge(edge)
+    }
+
+    /// Create a weighted relationship between two objects using a string edge type
+    pub fn connect_objects_weighted_str(
+        &self,
+        from: ObjectId,
+        to: ObjectId,
+        edge_type: &str,
+        weight: f32,
+    ) -> Result<()> {
+        let edge = Edge::new(from, to, EdgeType::from_str(edge_type)).with_weight(weight);
         self.storage.upsert_edge(edge)
     }
 
@@ -316,7 +334,7 @@ mod tests {
             .unwrap();
 
         // Connect them with a relationship
-        graph.connect_objects(gandalf_id, frodo_id, EdgeType::Knows).unwrap();
+        graph.connect_objects_str(gandalf_id, frodo_id, "knows").unwrap();
 
         // Verify the objects exist
         let gandalf = graph.get_object(gandalf_id).unwrap().unwrap();
@@ -330,7 +348,7 @@ mod tests {
         let gandalf_relationships = graph.get_relationships(gandalf_id).unwrap();
         assert_eq!(gandalf_relationships.len(), 1);
         assert_eq!(gandalf_relationships[0].to, frodo_id);
-        assert_eq!(gandalf_relationships[0].edge_type, EdgeType::Knows);
+        assert_eq!(gandalf_relationships[0].edge_type, EdgeType::from_str("knows"));
 
         // Test neighbors
         let gandalf_neighbors = graph.get_neighbors(gandalf_id).unwrap();
@@ -383,12 +401,12 @@ mod tests {
         let frodo_id = ObjectBuilder::character("Frodo".to_string()).add_to_graph(&graph).unwrap();
 
         // Create a strong enemy relationship
-        graph.connect_objects_weighted(sauron_id, frodo_id, EdgeType::EnemyOf, 0.9).unwrap();
+        graph.connect_objects_weighted_str(sauron_id, frodo_id, "enemy_of", 0.9).unwrap();
 
         let relationships = graph.get_relationships(sauron_id).unwrap();
         assert_eq!(relationships.len(), 1);
         assert_eq!(relationships[0].weight, 0.9);
-        assert_eq!(relationships[0].edge_type, EdgeType::EnemyOf);
+        assert_eq!(relationships[0].edge_type, EdgeType::from_str("enemy_of"));
     }
 
     #[test]
@@ -422,10 +440,10 @@ mod tests {
             .unwrap();
 
         // Create relationships
-        graph.connect_objects(bag_end_id, shire_id, EdgeType::LocatedIn).unwrap();
-        graph.connect_objects(frodo_id, bag_end_id, EdgeType::LocatedIn).unwrap();
-        graph.connect_objects(frodo_id, ring_id, EdgeType::OwnedBy).unwrap();
-        graph.connect_objects(frodo_id, fellowship_id, EdgeType::MemberOf).unwrap();
+        graph.connect_objects_str(bag_end_id, shire_id, "located_in").unwrap();
+        graph.connect_objects_str(frodo_id, bag_end_id, "located_in").unwrap();
+        graph.connect_objects_str(frodo_id, ring_id, "owned_by").unwrap();
+        graph.connect_objects_str(frodo_id, fellowship_id, "member_of").unwrap();
 
         // Query the subgraph around Frodo
         let frodo_world = graph.query_subgraph(frodo_id, 2).unwrap();

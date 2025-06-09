@@ -15,7 +15,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use u_forge_ai::{
-    KnowledgeGraph, ObjectBuilder, SchemaIngestion, EdgeType
+    KnowledgeGraph, ObjectBuilder, SchemaIngestion
 };
 
 #[tokio::main]
@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
     println!("✅ Created Free Traders Alliance (ID: {})", traders_id);
 
     // Set up faction rivalry
-    graph.connect_objects(stellar_id, traders_id, EdgeType::EnemyOf)?;
+    graph.connect_objects_str(stellar_id, traders_id, "enemy_of")?;
     println!("🔗 Established rivalry between Stellar Dynamics and Free Traders");
 
     // Demo 3: Create Key NPCs

@@ -38,6 +38,31 @@ pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
 }
 ```
 
+### String-Based Edge Type Patterns
+```rust
+// Use string-based edge types for maximum schema flexibility
+graph.connect_objects_str(character_id, spell_id, "learned_spell")?;
+graph.connect_objects_str(faction_id, territory_id, "controls_territory")?;
+graph.connect_objects_str(npc_id, quest_id, "offers_quest")?;
+
+// Weighted relationships with strings
+graph.connect_objects_weighted_str(enemy_id, player_id, "sworn_enemy_of", 0.9)?;
+
+// Edge type creation from strings
+let edge_type = EdgeType::from_str("governs"); // Preferred method
+let edge = Edge::new(ruler_id, kingdom_id, edge_type);
+
+// Schema-defined edge validation
+let edge_schema = EdgeTypeSchema::new(
+    "learned_spell".to_string(),
+    "Character knowledge of magical spells".to_string(),
+)
+.with_source_types(vec!["character".to_string()])
+.with_target_types(vec!["spell".to_string()])
+.with_property("proficiency_level".to_string(), 
+    PropertySchema::string("Level of spell mastery"));
+```
+
 ### Embedding Queue Pattern (Background Processing)
 ```rust
 // Background processing for UI responsiveness
@@ -441,6 +466,12 @@ fn create_test_graph() -> (KnowledgeGraph, TempDir) {
 ```
 
 ## Critical Implementation Notes
+
+### Edge Type Flexibility
+- **String-based relationships**: All edge types use `EdgeType::Custom(String)` for maximum schema flexibility
+- **No enum constraints**: Relationships like `"governs"`, `"led_by"`, `"trades_with"` preserve semantic meaning
+- **Schema validation**: Edge type definitions provide constraints without hardcoded enums
+- **Backward compatibility**: Legacy enum variants deprecated but functional
 
 ### RocksDB Compilation Requirements
 - **Always set**: `CC=gcc-13 CXX=g++-13` before building

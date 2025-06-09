@@ -37,50 +37,47 @@ pub type ObjectId = ForgeUuid;
 /// Unique identifier for text chunks
 pub type ChunkId = ForgeUuid;
 
-/// Edge relationship types
+/// Edge relationship types - primarily string-based for schema flexibility
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EdgeType {
-    /// Generic relationships
-    RelatedTo,
-    Contains,
-    OwnedBy,
-    LocatedIn,
-    MemberOf,
-    
-    /// Character-specific relationships
-    Knows,
-    EnemyOf,
-    AllyOf,
-    FamilyOf,
-    
-    /// Event relationships
-    CausedBy,
-    LeadsTo,
-    HappenedAt,
-    ParticipatedIn,
-    
-    /// Custom relationship type
+    /// Custom relationship type (primary variant)
     Custom(String),
+    
+    /// Legacy core types for backward compatibility only
+    /// Use Custom(String) for all new relationships
+    #[deprecated(note = "Use Custom(String) for new relationships")]
+    Contains,
+    #[deprecated(note = "Use Custom(String) for new relationships")]
+    OwnedBy,
+    #[deprecated(note = "Use Custom(String) for new relationships")]
+    LocatedIn,
+    #[deprecated(note = "Use Custom(String) for new relationships")]
+    MemberOf,
 }
 
 impl EdgeType {
     pub fn as_str(&self) -> &str {
         match self {
-            EdgeType::RelatedTo => "related_to",
-            EdgeType::Contains => "contains",
-            EdgeType::OwnedBy => "owned_by",
-            EdgeType::LocatedIn => "located_in",
-            EdgeType::MemberOf => "member_of",
-            EdgeType::Knows => "knows",
-            EdgeType::EnemyOf => "enemy_of",
-            EdgeType::AllyOf => "ally_of",
-            EdgeType::FamilyOf => "family_of",
-            EdgeType::CausedBy => "caused_by",
-            EdgeType::LeadsTo => "leads_to",
-            EdgeType::HappenedAt => "happened_at",
-            EdgeType::ParticipatedIn => "participated_in",
             EdgeType::Custom(name) => name,
+            #[allow(deprecated)]
+            EdgeType::Contains => "contains",
+            #[allow(deprecated)]
+            EdgeType::OwnedBy => "owned_by",
+            #[allow(deprecated)]
+            EdgeType::LocatedIn => "located_in",
+            #[allow(deprecated)]
+            EdgeType::MemberOf => "member_of",
         }
+    }
+
+    /// Create an EdgeType from a string (preferred method)
+    pub fn from_string(edge_type: String) -> Self {
+        EdgeType::Custom(edge_type)
+    }
+
+    /// Create an EdgeType from a string slice
+    pub fn from_str(edge_type: &str) -> Self {
+        EdgeType::Custom(edge_type.to_string())
     }
 }
 
@@ -345,15 +342,24 @@ mod tests {
         let id1 = ForgeUuid::new_v4();
         let id2 = ForgeUuid::new_v4();
         
-        let edge = Edge::new(id1, id2, EdgeType::Knows)
+        let edge = Edge::new(id1, id2, EdgeType::from_str("knows"))
             .with_weight(0.8)
             .with_metadata("context".to_string(), "fellowship".to_string());
         
         assert_eq!(edge.from, id1);
         assert_eq!(edge.to, id2);
-        assert_eq!(edge.edge_type, EdgeType::Knows);
+        assert_eq!(edge.edge_type, EdgeType::from_str("knows"));
         assert_eq!(edge.weight, 0.8);
         assert_eq!(edge.metadata.get("context"), Some(&"fellowship".to_string()));
+    }
+
+    #[test]
+    fn test_edge_type_from_string() {
+        let edge_type = EdgeType::from_string("led_by".to_string());
+        assert_eq!(edge_type.as_str(), "led_by");
+        
+        let edge_type2 = EdgeType::from_str("governs");
+        assert_eq!(edge_type2.as_str(), "governs");
     }
 
     #[test]

@@ -8,6 +8,7 @@ The u-forge.ai configurable schema system provides runtime-definable object type
 
 - **Dynamic Object Types**: Define new object types at runtime (spells, classes, vehicles, etc.)
 - **Property Validation**: Type checking, value constraints, and custom validation rules
+- **String-Based Edge Types**: Flexible relationship types using descriptive strings
 - **Relationship Schemas**: Define valid edge types and their constraints
 - **Schema Versioning**: Support for schema evolution and migration
 - **Multi-System Support**: Multiple schemas can coexist in the same database
@@ -99,6 +100,10 @@ let validation_result = schema_manager.validate_object_with_schema(&fireball, &d
 if validation_result.valid {
     let object_id = graph.add_object(fireball)?;
     println!("Object created successfully: {}", object_id);
+    
+    // Create relationships using string-based edge types
+    graph.connect_objects_str(character_id, object_id, "learned_spell")?;
+    graph.connect_objects_str(object_id, evocation_school_id, "belongs_to_school")?;
 } else {
     for error in validation_result.errors {
         println!("Validation error: {}: {}", error.property, error.message);
@@ -174,23 +179,51 @@ ValidationRule::new()
 
 ## Edge Type Schemas
 
-Define relationships between object types:
+### String-Based Relationship Types
+
+**All edge types are now string-based for maximum flexibility**. This eliminates the need to map semantic relationships to predefined enum variants:
 
 ```rust
-let learned_by_edge = EdgeTypeSchema::new(
-    "learned_by".to_string(),
+// Create relationships directly with descriptive strings
+graph.connect_objects_str(character_id, spell_id, "learned_spell")?;
+graph.connect_objects_str(faction_id, territory_id, "controls_territory")?;
+graph.connect_objects_str(npc_id, quest_id, "offers_quest")?;
+graph.connect_objects_str(item_id, location_id, "found_at")?;
+```
+
+### Schema-Defined Edge Types
+
+Define valid relationship types and their constraints in schemas:
+
+```rust
+let learned_spell_edge = EdgeTypeSchema::new(
+    "learned_spell".to_string(),
     "Indicates a character has learned a spell".to_string(),
 )
-.with_source_types(vec!["spell".to_string()])
-.with_target_types(vec!["character".to_string()])
+.with_source_types(vec!["character".to_string()])
+.with_target_types(vec!["spell".to_string()])
 .with_property(
     "mastery_level".to_string(),
     PropertySchema::new(
         PropertyType::Enum(vec!["novice".to_string(), "expert".to_string()]),
         "Level of mastery".to_string(),
     ),
+)
+.with_property(
+    "date_learned".to_string(),
+    PropertySchema::string("When the spell was learned"),
 );
+
+// Add to schema
+dnd5e_schema.add_edge_type("learned_spell".to_string(), learned_spell_edge);
 ```
+
+### Benefits of String-Based Edge Types
+
+1. **Semantic Clarity**: Relationship names like `"governs"`, `"led_by"`, `"trades_with"` preserve exact meaning
+2. **Domain Flexibility**: Different TTRPG systems can define custom relationship vocabularies
+3. **No Enum Constraints**: Add new relationship types without code changes
+4. **Schema Validation**: Edge type definitions provide validation and constraints
 
 ## Default Schema
 
@@ -341,11 +374,29 @@ See `examples/schema_demo.rs` for a comprehensive demonstration of:
 
 - Creating custom D&D 5e and Cyberpunk schemas
 - Defining object types with complex properties
+- **String-based edge types and relationship schemas**
 - Validation success and failure scenarios
 - Runtime schema registration
 - Multi-schema environments
 
-## API Reference
+### Edge Type Examples
+
+```rust
+// Domain-specific relationship types
+graph.connect_objects_str(character_id, spell_id, "knows_spell")?;
+graph.connect_objects_str(character_id, faction_id, "sworn_enemy_of")?;
+graph.connect_objects_str(location_id, faction_id, "controlled_by")?;
+graph.connect_objects_str(quest_id, npc_id, "given_by")?;
+graph.connect_objects_str(item_id, character_id, "forged_by")?;
+
+// No need for enum mapping - schemas define validity
+schema.add_edge_type("knows_spell".to_string(), 
+    EdgeTypeSchema::new("knows_spell".to_string(), "Character knowledge of spells")
+        .with_source_types(vec!["character".to_string()])
+        .with_target_types(vec!["spell".to_string()]));
+```
+
+### API Reference
 
 ### Core Types
 
@@ -365,11 +416,18 @@ See `examples/schema_demo.rs` for a comprehensive demonstration of:
 - `register_object_type()`: Add new object type
 - `register_edge_type()`: Add new edge type
 
+### Relationship API
+
+- `graph.connect_objects_str(from, to, "edge_type")`: Create string-based relationship
+- `graph.connect_objects_weighted_str(from, to, "edge_type", weight)`: Weighted relationship
+- `EdgeType::from_str("edge_type")`: Convert string to EdgeType (for compatibility)
+
 ### Builder Patterns
 
 - `ObjectTypeSchema::new()`: Create object type
 - `PropertySchema::string()`: String property
 - `PropertySchema::number()`: Numeric property
 - `ValidationRule::new()`: Create validation rule
+- `EdgeTypeSchema::new()`: Create edge type definition
 
 The configurable schema system provides the foundation for flexible, type-safe TTRPG worldbuilding while maintaining excellent performance and user experience.
