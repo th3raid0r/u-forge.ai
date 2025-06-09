@@ -3,20 +3,19 @@
 //! vector_search.rs - Handles vector-based semantic search and exact name matching.
 
 use crate::embeddings::EmbeddingProvider;
-use crate::types::{ChunkId, ObjectId, ObjectType, ForgeUuid};
-use anyhow::{Result, anyhow};
+use crate::types::{ChunkId, ObjectId, ObjectType};
+use anyhow::Result;
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
+use hnsw_rs::prelude::*;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 // Constants for file naming
-const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
-const HNSW_MAP_FILE: &str = "hnsw_map.bin";
 const FST_INDEX_FILE: &str = "name_index.fst";
 const FST_VALUES_FILE: &str = "name_values.bin";
 
@@ -66,75 +65,103 @@ pub struct HybridSearchResult {
     pub exact_results: Vec<ExactSearchResult>,
 }
 
-type PointMap = HashMap<usize, (ChunkId, ObjectId, String)>;
 
-/// Simple vector store for now (can be replaced with HNSW later)
-#[derive(Debug)]
-struct SimpleVectorStore {
-    vectors: Vec<Vec<f32>>,
-    metadata: Vec<(ChunkId, ObjectId, String)>,
+
+/// HNSW-based vector store for efficient similarity search
+struct HnswVectorStore {
+    hnsw: Hnsw<'static, f32, DistL2>,
+    metadata: HashMap<usize, (ChunkId, ObjectId, String)>,
+    next_id: usize,
     dimensions: usize,
 }
 
-impl SimpleVectorStore {
-    fn new(dimensions: usize) -> Self {
+impl HnswVectorStore {
+    fn new(
+        dimensions: usize,
+        max_elements: usize,
+        m: usize,
+        ef_construction: usize,
+    ) -> Self {
+        let hnsw = Hnsw::<f32, DistL2>::new(
+            m,
+            max_elements,
+            16, // max_layer - fixed value for now
+            ef_construction,
+            DistL2 {},
+        );
+        
         Self {
-            vectors: Vec::new(),
-            metadata: Vec::new(),
+            hnsw,
+            metadata: HashMap::new(),
+            next_id: 0,
             dimensions,
         }
     }
-
-    fn add(&mut self, vector: Vec<f32>, chunk_id: ChunkId, object_id: ObjectId, text_preview: String) -> Result<()> {
-        if vector.len() != self.dimensions {
-            return Err(anyhow!("Vector dimension mismatch: expected {}, got {}", self.dimensions, vector.len()));
-        }
-        self.vectors.push(vector);
-        self.metadata.push((chunk_id, object_id, text_preview));
-        Ok(())
+    
+    fn try_load_from_file(
+        _index_path: &PathBuf,
+        _basename: &str,
+        _dimensions: usize,
+        _max_elements: usize,
+        _m: usize,
+        _ef_construction: usize,
+    ) -> Option<Self> {
+        // For now, always create new since file_load doesn't exist in v0.3
+        // TODO: Implement proper persistence when API supports it
+        None
     }
-
-    fn search(&self, query_vector: &[f32], k: usize) -> Vec<SemanticSearchResult> {
-        if query_vector.len() != self.dimensions {
-            return Vec::new();
-        }
-
-        let mut results = Vec::new();
+    
+    fn add(&mut self, vector: Vec<f32>, chunk_id: ChunkId, object_id: ObjectId, preview: String) -> usize {
+        // Validate vector dimensions
+        assert_eq!(vector.len(), self.dimensions, 
+                   "Vector dimension mismatch: expected {}, got {}", 
+                   self.dimensions, vector.len());
         
-        for (idx, stored_vector) in self.vectors.iter().enumerate() {
-            let similarity = cosine_similarity(query_vector, stored_vector);
-            if let Some((chunk_id, object_id, text_preview)) = self.metadata.get(idx) {
-                results.push(SemanticSearchResult {
-                    chunk_id: *chunk_id,
-                    object_id: *object_id,
-                    similarity,
-                    text_preview: text_preview.clone(),
-                });
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        // Insert into HNSW
+        self.hnsw.insert((&vector, id));
+        
+        // Store metadata
+        self.metadata.insert(id, (chunk_id, object_id, preview));
+        
+        id
+    }
+    
+    fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(usize, f32)> {
+        // Set search parameters
+        let neighbours = self.hnsw.search(query, k, ef_search);
+        
+        // Convert to our format
+        neighbours.into_iter()
+            .map(|neighbour| (neighbour.d_id, neighbour.distance))
+            .collect()
+    }
+    
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.hnsw.get_nb_point()
+    }
+    
+    fn save_to_file(&self, index_path: &PathBuf, basename: &str) -> Result<()> {
+        // Only save HNSW index if it has data
+        if self.hnsw.get_nb_point() > 0 {
+            if let Err(e) = self.hnsw.file_dump(index_path, basename) {
+                return Err(anyhow::Error::msg(format!("Failed to save HNSW index: {}", e)));
             }
         }
-
-        // Sort by similarity (highest first)
-        results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(k);
-        results
-    }
-
-    fn len(&self) -> usize {
-        self.vectors.len()
+        
+        // Save metadata separately
+        let metadata_file = index_path.join(format!("{}_metadata.bin", basename));
+        let metadata_bytes = bincode::serialize(&self.metadata)?;
+        fs::write(metadata_file, metadata_bytes)?;
+        
+        Ok(())
     }
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    
-    if norm_a == 0.0 || norm_b == 0.0 {
-        0.0
-    } else {
-        dot_product / (norm_a * norm_b)
-    }
-}
+
 
 /// Main vector search engine
 pub struct VectorSearchEngine {
@@ -142,8 +169,8 @@ pub struct VectorSearchEngine {
     embedding_provider: Arc<dyn EmbeddingProvider>,
     index_path: PathBuf,
     
-    // Simple vector store (will be replaced with HNSW later)
-    vector_store: RwLock<SimpleVectorStore>,
+    // HNSW-based vector store for efficient similarity search
+    vector_store: RwLock<HnswVectorStore>,
     
     // Name-based exact search using FST
     name_fst: RwLock<Option<Map<Vec<u8>>>>,
@@ -161,7 +188,24 @@ impl VectorSearchEngine {
     ) -> Result<Self> {
         std::fs::create_dir_all(&index_path)?;
         
-        let vector_store = RwLock::new(SimpleVectorStore::new(config.dimensions));
+        // Try to load existing HNSW index, fall back to creating new one
+        let vector_store = if let Some(loaded_store) = HnswVectorStore::try_load_from_file(
+            &index_path,
+            "hnsw_index",
+            config.dimensions,
+            config.max_elements,
+            config.hnsw_m,
+            config.hnsw_ef_construction,
+        ) {
+            RwLock::new(loaded_store)
+        } else {
+            RwLock::new(HnswVectorStore::new(
+                config.dimensions,
+                config.max_elements,
+                config.hnsw_m,
+                config.hnsw_ef_construction,
+            ))
+        };
         
         Ok(Self {
             config,
@@ -200,7 +244,7 @@ impl VectorSearchEngine {
         // Add to vector store
         {
             let mut store = self.vector_store.write();
-            store.add(embedding, chunk_id, object_id, preview.clone())?;
+            store.add(embedding, chunk_id, object_id, preview.clone());
         }
         
         // Store preview
@@ -251,9 +295,22 @@ impl VectorSearchEngine {
         // Generate query embedding
         let query_embedding = self.embedding_provider.embed(query).await?;
         
-        // Search using simple vector store
+        // Search using HNSW vector store
         let store = self.vector_store.read();
-        let results = store.search(&query_embedding, limit);
+        let raw_results = store.search(&query_embedding, limit, self.config.hnsw_ef_search);
+        
+        // Convert raw results to SemanticSearchResult format
+        let mut results = Vec::new();
+        for (point_id, distance) in raw_results {
+            if let Some((chunk_id, object_id, preview)) = store.metadata.get(&point_id) {
+                results.push(SemanticSearchResult {
+                    chunk_id: *chunk_id,
+                    object_id: *object_id,
+                    similarity: 1.0 - distance, // Convert distance to similarity
+                    text_preview: preview.clone(),
+                });
+            }
+        }
         
         Ok(results)
     }
@@ -305,7 +362,12 @@ impl VectorSearchEngine {
     }
 
     pub fn save_indexes(&self) -> Result<()> {
-        // For the simple vector store, we don't need to save anything special
+        // Save HNSW vector store
+        {
+            let store = self.vector_store.read();
+            store.save_to_file(&self.index_path, "hnsw_index")?;
+        }
+        
         // The FST is already saved when rebuilt
         println!("Vector search indexes saved");
         Ok(())
@@ -340,6 +402,7 @@ impl VectorSearchEngine {
 mod tests {
     use super::*;
     use crate::embeddings::{EmbeddingProvider, EmbeddingProviderType, LocalEmbeddingModelType};
+    use crate::types::ForgeUuid;
     use async_trait::async_trait;
     use tempfile::TempDir;
 

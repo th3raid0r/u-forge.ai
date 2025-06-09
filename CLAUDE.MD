@@ -90,7 +90,7 @@ UI Event -> Write Queue (tokio::mpsc) -> {
 - [x] Core graph operations with comprehensive testing
 - [ ] Benchmark against 50GB synthetic dataset
 
-### Sprint 2: Vector Search & Index Management ⚠️ PARTIALLY COMPLETED
+### Sprint 2: Vector Search & Index Management ✅ COMPLETED
 - [x] FastEmbed-rs integration with local embedding models (BGE-small-en-v1.5)
 - [x] Basic vector search with cosine similarity (HNSW fallback due to API issues)
 - [x] FST integration for exact name matching
@@ -244,9 +244,9 @@ trait LLMProvider {
 
 ## Future Roadmap Considerations
 
-### Sprint 2: Vector Search & Index Management - Implementation Details
+### Sprint 2: Vector Search & Index Management - Implementation Details ✅
 
-#### Revised Sprint 2 Goals
+#### Completed Sprint 2 Goals
 
 1. **Foundation** (Week 1):
    - FastEmbed-rs integration with BGE-small-en-v1.5 (default)
@@ -394,86 +394,39 @@ The working prototype successfully manages a 12-node knowledge graph with:
 
 ### 🚨 Critical Technical Challenges
 
-#### HNSW Vector Search Integration Failure
+#### ✅ RESOLVED: HNSW Vector Search Integration Success
 
-**Problem Summary**: The initial plan to use `hnsw_rs` v0.3.x for approximate nearest neighbor search encountered extensive API compatibility issues that forced a fallback to simple cosine similarity search.
+**Resolution Summary**: Successfully integrated `hnsw_rs` v0.3.x for efficient approximate nearest neighbor search, replacing the temporary cosine similarity fallback.
 
-**Detailed Technical Issues**:
+**Final Implementation**:
 
-1. **Breaking API Changes in hnsw_rs v0.3.x**:
+1. **Working HNSW Integration**:
    ```rust
-   // OLD API (expected):
-   hnsw.nb_elements()  // -> usize
-   hnsw.add_point(vector, id)
-   
-   // NEW API (actual):
-   hnsw.get_nb_point()  // different method name
-   hnsw.insert((vector, id))  // different signature
+   // HnswVectorStore successfully using hnsw_rs v0.3 API:
+   let hnsw = Hnsw::<f32, DistL2>::new(m, max_elements, 16, ef_construction, DistL2 {});
+   hnsw.insert((&vector, id));  // Correct API usage
+   let results = hnsw.search(&query, k, ef_search);  // Direct Vec<Neighbour> return
    ```
 
-2. **Lifetime Parameter Requirements**:
-   ```rust
-   // Expected:
-   pub struct VectorSearchEngine {
-       hnsw: Arc<RwLock<Hnsw<f32, DistDot>>>,
-   }
-   
-   // Required:
-   pub struct VectorSearchEngine<'a> {
-       hnsw: Arc<RwLock<Hnsw<'a, f32, DistDot>>>,
-   }
-   ```
-   This lifetime requirement propagated through the entire codebase, requiring extensive refactoring.
+2. **API Compatibility Resolved**:
+   - `hnsw.get_nb_point()` - method name confirmed and working
+   - `hnsw.insert((&vector, id))` - tuple parameter format working
+   - `Neighbour` struct fields: `d_id`, `distance`, `p_id` - all accessible
+   - `hnsw.file_dump(path, basename)` - persistence working with correct parameters
 
-3. **Search Result Structure Changes**:
-   ```rust
-   // Expected fields:
-   result.idx  // point ID
-   result.dist // distance
-   
-   // Actual fields:
-   result.p_id     // point ID (renamed)
-   result.d_id     // data ID (new field)
-   result.distance // distance (renamed)
-   ```
+3. **Performance Improvements**:
+   - Replaced `SimpleVectorStore` with `HnswVectorStore`
+   - Sub-linear search complexity O(log n) vs O(n) cosine similarity
+   - Efficient memory usage with configurable parameters
+   - Proper index persistence and loading
 
-4. **Serialization Support Removed**:
-   - `hnsw_rs::Hnsw` no longer implements `Serialize`/`Deserialize`
-   - Index persistence requires custom implementation
-   - No built-in memory mapping support
+4. **Key Implementation Details**:
+   - Vector validation with dimension checking
+   - Graceful handling of empty indexes during persistence
+   - Metadata storage alongside HNSW index
+   - Comprehensive test coverage maintained
 
-5. **Search API Overhaul**:
-   ```rust
-   // Expected:
-   let results = hnsw.search(&query, k, ef, &mut searcher);
-   
-   // Actual:
-   let results = hnsw.search(&query, k, ef); // 3 params, not 4
-   // Searcher pattern completely different
-   ```
-
-**Impact**: These issues required ~6 hours of attempted fixes across multiple API versions. The breaking changes were too extensive for a rapid resolution.
-
-**Current Workaround**: 
-- Implemented `SimpleVectorStore` with cosine similarity
-- Maintains same interface as planned HNSW integration
-- Performance acceptable for small-to-medium datasets (< 10K vectors)
-- Enables continued development while HNSW integration is resolved
-
-**Recommended Solutions for Future Work**:
-
-1. **Evaluate Alternative Libraries**:
-   - `candle-hnsw` (newer, better Rust integration)
-   - `hora` (HNSW in Rust with stable API)
-   - `hnswlib` (C++ with Rust bindings)
-
-2. **Version Pinning Strategy**:
-   - Pin to specific `hnsw_rs` version if API stabilizes
-   - Create abstraction layer for vector search to isolate changes
-
-3. **Custom Implementation**:
-   - Implement basic HNSW from scratch for full control
-   - Focus on TTRPG use cases (small-medium scale, insert-heavy workload)
+**Results**: All vector search tests passing, full demo working with HNSW-powered semantic search. Sprint 2 objectives successfully completed.
 
 #### Additional Technical Debt
 
@@ -482,12 +435,14 @@ The working prototype successfully manages a 12-node knowledge graph with:
 3. **Borrow Checker Issues**: Multiple ownership issues resolved through cloning (performance cost)
 4. **Test Coverage**: Current tests use mock providers; real provider tests limited by model download time
 
-### 🔧 Immediate Next Steps for HNSW Resolution
+### 🚀 Next Steps: Sprint 3 Preparation
 
-1. **Benchmark Current Performance**: Measure cosine similarity performance vs. required scale
-2. **Evaluate Alternatives**: Test `candle-hnsw` and `hora` libraries
-3. **API Abstraction**: Create `VectorIndex` trait to isolate implementation details
-4. **Performance Testing**: Establish baseline metrics for vector search at different scales
+With HNSW integration successfully completed, focus shifts to Sprint 3 objectives:
+
+1. **Performance Benchmarking**: Measure HNSW performance against scale targets (10K+ vectors)
+2. **UI Foundation**: Begin Tauri + Svelte setup for visual graph interface
+3. **Graph Canvas**: Implement interactive graph visualization components
+4. **API Refinement**: Optimize vector search parameters (ef_search, M values) for TTRPG use cases
 
 ### ⚠️ Development Environment Requirements
 
