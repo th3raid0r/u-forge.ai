@@ -3,7 +3,8 @@
 //! vector_search.rs - Handles vector-based semantic search and exact name matching.
 
 use crate::embeddings::EmbeddingProvider;
-use crate::types::{ChunkId, ObjectId, ObjectType};
+use crate::embedding_queue::EmbeddingQueue;
+use crate::types::{ChunkId, ObjectId};
 use anyhow::Result;
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 use hnsw_rs::prelude::*;
@@ -14,6 +15,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::task;
 
 // Constants for file naming
 const FST_INDEX_FILE: &str = "name_index.fst";
@@ -55,7 +57,7 @@ pub struct SemanticSearchResult {
 pub struct ExactSearchResult {
     pub object_id: ObjectId,
     pub name: String,
-    pub object_type: ObjectType,
+    pub object_type: String,
 }
 
 /// Combined search results
@@ -170,14 +172,14 @@ pub struct VectorSearchEngine {
     index_path: PathBuf,
     
     // HNSW-based vector store for efficient similarity search
-    vector_store: RwLock<HnswVectorStore>,
+    vector_store: Arc<RwLock<HnswVectorStore>>,
     
     // Name-based exact search using FST
     name_fst: RwLock<Option<Map<Vec<u8>>>>,
-    fst_value_store: RwLock<Vec<(ObjectId, ObjectType)>>,
+    fst_value_store: RwLock<Vec<(ObjectId, String)>>,
     
     // Text previews for chunks
-    chunk_previews: RwLock<HashMap<ChunkId, String>>,
+    chunk_previews: Arc<RwLock<HashMap<ChunkId, String>>>,
 }
 
 impl VectorSearchEngine {
@@ -197,14 +199,14 @@ impl VectorSearchEngine {
             config.hnsw_m,
             config.hnsw_ef_construction,
         ) {
-            RwLock::new(loaded_store)
+            Arc::new(RwLock::new(loaded_store))
         } else {
-            RwLock::new(HnswVectorStore::new(
+            Arc::new(RwLock::new(HnswVectorStore::new(
                 config.dimensions,
                 config.max_elements,
                 config.hnsw_m,
                 config.hnsw_ef_construction,
-            ))
+            )))
         };
         
         Ok(Self {
@@ -214,7 +216,7 @@ impl VectorSearchEngine {
             vector_store,
             name_fst: RwLock::new(None),
             fst_value_store: RwLock::new(Vec::new()),
-            chunk_previews: RwLock::new(HashMap::new()),
+            chunk_previews: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -256,7 +258,60 @@ impl VectorSearchEngine {
         Ok(())
     }
 
-    pub fn rebuild_name_index(&self, objects: Vec<(ObjectId, String, ObjectType)>) -> Result<()> {
+    /// Add chunk using background embedding queue for UI responsiveness
+    pub async fn add_chunk_background(
+        &self,
+        chunk_id: ChunkId,
+        object_id: ObjectId,
+        content: &str,
+        embedding_queue: &EmbeddingQueue,
+    ) -> Result<()> {
+        // Create text preview (first 100 chars)
+        let preview = if content.len() > 100 {
+            format!("{}...", &content[..97])
+        } else {
+            content.to_string()
+        };
+
+        // Submit to background queue
+        let receiver = embedding_queue
+            .embed_text(content.to_string(), Some(chunk_id), Some(object_id))
+            .await?;
+
+        // Use spawn_blocking to avoid blocking UI while waiting
+        let vector_store = Arc::clone(&self.vector_store);
+        let chunk_previews = Arc::clone(&self.chunk_previews);
+        let preview_clone = preview.clone();
+
+        task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async {
+                match receiver.await {
+                    Ok(Ok(embedding)) => {
+                        // Add to vector store
+                        {
+                            let mut store = vector_store.write();
+                            store.add(embedding, chunk_id, object_id, preview_clone.clone());
+                        }
+                        
+                        // Store preview
+                        {
+                            let mut previews = chunk_previews.write();
+                            previews.insert(chunk_id, preview_clone);
+                        }
+                        
+                        Ok(())
+                    }
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(anyhow::Error::msg("Embedding request was cancelled")),
+                }
+            })
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    pub fn rebuild_name_index(&self, objects: Vec<(ObjectId, String, String)>) -> Result<()> {
         let fst_path = self.index_path.join(FST_INDEX_FILE);
         let values_path = self.index_path.join(FST_VALUES_FILE);
         
@@ -384,7 +439,7 @@ impl VectorSearchEngine {
             
             // Load value store
             let values_file = File::open(&values_path)?;
-            let value_store: Vec<(ObjectId, ObjectType)> = 
+            let value_store: Vec<(ObjectId, String)> = 
                 bincode::deserialize_from(BufReader::new(values_file))?;
             
             let value_store_len = value_store.len();
@@ -571,9 +626,9 @@ mod tests {
 
         // Build name index
         let objects = vec![
-            (gandalf_id, "Gandalf".to_string(), ObjectType::Character),
-            (frodo_id, "Frodo Baggins".to_string(), ObjectType::Character),
-            (sauron_id, "Sauron".to_string(), ObjectType::Character),
+            (gandalf_id, "Gandalf".to_string(), "character".to_string()),
+            (frodo_id, "Frodo Baggins".to_string(), "character".to_string()),
+            (sauron_id, "Sauron".to_string(), "character".to_string()),
         ];
         
         engine.rebuild_name_index(objects).unwrap();
@@ -607,8 +662,8 @@ mod tests {
 
         // Build name index
         let objects = vec![
-            (gandalf_id, "Gandalf".to_string(), ObjectType::Character),
-            (frodo_id, "Frodo Baggins".to_string(), ObjectType::Character),
+            (gandalf_id, "Gandalf".to_string(), "character".to_string()),
+            (frodo_id, "Frodo Baggins".to_string(), "character".to_string()),
         ];
         engine.rebuild_name_index(objects).unwrap();
 
@@ -640,8 +695,8 @@ mod tests {
             engine.initialize().await.unwrap();
             
             let objects = vec![
-                (gandalf_id, "Gandalf".to_string(), ObjectType::Character),
-                (frodo_id, "Frodo Baggins".to_string(), ObjectType::Character),
+                (gandalf_id, "Gandalf".to_string(), "character".to_string()),
+                (frodo_id, "Frodo Baggins".to_string(), "character".to_string()),
             ];
             engine.rebuild_name_index(objects).unwrap();
             engine.save_indexes().unwrap();

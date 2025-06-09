@@ -2630,6 +2630,7 @@ dependencies = [
  "parking_lot",
  "petgraph",
  "rayon",
+ "regex",
  "reqwest",
  "rocksdb",
  "serde",

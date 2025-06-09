@@ -230,7 +230,7 @@ async fn main() -> Result<()> {
     struct TextToIndex {
         chunk_id: u_forge_ai::ChunkId,
         object_id: u_forge_ai::ObjectId,
-        object_type: ObjectType,
+        object_type: String,
         content: String,
     }
     let mut texts_to_index: Vec<TextToIndex> = Vec::new();
@@ -248,14 +248,14 @@ async fn main() -> Result<()> {
         // Add object name and description to index as well
         if let Some(desc) = &obj_meta.description {
             texts_to_index.push(TextToIndex {
-                chunk_id: ForgeUuid::new_v4(), // Synthetic ChunkId for metadata
+                chunk_id: u_forge_ai::ForgeUuid::new_v4(), // Generate a new ID for name/description chunks
                 object_id: obj_meta.id,
                 object_type: obj_meta.object_type.clone(),
                 content: desc.clone(),
             });
         }
         texts_to_index.push(TextToIndex {
-            chunk_id: ForgeUuid::new_v4(), // Synthetic ChunkId for metadata
+            chunk_id: u_forge_ai::ForgeUuid::new_v4(), // Generate a new ID for name chunks
             object_id: obj_meta.id,
             object_type: obj_meta.object_type.clone(),
             content: obj_meta.name.clone(),
@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
     }
     
     // Rebuild name index for FST
-    let names_for_fst: Vec<(u_forge_ai::ObjectId, String, ObjectType)> = all_objects.iter()
+    let names_for_fst: Vec<(u_forge_ai::ObjectId, String, String)> = all_objects.iter()
         .map(|obj| (obj.id, obj.name.clone(), obj.object_type.clone()))
         .collect();
     search_engine.rebuild_name_index(names_for_fst)?;
@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
 
     // Demonstrate search by name
     println!("\n🔍 Finding characters named 'Frodo':");
-    let frodo_matches = graph.find_by_name(ObjectType::Character, "Frodo Baggins")?;
+    let frodo_matches = graph.find_by_name("character", "Frodo Baggins")?;
     for character in frodo_matches {
         println!("   • Found: {} (ID: {})", character.name, character.id);
     }

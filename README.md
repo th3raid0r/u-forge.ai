@@ -141,7 +141,7 @@ The current demo creates a small Middle-earth knowledge graph and demonstrates:
 ## 🎯 Intended Use Cases (*When Complete*)
 
 ### For In-Person Campaign Management
-- Track complex political relationships between factions with visual connections  
+- Track complex political relationships between factions with visual connections
 - Remember which NPCs know which secrets and when they revealed them
 - Quickly find story elements using semantic search
 - Generate consistent lore that builds on established facts
@@ -202,7 +202,7 @@ This is an early prototype. Contributions welcome, but expect significant API ch
 - [x] Simple semantic search
 - [x] FST-based exact matching
 - [x] Command-line demo
-- [ ] HNSW vector search integration
+- [x] HNSW vector search integration
 - [ ] Basic GUI interface
 - [ ] Cross-platform packaging
 

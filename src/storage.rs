@@ -11,6 +11,7 @@ const CF_NODES: &str = "nodes";
 const CF_CHUNKS: &str = "chunks";
 const CF_EDGES: &str = "edges";
 const CF_NAMES: &str = "names";
+const CF_SCHEMAS: &str = "schemas";
 
 /// Storage engine for the knowledge graph using RocksDB
 pub struct KnowledgeGraphStorage {
@@ -62,6 +63,7 @@ impl KnowledgeGraphStorage {
             ColumnFamilyDescriptor::new(CF_CHUNKS, Options::default()),
             ColumnFamilyDescriptor::new(CF_EDGES, Options::default()),
             ColumnFamilyDescriptor::new(CF_NAMES, Options::default()),
+            ColumnFamilyDescriptor::new(CF_SCHEMAS, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
@@ -70,13 +72,13 @@ impl KnowledgeGraphStorage {
         Ok(Self { db: Arc::new(db) })
     }
 
-    /// Insert or update a node in the knowledge graph
+    /// Insert or update a node in the graph
     pub fn upsert_node(&self, metadata: ObjectMetadata) -> Result<()> {
         let _cf_nodes = self.get_cf(CF_NODES)?;
         let cf_names = self.get_cf(CF_NAMES)?;
 
         let key = metadata.id.as_bytes();
-        let value = bincode::serialize(&metadata).context("Failed to serialize node metadata")?;
+        let value = serde_json::to_vec(&metadata).context("Failed to serialize node metadata")?;
 
         let mut batch = WriteBatch::default();
 
@@ -84,7 +86,7 @@ impl KnowledgeGraphStorage {
         batch.put_cf(&_cf_nodes, key, value);
 
         // Index by name for fast lookups
-        let name_key = format!("{}:{}", metadata.object_type.as_str(), metadata.name);
+        let name_key = format!("{}:{}", metadata.object_type, metadata.name);
         batch.put_cf(&cf_names, name_key.as_bytes(), key);
 
         self.db
@@ -95,6 +97,7 @@ impl KnowledgeGraphStorage {
     }
 
     /// Get a node by its ID
+    /// Retrieve a node by its ID
     pub fn get_node(&self, id: ObjectId) -> Result<Option<ObjectMetadata>> {
         let cf_nodes = self.get_cf(CF_NODES)?;
         let key = id.as_bytes();
@@ -102,7 +105,7 @@ impl KnowledgeGraphStorage {
         match self.db.get_cf(cf_nodes, key)? {
             Some(value) => {
                 let metadata: ObjectMetadata =
-                    bincode::deserialize(&value).context("Failed to deserialize node metadata")?;
+                    serde_json::from_slice(&value).context("Failed to deserialize node metadata")?;
                 Ok(Some(metadata))
             }
             None => Ok(None),
@@ -118,7 +121,7 @@ impl KnowledgeGraphStorage {
         for item in iter {
             match item {
                 Ok((_key, value)) => {
-                    let metadata: ObjectMetadata = bincode::deserialize(&value)
+                    let metadata: ObjectMetadata = serde_json::from_slice(&value)
                         .context("Failed to deserialize ObjectMetadata")?;
                     objects.push(metadata);
                 }
@@ -423,6 +426,61 @@ impl KnowledgeGraphStorage {
             None => Ok(None),
         }
     }
+
+    /// Get a schema by name
+    pub fn get_schema(&self, name: &str) -> Result<Option<crate::schema::SchemaDefinition>> {
+        let cf = self.get_cf(CF_SCHEMAS)?;
+        let key = name.as_bytes();
+        
+        match self.db.get_cf(&cf, key)? {
+            Some(data) => {
+                let schema: crate::schema::SchemaDefinition = bincode::deserialize(&data)
+                    .context("Failed to deserialize schema")?;
+                Ok(Some(schema))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Save a schema
+    pub fn save_schema(&self, schema: &crate::schema::SchemaDefinition) -> Result<()> {
+        let cf = self.get_cf(CF_SCHEMAS)?;
+        let key = schema.name.as_bytes();
+        let value = bincode::serialize(schema)
+            .context("Failed to serialize schema")?;
+        
+        self.db.put_cf(&cf, key, value)
+            .context("Failed to save schema")?;
+        
+        Ok(())
+    }
+
+    /// Delete a schema
+    pub fn delete_schema(&self, name: &str) -> Result<()> {
+        let cf = self.get_cf(CF_SCHEMAS)?;
+        let key = name.as_bytes();
+        
+        self.db.delete_cf(&cf, key)
+            .context("Failed to delete schema")?;
+        
+        Ok(())
+    }
+
+    /// List all schema names
+    pub fn list_schemas(&self) -> Result<Vec<String>> {
+        let cf = self.get_cf(CF_SCHEMAS)?;
+        let mut schemas = Vec::new();
+        
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item?;
+            let name = String::from_utf8(key.to_vec())
+                .context("Invalid UTF-8 in schema name")?;
+            schemas.push(name);
+        }
+        
+        Ok(schemas)
+    }
 }
 
 #[cfg(test)]
@@ -441,7 +499,7 @@ mod tests {
     fn test_node_operations() {
         let (storage, _temp_dir) = create_test_storage();
 
-        let metadata = ObjectMetadata::new(ObjectType::Character, "Gandalf".to_string())
+        let metadata = ObjectMetadata::new("character".to_string(), "Gandalf".to_string())
             .with_description("A wise wizard".to_string());
         let node_id = metadata.id;
 
@@ -451,7 +509,7 @@ mod tests {
         // Retrieve node
         let retrieved = storage.get_node(node_id).unwrap().unwrap();
         assert_eq!(retrieved.name, "Gandalf");
-        assert_eq!(retrieved.object_type, ObjectType::Character);
+        assert_eq!(retrieved.object_type, "character");
 
         // Find by name
         let found = storage.find_nodes_by_name("character", "Gandalf").unwrap();
@@ -464,8 +522,8 @@ mod tests {
         let (storage, _temp_dir) = create_test_storage();
 
         // Create two nodes
-        let gandalf = ObjectMetadata::new(ObjectType::Character, "Gandalf".to_string());
-        let frodo = ObjectMetadata::new(ObjectType::Character, "Frodo".to_string());
+        let gandalf = ObjectMetadata::new("character".to_string(), "Gandalf".to_string());
+        let frodo = ObjectMetadata::new("character".to_string(), "Frodo".to_string());
 
         storage.upsert_node(gandalf.clone()).unwrap();
         storage.upsert_node(frodo.clone()).unwrap();
@@ -494,7 +552,7 @@ mod tests {
     fn test_chunk_operations() {
         let (storage, _temp_dir) = create_test_storage();
 
-        let metadata = ObjectMetadata::new(ObjectType::Location, "Shire".to_string());
+        let metadata = ObjectMetadata::new("location".to_string(), "Shire".to_string());
         storage.upsert_node(metadata.clone()).unwrap();
 
         let chunk = TextChunk::new(
@@ -515,9 +573,9 @@ mod tests {
         let (storage, _temp_dir) = create_test_storage();
 
         // Create a small graph: Gandalf -> Frodo -> Sam
-        let gandalf = ObjectMetadata::new(ObjectType::Character, "Gandalf".to_string());
-        let frodo = ObjectMetadata::new(ObjectType::Character, "Frodo".to_string());
-        let sam = ObjectMetadata::new(ObjectType::Character, "Sam".to_string());
+        let gandalf = ObjectMetadata::new("character".to_string(), "Gandalf".to_string());
+        let frodo = ObjectMetadata::new("character".to_string(), "Frodo".to_string());
+        let sam = ObjectMetadata::new("character".to_string(), "Sam".to_string());
 
         storage.upsert_node(gandalf.clone()).unwrap();
         storage.upsert_node(frodo.clone()).unwrap();
@@ -541,8 +599,8 @@ mod tests {
     fn test_node_deletion() {
         let (storage, _temp_dir) = create_test_storage();
 
-        let gandalf = ObjectMetadata::new(ObjectType::Character, "Gandalf".to_string());
-        let frodo = ObjectMetadata::new(ObjectType::Character, "Frodo".to_string());
+        let gandalf = ObjectMetadata::new("character".to_string(), "Gandalf".to_string());
+        let frodo = ObjectMetadata::new("character".to_string(), "Frodo".to_string());
 
         storage.upsert_node(gandalf.clone()).unwrap();
         storage.upsert_node(frodo.clone()).unwrap();
@@ -565,8 +623,8 @@ mod tests {
     fn test_stats() {
         let (storage, _temp_dir) = create_test_storage();
 
-        let gandalf = ObjectMetadata::new(ObjectType::Character, "Gandalf".to_string());
-        let frodo = ObjectMetadata::new(ObjectType::Character, "Frodo".to_string());
+        let gandalf = ObjectMetadata::new("character".to_string(), "Gandalf".to_string());
+        let frodo = ObjectMetadata::new("character".to_string(), "Frodo".to_string());
 
         storage.upsert_node(gandalf.clone()).unwrap();
         storage.upsert_node(frodo.clone()).unwrap();
@@ -586,5 +644,29 @@ mod tests {
         assert_eq!(stats.edge_count, 1);
         assert_eq!(stats.chunk_count, 1);
         assert!(stats.total_tokens > 0);
+    }
+
+    #[test]
+    fn test_schema_operations() {
+        let (storage, _temp) = create_test_storage();
+        
+        // Create a test schema
+        let schema = crate::schema::SchemaDefinition::create_default();
+        
+        // Save schema
+        storage.save_schema(&schema).unwrap();
+        
+        // Retrieve schema
+        let retrieved = storage.get_schema("default").unwrap().unwrap();
+        assert_eq!(retrieved.name, "default");
+        assert_eq!(retrieved.version, "1.0.0");
+        
+        // List schemas
+        let schemas = storage.list_schemas().unwrap();
+        assert!(schemas.contains(&"default".to_string()));
+        
+        // Delete schema
+        storage.delete_schema("default").unwrap();
+        assert!(storage.get_schema("default").unwrap().is_none());
     }
 }

@@ -1,480 +1,482 @@
-# CLAUDE.md - u-forge.ai Implementation Guide
+# CLAUDE.md - Technical Implementation Guide
 
-## Project Overview
+This document provides technical implementation patterns and guidance for working with the u-forge.ai codebase.
 
-**u-forge.ai** (Universe Forge) is a local-first, cross-platform TTRPG worldbuilding application that combines object-oriented note-taking with AI-powered knowledge graphs. The core application is open source (MIT) and provides essential worldbuilding tools for pen-and-paper GMs, while premium integrations for VTT platforms are offered as separate commercial products.
+## Codebase Architecture Patterns
 
-## Business Model & Feature Separation
-
-**Core Philosophy**: Free for pen-and-paper, premium for digital tools.
-
-### Core Application (MIT License - Always Free)
-- Local-first data storage and privacy
-- Basic AI integration (user's own API keys)
-- Visual knowledge graph with TTRPG schemas
-- Semantic search over large datasets
-- Local session recording and transcription for in-person table games
-- Speaker identification and smart note promotion from session audio
-- Import/export capabilities
-- Cross-platform desktop application
-
-### Premium Products (Separate Commercial Licenses)
-- **Virtual Session Recording**: Enhanced transcription for online games with multi-platform support (Discord voice + FoundryVTT text + Roll20 dice, etc.)
-- **Multi-Platform Integration**: Unified session capture that correlates voice chat, text messages, dice rolls, and character actions across different platforms
-- **Cloud Sync Service**: Multi-device access, collaboration, shared campaigns
-- **U-Store**: Official licensed content marketplace where publishers can offer pre-built knowledge graphs for their copyrighted IP (D&D modules, Pathfinder APs, etc.)
-- **Mobile Companion App**: Session notes, quick lookups during games
-
-### Core Value Proposition
-- **Local-first**: No servers, user owns their data and API keys
-- **AI-augmented**: Context-aware LLM integration for worldbuilding
-- **Graph-native**: Visual knowledge graph with TTRPG-specific schemas
-- **Performance-first**: Sub-second queries over billion-token datasets
-- **Session-aware**: Audio transcription and auto-promotion of campaign notes
-
-## Technical Architecture
-
-### Stack Decision Matrix
-- **Core Engine**: Rust (performance, memory safety, cross-platform)
-- **UI Framework**: Tauri + Svelte (native performance, web flexibility)
-- **Storage**: RocksDB (proven scale, crash recovery, column families)
-- **Vector Search**: hnswlib-rs (memory-mapped, hot-swappable indexes)
-- **Graph Processing**: Custom CSR + petgraph (on-disk + in-memory hybrid)
-
-### Data Model
-
+### RocksDB Integration Pattern
 ```rust
-// Core object types
-enum ObjectType {
-    Character,
-    Location,
-    Faction,
-    Item,
-    Event,
-    Session,
-    CustomType(String)
-}
+// Always use column families for data separation
+let cf_nodes = db.cf_handle("nodes").unwrap();
+let cf_chunks = db.cf_handle("chunks").unwrap();
+let cf_edges = db.cf_handle("edges").unwrap();
 
-// Storage layout in RocksDB column families
-cf_nodes:   ObjectID -> ObjectMetadata (JSON)
-cf_chunks:  ChunkID -> TextBlob (≤1000 tokens)
-cf_edges:   ObjectID -> CompressedAdjacencyList (CSR format)
-cf_names:   FST index for exact proper noun lookups
-cf_vectors: ChunkID -> EmbeddingPointer (HNSW index reference)
+// Use transactions for atomic operations
+let mut batch = WriteBatch::default();
+batch.put_cf(&cf_nodes, key, value);
+batch.put_cf(&cf_edges, edge_key, edge_value);
+db.write(batch)?;
 ```
 
-### Query Pipeline (Target: <300ms end-to-end)
-
-1. **ANN Phase** (~2ms): Query HNSW index for top-K semantically similar chunks
-2. **Graph Expansion** (~10ms): Multi-get RocksDB for 1-2 hop neighbors via CSR
-3. **Context Assembly** (~20ms): Stream chunks through token-aware iterator to 1K budget
-4. **LLM Submission**: Direct API call with assembled context
-
-### Write Path & Concurrency
-
+### Error Handling Patterns
 ```rust
-// Single-writer pattern with async background processing
-UI Event -> Write Queue (tokio::mpsc) -> {
-    1. Immediate: RocksDB transaction (metadata + chunks + edges)
-    2. Async: LLM embedding computation
-    3. Completion: HNSW index update + WAL checkpoint
+// Use Result<T, E> everywhere, never panic in library code
+pub fn get_node(&self, id: &str) -> Result<Option<Node>, StorageError> {
+    match self.db.get_cf(&self.cf_nodes, id) {
+        Ok(Some(bytes)) => Ok(Some(bincode::deserialize(&bytes)?)),
+        Ok(None) => Ok(None),
+        Err(e) => Err(StorageError::Database(e)),
+    }
+}
+
+// Use anyhow::Result for most error handling in this codebase
+pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    let documents = vec![text];
+    let embeddings: Vec<FastEmbedEmbedding> = self.model.embed(documents, None)
+        .map_err(|e| anyhow!("FastEmbed embedding failed: {}", e))?;
+    // ...
 }
 ```
 
-## Implementation Priorities
-
-### Sprint 1: Storage Foundation ✅ COMPLETED
-- [x] RocksDB integration with column families
-- [x] Adjacency list edge storage (implemented, CSR for future optimization)
-- [x] Crash recovery and WAL checkpointing (built on RocksDB guarantees)
-- [x] Core graph operations with comprehensive testing
-- [ ] Benchmark against 50GB synthetic dataset
-
-### Sprint 2: Vector Search & Index Management ✅ COMPLETED
-- [x] FastEmbed-rs integration with local embedding models (BGE-small-en-v1.5)
-- [x] Basic vector search with cosine similarity (HNSW fallback due to API issues)
-- [x] FST integration for exact name matching
-- [x] Query pipeline implementation with hybrid search
-- [x] Enhanced demonstration with semantic search capabilities
-- [ ] Memory-mapped HNSW integration (blocked by hnsw_rs API compatibility)
-- [ ] Background embedder with backpressure
-- [ ] Latency optimization and performance testing
-
-### Sprint 3: Core UI & Graph Canvas
-- [ ] Tauri application shell with Svelte frontend
-- [ ] Interactive D3.js graph canvas (≤2K nodes initially)
-- [ ] CRUD operations for TTRPG objects
-- [ ] Keyboard navigation and accessibility
-
-### Sprint 4: AI Integration & Local Session Capture
-- [ ] Multi-provider LLM client (OpenAI, Anthropic, local)
-- [ ] OS keystore integration for API keys
-- [ ] Whisper-cpp audio transcription for local table recording
-- [ ] Speaker identification and diarization for in-person sessions
-- [ ] Entity detection and automatic note promotion from transcripts
-- [ ] Session-to-graph linking (characters mentioned, locations visited, etc.)
-
-## Key Design Decisions & Rationale
-
-### Why RocksDB over sled?
-- **Maturity**: Production-proven at scale vs beta software
-- **Recovery**: Snapshotting + WAL for sub-second crash recovery
-- **Column Families**: Separate hot/cold data with different caching strategies
-- **Multi-writer Ready**: Easier CRDT integration in future versions
-
-### Why Memory-Mapped HNSW?
-- **Scale**: 2M vectors × 384 dims = ~8GB; must avoid loading into RAM
-- **Hot Swap**: Background index rebuilds without UI freeze
-- **Persistence**: Survives application restarts without rebuild
-
-### Why Tauri over Electron?
-- **Performance**: Native binary vs V8 overhead
-- **Size**: ~50MB vs ~200MB distribution
-- **Security**: Rust backend vs Node.js attack surface
-- **Linux Support**: Better Wayland/X11 compatibility
-
-## Cross-Platform Packaging Strategy
-
-### Linux (Primary)
-- **Flatpak**: Main distribution (runtime bundling, universal compatibility)
-- **DEB/RPM**: Optional for power users via cargo-deb
-
-### macOS/Windows
-- **Native Installers**: DMG/MSI via Tauri bundler
-- **Code Signing**: Required for modern OS compatibility
-- **Auto-update**: GitHub Releases + Tauri updater
-
-**Note**: Premium integrations will use separate distribution channels (FoundryVTT marketplace, Discord bot directory, etc.)
-
-## AI Integration Architecture
-
-### Local-First Embedding Strategy
-
-**Core Philosophy**: Prioritize local-first solutions with cloud APIs as optional enhancements.
-
-#### Primary Local Embedding Solutions (Ranked by Priority)
-
-1. **FastEmbed-rs** (Recommended Primary)
-   - **Pros**: Pure Rust, ONNX-based, no tokio dependency, batch processing with rayon
-   - **Models**: 15+ pre-trained models including BGE, E5, Nomic, MiniLM variants
-   - **Performance**: Optimized for production use with ONNX Runtime
-   - **Size**: Models range from 23MB (all-minilm) to 1.3GB (multilingual-e5-large)
-   - **Local**: 100% local inference, no network requirements
-
-2. **Ollama Integration** (Secondary/Optional)
-   - **Pros**: User-friendly model management, REST API, supports nomic-embed-text
-   - **Models**: nomic-embed-text (274MB), mxbai-embed-large, snowflake-arctic-embed
-   - **Performance**: Good for development, may have higher latency than FastEmbed
-   - **Dependency**: Requires separate Ollama installation
-
-3. **Cloud APIs** (Tertiary/Optional)
-   - OpenAI, Anthropic as fallback options
-   - User-provided API keys stored in OS keystore
-   - Clear UX indication when using external services
-
-### Multi-Provider Support
+### Embedding Queue Pattern (Background Processing)
 ```rust
-// Multi-tier embedding provider system
-trait EmbeddingProvider {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
-    async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>>;
-    fn dimensions(&self) -> usize;
-    fn max_tokens(&self) -> usize;
-    fn provider_type(&self) -> EmbeddingProviderType;
+// Background processing for UI responsiveness
+pub async fn embed_text(&self, text: String, chunk_id: ChunkId, object_id: ObjectId) -> Result<RequestId> {
+    let request_id = RequestId::new_v4();
+    let request = EmbeddingRequest {
+        id: request_id,
+        text,
+        chunk_id,
+        object_id,
+        response_sender: response_tx,
+    };
+    
+    self.sender.send(QueueMessage::Single(request)).await?;
+    Ok(request_id)
 }
 
-enum EmbeddingProviderType {
-    Local(LocalEmbeddingModel),
-    Ollama(OllamaConfig),
-    Cloud(CloudProvider),
+// Always validate dimensions before insertion
+fn validate_embedding(&self, embedding: &[f32]) -> Result<(), VectorError> {
+    if embedding.len() != self.expected_dimensions {
+        return Err(VectorError::DimensionMismatch {
+            expected: self.expected_dimensions,
+            actual: embedding.len(),
+        });
+    }
+    Ok(())
+}
+```
+
+## Testing Patterns
+
+### Unit Test Structure
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    
+    fn setup_test_storage() -> (KnowledgeGraph, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let kg = KnowledgeGraph::new(temp_dir.path(), None).unwrap();
+        (kg, temp_dir)
+    }
+    
+    #[tokio::test]
+    async fn test_node_crud_operations() {
+        let (graph, _temp) = setup_test_storage();
+        
+        // Test creation using ObjectBuilder pattern
+        let gandalf_id = ObjectBuilder::character("Gandalf".to_string())
+            .with_description("A wise wizard".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        
+        // Test retrieval
+        let retrieved = graph.get_object(gandalf_id).unwrap().unwrap();
+        assert_eq!(retrieved.name, "Gandalf");
+        
+        // Test deletion
+        graph.delete_object(gandalf_id).unwrap();
+        assert!(graph.get_object(gandalf_id).unwrap().is_none());
+    }
+}
+```
+
+### Mock Provider Pattern for Testing
+```rust
+struct MockEmbeddingProvider {
+    dimensions: usize,
 }
 
-// Primary implementation using FastEmbed-rs
-struct FastEmbedProvider {
-    model: TextEmbedding,
-    model_info: ModelInfo,
+#[async_trait]
+impl EmbeddingProvider for MockEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        // Return deterministic mock embeddings for testing
+        let mut embedding = vec![0.1; self.dimensions];
+        embedding[0] = text.len() as f32 / 100.0; // Make it text-dependent
+        Ok(embedding)
+    }
+    
+    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let mut results = Vec::new();
+        for text in texts {
+            results.push(self.embed(&text).await?);
+        }
+        Ok(results)
+    }
+    
+    fn dimensions(&self) -> Result<usize> { Ok(self.dimensions) }
+    fn max_tokens(&self) -> Result<usize> { Ok(512) }
+    // ... other trait methods
+}
+```
+
+## Vector Search Implementation
+
+### HNSW Integration (Current Working Implementation)
+```rust
+// Initialize HNSW with proper parameters
+let hnsw = Hnsw::<f32, DistL2>::new(
+    config.hnsw_m,              // M - number of connections (default: 16)
+    config.max_elements,        // capacity
+    16,                         // ef_construction (fixed)
+    config.hnsw_ef_search,      // ef_search (default: 32)
+    DistL2 {}                   // L2 distance function
+);
+
+// Insert with proper error handling
+pub fn add(&mut self, vector: Vec<f32>) -> Result<usize> {
+    if vector.len() != self.dimensions {
+        return Err(anyhow!("Vector dimension mismatch"));
+    }
+    
+    let id = self.next_id;
+    self.hnsw.insert((&vector, id))?;
+    self.metadata.insert(id, vector);
+    self.next_id += 1;
+    Ok(id)
 }
 
-// Secondary implementation for Ollama users
-struct OllamaEmbeddingProvider {
-    client: OllamaClient,
-    model_name: String,
+// Search with configurable parameters
+pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(usize, f32)>> {
+    if query.len() != self.dimensions {
+        return Err(anyhow!("Query dimension mismatch"));
+    }
+    
+    let results = self.hnsw.search(query, k, 32); // ef_search = 32
+    Ok(results.into_iter()
+        .map(|neighbor| (neighbor.d_id, neighbor.distance))
+        .collect())
+}
+```
+
+### FST Integration for Exact Matching
+```rust
+// Build FST index for exact name matching
+pub fn rebuild_name_index(&mut self, objects: Vec<(String, ObjectId, ObjectType)>) -> Result<()> {
+    let mut builder = fst::MapBuilder::memory();
+    let mut value_store = Vec::new();
+    
+    for (i, (name, object_id, object_type)) in objects.iter().enumerate() {
+        builder.insert(&name.to_lowercase(), i as u64)?;
+        value_store.push(ExactSearchResult {
+            object_id: *object_id,
+            name: name.clone(),
+            object_type: object_type.clone(),
+        });
+    }
+    
+    let fst_bytes = builder.into_inner()?;
+    let fst = fst::Map::new(fst_bytes)?;
+    
+    self.name_fst = Some(fst);
+    self.fst_value_store = value_store;
+    Ok(())
+}
+```
+
+### Hybrid Search Pattern
+```rust
+pub async fn search_hybrid(&mut self, query: &str, k: usize) -> Result<HybridSearchResult> {
+    // Run semantic search
+    let semantic_future = self.search_semantic(query, k);
+    
+    // Run exact search in parallel
+    let exact_results = self.search_exact(query, k);
+    
+    // Await semantic results
+    let semantic_results = semantic_future.await?;
+    
+    Ok(HybridSearchResult {
+        semantic_results,
+        exact_results,
+    })
+}
+```
+
+## Embedding Provider Patterns
+
+### FastEmbed Integration
+```rust
+// Always use proper model initialization
+pub fn new(model_type: FastEmbedModel, cache_dir: Option<PathBuf>, show_download_progress: bool) -> Result<Self> {
+    let embedding_model = model_type.to_embedding_model();
+    let mut init_options = InitOptions {
+        model_name: embedding_model.clone(),
+        show_download_progress,
+        ..Default::default()
+    };
+    
+    if let Some(cache_path) = cache_dir {
+        init_options.cache_dir = cache_path;
+    }
+
+    let model = TextEmbedding::try_new(init_options)
+        .map_err(|e| anyhow!("Failed to initialize FastEmbed model: {}", e))?;
+    
+    let model_info = TextEmbedding::get_model_info(&embedding_model).clone();
+    Ok(Self { model, model_info, model_type })
 }
 
-trait LLMProvider {
-    async fn generate(&self, prompt: &str) -> Result<String>;
-    fn count_tokens(&self, text: &str) -> usize;
+// Batch processing for efficiency
+pub async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    let text_slices: Vec<&str> = texts.iter().map(AsRef::as_ref).collect();
+    let embeddings: Vec<FastEmbedEmbedding> = self.model.embed(text_slices, None)
+        .map_err(|e| anyhow!("FastEmbed batch embedding failed: {}", e))?;
+    Ok(embeddings)
+}
+```
+
+## Background Processing Patterns
+
+### Embedding Queue Implementation
+```rust
+// Non-blocking embedding submission
+pub async fn embed_text(&self, text: String, chunk_id: ChunkId, object_id: ObjectId) -> Result<RequestId> {
+    let request_id = RequestId::new_v4();
+    let (response_tx, response_rx) = oneshot::channel();
+    
+    let request = EmbeddingRequest {
+        id: request_id,
+        text,
+        chunk_id,
+        object_id,
+        response_sender: response_tx,
+    };
+    
+    self.sender.send(QueueMessage::Single(request)).await
+        .map_err(|_| anyhow!("Failed to send embedding request"))?;
+    
+    Ok(request_id)
 }
 
-// Implementations: OpenAI, Anthropic, local llama-cpp
+// Progress tracking pattern
+pub async fn try_recv_progress(&self) -> Option<EmbeddingProgress> {
+    self.progress_receiver.try_recv().ok()
+}
+
+// Worker loop pattern with proper error handling
+async fn worker_loop(
+    mut receiver: mpsc::Receiver<QueueMessage>,
+    provider: Arc<dyn EmbeddingProvider>,
+    progress_sender: watch::Sender<Option<EmbeddingProgress>>,
+    request_status: Arc<Mutex<HashMap<RequestId, RequestStatus>>>,
+) {
+    while let Some(message) = receiver.recv().await {
+        match message {
+            QueueMessage::Single(request) => {
+                Self::process_single_request(request, &provider, &progress_sender, &request_status).await;
+            }
+            QueueMessage::Batch(request) => {
+                Self::process_batch_request(request, &provider, &progress_sender, &request_status).await;
+            }
+            QueueMessage::Cancel(request_id) => {
+                // Handle cancellation
+            }
+            QueueMessage::Shutdown => break,
+        }
+    }
+}
 ```
 
-### Local Fallback Strategy
-- Bundle optional 3-4GB GGUF model for offline "explain node" functionality
-- Local Whisper model for session transcription without internet dependency
-- Graceful degradation when API keys unavailable
-- Clear UX indication of online vs offline capabilities
-- Session recording works completely offline for maximum privacy
+## Storage Patterns
 
-## Performance Requirements & Testing
+### Column Family Usage
+```rust
+// Always use appropriate column families
+const CF_NODES: &str = "nodes";      // ObjectMetadata storage
+const CF_CHUNKS: &str = "chunks";    // TextChunk storage  
+const CF_EDGES: &str = "edges";      // Edge storage
+const CF_NAMES: &str = "names";      // Name-based lookups
 
-### Scale Targets
-- **Dataset Size**: 1 billion tokens (~2M chunks)
-- **Query Latency**: <300ms context assembly
-- **Memory Usage**: <4GB on 8GB systems
-- **Storage Footprint**: ~10GB for full dataset + indexes
-
-### Benchmark Scenarios
-- Cold start recovery after crash
-- Concurrent read/write under high embedding load
-- Graph traversal performance on highly connected networks
-- Cross-platform UI responsiveness with large datasets
-
-## Security & Privacy Model
-
-### Data Sovereignty
-- All user data stored locally in RocksDB
-- No telemetry or analytics collection
-- Import/export for user-controlled backups
-
-### API Key Management
-- OS keystore integration (libsecret/Keychain/CredentialManager)
-- Environment variable fallback for headless usage
-- Clear audit trail of API usage and costs
-
-## Future Roadmap Considerations
-
-### Sprint 2: Vector Search & Index Management - Implementation Details ✅
-
-#### Completed Sprint 2 Goals
-
-1. **Foundation** (Week 1):
-   - FastEmbed-rs integration with BGE-small-en-v1.5 (default)
-   - Basic embedding provider trait system
-   - Local HNSW index using hnsw_rs
-
-2. **Multi-Provider Support** (Week 2):
-   - Ollama integration for advanced users
-   - Provider auto-detection and fallback
-   - Configuration system for model selection
-
-3. **Search Integration** (Week 3):
-   - FST exact matching for TTRPG entities
-   - Hybrid search (semantic + exact)
-   - Query pipeline with context assembly
-
-4. **Performance & UX** (Week 4):
-   - Background embedding with backpressure
-   - Progress indicators for model downloads
-   - Memory-mapped vector storage
-
-#### Model Selection Strategy
-
-**Default Configuration** (Automatic):
-- **Primary**: FastEmbed BGE-small-en-v1.5 (133MB, 384 dimensions)
-- **Reasoning**: Good balance of quality, size, and performance
-- **Fallback**: all-MiniLM-L6-v2 (80MB, 384 dimensions) if BGE unavailable
-
-**Advanced Configuration** (User Choice):
-- **Quality-First**: BGE-large-en-v1.5 (1.3GB, 1024 dimensions)
-- **Size-Constrained**: all-MiniLM-L6-v2 (80MB, 384 dimensions)  
-- **Multilingual**: multilingual-e5-base (1.1GB, 768 dimensions)
-- **Ollama**: nomic-embed-text via local Ollama installation
-
-#### Memory and Performance Targets
-
-**Local Model Constraints**:
-- **Model Storage**: 100MB-1.3GB depending on choice
-- **Runtime Memory**: <500MB for embedding computation
-- **Vector Index**: Memory-mapped to handle large datasets
-- **Total Budget**: <2GB additional memory usage on 8GB systems
-
-**Performance Expectations**:
-- **FastEmbed**: ~100-500 docs/second on CPU
-- **Ollama**: ~50-200 docs/second (varies by model)
-- **Hybrid Search**: <300ms end-to-end including graph expansion
-
-### v0.2 Core Enhancements (Open Source)
-- WebGL graph canvas for >5K node visualizations
-- Git integration for version control
-- Enhanced import/export capabilities
-- Performance optimizations for massive datasets
-
-### v0.3 Premium Ecosystem (Commercial Products)
-- Virtual session recording with multi-platform support (Discord + FoundryVTT + Roll20 + others)
-- Cross-platform integration for mixed voice/text/dice streams with temporal correlation
-- Cloud sync and collaboration features for distributed teams
-- U-Store marketplace launch with partnerships for licensed publisher content
-- Mobile companion app for session notes and quick lookups
-
-### U-Store Business Model
-The U-Store represents a revenue-sharing marketplace where major publishers can offer official, pre-built knowledge graphs for their copyrighted content:
-
-- **Publishers**: Upload comprehensive knowledge graphs for their settings (Forgotten Realms, Golarion, etc.)
-- **Content**: Pre-populated characters, locations, lore, relationships, and canonical information
-- **Revenue Split**: Publishers receive majority share, u-forge.ai takes platform fee
-- **Integration**: Seamless import into user's local worldbuilding environment
-- **Examples**: Official D&D Curse of Strahd knowledge graph, Pathfinder Kingmaker campaign setting, etc.
-- **Value Proposition**: Drop-in play for existing IP without hours of manual data entry
-
-## Build Requirements & Environment
-
-### Required Environment Variables
-The project requires specific GCC versions for RocksDB compilation:
-
-```bash
-export CC=gcc-13
-export CXX=g++-13
+// Proper initialization with all column families
+pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.create_missing_column_families(true);
+    
+    let cfs = vec![CF_NODES, CF_CHUNKS, CF_EDGES, CF_NAMES];
+    let db = DB::open_cf(&opts, path, cfs)?;
+    
+    Ok(Self { db })
+}
 ```
 
-### Build Commands
-```bash
-# Development build
-CC=gcc-13 CXX=g++-13 cargo build
-
-# Run tests
-CC=gcc-13 CXX=g++-13 cargo test --lib
-
-# Run demonstration
-CC=gcc-13 CXX=g++-13 cargo run
+### Adjacency List Pattern
+```rust
+// Efficient edge storage using adjacency lists
+fn update_adjacency_lists(&self, edge: &Edge) -> Result<()> {
+    // Update outgoing edges for source node
+    let mut source_adj = self.get_adjacency_list(edge.from)?;
+    source_adj.outgoing.push(edge.to);
+    self.store_adjacency_list(edge.from, &source_adj)?;
+    
+    // Update incoming edges for target node
+    let mut target_adj = self.get_adjacency_list(edge.to)?;
+    target_adj.incoming.push(edge.from);
+    self.store_adjacency_list(edge.to, &target_adj)?;
+    
+    Ok(())
+}
 ```
 
-### Build Script
-A `build.sh` script is provided for convenience:
-```bash
-chmod +x build.sh
-./build.sh
+## Performance Monitoring Patterns
+
+### Timing Instrumentation
+```rust
+use std::time::Instant;
+
+// Macro for consistent operation timing
+macro_rules! time_operation {
+    ($name:expr, $items:expr, $operation:block) => {
+        {
+            let start = Instant::now();
+            let result = $operation;
+            let duration = start.elapsed();
+            
+            tracing::debug!(
+                operation = $name,
+                duration_ms = duration.as_millis(),
+                items = $items,
+                items_per_sec = $items as f64 / duration.as_secs_f64(),
+                "Operation completed"
+            );
+            
+            result
+        }
+    };
+}
+
+// Usage in embedding operations
+pub async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    time_operation!("embed_batch", texts.len(), {
+        let text_slices: Vec<&str> = texts.iter().map(AsRef::as_ref).collect();
+        self.model.embed(text_slices, None)
+            .map_err(|e| anyhow!("FastEmbed batch embedding failed: {}", e))
+    })
+}
 ```
 
-## Sprint 1 Implementation Results
+## Build and Environment Patterns
 
-### ✅ Completed Core Features
-- **RocksDB Storage Engine**: Column families for nodes, edges, chunks, and name indexing
-- **Graph Data Model**: TTRPG-specific object types (Character, Location, Faction, Item, Event, Session)
-- **Relationship Management**: Weighted edges with metadata and adjacency list storage
-- **Text Chunk Support**: Token-aware content storage for future AI integration
-- **Query Engine**: Multi-hop graph traversal with configurable depth limits
-- **Builder Pattern API**: Fluent interface for creating interconnected worldbuilding objects
-- **Comprehensive Testing**: 14 unit and integration tests covering all core functionality
+### Environment Configuration
+```rust
+use std::env;
+use std::path::PathBuf;
 
-### 🧪 Test Coverage
-- Node CRUD operations
-- Edge creation and traversal
-- Text chunk management
-- Subgraph queries
-- Node deletion with relationship cleanup
-- Graph statistics
-- Complex worldbuilding scenarios (Middle-earth demo)
+pub struct Config {
+    pub log_level: String,
+    pub db_path: PathBuf,
+    pub model_cache_dir: PathBuf,
+    pub embedding_model: FastEmbedModel,
+}
 
-### 📊 Demonstration Results
-The working prototype successfully manages a 12-node knowledge graph with:
-- 19 relationships between entities
-- 3 text chunks (115 tokens)
-- Sub-millisecond query performance
-- Full relationship integrity
-
-### Key Implementation Decisions Made
-1. **Bincode 1.3**: Used for serde compatibility instead of 2.0 (different trait requirements)
-2. **Adjacency Lists**: Implemented for edge storage (simpler than CSR, adequate for initial scale)
-3. **Cloned Edges**: Edge structs are cloned during insertion to avoid borrow checker issues
-4. **Column Family Strategy**: Separate CFs for different data types enable independent optimization
-5. **FastEmbed-rs Primary**: Chosen over Ollama/cloud APIs for default embedding provider
-6. **Local Model Storage**: Models downloaded to local cache, memory-mapped for efficiency
-7. **Hybrid Search**: FST + HNSW combination for comprehensive TTRPG entity retrieval
-
-## Current Implementation Status & Known Issues
-
-### ✅ Completed Components (Prototype State)
-- **Storage Engine**: RocksDB-backed knowledge graph with CRUD operations
-- **Embeddings**: FastEmbed integration with BGE-small-en-v1.5 model
-- **Basic Search**: Simple cosine similarity vector search
-- **Exact Matching**: FST (Finite State Transducer) for name-based search
-- **Type System**: Complete TTRPG object model (Character, Location, Faction, etc.)
-- **Demo Application**: CLI demonstration of core capabilities
-
-### 🚨 Critical Technical Challenges
-
-#### ✅ RESOLVED: HNSW Vector Search Integration Success
-
-**Resolution Summary**: Successfully integrated `hnsw_rs` v0.3.x for efficient approximate nearest neighbor search, replacing the temporary cosine similarity fallback.
-
-**Final Implementation**:
-
-1. **Working HNSW Integration**:
-   ```rust
-   // HnswVectorStore successfully using hnsw_rs v0.3 API:
-   let hnsw = Hnsw::<f32, DistL2>::new(m, max_elements, 16, ef_construction, DistL2 {});
-   hnsw.insert((&vector, id));  // Correct API usage
-   let results = hnsw.search(&query, k, ef_search);  // Direct Vec<Neighbour> return
-   ```
-
-2. **API Compatibility Resolved**:
-   - `hnsw.get_nb_point()` - method name confirmed and working
-   - `hnsw.insert((&vector, id))` - tuple parameter format working
-   - `Neighbour` struct fields: `d_id`, `distance`, `p_id` - all accessible
-   - `hnsw.file_dump(path, basename)` - persistence working with correct parameters
-
-3. **Performance Improvements**:
-   - Replaced `SimpleVectorStore` with `HnswVectorStore`
-   - Sub-linear search complexity O(log n) vs O(n) cosine similarity
-   - Efficient memory usage with configurable parameters
-   - Proper index persistence and loading
-
-4. **Key Implementation Details**:
-   - Vector validation with dimension checking
-   - Graceful handling of empty indexes during persistence
-   - Metadata storage alongside HNSW index
-   - Comprehensive test coverage maintained
-
-**Results**: All vector search tests passing, full demo working with HNSW-powered semantic search. Sprint 2 objectives successfully completed.
-
-#### Additional Technical Debt
-
-1. **FST Stream Iteration**: Required importing `Streamer` trait due to API changes
-2. **Model Info Access**: FastEmbed `get_model_info()` API inconsistencies
-3. **Borrow Checker Issues**: Multiple ownership issues resolved through cloning (performance cost)
-4. **Test Coverage**: Current tests use mock providers; real provider tests limited by model download time
-
-### 🚀 Next Steps: Sprint 3 Preparation
-
-With HNSW integration successfully completed, focus shifts to Sprint 3 objectives:
-
-1. **Performance Benchmarking**: Measure HNSW performance against scale targets (10K+ vectors)
-2. **UI Foundation**: Begin Tauri + Svelte setup for visual graph interface
-3. **Graph Canvas**: Implement interactive graph visualization components
-4. **API Refinement**: Optimize vector search parameters (ef_search, M values) for TTRPG use cases
-
-### ⚠️ Development Environment Requirements
-
-**Critical**: The following environment variables are required for RocksDB compilation:
-```bash
-export CC=gcc-13
-export CXX=g++-13
+impl Config {
+    pub fn from_env() -> Self {
+        Self {
+            log_level: env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+            db_path: env::var("U_FORGE_DB_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("./data")),
+            model_cache_dir: env::var("U_FORGE_MODEL_CACHE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("./models")),
+            embedding_model: match env::var("U_FORGE_EMBEDDING_MODEL").as_deref() {
+                Ok("all-minilm-l6-v2") => FastEmbedModel::AllMiniLmL6V2,
+                Ok("bge-base-en-v1.5") => FastEmbedModel::BgeBaseEnV15,
+                Ok("bge-large-en-v1.5") => FastEmbedModel::BgeLargeEnV15,
+                _ => FastEmbedModel::BgeSmallEnV15, // Default
+            },
+        }
+    }
+}
 ```
 
-**Build Process**: First build takes ~10 minutes due to RocksDB + FastEmbed compilation.
+### Test Helper Patterns
+```rust
+// Consistent test cache directory
+fn get_test_cache_dir() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test_model_cache");
+    std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
+    path
+}
 
-## Implementation Notes for LLM Assistant
+// Real provider testing (with caching)
+async fn create_real_embedding_manager() -> EmbeddingManager {
+    let cache_dir = get_test_cache_dir();
+    EmbeddingManager::try_new_local_default(Some(cache_dir))
+        .expect("Failed to create real embedding manager")
+}
 
-When helping implement this system:
+// Temporary directory pattern for isolated tests
+fn create_test_graph() -> (KnowledgeGraph, TempDir) {
+    let temp_dir = TempDir::new().unwrap();
+    let cache_dir = get_test_cache_dir();
+    let graph = KnowledgeGraph::new(temp_dir.path(), Some(&cache_dir)).unwrap();
+    (graph, temp_dir)
+}
+```
 
-1. **Prioritize Correctness**: Data corruption is unacceptable; prefer safe, well-tested patterns
-2. **Measure Everything**: Include timing instrumentation from day one  
-3. **Error Handling**: Graceful degradation when AI services unavailable
-4. **Memory Management**: Profile regularly on 8GB systems
-5. **Cross-Platform Testing**: Linux/macOS/Windows compatibility from start
-6. **Documentation**: Inline code documentation for complex graph algorithms
-7. **Feature Boundaries**: Keep premium features (VTT integrations, cloud sync, advanced AI) out of core codebase
-8. **Build Environment**: Always use `CC=gcc-13 CXX=g++-13` for RocksDB compilation compatibility
-9. **Dependency Management**: Prefer stable crate versions (bincode 1.3 vs 2.0) for API stability
-10. **Testing First**: Implement comprehensive unit tests before moving to next sprint
-11. **Local-First Priority**: Implement FastEmbed-rs before cloud APIs; ensure offline functionality
-12. **Model Management**: Handle model downloads gracefully with progress indicators and fallbacks
-13. **Vector Search Priority**: Resolve HNSW integration before scaling beyond prototype
-14. **API Abstraction**: Create stable interfaces to isolate external dependency changes
+## Critical Implementation Notes
 
-**Core Product Goal**: A professional-grade local-first application that feels as fast as native tools while providing essential AI-assisted worldbuilding capabilities and comprehensive session recording for in-person tabletop groups—all without compromising user data sovereignty.
+### RocksDB Compilation Requirements
+- **Always set**: `CC=gcc-13 CXX=g++-13` before building
+- **First build**: Takes ~10 minutes due to RocksDB compilation
+- **Column families**: Must be created at DB open time, cannot be added later
+- **Write batches**: Use for atomic multi-key operations
 
-**Current Reality**: Early prototype demonstrating core concepts with simplified vector search. Suitable for development and testing, not production use.
+### FastEmbed Integration
+- **Model loading**: First use downloads model to cache (~133MB for BGE-small)
+- **Thread safety**: FastEmbed models are Send + Sync, wrap in Arc for sharing
+- **Batch processing**: Always prefer `embed_batch()` over multiple `embed()` calls
+- **Error handling**: Network errors during model download must be handled gracefully
 
-**Premium Products Goal**: Seamless multi-platform integrations for online gaming, enhanced virtual session recording that combines voice and text streams, and the U-Store marketplace for official licensed content that enhances the core experience for digital gaming groups while maintaining clear value separation from the free tier.
+### HNSW Vector Search
+- **Working status**: HNSW integration is functional and tested
+- **Parameters**: M=16, ef_construction=16, ef_search=32 provide good balance
+- **Memory usage**: Indexes are memory-mapped for efficiency
+- **Persistence**: Use `save_to_file()` and `try_load_from_file()` for index persistence
+
+### Async Patterns
+- **Background embedding**: Use `EmbeddingQueue` for non-blocking operations
+- **Progress tracking**: Implement with `tokio::sync::watch` for UI updates
+- **Cancellation**: Use `oneshot::channel` for request/response patterns
+- **Backpressure**: EmbeddingQueue implements bounded channels automatically
+
+### Testing Strategy
+- **Unit tests**: Use mock providers for fast, deterministic tests
+- **Integration tests**: Use temporary directories for RocksDB instances
+- **Real provider tests**: Cache models in `target/test_model_cache` for CI efficiency
+- **Performance tests**: Include timing assertions for critical paths (embeddings, search)
+- **Cross-platform**: Test on Linux primarily, validate others as needed
+
+### Current Performance Metrics
+- **Object insertion**: ~1ms average (RocksDB)
+- **Embedding generation**: ~50ms per text chunk (BGE-small on CPU)
+- **HNSW search**: ~5-10ms for 10K vectors
+- **Memory usage**: ~500MB for demo dataset with embeddings
+
+This document should be updated as implementation patterns evolve. Focus on the "how" of implementation rather than the "what" or "why" of features.

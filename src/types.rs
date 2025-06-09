@@ -122,28 +122,35 @@ impl Edge {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMetadata {
     pub id: ObjectId,
-    pub object_type: ObjectType,
+    pub object_type: String, // Changed from enum to string for dynamic types
+    pub schema_name: Option<String>, // Optional schema reference
     pub name: String,
     pub description: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub tags: Vec<String>,
-    pub properties: HashMap<String, String>,
+    pub properties: serde_json::Value, // Changed from HashMap<String, String> to JSON
 }
 
 impl ObjectMetadata {
-    pub fn new(object_type: ObjectType, name: String) -> Self {
+    pub fn new(object_type: String, name: String) -> Self {
         let now = chrono::Utc::now();
         Self {
             id: ForgeUuid::new_v4(),
             object_type,
+            schema_name: None,
             name,
             description: None,
             created_at: now,
             updated_at: now,
             tags: Vec::new(),
-            properties: HashMap::new(),
+            properties: serde_json::Value::Object(serde_json::Map::new()),
         }
+    }
+
+    /// Create a new object with legacy ObjectType enum (for backward compatibility)
+    pub fn new_with_type(object_type: ObjectType, name: String) -> Self {
+        Self::new(object_type.as_str().to_string(), name)
     }
     
     pub fn with_description(mut self, description: String) -> Self {
@@ -152,8 +159,54 @@ impl ObjectMetadata {
     }
     
     pub fn with_property(mut self, key: String, value: String) -> Self {
-        self.properties.insert(key, value);
+        if let Some(obj) = self.properties.as_object_mut() {
+            obj.insert(key, serde_json::Value::String(value));
+        }
         self
+    }
+
+    /// Add a property with a JSON value
+    pub fn with_json_property(mut self, key: String, value: serde_json::Value) -> Self {
+        if let Some(obj) = self.properties.as_object_mut() {
+            obj.insert(key, value);
+        }
+        self
+    }
+
+    /// Set the schema name for this object
+    pub fn with_schema(mut self, schema_name: String) -> Self {
+        self.schema_name = Some(schema_name);
+        self
+    }
+
+    /// Get a property value as a string
+    pub fn get_property(&self, key: &str) -> Option<String> {
+        self.properties.as_object()
+            .and_then(|obj| obj.get(key))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Get a property value as JSON
+    pub fn get_json_property(&self, key: &str) -> Option<&serde_json::Value> {
+        self.properties.as_object()
+            .and_then(|obj| obj.get(key))
+    }
+
+    /// Set a property value
+    pub fn set_property(&mut self, key: String, value: String) {
+        if let Some(obj) = self.properties.as_object_mut() {
+            obj.insert(key, serde_json::Value::String(value));
+        }
+        self.touch();
+    }
+
+    /// Set a property with JSON value
+    pub fn set_json_property(&mut self, key: String, value: serde_json::Value) {
+        if let Some(obj) = self.properties.as_object_mut() {
+            obj.insert(key, value);
+        }
+        self.touch();
     }
     
     pub fn add_tag(&mut self, tag: String) {
@@ -256,19 +309,35 @@ mod tests {
 
     #[test]
     fn test_object_metadata_creation() {
-        let mut obj = ObjectMetadata::new(ObjectType::Character, "Gandalf".to_string())
+        let mut obj = ObjectMetadata::new("character".to_string(), "Gandalf".to_string())
             .with_description("A wise wizard".to_string())
             .with_property("race".to_string(), "Maiar".to_string());
         
         assert_eq!(obj.name, "Gandalf");
-        assert_eq!(obj.object_type, ObjectType::Character);
+        assert_eq!(obj.object_type, "character");
         assert_eq!(obj.description, Some("A wise wizard".to_string()));
-        assert_eq!(obj.properties.get("race"), Some(&"Maiar".to_string()));
+        assert_eq!(obj.get_property("race"), Some("Maiar".to_string()));
         
         obj.add_tag("wizard".to_string());
         obj.add_tag("wizard".to_string()); // Should not duplicate
         assert_eq!(obj.tags.len(), 1);
         assert_eq!(obj.tags[0], "wizard");
+    }
+
+    #[test]
+    fn test_object_metadata_json_properties() {
+        let obj = ObjectMetadata::new("spell".to_string(), "Fireball".to_string())
+            .with_json_property("level".to_string(), serde_json::Value::Number(serde_json::Number::from(3)))
+            .with_json_property("damage".to_string(), serde_json::json!({"dice": "8d6", "type": "fire"}));
+        
+        assert_eq!(obj.get_json_property("level").unwrap().as_u64(), Some(3));
+        assert!(obj.get_json_property("damage").unwrap().is_object());
+    }
+
+    #[test]
+    fn test_backward_compatibility() {
+        let obj = ObjectMetadata::new_with_type(ObjectType::Character, "Frodo".to_string());
+        assert_eq!(obj.object_type, "character");
     }
 
     #[test]

@@ -55,6 +55,9 @@ parking_lot = "^0.12"
 # Temp directories for examples
 tempfile = "^3.20"
 
+# Regular expressions for pattern validation
+regex = "^1.10"
+
 # ORT Override
 ort-sys = { version = "=2.0.0-rc.4", default-features = false }
 ort = { version = "=2.0.0-rc.4", features = ["download-binaries"] }
