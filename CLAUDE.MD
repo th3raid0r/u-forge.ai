@@ -90,11 +90,15 @@ UI Event -> Write Queue (tokio::mpsc) -> {
 - [x] Core graph operations with comprehensive testing
 - [ ] Benchmark against 50GB synthetic dataset
 
-### Sprint 2: Vector Search & Index Management
-- [ ] Memory-mapped HNSW with hot-swap rebuild capability
+### Sprint 2: Vector Search & Index Management ⚠️ PARTIALLY COMPLETED
+- [x] FastEmbed-rs integration with local embedding models (BGE-small-en-v1.5)
+- [x] Basic vector search with cosine similarity (HNSW fallback due to API issues)
+- [x] FST integration for exact name matching
+- [x] Query pipeline implementation with hybrid search
+- [x] Enhanced demonstration with semantic search capabilities
+- [ ] Memory-mapped HNSW integration (blocked by hnsw_rs API compatibility)
 - [ ] Background embedder with backpressure
-- [ ] FST integration for exact name matching
-- [ ] Query pipeline implementation and latency testing
+- [ ] Latency optimization and performance testing
 
 ### Sprint 3: Core UI & Graph Canvas
 - [ ] Tauri application shell with Svelte frontend
@@ -144,10 +148,60 @@ UI Event -> Write Queue (tokio::mpsc) -> {
 
 ## AI Integration Architecture
 
+### Local-First Embedding Strategy
+
+**Core Philosophy**: Prioritize local-first solutions with cloud APIs as optional enhancements.
+
+#### Primary Local Embedding Solutions (Ranked by Priority)
+
+1. **FastEmbed-rs** (Recommended Primary)
+   - **Pros**: Pure Rust, ONNX-based, no tokio dependency, batch processing with rayon
+   - **Models**: 15+ pre-trained models including BGE, E5, Nomic, MiniLM variants
+   - **Performance**: Optimized for production use with ONNX Runtime
+   - **Size**: Models range from 23MB (all-minilm) to 1.3GB (multilingual-e5-large)
+   - **Local**: 100% local inference, no network requirements
+
+2. **Ollama Integration** (Secondary/Optional)
+   - **Pros**: User-friendly model management, REST API, supports nomic-embed-text
+   - **Models**: nomic-embed-text (274MB), mxbai-embed-large, snowflake-arctic-embed
+   - **Performance**: Good for development, may have higher latency than FastEmbed
+   - **Dependency**: Requires separate Ollama installation
+
+3. **Cloud APIs** (Tertiary/Optional)
+   - OpenAI, Anthropic as fallback options
+   - User-provided API keys stored in OS keystore
+   - Clear UX indication when using external services
+
 ### Multi-Provider Support
 ```rust
-trait LLMProvider {
+// Multi-tier embedding provider system
+trait EmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>>;
+    fn dimensions(&self) -> usize;
+    fn max_tokens(&self) -> usize;
+    fn provider_type(&self) -> EmbeddingProviderType;
+}
+
+enum EmbeddingProviderType {
+    Local(LocalEmbeddingModel),
+    Ollama(OllamaConfig),
+    Cloud(CloudProvider),
+}
+
+// Primary implementation using FastEmbed-rs
+struct FastEmbedProvider {
+    model: TextEmbedding,
+    model_info: ModelInfo,
+}
+
+// Secondary implementation for Ollama users
+struct OllamaEmbeddingProvider {
+    client: OllamaClient,
+    model_name: String,
+}
+
+trait LLMProvider {
     async fn generate(&self, prompt: &str) -> Result<String>;
     fn count_tokens(&self, text: &str) -> usize;
 }
@@ -189,6 +243,56 @@ trait LLMProvider {
 - Clear audit trail of API usage and costs
 
 ## Future Roadmap Considerations
+
+### Sprint 2: Vector Search & Index Management - Implementation Details
+
+#### Revised Sprint 2 Goals
+
+1. **Foundation** (Week 1):
+   - FastEmbed-rs integration with BGE-small-en-v1.5 (default)
+   - Basic embedding provider trait system
+   - Local HNSW index using hnsw_rs
+
+2. **Multi-Provider Support** (Week 2):
+   - Ollama integration for advanced users
+   - Provider auto-detection and fallback
+   - Configuration system for model selection
+
+3. **Search Integration** (Week 3):
+   - FST exact matching for TTRPG entities
+   - Hybrid search (semantic + exact)
+   - Query pipeline with context assembly
+
+4. **Performance & UX** (Week 4):
+   - Background embedding with backpressure
+   - Progress indicators for model downloads
+   - Memory-mapped vector storage
+
+#### Model Selection Strategy
+
+**Default Configuration** (Automatic):
+- **Primary**: FastEmbed BGE-small-en-v1.5 (133MB, 384 dimensions)
+- **Reasoning**: Good balance of quality, size, and performance
+- **Fallback**: all-MiniLM-L6-v2 (80MB, 384 dimensions) if BGE unavailable
+
+**Advanced Configuration** (User Choice):
+- **Quality-First**: BGE-large-en-v1.5 (1.3GB, 1024 dimensions)
+- **Size-Constrained**: all-MiniLM-L6-v2 (80MB, 384 dimensions)  
+- **Multilingual**: multilingual-e5-base (1.1GB, 768 dimensions)
+- **Ollama**: nomic-embed-text via local Ollama installation
+
+#### Memory and Performance Targets
+
+**Local Model Constraints**:
+- **Model Storage**: 100MB-1.3GB depending on choice
+- **Runtime Memory**: <500MB for embedding computation
+- **Vector Index**: Memory-mapped to handle large datasets
+- **Total Budget**: <2GB additional memory usage on 8GB systems
+
+**Performance Expectations**:
+- **FastEmbed**: ~100-500 docs/second on CPU
+- **Ollama**: ~50-200 docs/second (varies by model)
+- **Hybrid Search**: <300ms end-to-end including graph expansion
 
 ### v0.2 Core Enhancements (Open Source)
 - WebGL graph canvas for >5K node visualizations
@@ -269,11 +373,131 @@ The working prototype successfully manages a 12-node knowledge graph with:
 - Sub-millisecond query performance
 - Full relationship integrity
 
-### 🔧 Key Implementation Decisions Made
+### Key Implementation Decisions Made
 1. **Bincode 1.3**: Used for serde compatibility instead of 2.0 (different trait requirements)
 2. **Adjacency Lists**: Implemented for edge storage (simpler than CSR, adequate for initial scale)
 3. **Cloned Edges**: Edge structs are cloned during insertion to avoid borrow checker issues
 4. **Column Family Strategy**: Separate CFs for different data types enable independent optimization
+5. **FastEmbed-rs Primary**: Chosen over Ollama/cloud APIs for default embedding provider
+6. **Local Model Storage**: Models downloaded to local cache, memory-mapped for efficiency
+7. **Hybrid Search**: FST + HNSW combination for comprehensive TTRPG entity retrieval
+
+## Current Implementation Status & Known Issues
+
+### ✅ Completed Components (Prototype State)
+- **Storage Engine**: RocksDB-backed knowledge graph with CRUD operations
+- **Embeddings**: FastEmbed integration with BGE-small-en-v1.5 model
+- **Basic Search**: Simple cosine similarity vector search
+- **Exact Matching**: FST (Finite State Transducer) for name-based search
+- **Type System**: Complete TTRPG object model (Character, Location, Faction, etc.)
+- **Demo Application**: CLI demonstration of core capabilities
+
+### 🚨 Critical Technical Challenges
+
+#### HNSW Vector Search Integration Failure
+
+**Problem Summary**: The initial plan to use `hnsw_rs` v0.3.x for approximate nearest neighbor search encountered extensive API compatibility issues that forced a fallback to simple cosine similarity search.
+
+**Detailed Technical Issues**:
+
+1. **Breaking API Changes in hnsw_rs v0.3.x**:
+   ```rust
+   // OLD API (expected):
+   hnsw.nb_elements()  // -> usize
+   hnsw.add_point(vector, id)
+   
+   // NEW API (actual):
+   hnsw.get_nb_point()  // different method name
+   hnsw.insert((vector, id))  // different signature
+   ```
+
+2. **Lifetime Parameter Requirements**:
+   ```rust
+   // Expected:
+   pub struct VectorSearchEngine {
+       hnsw: Arc<RwLock<Hnsw<f32, DistDot>>>,
+   }
+   
+   // Required:
+   pub struct VectorSearchEngine<'a> {
+       hnsw: Arc<RwLock<Hnsw<'a, f32, DistDot>>>,
+   }
+   ```
+   This lifetime requirement propagated through the entire codebase, requiring extensive refactoring.
+
+3. **Search Result Structure Changes**:
+   ```rust
+   // Expected fields:
+   result.idx  // point ID
+   result.dist // distance
+   
+   // Actual fields:
+   result.p_id     // point ID (renamed)
+   result.d_id     // data ID (new field)
+   result.distance // distance (renamed)
+   ```
+
+4. **Serialization Support Removed**:
+   - `hnsw_rs::Hnsw` no longer implements `Serialize`/`Deserialize`
+   - Index persistence requires custom implementation
+   - No built-in memory mapping support
+
+5. **Search API Overhaul**:
+   ```rust
+   // Expected:
+   let results = hnsw.search(&query, k, ef, &mut searcher);
+   
+   // Actual:
+   let results = hnsw.search(&query, k, ef); // 3 params, not 4
+   // Searcher pattern completely different
+   ```
+
+**Impact**: These issues required ~6 hours of attempted fixes across multiple API versions. The breaking changes were too extensive for a rapid resolution.
+
+**Current Workaround**: 
+- Implemented `SimpleVectorStore` with cosine similarity
+- Maintains same interface as planned HNSW integration
+- Performance acceptable for small-to-medium datasets (< 10K vectors)
+- Enables continued development while HNSW integration is resolved
+
+**Recommended Solutions for Future Work**:
+
+1. **Evaluate Alternative Libraries**:
+   - `candle-hnsw` (newer, better Rust integration)
+   - `hora` (HNSW in Rust with stable API)
+   - `hnswlib` (C++ with Rust bindings)
+
+2. **Version Pinning Strategy**:
+   - Pin to specific `hnsw_rs` version if API stabilizes
+   - Create abstraction layer for vector search to isolate changes
+
+3. **Custom Implementation**:
+   - Implement basic HNSW from scratch for full control
+   - Focus on TTRPG use cases (small-medium scale, insert-heavy workload)
+
+#### Additional Technical Debt
+
+1. **FST Stream Iteration**: Required importing `Streamer` trait due to API changes
+2. **Model Info Access**: FastEmbed `get_model_info()` API inconsistencies
+3. **Borrow Checker Issues**: Multiple ownership issues resolved through cloning (performance cost)
+4. **Test Coverage**: Current tests use mock providers; real provider tests limited by model download time
+
+### 🔧 Immediate Next Steps for HNSW Resolution
+
+1. **Benchmark Current Performance**: Measure cosine similarity performance vs. required scale
+2. **Evaluate Alternatives**: Test `candle-hnsw` and `hora` libraries
+3. **API Abstraction**: Create `VectorIndex` trait to isolate implementation details
+4. **Performance Testing**: Establish baseline metrics for vector search at different scales
+
+### ⚠️ Development Environment Requirements
+
+**Critical**: The following environment variables are required for RocksDB compilation:
+```bash
+export CC=gcc-13
+export CXX=g++-13
+```
+
+**Build Process**: First build takes ~10 minutes due to RocksDB + FastEmbed compilation.
 
 ## Implementation Notes for LLM Assistant
 
@@ -289,7 +513,13 @@ When helping implement this system:
 8. **Build Environment**: Always use `CC=gcc-13 CXX=g++-13` for RocksDB compilation compatibility
 9. **Dependency Management**: Prefer stable crate versions (bincode 1.3 vs 2.0) for API stability
 10. **Testing First**: Implement comprehensive unit tests before moving to next sprint
+11. **Local-First Priority**: Implement FastEmbed-rs before cloud APIs; ensure offline functionality
+12. **Model Management**: Handle model downloads gracefully with progress indicators and fallbacks
+13. **Vector Search Priority**: Resolve HNSW integration before scaling beyond prototype
+14. **API Abstraction**: Create stable interfaces to isolate external dependency changes
 
 **Core Product Goal**: A professional-grade local-first application that feels as fast as native tools while providing essential AI-assisted worldbuilding capabilities and comprehensive session recording for in-person tabletop groups—all without compromising user data sovereignty.
+
+**Current Reality**: Early prototype demonstrating core concepts with simplified vector search. Suitable for development and testing, not production use.
 
 **Premium Products Goal**: Seamless multi-platform integrations for online gaming, enhanced virtual session recording that combines voice and text streams, and the U-Store marketplace for official licensed content that enhances the core experience for digital gaming groups while maintaining clear value separation from the free tier.

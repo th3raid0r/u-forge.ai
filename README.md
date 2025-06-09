@@ -4,20 +4,42 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)
-![Status](https://img.shields.io/badge/status-In%20Development-orange.svg)
+![Status](https://img.shields.io/badge/status-Early%20Prototype-red.svg)
 
 ## What is u-forge.ai?
 
-u-forge.ai (Universe Forge) is a revolutionary worldbuilding application designed specifically for tabletop RPG creators. It combines the power of AI-assisted content generation with a visual knowledge graph, all while keeping your precious campaign data completely local and under your control.
+u-forge.ai (Universe Forge) is an **early prototype** of a local-first TTRPG worldbuilding tool. Currently in very early development, it demonstrates core concepts for AI-powered knowledge management while keeping your data completely local and under your control.
 
-### 🎯 Perfect for Game Masters who want to:
+**⚠️ Current Status: This is a bare-bones proof-of-concept, not a production application.**
+
+### 🎯 Vision for Game Masters:
 - Build rich, interconnected worlds with characters, locations, factions, and lore
 - Never lose track of campaign details with AI-powered semantic search
-- Capture session notes automatically through audio transcription
-- Visualize relationships between story elements in an interactive graph
+- Capture session notes automatically through audio transcription (*planned*)
+- Visualize relationships between story elements in an interactive graph (*planned*)
 - Keep their data private without relying on cloud services
 
-## ✨ Key Features
+**Note: Most features are planned for future development. See "Current Prototype Features" below.**
+
+## 🚧 Current Prototype Features
+
+**What Actually Works Today:**
+- Basic RocksDB-backed knowledge graph storage
+- Local text embeddings using FastEmbed (BGE-small-en-v1.5)
+- Simple semantic search with cosine similarity
+- FST-based exact name matching
+- Basic CRUD operations for worldbuilding objects
+- Command-line demo application
+
+**⚠️ What's Missing (Planned for Future):**
+- Visual graph interface
+- Advanced vector search (HNSW integration)
+- Audio transcription
+- Content generation
+- Cross-platform GUI
+- Most features described in the vision above
+
+## 🔮 Planned Features
 
 ### 🏠 Local-First & Private
 - All your worldbuilding data stays on your device
@@ -26,10 +48,13 @@ u-forge.ai (Universe Forge) is a revolutionary worldbuilding application designe
 - Works completely offline (with reduced AI features)
 
 ### 🧠 AI-Powered Worldbuilding
-- Semantic search across massive campaign notes (1B+ tokens)
-- Context-aware content generation using your world's established lore
-- Automatic entity detection and relationship mapping
-- Support for OpenAI, Anthropic, and local AI models
+- **Local-First Embeddings**: Built-in semantic search using FastEmbed-rs (no external APIs required)
+- **Multiple Model Options**: Choose from 15+ pre-trained models based on your quality/size preferences
+- **Hybrid Search**: Combine semantic similarity with exact name matching for comprehensive retrieval
+- **Context-aware Content Generation**: Using your world's established lore with optional cloud AI integration
+- **Automatic Entity Detection**: AI-powered relationship mapping between story elements
+- **Optional Cloud Integration**: Add OpenAI/Anthropic API keys for enhanced generation capabilities
+- **Ollama Support**: Seamless integration if you're already using Ollama for local LLMs
 
 ### 🕸️ Visual Knowledge Graph
 - Interactive graph canvas showing connections between story elements
@@ -37,148 +62,165 @@ u-forge.ai (Universe Forge) is a revolutionary worldbuilding application designe
 - Zoom from high-level campaign overview to detailed character relationships
 - Real-time updates as you build your world
 
-### 🎙️ Session Capture & Notes (Local Table Focus)
+### 🎙️ Session Capture & Notes (*Future Development*)
 - Record in-person game sessions with automatic speech-to-text transcription
 - AI automatically detects and promotes important story beats to permanent campaign notes
 - Smart speaker identification for tracking who said what around the table
 - Link session events directly to characters, locations, and plot threads in your world graph
-- Perfect for traditional tabletop groups who want digital organization without losing the in-person magic
 
-### 🏪 U-Store (Available to All Users)
+### 🏪 U-Store (*Future Development*)
 - Official licensed content from major publishers with pre-built knowledge graphs
-- Perfect companion: Buy the physical book, download the knowledge graph for the best of both worlds
-- Drop-in ready campaigns like Curse of Strahd, Pathfinder Adventure Paths, and official campaign settings
-- Publisher partnership marketplace supporting your favorite game companies
-- Note: U-Store content is sold separately - pricing varies by publisher and content
+- Integration with physical book purchases
+- Drop-in ready campaigns and official campaign settings
 
-### 🚀 Premium Integrations (Separate Products)
-- Virtual session recording with multi-platform correlation (Discord voice + FoundryVTT text + Roll20 dice)
-- Unified session capture across different platforms in one coherent timeline
-- Cloud sync and collaboration for distributed gaming groups
-- Enhanced U-Store integration with automatic session correlation
+### 🚀 Premium Integrations (*Future Development*)
+- Virtual session recording with multi-platform correlation
+- Unified session capture across platforms
+- Cloud sync and collaboration features
 
-### ⚡ Performance First
-- Sub-second search across millions of notes and documents
-- Native application performance (built with Rust + Tauri)
-- Efficient memory usage even with massive datasets
-- Instant startup and responsive UI
+### ⚡ Performance Goals
+- Sub-second search across large datasets (*in development*)
+- Native application performance with Rust + Tauri (*planned*)
+- Efficient memory usage (*basic implementation complete*)
+- Responsive UI (*planned*)
 
-## 🚀 Getting Started
+## 🛠️ Development Setup
 
-> **Note:** u-forge.ai is currently in development. Follow this repo for updates!
+> **⚠️ This is a prototype for developers only. No end-user releases are available.**
 
 ### System Requirements
-- RAM: 8GB recommended (4GB minimum)
-- Storage: 10GB free space for large datasets
-- OS: Linux (primary), macOS, Windows
+- RAM: 4GB minimum for development
+- Storage: 2GB for Rust toolchain + dependencies
+- OS: Linux (primary), macOS, Windows (all require development setup)
+- GCC 13+ (for RocksDB compilation)
 
-### Installation
+### Current Model Support
+- BGE-small-en-v1.5 (133MB) - Default local embedding model
+- Other FastEmbed models available but not pre-configured
 
-#### Linux (Flatpak - Recommended)
+### Development Installation
+
+**Prerequisites:**
 ```bash
-# Coming soon to Flathub
-flatpak install ai.u-forge.universe-forge
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Linux: Install GCC 13
+sudo apt install gcc-13 g++-13  # Ubuntu/Debian
+# or your distribution's equivalent
+
+# Set environment variables
+export CC=gcc-13
+export CXX=g++-13
 ```
 
-#### macOS
+**Build and Run:**
 ```bash
-# Download from releases page
-# Install DMG package
+git clone https://github.com/your-org/u-forge.ai.git
+cd u-forge.ai
+
+# Build (first build takes ~10 minutes due to RocksDB compilation)
+cargo build
+
+# Run the demo
+cargo run --bin u-forge-ai
 ```
 
-#### Windows
-```bash
-# Download from releases page  
-# Run MSI installer
-```
+### What the Demo Shows
 
-### Quick Start
+The current demo creates a small Middle-earth knowledge graph and demonstrates:
+1. Object creation (characters, locations, items)
+2. Relationship mapping
+3. Text chunk storage with embeddings
+4. Basic semantic search
+5. Exact name matching with FST
+6. Hybrid search combining both approaches
 
-1. Launch u-forge.ai and create your first world
-2. Set up AI integration by adding your API keys (stored securely in your OS keystore)
-3. Create your first nodes - characters, locations, or factions
-4. Start connecting related elements to build your knowledge graph
-5. Search and explore your world using natural language queries
+**Note: This is a single-shot CLI demo, not an interactive application.**
 
-## 🎮 Use Cases
+## 🎯 Intended Use Cases (*When Complete*)
 
 ### For In-Person Campaign Management
-- Record your table sessions and never miss important plot developments
-- Track complex political relationships between factions with visual connections
+- Track complex political relationships between factions with visual connections  
 - Remember which NPCs know which secrets and when they revealed them
-- Quickly find that tavern from three sessions ago using natural language search
-- Generate consistent lore that builds on established facts from your recorded sessions
-- U-Store integration: Buy Curse of Strahd at your local game store, then purchase the official knowledge graph to have Barovia's entire cast of characters, locations, and plot threads ready to explore
+- Quickly find story elements using semantic search
+- Generate consistent lore that builds on established facts
+- Work completely offline with local models
 
 ### For Worldbuilding Authors
 - Maintain consistency across large fictional universes
-- Explore "what if" scenarios with AI assistance
+- Find related concepts instantly through semantic search
 - Visualize how different story elements connect
-- Export your world data for use in other tools
-- Learn from the masters: Study how professional game designers structure their worlds by exploring official knowledge graphs from the U-Store
+- Export world data for use in other tools
 
 ### For Content Creators
 - Build comprehensive campaign settings for publication
 - Create interconnected adventure modules
 - Maintain series continuity across multiple works
-- Export your world data for use in other tools
-- Professional templates: Use official publisher knowledge graphs as starting points for your own derivative works
 
-### For VTT Users (Premium Features)
-- Unified session recording that combines Discord voice chat with FoundryVTT text interactions, Roll20 dice rolls, and D&D Beyond character updates in one timeline
-- Cross-platform intelligence that automatically correlates "I cast fireball" in Discord with spell usage in FoundryVTT and damage rolls in Roll20
-- Advanced speaker separation that identifies players across different usernames on different platforms
-- Cloud sync for multi-device access during online games with real-time collaboration
-- Enhanced U-Store integration with premium features like automatic session correlation with official content
+**Note: These are planned capabilities. Current prototype only demonstrates basic storage and search.**
 
-## 🛠️ Development
+## 🛠️ Technical Architecture
 
-u-forge.ai is built with modern, performant technologies:
+**Current Implementation:**
+- Core Engine: Rust (performance and memory safety)
+- Database: RocksDB (storage and crash recovery)
+- Embeddings: FastEmbed-rs (local text embeddings)
+- Vector Search: Simple cosine similarity (*HNSW integration pending*)
+- Name Search: FST (finite state transducers)
 
-- Core Engine: Rust (for performance and memory safety)
-- UI Framework: Tauri + Svelte (native performance with web flexibility)
-- Database: RocksDB (proven scalability and crash recovery)
-- AI Integration: Multi-provider support (OpenAI, Anthropic, local models)
-- Vector Search: HNSW (memory-mapped for massive datasets)
+**Planned Additions:**
+- UI Framework: Tauri + Svelte
+- Advanced vector search with HNSW
+- Multi-provider AI integration
+- Audio transcription pipeline
+
+### Known Technical Challenges
+
+**HNSW Integration Issues:**
+The current implementation uses a simplified vector search due to significant API compatibility issues with `hnsw_rs` v0.3.x. The HNSW crate underwent major breaking changes that affected:
+- Method signatures (`nb_elements` → `get_nb_point`, etc.)
+- Struct field names in search results
+- Serialization/deserialization support
+- Lifetime parameter requirements
+
+This forced a fallback to basic cosine similarity search. Proper HNSW integration requires either:
+1. Extensive API migration work, or
+2. Evaluating alternative vector search libraries
+
+See `CLAUDE.MD` for detailed technical documentation of these issues.
 
 ### Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+This is an early prototype. Contributions welcome, but expect significant API changes.
 
-### Development Setup
+## 🗺️ Development Roadmap
 
-```bash
-# Clone the repository
-git clone https://github.com/your-org/u-forge.ai.git
-cd u-forge.ai
-
-# Install Rust and Node.js dependencies
-cargo build
-npm install
-
-# Run in development mode
-cargo tauri dev
-```
-
-## 🗺️ Roadmap
-
-### v0.1 - Foundation (Current)
-- [ ] Core storage engine with RocksDB
-- [ ] Basic graph visualization and editing
-- [ ] AI integration with major providers
+### Current State - Foundation Prototype
+- [x] Core storage engine with RocksDB
+- [x] Basic text embeddings (FastEmbed)
+- [x] Simple semantic search
+- [x] FST-based exact matching
+- [x] Command-line demo
+- [ ] HNSW vector search integration
+- [ ] Basic GUI interface
 - [ ] Cross-platform packaging
 
-### v0.2 - Enhanced Experience
-- [ ] Advanced graph layouts and filtering
-- [ ] Git integration for version control
-- [ ] Enhanced import/export capabilities
-- [ ] Performance optimizations
+### Next Phase - Minimal Viable Product
+- [ ] Tauri-based desktop application
+- [ ] Visual knowledge graph interface
+- [ ] Improved vector search performance
+- [ ] Basic content generation features
+- [ ] Import/export capabilities
 
-### v0.3 - Premium Ecosystem
-- [ ] Virtual session recording with multi-platform support and temporal correlation (Premium)
-- [ ] Cross-platform integration (Discord + FoundryVTT + Roll20 + D&D Beyond) (Premium)
-- [ ] Cloud sync and collaboration for distributed teams (Premium)
-- [ ] U-Store marketplace launch with publisher partnerships for official licensed content
+### Future Development
+- [ ] Audio transcription pipeline
+- [ ] Advanced graph layouts and filtering
+- [ ] Multi-platform session recording
+- [ ] Cloud integration options
+- [ ] Publisher content marketplace
+
+**Timeline: No specific dates. This is exploratory development.**
 
 ## 🤝 Community
 
@@ -192,15 +234,17 @@ The core u-forge.ai application is released under the [MIT License](LICENSE). Yo
 
 Premium integrations and cloud services are available under separate commercial licenses.
 
-## 💼 Business Model
+## 💼 Future Business Model
 
-Core Philosophy: Free for pen-and-paper, premium for digital tools.
+**Current Status: Open source prototype (MIT License)**
 
-- Core Application: Always free and open source (MIT License)
-- U-Store Content: Available to all users - purchase official licensed knowledge graphs to complement your physical books (pricing varies by publisher)
-- Premium Integrations: Enhanced session recording with multi-platform correlation and cross-platform VTT integrations
-- Cloud Services: Optional paid services for sync, collaboration, and unified multi-platform session management
-- Your Data: Always yours, whether you use free, U-Store, or premium features
+Planned approach if development continues:
+- Core Application: Free and open source (MIT License)
+- Premium Features: Enhanced integrations and cloud services
+- Content Marketplace: Official licensed knowledge graphs
+- Your Data: Always yours, regardless of tier
+
+**Note: No commercial features exist yet. This is purely conceptual.**
 
 ## 🙏 Acknowledgments
 
@@ -210,4 +254,6 @@ Core Philosophy: Free for pen-and-paper, premium for digital tools.
 
 ---
 
-**Ready to forge your universe?** Star this repo to stay updated on our progress! 🌟
+**Interested in local-first TTRPG tools?** Star this repo to follow early development progress! 🌟
+
+**⚠️ Reminder: This is an early prototype, not a usable application.**

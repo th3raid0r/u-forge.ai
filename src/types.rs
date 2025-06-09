@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+// Re-export Uuid for easier access throughout the crate
+pub use uuid::Uuid as ForgeUuid;
+
 /// Core object types in the TTRPG knowledge graph
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ObjectType {
@@ -29,10 +32,10 @@ impl ObjectType {
 }
 
 /// Unique identifier for graph objects
-pub type ObjectId = Uuid;
+pub type ObjectId = ForgeUuid;
 
 /// Unique identifier for text chunks
-pub type ChunkId = Uuid;
+pub type ChunkId = ForgeUuid;
 
 /// Edge relationship types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,7 +135,7 @@ impl ObjectMetadata {
     pub fn new(object_type: ObjectType, name: String) -> Self {
         let now = chrono::Utc::now();
         Self {
-            id: Uuid::new_v4(),
+            id: ForgeUuid::new_v4(),
             object_type,
             name,
             description: None,
@@ -193,7 +196,7 @@ pub enum ChunkType {
 impl TextChunk {
     pub fn new(object_id: ObjectId, content: String, chunk_type: ChunkType) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: ForgeUuid::new_v4(),
             object_id,
             token_count: estimate_token_count(&content),
             content,
@@ -270,8 +273,8 @@ mod tests {
 
     #[test]
     fn test_edge_creation() {
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
+        let id1 = ForgeUuid::new_v4();
+        let id2 = ForgeUuid::new_v4();
         
         let edge = Edge::new(id1, id2, EdgeType::Knows)
             .with_weight(0.8)
@@ -286,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_text_chunk_creation() {
-        let obj_id = Uuid::new_v4();
+        let obj_id = ForgeUuid::new_v4();
         let content = "This is a test description with some content.".to_string();
         
         let chunk = TextChunk::new(obj_id, content.clone(), ChunkType::Description);
@@ -299,7 +302,7 @@ mod tests {
     #[test]
     fn test_query_result_token_budget() {
         let mut result = QueryResult::new();
-        let obj_id = Uuid::new_v4();
+        let obj_id = ForgeUuid::new_v4();
         
         let chunk1 = TextChunk::new(obj_id, "Short text".to_string(), ChunkType::Description);
         let chunk2 = TextChunk::new(obj_id, "This is a much longer piece of text that should have more tokens".to_string(), ChunkType::UserNote);

@@ -8,23 +8,40 @@
 
 pub mod types;
 pub mod storage;
+pub mod embeddings; // Added embeddings module
+pub mod vector_search; // Added vector_search module
 
 pub use types::*;
 pub use storage::KnowledgeGraphStorage;
+pub use embeddings::{EmbeddingManager, EmbeddingProvider, FastEmbedModel}; // Re-export key embedding types
+pub use vector_search::{VectorSearchEngine, VectorSearchConfig, HybridSearchResult, SemanticSearchResult, ExactSearchResult}; // Re-export key vector_search types
 
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Main knowledge graph interface combining storage and query capabilities
 pub struct KnowledgeGraph {
     storage: KnowledgeGraphStorage,
+    embedding_manager: Arc<EmbeddingManager>,
 }
 
 impl KnowledgeGraph {
     /// Create a new knowledge graph instance
-    pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let storage = KnowledgeGraphStorage::new(db_path)?;
-        Ok(Self { storage })
+    ///
+    /// # Arguments
+    /// * `db_path` - Path to the RocksDB database.
+    /// * `embedding_cache_dir` - Optional path to cache downloaded embedding models.
+    pub fn new<P: AsRef<Path>>(db_path: P, embedding_cache_dir: Option<P>) -> Result<Self> {
+        let storage = KnowledgeGraphStorage::new(db_path.as_ref())?;
+        let cache_path_buf = embedding_cache_dir.map(|p| p.as_ref().to_path_buf());
+        let embedding_manager = Arc::new(EmbeddingManager::try_new_local_default(cache_path_buf)?);
+        Ok(Self { storage, embedding_manager })
+    }
+
+    /// Get a reference to the embedding provider
+    pub fn get_embedding_provider(&self) -> Arc<dyn EmbeddingProvider> {
+        self.embedding_manager.get_provider()
     }
 
     /// Add a new object to the knowledge graph
@@ -37,6 +54,11 @@ impl KnowledgeGraph {
     /// Get an object by its ID
     pub fn get_object(&self, id: ObjectId) -> Result<Option<ObjectMetadata>> {
         self.storage.get_node(id)
+    }
+
+    /// Get all objects from the knowledge graph
+    pub fn get_all_objects(&self) -> Result<Vec<ObjectMetadata>> {
+        self.storage.get_all_objects()
     }
 
     /// Update an existing object
@@ -188,10 +210,20 @@ impl ObjectBuilder {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use std::path::PathBuf;
+
+    fn get_test_embedding_cache_dir() -> PathBuf {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("lib_test_model_cache");
+        std::fs::create_dir_all(&path).expect("Failed to create test model cache dir for lib.rs");
+        path
+    }
 
     fn create_test_graph() -> (KnowledgeGraph, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let graph = KnowledgeGraph::new(temp_dir.path()).unwrap();
+        let cache_dir = get_test_embedding_cache_dir();
+        let graph = KnowledgeGraph::new(temp_dir.path(), Some(&cache_dir)).unwrap();
         (graph, temp_dir)
     }
 
