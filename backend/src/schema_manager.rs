@@ -2,6 +2,7 @@ use crate::schema::{SchemaDefinition, ObjectTypeSchema, PropertySchema, Property
 use crate::types::{ObjectMetadata, Edge};
 use crate::storage::KnowledgeGraphStorage;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
@@ -392,7 +393,7 @@ impl SchemaManager {
 }
 
 /// Statistics about a schema
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaStats {
     pub name: String,
     pub version: String,

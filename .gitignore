@@ -1,2 +1,8 @@
 /target
 /.fastembed_cache
+/dist
+/src-tauri/default-project
+/node_modules
+/frontend/node_modules
+/backend/.fastembed_cache
+/backend/target

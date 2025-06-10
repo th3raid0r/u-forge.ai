@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>u-forge.ai - Universe Forge</title>
+    
+    <!-- Prevent default drag behaviors -->
+    <style>
+      * {
+        -webkit-user-drag: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+      }
+      
+      input, textarea, [contenteditable] {
+        user-select: text;
+        -webkit-user-select: text;
+        -moz-user-select: text;
+        -ms-user-select: text;
+      }
+      
+      /* Custom window controls area for Client Side Decorations */
+      .titlebar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 30px;
+        background: transparent;
+        -webkit-app-region: drag;
+        z-index: 1000;
+      }
+      
+      .titlebar-controls {
+        -webkit-app-region: no-drag;
+      }
+      
+      /* Dark theme base */
+      :root {
+        color-scheme: dark;
+        --bg-primary: #1e1e1e;
+        --bg-secondary: #252526;
+        --bg-tertiary: #2d2d30;
+        --text-primary: #cccccc;
+        --text-secondary: #969696;
+        --border-color: #3e3e42;
+        --accent-color: #007acc;
+        --accent-hover: #005a9e;
+      }
+      
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+          'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+          sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        background-color: var(--bg-primary);
+        color: var(--text-primary);
+        overflow: hidden;
+      }
+      
+      #app {
+        width: 100vw;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Custom titlebar for Client Side Decorations -->
+    <div class="titlebar" data-tauri-drag-region>
+      <div class="titlebar-controls"></div>
+    </div>
+    
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

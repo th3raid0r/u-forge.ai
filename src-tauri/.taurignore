@@ -1,0 +1,51 @@
+# Exclude database files from Tauri dev server file watching
+# These files change frequently during normal operation and should not trigger rebuilds
+
+# RocksDB database directory (all variations)
+default-project/db/
+default-project/db/*
+*/db/
+*/db/*
+db/
+db/*
+
+# Common database file patterns (RocksDB specific)
+*.db
+*.dbtmp
+*.log
+*.sst
+MANIFEST-*
+CURRENT
+OPTIONS-*
+LOG.old.*
+LOCK
+IDENTITY
+**/MANIFEST-*
+**/CURRENT  
+**/OPTIONS-*
+**/LOG
+**/LOCK
+**/IDENTITY
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-*
+
+# Build artifacts that shouldn't trigger rebuilds
+target/debug/
+target/release/
+node_modules/
+dist/

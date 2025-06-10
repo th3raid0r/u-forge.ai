@@ -4,6 +4,8 @@
 
 The u-forge.ai configurable schema system provides runtime-definable object types and validation rules for TTRPG worldbuilding. This system allows users to create custom object types, properties, and relationships without recompiling the application, making it adaptable to any TTRPG system.
 
+**🎉 NEW: Dynamic Frontend Integration** - The frontend now dynamically adapts to backend schemas, displaying custom object types and properties defined in JSON schema files without requiring frontend code changes.
+
 ## Key Features
 
 - **Dynamic Object Types**: Define new object types at runtime (spells, classes, vehicles, etc.)
@@ -16,7 +18,7 @@ The u-forge.ai configurable schema system provides runtime-definable object type
 
 ## Architecture
 
-### Core Components
+### Backend Components
 
 1. **SchemaDefinition**: Top-level schema container
 2. **ObjectTypeSchema**: Definition for a specific object type
@@ -25,16 +27,70 @@ The u-forge.ai configurable schema system provides runtime-definable object type
 5. **SchemaManager**: Runtime schema management and validation
 6. **ValidationResult**: Validation outcome with errors and warnings
 
+### Frontend Components (NEW)
+
+1. **SchemaStore** (`schemaStore.ts`): Svelte store for dynamic schema management
+2. **DynamicPropertyEditor** (`DynamicPropertyEditor.svelte`): Schema-driven form renderer
+3. **Updated ContentEditor**: Now uses dynamic schemas instead of hardcoded types
+
 ### Storage Layer
 
 - **Schemas**: Stored in dedicated RocksDB column family (`CF_SCHEMAS`)
 - **Objects**: Use JSON serialization for flexible property storage
-- **Caching**: In-memory schema cache for performance
+- **Caching**: In-memory schema cache for performance (backend + frontend)
 - **Migration**: Support for schema evolution without data loss
 
 ## Basic Usage
 
-### Creating a Schema
+### Creating a Schema (JSON File)
+
+The easiest way to create new object types is by adding JSON schema files:
+
+```json
+// examples/schemas/spell.schema.json
+{
+  "name": "add_spell",
+  "description": "Add a new Spell to the knowledge graph",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Spell name",
+      "required": true
+    },
+    "level": {
+      "type": "number",
+      "description": "Spell level (0-9)",
+      "required": true,
+      "validation": {
+        "min_value": 0,
+        "max_value": 9
+      }
+    },
+    "school": {
+      "type": "string",
+      "description": "School of magic",
+      "required": true,
+      "validation": {
+        "allowed_values": [
+          "Abjuration",
+          "Conjuration", 
+          "Evocation",
+          "Illusion",
+          "Necromancy",
+          "Transmutation"
+        ]
+      }
+    },
+    "components": {
+      "type": "array",
+      "description": "Spell components (V, S, M)",
+      "required": false
+    }
+  }
+}
+```
+
+### Creating a Schema (Programmatically)
 
 ```rust
 use u_forge_ai::schema::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, ValidationRule};
@@ -84,8 +140,33 @@ schema_manager.save_schema(&dnd5e_schema).await?;
 schema_manager.register_object_type("dnd5e", "spell", spell_schema).await?;
 ```
 
+### Frontend Integration (NEW)
+
+The frontend automatically adapts to schema changes:
+
+```typescript
+// Frontend automatically loads available schemas
+import { schemaStore, availableObjectTypes } from '$lib/stores/schemaStore';
+
+// Initialize schema system
+await schemaStore.initialize();
+
+// Get available object types (dynamically loaded)
+const objectTypes = $availableObjectTypes; 
+// Returns: [{ value: "spell", label: "Spell", icon: "✨" }, ...]
+
+// Create object with schema validation
+const defaultProperties = await schemaStore.createDefaultProperties("spell");
+// Returns: { level: 0, school: "", components: [] }
+
+// Validate properties against schema
+const validation = await schemaStore.validateObjectProperties("spell", properties);
+// Returns: { valid: boolean, errors: [...], warnings: [...] }
+```
+
 ### Creating and Validating Objects
 
+**Backend (Rust)**:
 ```rust
 // Create a spell object
 let fireball = ObjectBuilder::custom("spell".to_string(), "Fireball".to_string())
@@ -110,6 +191,15 @@ if validation_result.valid {
     }
 }
 ```
+
+**Frontend (Automatic UI Generation)**:
+The frontend automatically generates forms based on schema definitions. Users simply:
+1. Select "Spell" from the object type dropdown (dynamically populated)
+2. Fill in form fields that are automatically generated from the schema
+3. Get real-time validation feedback
+4. Save with automatic schema validation
+
+No frontend code changes needed when adding new object types!
 
 ## Property Types
 
@@ -368,16 +458,95 @@ The schema system integrates with the vector search engine:
 3. **Async Validation**: External validation services
 4. **Conditional Logic**: Property validation based on other properties
 
+## Dynamic Frontend Implementation
+
+### How It Works
+
+1. **Schema Loading**: Frontend fetches available schemas from backend via Tauri commands
+2. **Dynamic UI Generation**: Form fields are generated based on schema property definitions
+3. **Real-time Validation**: Properties are validated against schema rules as users type
+4. **Automatic Adaptation**: Adding new schema files automatically adds new object types to the UI
+
+### Supported Property Types
+
+The dynamic frontend supports all schema property types:
+
+| Property Type | UI Component | Features |
+|---------------|--------------|----------|
+| `string` | Text input | Length validation, pattern matching |
+| `text` | Textarea | Multi-line text with length limits |
+| `number` | Number input | Min/max validation, step increments |
+| `boolean` | Checkbox | True/false values |
+| `array` | Dynamic list | Add/remove items, validation per item |
+| `enum` | Select dropdown | Predefined options from schema |
+| `object` | JSON editor | Nested object editing (planned) |
+| `reference` | Object picker | References to other objects (planned) |
+
+### Schema Store Features
+
+- **Lazy Loading**: Object type schemas loaded on-demand for performance
+- **Caching**: Schemas cached in memory after first load
+- **Error Handling**: Graceful fallbacks when schemas can't be loaded
+- **Validation**: Real-time property validation with user-friendly error messages
+- **Default Values**: Automatic generation of default property values
+
 ## Examples
 
-See `examples/schema_demo.rs` for a comprehensive demonstration of:
+### JSON Schema Files
 
-- Creating custom D&D 5e and Cyberpunk schemas
-- Defining object types with complex properties
-- **String-based edge types and relationship schemas**
-- Validation success and failure scenarios
-- Runtime schema registration
-- Multi-schema environments
+The project includes comprehensive example schemas in `src-tauri/examples/schemas/`:
+
+- `player_character.schema.json` - Player characters with skills, affiliations
+- `npc.schema.json` - Non-player characters
+- `location.schema.json` - Places with climate, government details
+- `faction.schema.json` - Organizations with goals, resources
+- `quest.schema.json` - Missions with objectives, rewards
+- `artifact.schema.json` - Magical items with powers
+- `temporal.schema.json` - Time-based events
+- `transportation.schema.json` - Vehicles and mounts
+- `currency.schema.json` - Economic systems
+- `inventory.schema.json` - Item collections
+- `skills.schema.json` - Character abilities
+- `setting_reference.schema.json` - Campaign settings
+- `system_reference.schema.json` - Game system rules
+
+### Adding a New Object Type
+
+1. **Create Schema File** (`examples/schemas/vehicle.schema.json`):
+```json
+{
+  "name": "add_vehicle",
+  "description": "Add a new Vehicle to the knowledge graph",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Vehicle name",
+      "required": true
+    },
+    "type": {
+      "type": "string",
+      "description": "Type of vehicle",
+      "required": true,
+      "validation": {
+        "allowed_values": ["car", "ship", "aircraft", "mount"]
+      }
+    },
+    "speed": {
+      "type": "number",
+      "description": "Maximum speed",
+      "required": false,
+      "validation": {
+        "min_value": 0,
+        "max_value": 1000
+      }
+    }
+  }
+}
+```
+
+2. **Restart Application**: The schema will be automatically loaded
+3. **Use in Frontend**: "Vehicle" appears in object type dropdown automatically
+4. **Dynamic Properties**: Form fields generated based on schema
 
 ### Edge Type Examples
 
@@ -430,4 +599,59 @@ schema.add_edge_type("knows_spell".to_string(),
 - `ValidationRule::new()`: Create validation rule
 - `EdgeTypeSchema::new()`: Create edge type definition
 
-The configurable schema system provides the foundation for flexible, type-safe TTRPG worldbuilding while maintaining excellent performance and user experience.
+## Testing the System
+
+The schema system can be tested with the CLI demo:
+
+```bash
+# Test with example schemas
+cd backend
+cargo run --example cli_demo ../src-tauri/examples/data/memory.json ../src-tauri/examples/schemas
+
+# Expected output:
+# ✅ Loaded 13 object types from schema directory
+# ✅ Objects created: 220
+# ✅ Relationships created: 312
+```
+
+Or run the full Tauri application:
+
+```bash
+# Start development environment
+./dev.sh
+
+# The frontend will automatically:
+# - Load available schemas from backend
+# - Display custom object types in dropdowns
+# - Generate appropriate form fields
+# - Provide real-time validation
+```
+
+## Benefits Achieved
+
+### Complete Flexibility
+- Any TTRPG system can define custom object types without frontend code changes
+- Properties are completely configurable through JSON schema files
+- No compilation required - just add schema files and restart
+
+### Type Safety
+- Real-time validation against schema rules
+- Prevents invalid data entry with clear error messages
+- Frontend and backend validation consistency
+
+### Better User Experience
+- Appropriate UI components for each property type (dropdowns for enums, number inputs for numbers, etc.)
+- Auto-completion and validation feedback
+- Context-aware form fields with helpful descriptions
+
+### Maintainability
+- Single source of truth for object definitions
+- Schemas can be version controlled and shared
+- Easy to update and distribute to team members
+
+### Performance
+- Lazy loading of schemas for fast startup
+- Efficient caching system minimizes API calls
+- Responsive UI that doesn't block on schema loading
+
+The configurable schema system provides the foundation for flexible, type-safe TTRPG worldbuilding while maintaining excellent performance and user experience. With the new dynamic frontend integration, users can now define completely custom object types and see them immediately reflected in the user interface without any code changes.

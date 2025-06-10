@@ -14,6 +14,7 @@ pub mod embedding_queue; // Added embedding_queue module
 pub mod schema; // Added schema module
 pub mod schema_manager; // Added schema_manager module
 pub mod schema_ingestion; // Added schema_ingestion module
+pub mod data_ingestion; // Added data_ingestion module
 
 pub use types::*;
 pub use storage::KnowledgeGraphStorage;
