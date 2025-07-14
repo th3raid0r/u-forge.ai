@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
 
 // Re-export Uuid for easier access throughout the crate
 pub use uuid::Uuid as ForgeUuid;

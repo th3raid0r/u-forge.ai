@@ -486,7 +486,7 @@ impl KnowledgeGraphStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{EdgeType, ObjectType};
+    use crate::types::EdgeType;
     use tempfile::TempDir;
 
     fn create_test_storage() -> (KnowledgeGraphStorage, TempDir) {

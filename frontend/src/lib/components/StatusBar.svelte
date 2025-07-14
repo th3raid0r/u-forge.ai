@@ -1,23 +1,23 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { projectStore, hasUnsavedChanges } from '../stores/projectStore';
-  import { uiStore, hasUnsavedEditorChanges } from '../stores/uiStore';
-  import { graphStore, graphStats } from '../stores/graphStore';
+  import { hasUnsavedChanges } from '../stores/projectStore';
+  import { hasUnsavedEditorChanges } from '../stores/uiStore';
+  import { graphStats } from '../stores/graphStore';
   import type { ProjectInfo } from '../types';
   
   export let currentProject: ProjectInfo | null = null;
   
-  let connectionStatus = 'connected';
+
   let lastSaveTime: Date | null = null;
   let memoryUsage = 0;
   let processingQueue = 0;
   let currentTime = new Date();
-  let timeInterval: number;
+  let timeInterval: ReturnType<typeof setInterval>;
   
   // Status indicators
   let saveStatus = 'saved'; // 'saved', 'saving', 'unsaved', 'error'
   let aiStatus = 'connected'; // 'connected', 'disconnected', 'processing'
-  let graphStatus = 'ready'; // 'ready', 'loading', 'error'
+
   
   onMount(() => {
     // Update current time every second
@@ -114,10 +114,7 @@
     console.log('Save all triggered');
   }
   
-  function handleRefreshProject() {
-    // Trigger project refresh
-    console.log('Refresh project triggered');
-  }
+
   
   function toggleVerboseMode() {
     // Toggle detailed status information

@@ -1,0 +1,125 @@
+{
+  "name": "add_location",
+  "description": "Add a new location to the knowledge graph",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Location's name",
+      "required": true
+    },
+    "type": {
+      "type": "string",
+      "description": "Type of location (e.g., City, Facility, District, Ship, Region, Wilds, Planet, System, Sector).",
+      "required": true
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed description of the location",
+      "required": true
+    },
+    "status": {
+      "type": "string",
+      "description": "Current state of the location",
+      "required": true
+    },
+    "parentLocation": {
+      "type": "string",
+      "description": "The parent location this location belongs to",
+      "required": false,
+      "relationship": {
+        "edgeType": "a_part_of",
+        "description": "A part of this parent location."
+      }
+    },
+    "atmosphere": {
+      "type": "string",
+      "description": "The general feel/mood of the location",
+      "required": false
+    },
+    "accessibility": {
+      "type": "string",
+      "description": "How characters can enter/exit the location",
+      "required": false
+    },
+    "size": {
+      "type": "string",
+      "description": "The size or scale of the location",
+      "required": false
+    },
+    "dangerLevel": {
+      "type": "string",
+      "description": "The level of danger present in the location",
+      "required": false
+    },
+    "notableFeatures": {
+      "type": "array",
+      "description": "Distinct characteristics of the location",
+      "required": false
+    },
+    "subLocations": {
+      "type": "array",
+      "description": "Locations contained within this location",
+      "required": false,
+      "relationship": {
+        "edgeType": "contains",
+        "description": "Locations contained within this location"
+      }
+    },
+    "relatedCharacters": {
+      "type": "array",
+      "description": "Characters present in or associated with this location",
+      "required": false,
+      "relationship": {
+        "edgeType": "present_in",
+        "description": "Characters associated with the location"
+      }
+    },
+    "relatedQuests": {
+      "type": "array",
+      "description": "Quests associated with this location",
+      "required": false,
+      "relationship": {
+        "edgeType": "takes_place_in",
+        "description": "Quests associated with the location"
+      }
+    },
+    "relatedArtifacts": {
+      "type": "array",
+      "description": "Artifacts found or stored at this location",
+      "required": false,
+      "relationship": {
+        "edgeType": "located_at",
+        "description": "Artifacts associated with the location"
+      }
+    },
+    "controlledBy": {
+      "type": "string",
+      "description": "Current owner or controlling entity.",
+      "required": false,
+      "relationship": {
+        "edgeType": "controlled_by",
+        "description": "Entity, faction, or person with effective control over the location."
+      }
+    },
+    "historicalEvents": {
+      "type": "array",
+      "description": "References to notable events that occurred at or changed this location.",
+      "required": false,
+      "relationship": {
+        "edgeType": "occurred_at",
+        "description": "Events of significance that took place here."
+      }
+    },
+    "hazards": {
+      "type": "array",
+      "description": "Environmental, social, or other hazards present at this location.",
+      "required": false
+    },
+    "tags": {
+      "type": "array",
+      "description": "Tags for filtering, grouping, or scenario hooks.",
+      "required": false
+    }
+  },
+  "additionalProperties": true
+}

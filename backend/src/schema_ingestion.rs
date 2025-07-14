@@ -1,7 +1,6 @@
 use crate::schema::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, EdgeTypeSchema, ValidationRule, RelationshipDefinition, Cardinality};
 use anyhow::{Context, Result};
 use serde_json::{Value, Map};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +16,25 @@ struct JsonSchemaFile {
 }
 
 impl SchemaIngestion {
+    /// Load schemas using environment variable or default path
+    ///
+    /// Uses UFORGE_SCHEMA_DIR environment variable if set, otherwise defaults to ./defaults/schemas
+    pub fn load_default_schemas() -> Result<SchemaDefinition> {
+        let schema_dir = std::env::var("UFORGE_SCHEMA_DIR")
+            .unwrap_or_else(|_| "./defaults/schemas".to_string());
+
+        println!("Attempting to load schemas from: {}", schema_dir);
+
+        if !std::path::Path::new(&schema_dir).exists() {
+            return Err(anyhow::anyhow!(
+                "Schema directory not found: {}. Set UFORGE_SCHEMA_DIR environment variable or place schemas at ./defaults/schemas", 
+                schema_dir
+            ));
+        }
+
+        Self::load_schemas_from_directory(&schema_dir, "default", "1.0")
+    }
+
     /// Load all JSON schema files from a directory and create a SchemaDefinition
     pub fn load_schemas_from_directory<P: AsRef<Path>>(
         directory: P,

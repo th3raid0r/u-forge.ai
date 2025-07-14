@@ -12,8 +12,8 @@ export WEBKIT_DISABLE_DMABUF_RENDERER=1
 # Optional: Set default paths for data ingestion
 # These can be overridden by setting these environment variables
 # For development with Tauri:
-export UFORGE_SCHEMA_DIR="${UFORGE_SCHEMA_DIR:-./src-tauri/examples/schemas}"
-export UFORGE_DATA_FILE="${UFORGE_DATA_FILE:-./src-tauri/examples/data/memory.json}"
+export UFORGE_SCHEMA_DIR="./examples/schemas"
+export UFORGE_DATA_FILE="./examples/data/memory.json"
 
 # For development with backend CLI:
 # export UFORGE_SCHEMA_DIR="${UFORGE_SCHEMA_DIR:-./examples/schemas}"
@@ -35,7 +35,7 @@ echo "   UFORGE_SCHEMA_DIR=$UFORGE_SCHEMA_DIR"
 echo "   UFORGE_DATA_FILE=$UFORGE_DATA_FILE"
 echo ""
 echo -e "${YELLOW}💡 Usage examples:${NC}"
-echo "   cargo build                    # Build with correct environment"  
+echo "   cargo build                    # Build with correct environment"
 echo "   cargo test                     # Run tests"
 echo "   cargo run --example cli_demo   # Run CLI demo"
 echo "   cd backend && cargo check      # Check backend code"

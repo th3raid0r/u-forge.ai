@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-use anyhow::{Context, Result};
 
 /// Schema definition for a complete TTRPG system
 #[derive(Debug, Clone, Serialize, Deserialize)]

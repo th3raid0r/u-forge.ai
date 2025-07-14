@@ -154,7 +154,21 @@
 
   
   function getPropertyValue(propertyName: string, defaultValue: any): any {
-    return properties[propertyName] ?? defaultValue;
+    const value = properties[propertyName] ?? defaultValue;
+    
+    // For display purposes, ensure we have a consistent format
+    if (objectSchema?.properties[propertyName]?.property_type?.toString() === 'Array') {
+      // Always return an array for array properties
+      if (typeof value === 'string') {
+        return stringToArray(value);
+      }
+      if (Array.isArray(value)) {
+        return value.filter(item => item !== null && item !== undefined && item !== '');
+      }
+      return [];
+    }
+    
+    return value;
   }
   
   // Event value extraction helpers
@@ -176,28 +190,38 @@
   
   // Array manipulation functions
   
-  function addArrayItem(propertyName: string) {
-    const currentValue = getPropertyValue(propertyName, []);
-    const newValue = Array.isArray(currentValue) ? [...currentValue, ''] : [''];
-    handlePropertyChange(propertyName, newValue);
+  function arrayToString(value: any): string {
+    if (Array.isArray(value)) {
+      return value
+        .filter(item => item !== null && item !== undefined && item !== '')
+        .map(item => String(item).trim())
+        .join(', ');
+    }
+    if (typeof value === 'string') {
+      return value.trim();
+    }
+    return '';
   }
   
-  function removeArrayItem(propertyName: string, index: number) {
-    const currentValue = getPropertyValue(propertyName, []);
-    if (Array.isArray(currentValue)) {
-      const newValue = currentValue.filter((_, i) => i !== index);
-      handlePropertyChange(propertyName, newValue);
+  function stringToArray(value: string): string[] {
+    if (!value || typeof value !== 'string') {
+      return [];
     }
+    
+    // Split by comma and clean up
+    return value
+      .split(',')
+      .map(item => item.trim())
+      .filter(item => item !== '' && item !== null && item !== undefined)
+      .filter((item, index, array) => array.indexOf(item) === index); // Remove duplicates
   }
   
-  function updateArrayItem(propertyName: string, index: number, newItemValue: any) {
-    const currentValue = getPropertyValue(propertyName, []);
-    if (Array.isArray(currentValue)) {
-      const newValue = [...currentValue];
-      newValue[index] = newItemValue;
-      handlePropertyChange(propertyName, newValue);
-    }
+  function handleArrayStringInput(propertyName: string, value: string) {
+    const arrayValue = stringToArray(value);
+    handlePropertyChange(propertyName, arrayValue);
   }
+  
+
 </script>
 
 <div class="dynamic-property-editor" class:compact class:readonly>
@@ -288,38 +312,17 @@
               
             {:else if propertySchema.property_type.toString() === 'Array'}
               <div class="array-input">
-                {#each getPropertyValue(propertyName, propertySchema.default_value || []) as item, index}
-                  <div class="array-item">
-                    <input
-                      type="text"
-                      value={item}
-                      {readonly}
-                      class="array-item-input"
-                      placeholder="Item {index + 1}"
-                      on:input={e => updateArrayItem(propertyName, index, getInputValue(e))}
-                    />
-                    {#if !readonly}
-                      <button
-                        type="button"
-                        class="btn-remove-item"
-                        title="Remove item"
-                        on:click={() => removeArrayItem(propertyName, index)}
-                      >
-                        ✕
-                      </button>
-                    {/if}
-                  </div>
-                {/each}
-                
-                {#if !readonly}
-                  <button
-                    type="button"
-                    class="btn-add-item"
-                    on:click={() => addArrayItem(propertyName)}
-                  >
-                    + Add Item
-                  </button>
-                {/if}
+                <textarea
+                  value={arrayToString(getPropertyValue(propertyName, propertySchema.default_value || []))}
+                  {readonly}
+                  class="property-textarea array-textarea"
+                  placeholder="Enter items separated by commas (e.g., item1, item2, item3)"
+                  rows="3"
+                  on:input={e => handleArrayStringInput(propertyName, getTextAreaValue(e))}
+                ></textarea>
+                <div class="array-help">
+                  <small>Enter items separated by commas. Single items without commas are also accepted.</small>
+                </div>
               </div>
               
             {:else}
@@ -543,59 +546,25 @@
   .array-input {
     display: flex;
     flex-direction: column;
-    gap: var(--space-sm);
+    gap: 0.5rem;
   }
   
-  .array-item {
-    display: flex;
-    gap: var(--space-sm);
-    align-items: center;
+  .array-textarea {
+    min-height: 80px;
+    resize: vertical;
   }
   
-  .array-item-input {
-    flex: 1;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-sm);
-    color: var(--text-primary);
-    padding: var(--space-sm);
-    font-size: var(--font-sm);
+  .array-help {
+    margin-top: 0.25rem;
   }
   
-  .btn-remove-item {
-    background: var(--error-color);
-    border: none;
-    border-radius: var(--radius-sm);
-    color: white;
-    width: 24px;
-    height: 24px;
-    font-size: var(--font-xs);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: background-color var(--transition-fast);
+  .array-help small {
+    color: var(--color-text-secondary, #aaaaaa);
+    font-size: 0.8rem;
+    font-style: italic;
   }
   
-  .btn-remove-item:hover {
-    background: var(--error-color-dark);
-  }
-  
-  .btn-add-item {
-    background: var(--accent-color);
-    border: none;
-    border-radius: var(--radius-sm);
-    color: white;
-    padding: var(--space-sm) var(--space-md);
-    font-size: var(--font-sm);
-    cursor: pointer;
-    transition: background-color var(--transition-fast);
-    align-self: flex-start;
-  }
-  
-  .btn-add-item:hover {
-    background: var(--accent-color-dark);
-  }
+
   
   /* Validation messages */
   .validation-message {
@@ -633,13 +602,6 @@
       gap: var(--space-sm);
     }
     
-    .array-item {
-      flex-direction: column;
-      align-items: stretch;
-    }
-    
-    .btn-remove-item {
-      align-self: flex-end;
-    }
+
   }
 </style>

@@ -1,7 +1,7 @@
 use crate::schema::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, ValidationResult, ValidationError, ValidationErrorType, ValidationWarning, EdgeTypeSchema};
 use crate::types::{ObjectMetadata, Edge};
 use crate::storage::KnowledgeGraphStorage;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -407,7 +407,7 @@ mod tests {
     use super::*;
     use crate::types::{ObjectMetadata, Edge, EdgeType};
     use tempfile::TempDir;
-    use uuid::Uuid;
+
 
     fn create_test_schema_manager() -> (SchemaManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();

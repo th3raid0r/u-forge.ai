@@ -319,7 +319,7 @@
               🔄
             </button>
             
-            <button class="btn icon-only" title="New Object">
+            <button class="btn icon-only" title="New Object" on:click={() => dispatch('createNewObject')}>
               ➕
             </button>
           </div>

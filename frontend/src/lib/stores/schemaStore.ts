@@ -116,7 +116,7 @@ const createSchemaStore = () => {
       update(state => ({ ...state, isLoading: true, error: null }));
       
       const maxRetries = 3;
-      const retryDelay = 1000; // 1 second
+      const retryDelay = 3000; // 3 seconds
       
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         console.log(`🔄 [SchemaStore] Attempt ${attempt + 1}/${maxRetries}`);
@@ -414,8 +414,18 @@ const createSchemaStore = () => {
             return;
           }
           
+          // Convert string arrays to actual arrays for validation
+          let processedValue = value;
+          if (propertySchema.property_type === PropertyType.Array && typeof value === 'string') {
+            // Convert comma-delimited string to array
+            processedValue = value
+              .split(',')
+              .map(item => item.trim())
+              .filter(item => item !== '' && item !== null && item !== undefined);
+          }
+          
           // Type validation
-          const typeValid = validatePropertyType(value, propertySchema.property_type);
+          const typeValid = validatePropertyType(processedValue, propertySchema.property_type);
           if (!typeValid) {
             errors.push({ property: key, message: `Invalid type. Expected ${propertySchema.property_type}` });
             return;
@@ -425,28 +435,47 @@ const createSchemaStore = () => {
           if (propertySchema.validation) {
             const validation = propertySchema.validation;
             
-            if (typeof value === 'string') {
-              if (validation.min_length && value.length < validation.min_length) {
+            // Use processed value for validation
+            const validationValue = processedValue;
+            
+            if (typeof validationValue === 'string') {
+              if (validation.min_length && validationValue.length < validation.min_length) {
                 errors.push({ property: key, message: `Minimum length is ${validation.min_length}` });
               }
-              if (validation.max_length && value.length > validation.max_length) {
+              if (validation.max_length && validationValue.length > validation.max_length) {
                 errors.push({ property: key, message: `Maximum length is ${validation.max_length}` });
               }
-              if (validation.pattern && !new RegExp(validation.pattern).test(value)) {
+              if (validation.pattern && !new RegExp(validation.pattern).test(validationValue)) {
                 errors.push({ property: key, message: 'Value does not match required pattern' });
               }
             }
             
-            if (typeof value === 'number') {
-              if (validation.min_value !== undefined && value < validation.min_value) {
+            if (typeof validationValue === 'number') {
+              if (validation.min_value !== undefined && validationValue < validation.min_value) {
                 errors.push({ property: key, message: `Minimum value is ${validation.min_value}` });
               }
-              if (validation.max_value !== undefined && value > validation.max_value) {
+              if (validation.max_value !== undefined && validationValue > validation.max_value) {
                 errors.push({ property: key, message: `Maximum value is ${validation.max_value}` });
               }
             }
             
-            if (validation.allowed_values && !validation.allowed_values.includes(String(value))) {
+            if (Array.isArray(validationValue)) {
+              // For arrays, validate each item if allowed_values is specified
+              if (validation.allowed_values) {
+                const invalidItems = validationValue.filter(item => !validation.allowed_values!.includes(String(item)));
+                if (invalidItems.length > 0) {
+                  errors.push({ property: key, message: `Invalid items: ${invalidItems.join(', ')}. Allowed values: ${validation.allowed_values.join(', ')}` });
+                }
+              }
+              
+              // Validate array length
+              if (validation.min_length && validationValue.length < validation.min_length) {
+                errors.push({ property: key, message: `Minimum ${validation.min_length} items required` });
+              }
+              if (validation.max_length && validationValue.length > validation.max_length) {
+                errors.push({ property: key, message: `Maximum ${validation.max_length} items allowed` });
+              }
+            } else if (validation.allowed_values && !validation.allowed_values.includes(String(validationValue))) {
               errors.push({ property: key, message: `Value must be one of: ${validation.allowed_values.join(', ')}` });
             }
           }
@@ -560,7 +589,8 @@ function validatePropertyType(value: any, propertyType: PropertyType): boolean {
     case PropertyType.Boolean:
       return typeof value === 'boolean';
     case PropertyType.Array:
-      return Array.isArray(value);
+      // Accept both arrays and strings (comma-delimited)
+      return Array.isArray(value) || typeof value === 'string';
     case PropertyType.Object:
       return typeof value === 'object' && value !== null && !Array.isArray(value);
     case PropertyType.Reference:

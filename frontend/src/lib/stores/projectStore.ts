@@ -1,5 +1,6 @@
 import { writable, derived } from 'svelte/store';
-import type { ProjectInfo, ProjectSettings, RecentProject, ProjectStats } from '../types';
+import { invoke } from '@tauri-apps/api/tauri';
+import type { ProjectInfo, ProjectSettings, RecentProject, ProjectStats, ApiResponse } from '../types';
 
 // Project state interface
 interface ProjectState {
@@ -143,6 +144,44 @@ const createProjectStore = () => {
     clearRecentProjects: () => {
       update(state => ({ ...state, recentProjects: [] }));
       localStorage.removeItem('recentProjects');
+    },
+    
+    // Refresh project statistics
+    refreshStats: async () => {
+      const state = projectStore.getCurrentState();
+      if (!state.currentProject) {
+        console.warn('No active project to refresh stats for');
+        return;
+      }
+
+      try {
+        console.log('🔄 [ProjectStore] Refreshing project stats...');
+        
+        const response = await invoke('get_project_stats') as ApiResponse<ProjectStats>;
+        
+        if (response.success && response.data) {
+          projectStore.setStats(response.data);
+          
+          // Also update the current project with new counts
+          if (state.currentProject) {
+              const updatedProject: ProjectInfo = {
+                  ...state.currentProject,
+                  object_count: response.data.total_objects,
+                  relationship_count: response.data.total_relationships,
+                  last_modified: new Date().toISOString(),
+              };
+              projectStore.setProject(updatedProject);
+          }
+          
+          console.log('✅ [ProjectStore] Project stats refreshed:', response.data);
+        } else {
+          console.error('❌ [ProjectStore] Failed to refresh stats:', response.error);
+          projectStore.setError(response.error || 'Failed to refresh project statistics');
+        }
+      } catch (error) {
+        console.error('❌ [ProjectStore] Error refreshing stats:', error);
+        projectStore.setError('Error refreshing project statistics');
+      }
     },
     
     // Utility methods

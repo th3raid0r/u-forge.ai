@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "src-tauri"]
+members = ["backend", "src-tauri", "cxx-qt-app"]
 resolver = "2"
 
 [workspace.dependencies]

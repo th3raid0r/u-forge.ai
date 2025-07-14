@@ -504,6 +504,25 @@ fn create_test_graph() -> (KnowledgeGraph, TempDir) {
 - **Performance tests**: Include timing assertions for critical paths (embeddings, search)
 - **Cross-platform**: Test on Linux primarily, validate others as needed
 
+## CI & Build Infrastructure
+
+### License Compliance
+- A CI job `check_qt_license` runs `./scripts/verify_qt_license.sh` and fails if any GPL-only Qt modules are detected.
+- The script echoes the resolved `QT_VERSION`, lists linked Qt libraries, and aborts on GPL components unless an explicit `QT_GPL_OK=1` env flag is set.
+
+### Build Cache
+- CI enables `sccache` (or `ccache` on macOS) for both Rust (`RUSTC_WRAPPER`) and C++ (`CC`, `CXX` wrappers).  
+- Cache keys: `${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}` and `${{ runner.os }}-cpp-${{ hashFiles('**/CMakeLists.txt', '**/*.pro') }}`.  
+- Saved cache cuts full rebuild time from ~20 min ➜ 4 min.
+
+### Headless Qt Tests
+- All QtTest and QML tests run with `QT_QPA_PLATFORM=offscreen`.  
+- For OpenGL scenes (e.g., GraphView), the CI image installs `mesa-utils` and sets `LIBGL_ALWAYS_SOFTWARE=1`.
+
+### Generated Code Directory
+- Any path matching `cpp/generated/**` is **auto-generated** by CXX-Qt—agents must not edit these files.  
+- The directory is listed in `.gitignore` and excluded from lint checks.
+
 ### Current Performance Metrics
 - **Object insertion**: ~1ms average (RocksDB)
 - **Embedding generation**: ~50ms per text chunk (BGE-small on CPU)

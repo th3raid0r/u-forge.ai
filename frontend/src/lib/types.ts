@@ -15,6 +15,14 @@ export interface ProjectInfo {
   relationship_count: number;
 }
 
+export interface DatabaseStatus {
+  has_data: boolean;
+  has_schemas: boolean;
+  object_count: number;
+  relationship_count: number;
+  schema_count: number;
+}
+
 export interface ObjectSummary {
   id: string;
   name: string;

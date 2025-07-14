@@ -27,6 +27,7 @@ tokio = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+env_logger = "0.10"
 
 # Logging
 tracing = { workspace = true }
