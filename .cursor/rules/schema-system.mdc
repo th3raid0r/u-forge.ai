@@ -1,0 +1,193 @@
+---
+description: Schema system usage and patterns
+---
+
+# Schema System Usage Guide
+
+## Schema File Structure
+
+Create JSON schema files in [defaults/schemas/](mdc:defaults/schemas/):
+
+```json
+{
+  "name": "add_spell",
+  "description": "Add a new Spell to the knowledge graph",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Spell name",
+      "required": true
+    },
+    "level": {
+      "type": "number",
+      "description": "Spell level (0-9)",
+      "required": true,
+      "validation": {
+        "min_value": 0,
+        "max_value": 9
+      }
+    },
+    "school": {
+      "type": "string",
+      "description": "School of magic",
+      "required": true,
+      "validation": {
+        "allowed_values": [
+          "Abjuration",
+          "Conjuration",
+          "Evocation",
+          "Illusion",
+          "Necromancy",
+          "Transmutation"
+        ]
+      }
+    }
+  }
+}
+```
+
+## Property Types
+
+### Basic Types
+- `string`: Text values with length constraints
+- `text`: Longer text content
+- `number`: Numeric values with range validation
+- `boolean`: True/false values
+
+### Complex Types
+- `array`: Collections of other types
+- `object`: Nested objects with schemas
+- `reference`: References to other objects by ID
+- `enum`: Predefined list of allowed values
+
+### Validation Rules
+- `min_length` / `max_length`: String length constraints
+- `min_value` / `max_value`: Numeric range constraints
+- `pattern`: Regex pattern matching
+- `allowed_values`: Enum-like validation
+
+## Schema Manager Usage
+
+```rust
+// Load schemas from directory
+let schema_manager = graph.get_schema_manager();
+
+// Create and validate objects
+let fireball = ObjectBuilder::custom("spell".to_string(), "Fireball".to_string())
+    .with_json_property("level".to_string(), json!(3))
+    .with_json_property("school".to_string(), json!("Evocation"))
+    .build();
+
+// Validate against schema
+let validation_result = schema_manager.validate_object(&fireball)?;
+if validation_result.valid {
+    let object_id = graph.add_object(fireball)?;
+}
+```
+
+## String-Based Edge Types
+
+Define relationships with descriptive strings:
+
+```rust
+// Create relationships directly
+graph.connect_objects_str(character_id, spell_id, "learned_spell")?;
+graph.connect_objects_str(faction_id, territory_id, "controls_territory")?;
+
+// Schema validation for edge types
+let edge_schema = EdgeTypeSchema::new(
+    "learned_spell".to_string(),
+    "Character knowledge of magical spells".to_string(),
+)
+.with_source_types(vec!["character".to_string()])
+.with_target_types(vec!["spell".to_string()])
+.with_property(
+    "mastery_level".to_string(),
+    PropertySchema::new(
+        PropertyType::Enum(vec!["novice".to_string(), "expert".to_string()]),
+        "Level of mastery".to_string(),
+    ),
+);
+```
+
+## Path Configuration
+
+Schema directory can be configured via environment variables:
+
+```bash
+export UFORGE_SCHEMA_DIR="./custom-schemas"
+source env.sh
+```
+
+## Testing Schema Changes
+
+```bash
+# Test schema loading with CLI demo
+source env.sh
+cargo run --example cli_demo ./data.json ./schemas/
+
+# Expected output:
+# ✅ Loaded X object types from schema directory
+# ✅ Objects created: N
+# ✅ Relationships created: M
+```
+
+## Default Schema Types
+
+The system includes default schemas for common TTRPG objects:
+
+- **character**: Game characters (PCs and NPCs)
+- **location**: Places in the game world
+- **faction**: Organizations and groups
+- **quest**: Missions and storylines
+- **artifact**: Items and equipment
+- **npc**: Non-player characters
+- **temporal**: Time-based events
+- **currency**: Economic systems
+- **skills**: Character abilities
+- **transportation**: Vehicles and mounts
+
+## Schema Evolution
+
+When modifying schemas:
+
+1. **Additive changes** (new optional properties): Safe
+2. **Constraint changes** (tighter validation): May require data migration
+3. **Type changes**: Require careful migration planning
+
+Use versioning for schema evolution:
+
+```rust
+let schema = SchemaDefinition::new(
+    "my_system".to_string(),
+    "2.0.0".to_string(),  // Version updated
+    "Updated schema with new features".to_string(),
+);
+```
+
+## Performance Considerations
+
+- Schemas are cached in memory after first load
+- Validation occurs on object creation/update
+- Use bulk validation for large datasets
+- Consider selective validation for read-heavy workloads
+
+## Common Patterns
+
+### Create Custom Object Type
+1. Add schema JSON file to `defaults/schemas/`
+2. Define properties with appropriate types and validation
+3. Test with CLI demo
+4. Use in application code
+
+### Define Relationship Types
+1. Use descriptive string names for edge types
+2. Define schema constraints for source/target types
+3. Add properties for relationship metadata
+4. Validate at creation time
+
+### Migrate Schema Changes
+1. Update schema version
+2. Add migration logic for existing data
+3. Test with sample data
+4. Deploy incrementally

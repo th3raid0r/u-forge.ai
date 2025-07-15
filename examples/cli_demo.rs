@@ -35,27 +35,27 @@ async fn main() -> Result<()> {
         println!("       {} --help", args[0]);
         println!();
         println!("Arguments:");
-        println!("  DATA_FILE   Path to JSON data file (default: ./examples/data/memory.json)");
-        println!("  SCHEMA_DIR  Path to schema directory (default: ./examples/schemas)");
+        println!("  DATA_FILE   Path to JSON data file (default: ./defaults/data/memory.json)");
+        println!("  SCHEMA_DIR  Path to schema directory (default: ./defaults/schemas)");
         println!();
         println!("Examples:");
         println!("  {}                                    # Use defaults", args[0]);
         println!("  {} custom.json                       # Custom data file", args[0]);
         println!("  {} custom.json ./schemas             # Custom data and schema", args[0]);
-        println!("  {} ../examples/data/memory.json ../examples/schemas  # Relative paths", args[0]);
+        println!("  {} ../defaults/data/memory.json ../defaults/schemas  # Relative paths", args[0]);
         return Ok(());
     }
     
     let data_file = if args.len() > 1 {
         args[1].clone()
     } else {
-        "./examples/data/memory.json".to_string()
+        std::env::var("UFORGE_DATA_FILE").unwrap_or_else(|_| "./defaults/data/memory.json".to_string())
     };
     
     let schema_dir = if args.len() > 2 {
         args[2].clone()
     } else {
-        "./examples/schemas".to_string()
+        std::env::var("UFORGE_SCHEMA_DIR").unwrap_or_else(|_| "./defaults/schemas".to_string())
     };
     
     println!("🌟 Welcome to u-forge.ai (Universe Forge) 🌟");
@@ -67,8 +67,17 @@ async fn main() -> Result<()> {
     let temp_dir = tempfile::TempDir::new()?;
     let db_path = temp_dir.path().join("db");
     std::fs::create_dir_all(&db_path)?;
-    let embedding_cache_dir = temp_dir.path().join("embedding_cache");
-    std::fs::create_dir_all(&embedding_cache_dir)?;
+    
+    // Use persistent cache directory from environment variable instead of temp dir
+    let embedding_cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let path = std::path::PathBuf::from("./defaults/default_model_cache");
+            std::fs::create_dir_all(&path).expect("Failed to create default model cache dir");
+            path
+        });
+    
+    println!("📦 Using embedding cache directory: {}", embedding_cache_dir.display());
 
     println!("🧠 Initializing KnowledgeGraph with local embedding models (FastEmbed)...");
     let graph_result = KnowledgeGraph::new(&db_path, Some(&embedding_cache_dir));

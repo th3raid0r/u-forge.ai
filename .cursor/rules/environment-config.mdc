@@ -1,0 +1,274 @@
+---
+globs: env.sh,dev.sh,*.toml,*.yaml,*.yml
+---
+
+# Environment and Configuration Guide
+
+## Critical Environment Variables
+
+**MUST BE SET** before any Rust commands:
+
+```bash
+# Required for RocksDB compilation
+export CC=gcc-13
+export CXX=g++-13
+
+# WebKit compatibility
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+
+# Use env.sh for automatic setup
+source env.sh
+```
+
+## Environment Script ([env.sh](mdc:env.sh))
+
+The [env.sh](mdc:env.sh) script sets up the complete development environment:
+
+```bash
+# Source before any development work
+source env.sh
+
+# This automatically sets:
+# - Compiler variables (CC, CXX)
+# - WebKit compatibility
+# - FastEmbed cache path
+# - Default data and schema paths
+```
+
+## Path Configuration
+
+### Development Paths
+
+```bash
+# For development with CLI
+export UFORGE_SCHEMA_DIR="./defaults/schemas"
+export UFORGE_DATA_FILE="./defaults/data/memory.json"
+
+# For custom data development
+export UFORGE_SCHEMA_DIR="/path/to/custom/schemas"
+export UFORGE_DATA_FILE="/path/to/custom/data.json"
+```
+
+### Cache Configuration
+
+```bash
+# FastEmbed model cache location
+export FASTEMBED_CACHE_PATH="$(pwd)/defaults/default_model_cache"
+```
+
+## Development Scripts
+
+### Main Development ([dev.sh](mdc:dev.sh))
+
+```bash
+./dev.sh                    # Full development environment
+./dev.sh --backend-only     # Backend development only
+./dev.sh --help             # Show all options
+```
+
+### Environment Management
+
+```bash
+# Check environment setup
+source env.sh
+echo "CC: $CC"
+echo "CXX: $CXX"
+echo "Schema dir: $UFORGE_SCHEMA_DIR"
+echo "Data file: $UFORGE_DATA_FILE"
+```
+
+## Cargo Configuration ([Cargo.toml](mdc:Cargo.toml))
+
+Key configuration sections:
+
+### Dependencies
+- **rocksdb**: Database storage
+- **fastembed**: AI embeddings
+- **hnsw_rs**: Vector search
+- **tokio**: Async runtime
+- **anyhow**: Error handling
+
+### Features
+- **default**: Base functionality
+- **cloud-apis**: Optional cloud integrations
+
+### ORT Override
+```toml
+# Override for ONNX Runtime compatibility
+ort-sys = { version = "=2.0.0-rc.10", default-features = false }
+ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }
+```
+
+## Logging Configuration
+
+### Environment Variables
+```bash
+# Debug level logging
+export RUST_LOG=debug
+
+# Module-specific logging
+export RUST_LOG=u_forge_ai::storage=debug,u_forge_ai::embeddings=info
+
+# Trace level (very verbose)
+export RUST_LOG=trace
+```
+
+### Structured Logging
+```rust
+use tracing::{info, warn, debug, error};
+
+// Log with structured data
+info!(
+    operation = "create_object",
+    object_type = %obj_type,
+    duration_ms = duration.as_millis(),
+    "Object created successfully"
+);
+```
+
+## Path Resolution Priority
+
+### Schema Directory
+1. `$UFORGE_SCHEMA_DIR` (if set)
+2. `./defaults/schemas`
+3. `../defaults/schemas`
+4. `./examples/schemas`
+
+### Data File
+1. `$UFORGE_DATA_FILE` (if set)
+2. `./defaults/data/memory.json`
+3. `../defaults/data/memory.json`
+4. `./examples/data/memory.json`
+
+## Cross-Platform Considerations
+
+### Linux (Primary Platform)
+```bash
+# Install GCC 13
+sudo apt install gcc-13 g++-13  # Ubuntu/Debian
+sudo dnf install gcc-13 g++-13  # Fedora
+sudo pacman -S gcc-13 g++-13    # Arch
+
+# Set environment
+export CC=gcc-13
+export CXX=g++-13
+```
+
+### macOS
+```bash
+# Install via Homebrew
+brew install gcc@13
+
+# Set environment
+export CC=gcc-13
+export CXX=g++-13
+```
+
+### Windows
+```bash
+# Use WSL2 with Ubuntu
+# Or install MSYS2 with GCC 13
+```
+
+## Performance Configuration
+
+### RocksDB Settings
+```rust
+// In code - RocksDB optimization
+let mut opts = Options::default();
+opts.create_if_missing(true);
+opts.create_missing_column_families(true);
+opts.set_max_background_jobs(4);
+opts.set_max_subcompactions(2);
+```
+
+### FastEmbed Cache
+```bash
+# Use consistent cache location
+export FASTEMBED_CACHE_PATH="$(pwd)/defaults/default_model_cache"
+mkdir -p "$FASTEMBED_CACHE_PATH"
+```
+
+## Development Workflow
+
+### First Time Setup
+```bash
+# 1. Set environment
+source env.sh
+
+# 2. Build (takes ~10 minutes first time)
+cargo build
+
+# 3. Test
+cargo test
+
+# 4. Run demo
+cargo run --example cli_demo
+```
+
+### Regular Development
+```bash
+# Always start with environment
+source env.sh
+
+# Build and test
+cargo build
+cargo test
+
+# Run with custom data
+cargo run --example cli_demo ./my-data.json ./my-schemas/
+```
+
+## Configuration Files
+
+### Git Configuration ([.gitignore](mdc:.gitignore))
+
+Ignores:
+- `/target` - Rust build artifacts
+- `/.fastembed_cache` - FastEmbed model cache
+- `/defaults/default_model_cache` - Model cache directory
+
+### Path Configuration ([PATH_CONFIGURATION.md](mdc:PATH_CONFIGURATION.md))
+
+Complete guide for path configuration across deployment scenarios.
+
+### Development Documentation ([DEVELOPMENT.md](mdc:DEVELOPMENT.md))
+
+Full development workflow and troubleshooting guide.
+
+## Troubleshooting Configuration
+
+### RocksDB Issues
+```bash
+# Symptoms: Compilation errors mentioning RocksDB
+# Solution: Ensure environment variables are set
+source env.sh
+cargo clean
+cargo build
+```
+
+### Path Resolution Issues
+```bash
+# Debug path resolution
+echo "Schema dir: $UFORGE_SCHEMA_DIR"
+echo "Data file: $UFORGE_DATA_FILE"
+ls -la "$UFORGE_SCHEMA_DIR"
+ls -la "$UFORGE_DATA_FILE"
+```
+
+### Model Cache Issues
+```bash
+# Clear model cache
+rm -rf "$FASTEMBED_CACHE_PATH"/*
+mkdir -p "$FASTEMBED_CACHE_PATH"
+```
+
+## Environment Best Practices
+
+1. **Always source env.sh** before development
+2. **Use absolute paths** in production
+3. **Separate environments** for different projects
+4. **Cache models consistently** across environments
+5. **Document custom paths** for team members
+6. **Test environment setup** on new machines
+7. **Version control environment scripts** but not cache directories

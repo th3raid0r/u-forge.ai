@@ -1,0 +1,156 @@
+---
+globs: src/*.rs,examples/*.rs
+---
+
+# Rust Code Patterns for u-forge.ai
+
+## Error Handling
+
+Use `anyhow::Result` for most error handling:
+```rust
+pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    let documents = vec![text];
+    let embeddings: Vec<FastEmbedEmbedding> = self.model.embed(documents, None)
+        .map_err(|e| anyhow!("FastEmbed embedding failed: {}", e))?;
+    Ok(embeddings)
+}
+```
+
+## RocksDB Integration
+
+Always use column families for data separation:
+```rust
+const CF_NODES: &str = "nodes";
+const CF_CHUNKS: &str = "chunks";
+const CF_EDGES: &str = "edges";
+
+let cf_nodes = db.cf_handle("nodes").unwrap();
+let cf_chunks = db.cf_handle("chunks").unwrap();
+```
+
+Use transactions for atomic operations:
+```rust
+let mut batch = WriteBatch::default();
+batch.put_cf(&cf_nodes, key, value);
+batch.put_cf(&cf_edges, edge_key, edge_value);
+db.write(batch)?;
+```
+
+## String-Based Edge Types
+
+Use flexible string-based relationships:
+```rust
+// Create relationships directly with descriptive strings
+graph.connect_objects_str(character_id, spell_id, "learned_spell")?;
+graph.connect_objects_str(faction_id, territory_id, "controls_territory")?;
+graph.connect_objects_str(npc_id, quest_id, "offers_quest")?;
+
+// Schema validation for edge types
+let edge_schema = EdgeTypeSchema::new(
+    "learned_spell".to_string(),
+    "Character knowledge of magical spells".to_string(),
+)
+.with_source_types(vec!["character".to_string()])
+.with_target_types(vec!["spell".to_string()]);
+```
+
+## Embedding Queue Pattern
+
+Background processing for UI responsiveness:
+```rust
+pub async fn embed_text(&self, text: String, chunk_id: ChunkId, object_id: ObjectId) -> Result<RequestId> {
+    let request_id = RequestId::new_v4();
+    let request = EmbeddingRequest {
+        id: request_id,
+        text,
+        chunk_id,
+        object_id,
+        response_sender: response_tx,
+    };
+    
+    self.sender.send(QueueMessage::Single(request)).await?;
+    Ok(request_id)
+}
+```
+
+## Testing Patterns
+
+Use temporary directories for isolated tests:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    
+    fn setup_test_storage() -> (KnowledgeGraph, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let kg = KnowledgeGraph::new(temp_dir.path(), None).unwrap();
+        (kg, temp_dir)
+    }
+    
+    #[tokio::test]
+    async fn test_node_crud_operations() {
+        let (graph, _temp) = setup_test_storage();
+        // Test implementation...
+    }
+}
+```
+
+## Performance Monitoring
+
+Use consistent timing instrumentation:
+```rust
+use std::time::Instant;
+
+// Time operations with consistent logging
+let start = Instant::now();
+let result = expensive_operation();
+let duration = start.elapsed();
+
+tracing::debug!(
+    operation = "expensive_operation",
+    duration_ms = duration.as_millis(),
+    "Operation completed"
+);
+```
+
+## Vector Search Validation
+
+Always validate embedding dimensions:
+```rust
+fn validate_embedding(&self, embedding: &[f32]) -> Result<(), VectorError> {
+    if embedding.len() != self.expected_dimensions {
+        return Err(VectorError::DimensionMismatch {
+            expected: self.expected_dimensions,
+            actual: embedding.len(),
+        });
+    }
+    Ok(())
+}
+```
+
+## Schema System Integration
+
+Use ObjectBuilder pattern for type-safe object creation:
+```rust
+let gandalf_id = ObjectBuilder::character("Gandalf".to_string())
+    .with_description("A wise wizard".to_string())
+    .add_to_graph(&graph)
+    .unwrap();
+```
+
+## Async Best Practices
+
+Use proper async patterns with background processing:
+```rust
+// Use Arc for shared state
+let provider = Arc::new(provider);
+
+// Use bounded channels for backpressure
+let (sender, receiver) = mpsc::channel(100);
+
+// Proper error handling in async contexts
+async fn process_request(request: Request) -> Result<Response> {
+    // Implementation with proper error propagation
+}
+```

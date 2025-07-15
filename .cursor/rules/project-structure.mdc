@@ -1,0 +1,57 @@
+---
+alwaysApply: true
+---
+
+# u-forge.ai Project Structure Guide
+
+This is a local-first TTRPG worldbuilding tool with AI-powered knowledge graphs built in Rust.
+
+## Core Architecture
+
+- **Main Library**: [src/lib.rs](mdc:src/lib.rs) - Core library entry point
+- **Storage Layer**: [src/storage.rs](mdc:src/storage.rs) - RocksDB-backed knowledge graph storage
+- **Embeddings**: [src/embeddings.rs](mdc:src/embeddings.rs) - FastEmbed AI embedding providers
+- **Vector Search**: [src/vector_search.rs](mdc:src/vector_search.rs) - HNSW-based semantic search
+- **Schema System**: [src/schema.rs](mdc:src/schema.rs) + [src/schema_manager.rs](mdc:src/schema_manager.rs) - Dynamic object type definitions
+- **Data Ingestion**: [src/data_ingestion.rs](mdc:src/data_ingestion.rs) - JSON data import system
+
+## Key Configuration Files
+
+- **Environment Setup**: [env.sh](mdc:env.sh) - CRITICAL: Must be sourced before any cargo commands
+- **Development Guide**: [DEVELOPMENT.md](mdc:DEVELOPMENT.md) - Complete development workflow
+- **Schema Documentation**: [SCHEMA_SYSTEM.md](mdc:SCHEMA_SYSTEM.md) - Configurable schema system
+- **Implementation Patterns**: [CLAUDE.md](mdc:CLAUDE.md) - Technical patterns and best practices
+
+## Default Data and Schemas
+
+- **Schema Definitions**: [defaults/schemas/](mdc:defaults/schemas/) - JSON schema files for object types
+- **Sample Data**: [defaults/data/memory.json](mdc:defaults/data/memory.json) - Foundation universe sample data
+- **Model Cache**: `/defaults/default_model_cache` - FastEmbed model storage (gitignored)
+
+## Development Scripts
+
+- **Main Dev Script**: [dev.sh](mdc:dev.sh) - Primary development workflow
+- **Environment Setup**: [env.sh](mdc:env.sh) - Environment variables for RocksDB compilation
+
+## Examples
+
+- **CLI Demo**: [examples/cli_demo.rs](mdc:examples/cli_demo.rs) - Command-line demonstration of core features
+
+## Critical Dependencies
+
+- **RocksDB**: Database storage with column families
+- **FastEmbed**: Local AI embeddings (BGE-small-en-v1.5)
+- **HNSW**: Vector similarity search
+- **FST**: Exact name matching
+- **Serde**: JSON serialization for flexible object storage
+
+## Environment Requirements
+
+**CRITICAL**: Always set these environment variables before any Rust commands:
+```bash
+export CC=gcc-13
+export CXX=g++-13
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+```
+
+Use `source env.sh` to set automatically.

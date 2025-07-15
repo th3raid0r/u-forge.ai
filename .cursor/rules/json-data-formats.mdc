@@ -1,0 +1,281 @@
+---
+globs: defaults/data/*.json,defaults/schemas/*.json,*.json
+---
+
+# JSON Data Formats Guide
+
+## Data File Format
+
+Data files use line-delimited JSON (JSONL) format with this structure:
+
+### Node Format
+```json
+{
+  "type": "node",
+  "name": "Character Name",
+  "nodeType": "character",
+  "metadata": [
+    "level:5",
+    "class:Fighter",
+    "Description: A brave warrior"
+  ]
+}
+```
+
+### Edge Format
+```json
+{
+  "type": "edge",
+  "from": "Character Name",
+  "to": "Location Name",
+  "edgeType": "located_at"
+}
+```
+
+### Supported Node Types
+
+- `character`: Game characters (PCs and NPCs)
+- `location`: Places, planets, systems
+- `npc`: Non-player characters
+- `player_character`: Player characters
+- `faction`: Organizations, governments
+- `quest`: Missions, events, storylines
+- `artifact`: Items, equipment, vehicles
+- `currency`: Money, resources
+- `skills`: Abilities, spells, powers
+- `temporal`: Events, timelines
+- `setting_reference`: Rules, lore
+- `system_reference`: Game mechanics
+- `transportation`: Vehicles, mounts
+- `inventory`: Item collections
+
+### String-Based Edge Types
+
+All edge types are string-based for maximum flexibility:
+
+```json
+// Examples of valid edge types
+{"type":"edge","from":"Character","to":"Spell","edgeType":"learned_spell"}
+{"type":"edge","from":"Faction","to":"Territory","edgeType":"controls_territory"}
+{"type":"edge","from":"NPC","to":"Quest","edgeType":"offers_quest"}
+{"type":"edge","from":"Character","to":"Faction","edgeType":"sworn_enemy_of"}
+{"type":"edge","from":"Location","to":"Faction","edgeType":"governed_by"}
+```
+
+## Schema File Format
+
+Schema files define object types and validation rules:
+
+```json
+{
+  "name": "add_character",
+  "description": "Add a new Character to the knowledge graph",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Character name",
+      "required": true,
+      "validation": {
+        "min_length": 1,
+        "max_length": 100
+      }
+    },
+    "level": {
+      "type": "number",
+      "description": "Character level",
+      "required": true,
+      "validation": {
+        "min_value": 1,
+        "max_value": 20
+      }
+    },
+    "class": {
+      "type": "string",
+      "description": "Character class",
+      "required": true,
+      "validation": {
+        "allowed_values": [
+          "Fighter",
+          "Wizard",
+          "Rogue",
+          "Cleric"
+        ]
+      }
+    },
+    "abilities": {
+      "type": "array",
+      "description": "List of abilities",
+      "required": false
+    },
+    "active": {
+      "type": "boolean",
+      "description": "Is the character active?",
+      "required": false
+    }
+  }
+}
+```
+
+### Property Types
+
+- `string`: Text with optional length constraints
+- `text`: Longer text content
+- `number`: Numeric values with range validation
+- `boolean`: True/false values
+- `array`: Collections of items
+- `object`: Nested objects
+- `reference`: References to other objects
+
+### Validation Rules
+
+- `min_length` / `max_length`: String length constraints
+- `min_value` / `max_value`: Numeric range constraints
+- `pattern`: Regex pattern matching
+- `allowed_values`: Enum-like validation
+- `required`: Whether the property is required
+
+## Example Data Files
+
+### Foundation Universe ([defaults/data/memory.json](mdc:defaults/data/memory.json))
+
+Sample entries from the included Foundation universe data:
+
+```json
+{"type":"node","name":"Hari Seldon","nodeType":"character","metadata":["role:psychohistorian","Description: Creator of psychohistory"]}
+{"type":"node","name":"Trantor","nodeType":"location","metadata":["type:planet","government:Imperial","Description: Capital of the Galactic Empire"]}
+{"type":"node","name":"Galactic Empire","nodeType":"faction","metadata":["type:government","status:declining","Description: Ruling government of the galaxy"]}
+{"type":"edge","from":"Hari Seldon","to":"Trantor","edgeType":"lived_on"}
+{"type":"edge","from":"Galactic Empire","to":"Trantor","edgeType":"capital_at"}
+```
+
+### Test Data Format
+
+For testing, create minimal datasets:
+
+```json
+{"type":"node","name":"Test Hero","nodeType":"character","metadata":["level:1","class:Fighter"]}
+{"type":"node","name":"Test Village","nodeType":"location","metadata":["population:100","climate:temperate"]}
+{"type":"node","name":"Test Guild","nodeType":"faction","metadata":["type:merchant","reputation:good"]}
+{"type":"edge","from":"Test Hero","to":"Test Village","edgeType":"born_in"}
+{"type":"edge","from":"Test Guild","to":"Test Village","edgeType":"operates_in"}
+```
+
+## JSON Validation
+
+### Schema Validation
+
+Validate schema files against expected format:
+
+```bash
+# Check JSON syntax
+cat schema.json | jq .
+
+# Validate required fields
+jq '.name, .description, .properties' schema.json
+
+# Check property types
+jq '.properties | to_entries[] | select(.value.type == null)' schema.json
+```
+
+### Data Validation
+
+Validate data files:
+
+```bash
+# Check JSONL format
+cat data.json | jq -c '.'
+
+# Validate node structure
+jq 'select(.type == "node") | .name, .nodeType, .metadata' data.json
+
+# Validate edge structure
+jq 'select(.type == "edge") | .from, .to, .edgeType' data.json
+```
+
+## Common JSON Patterns
+
+### Metadata Arrays
+
+Metadata is stored as string arrays with key:value pairs:
+
+```json
+"metadata": [
+  "level:5",
+  "class:Fighter",
+  "hp:45",
+  "Description: A brave warrior from the north"
+]
+```
+
+### Special Description Metadata
+
+Use "Description:" prefix for main object descriptions:
+
+```json
+"metadata": [
+  "type:planet",
+  "population:1000000",
+  "Description: A lush world with abundant forests"
+]
+```
+
+### Relationship Properties
+
+For future enhancement, edge properties can be stored as metadata:
+
+```json
+{
+  "type": "edge",
+  "from": "Character",
+  "to": "Spell",
+  "edgeType": "learned_spell",
+  "metadata": [
+    "mastery_level:expert",
+    "date_learned:2024-01-15"
+  ]
+}
+```
+
+## File Naming Conventions
+
+- **Data files**: `memory.json`, `campaign.json`, `world.json`
+- **Schema files**: `{type}.schema.json` (e.g., `character.schema.json`)
+- **Test files**: `test-data.json`, `sample-data.json`
+
+## Path Configuration
+
+JSON files can be located via environment variables:
+
+```bash
+export UFORGE_SCHEMA_DIR="./custom-schemas"
+export UFORGE_DATA_FILE="./custom-data.json"
+```
+
+Default paths:
+- **Schemas**: `./defaults/schemas/`
+- **Data**: `./defaults/data/memory.json`
+
+## Error Handling
+
+### Common JSON Errors
+
+1. **Invalid JSON syntax**: Use `jq` to validate
+2. **Missing required fields**: Check `type`, `name`, `nodeType`
+3. **Unknown node types**: Ensure types match schema definitions
+4. **Invalid edge references**: Verify `from` and `to` node names exist
+
+### Debug JSON Issues
+
+```bash
+# Test JSON parsing
+cat file.json | jq .
+
+# Find specific node
+jq 'select(.type == "node" and .name == "Character Name")' data.json
+
+# Count nodes by type
+jq 'select(.type == "node") | .nodeType' data.json | sort | uniq -c
+
+# Find orphaned edges
+jq 'select(.type == "edge") | .from, .to' data.json | sort | uniq
+```

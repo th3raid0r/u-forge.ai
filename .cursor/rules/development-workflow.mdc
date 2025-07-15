@@ -1,0 +1,82 @@
+---
+description: Development workflow and setup guide
+---
+
+# Development Workflow Guide
+
+## Critical Setup Requirements
+
+**ALWAYS** source environment variables before any Rust commands:
+```bash
+source env.sh
+```
+
+This sets:
+- `CC=gcc-13` and `CXX=g++-13` (required for RocksDB compilation)
+- `WEBKIT_DISABLE_DMABUF_RENDERER=1` (WebKit compatibility)
+- `FASTEMBED_CACHE_PATH` (consistent model caching)
+
+## Development Scripts
+
+### Main Development Script
+```bash
+./dev.sh                    # Start full development environment
+./dev.sh --backend-only     # Backend development mode
+./dev.sh --help             # Show all options
+```
+
+### Backend Development
+```bash
+cd backend
+source ../env.sh
+cargo build --lib           # Build library
+cargo test                  # Run tests
+cargo run --example cli_demo # Run CLI demo
+```
+
+### Common Development Tasks
+
+1. **First Time Setup:**
+   ```bash
+   source env.sh
+   cargo build  # Takes ~10 minutes due to RocksDB compilation
+   ```
+
+2. **Running Tests:**
+   ```bash
+   source env.sh
+   cargo test
+   ```
+
+3. **CLI Demo with Custom Data:**
+   ```bash
+   source env.sh
+   cargo run --example cli_demo ./custom-data.json ./custom-schemas/
+   ```
+
+4. **Schema Development:**
+   - Edit JSON files in [defaults/schemas/](mdc:defaults/schemas/)
+   - Test with CLI demo
+   - See [SCHEMA_SYSTEM.md](mdc:SCHEMA_SYSTEM.md) for details
+
+## Path Configuration
+
+Use environment variables to override default paths:
+```bash
+export UFORGE_SCHEMA_DIR="/path/to/schemas"
+export UFORGE_DATA_FILE="/path/to/data.json"
+```
+
+See [PATH_CONFIGURATION.md](mdc:PATH_CONFIGURATION.md) for complete guide.
+
+## Performance Notes
+
+- First build takes ~10 minutes (RocksDB compilation)
+- FastEmbed models download on first use (~133MB)
+- Use `target/test_model_cache` for consistent test model caching
+
+## Troubleshooting
+
+1. **RocksDB compilation errors**: Ensure `CC=gcc-13 CXX=g++-13` are set
+2. **Model download issues**: Check network connectivity and disk space
+3. **Path not found errors**: Verify environment variables and file existence

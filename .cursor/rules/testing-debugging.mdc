@@ -1,0 +1,343 @@
+---
+description: Testing and debugging patterns
+---
+
+# Testing and Debugging Guide
+
+## Test Environment Setup
+
+Always use temporary directories for test isolation:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    
+    fn setup_test_storage() -> (KnowledgeGraph, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = get_test_cache_dir();
+        let kg = KnowledgeGraph::new(temp_dir.path(), Some(&cache_dir)).unwrap();
+        (kg, temp_dir)
+    }
+    
+    fn get_test_cache_dir() -> PathBuf {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_model_cache");
+        std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
+        path
+    }
+}
+```
+
+## Running Tests
+
+### Basic Test Commands
+```bash
+# Set environment variables first
+source env.sh
+
+# Run all tests
+cargo test
+
+# Run specific test module
+cargo test storage
+
+# Run with output
+cargo test -- --nocapture
+
+# Run tests with debug logging
+RUST_LOG=debug cargo test -- --nocapture
+```
+
+### Test Categories
+
+1. **Unit Tests**: Individual component testing
+2. **Integration Tests**: Full system workflow testing
+3. **Real Provider Tests**: Tests with actual AI models (slower)
+4. **Mock Provider Tests**: Fast deterministic tests
+
+### Mock vs Real Provider Testing
+
+```rust
+// Mock provider for fast, deterministic tests
+struct MockEmbeddingProvider {
+    dimensions: usize,
+}
+
+#[async_trait]
+impl EmbeddingProvider for MockEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let mut embedding = vec![0.1; self.dimensions];
+        embedding[0] = text.len() as f32 / 100.0; // Make it text-dependent
+        Ok(embedding)
+    }
+}
+
+// Real provider for integration tests
+async fn create_real_embedding_manager() -> EmbeddingManager {
+    let cache_dir = get_test_cache_dir();
+    EmbeddingManager::try_new_local_default(Some(cache_dir))
+        .expect("Failed to create real embedding manager")
+}
+```
+
+## CLI Demo Testing
+
+### Basic Usage
+```bash
+# Test with default data
+source env.sh
+cargo run --example cli_demo
+
+# Test with custom data
+cargo run --example cli_demo ./test-data.json ./test-schemas/
+
+# Test with verbose output
+RUST_LOG=debug cargo run --example cli_demo
+```
+
+### Expected Output Patterns
+```
+✅ Loaded X object types from schema directory
+✅ Objects created: N
+✅ Relationships created: M
+🔍 Searching for: "query"
+```
+
+## Debugging Common Issues
+
+### RocksDB Compilation Errors
+```bash
+# Symptoms: Cryptic C++ compilation errors
+# Solution: Ensure environment variables are set
+export CC=gcc-13
+export CXX=g++-13
+source env.sh
+cargo clean
+cargo build
+```
+
+### FastEmbed Model Issues
+```bash
+# Symptoms: Model download failures, dimension mismatches
+# Debug: Check model cache and network
+ls -la ./defaults/default_model_cache/
+RUST_LOG=debug cargo run --example cli_demo
+```
+
+### Schema Loading Problems
+```bash
+# Symptoms: Schema not found, validation errors
+# Debug: Check schema directory and file format
+echo "Schema dir: $UFORGE_SCHEMA_DIR"
+ls -la $UFORGE_SCHEMA_DIR
+# Validate JSON syntax
+cat schema.json | jq .
+```
+
+### Vector Search Issues
+```bash
+# Symptoms: Dimension mismatches, search failures
+# Debug: Check embedding dimensions and vector store
+RUST_LOG=debug cargo test vector_search
+```
+
+## Performance Testing
+
+### Timing Operations
+```rust
+use std::time::Instant;
+
+// Time critical operations
+let start = Instant::now();
+let result = expensive_operation();
+let duration = start.elapsed();
+
+tracing::info!(
+    operation = "expensive_operation",
+    duration_ms = duration.as_millis(),
+    "Performance measurement"
+);
+```
+
+### Embedding Performance
+```rust
+#[tokio::test]
+async fn test_embedding_performance() {
+    let manager = create_real_embedding_manager().await;
+    let texts = vec!["test text".to_string(); 100];
+    
+    let start = Instant::now();
+    let embeddings = manager.embed_batch(texts).await.unwrap();
+    let duration = start.elapsed();
+    
+    println!("Embedded 100 texts in {:?}", duration);
+    assert!(duration.as_secs() < 10); // Should be under 10 seconds
+}
+```
+
+## Test Data Generation
+
+### Creating Test Objects
+```rust
+fn create_test_character() -> Object {
+    ObjectBuilder::character("Test Character".to_string())
+        .with_description("A character for testing".to_string())
+        .with_json_property("level".to_string(), json!(5))
+        .build()
+}
+
+fn create_test_location() -> Object {
+    ObjectBuilder::location("Test Location".to_string())
+        .with_description("A place for testing".to_string())
+        .build()
+}
+```
+
+### Sample Data Files
+```json
+// test-data.json
+{"type":"node","name":"Test Character","nodeType":"character","metadata":["level:5","class:Fighter"]}
+{"type":"node","name":"Test Location","nodeType":"location","metadata":["climate:temperate"]}
+{"type":"edge","from":"Test Character","to":"Test Location","edgeType":"located_at"}
+```
+
+## Logging and Tracing
+
+### Configure Logging
+```bash
+# Debug level logging
+export RUST_LOG=debug
+
+# Module-specific logging
+export RUST_LOG=u_forge_ai::storage=debug,u_forge_ai::embeddings=info
+
+# Trace level (very verbose)
+export RUST_LOG=trace
+```
+
+### Structured Logging
+```rust
+tracing::info!(
+    object_id = %object_id,
+    object_type = %object_type,
+    properties = ?properties,
+    "Object created successfully"
+);
+
+tracing::warn!(
+    query = %query,
+    results_count = results.len(),
+    duration_ms = duration.as_millis(),
+    "Search completed with few results"
+);
+```
+
+## Continuous Integration
+
+### Test Commands for CI
+```bash
+# Full test suite
+source env.sh
+cargo test --all-features
+
+# Check code formatting
+cargo fmt --check
+
+# Run clippy lints
+cargo clippy --all-features -- -D warnings
+
+# Build documentation
+cargo doc --no-deps
+
+# Run CLI demo with sample data
+cargo run --example cli_demo
+```
+
+## Memory and Resource Testing
+
+### Memory Usage Patterns
+```rust
+// Monitor memory usage in tests
+#[tokio::test]
+async fn test_memory_usage() {
+    let (graph, _temp) = setup_test_storage();
+    
+    // Create many objects
+    for i in 0..1000 {
+        let obj = ObjectBuilder::character(format!("Character {}", i))
+            .build();
+        graph.add_object(obj).unwrap();
+    }
+    
+    // Check memory usage here
+    // (Use external tools like valgrind or heaptrack)
+}
+```
+
+### Resource Cleanup
+```rust
+// Ensure proper cleanup in tests
+#[tokio::test]
+async fn test_resource_cleanup() {
+    let (graph, temp_dir) = setup_test_storage();
+    
+    // Use the graph...
+    
+    // Explicit cleanup
+    drop(graph);
+    
+    // Verify temp directory is clean
+    assert!(temp_dir.path().exists());
+    drop(temp_dir); // This removes the directory
+}
+```
+
+## Common Test Patterns
+
+### Test Object Creation and Retrieval
+```rust
+#[tokio::test]
+async fn test_object_lifecycle() {
+    let (graph, _temp) = setup_test_storage();
+    
+    // Create
+    let obj = create_test_character();
+    let id = graph.add_object(obj.clone()).unwrap();
+    
+    // Retrieve
+    let retrieved = graph.get_object(id).unwrap().unwrap();
+    assert_eq!(retrieved.name, obj.name);
+    
+    // Update
+    let updated = ObjectBuilder::from_existing(retrieved)
+        .with_description("Updated description".to_string())
+        .build();
+    graph.update_object(id, updated).unwrap();
+    
+    // Delete
+    graph.delete_object(id).unwrap();
+    assert!(graph.get_object(id).unwrap().is_none());
+}
+```
+
+### Test Relationship Operations
+```rust
+#[tokio::test]
+async fn test_relationships() {
+    let (graph, _temp) = setup_test_storage();
+    
+    let char_id = graph.add_object(create_test_character()).unwrap();
+    let loc_id = graph.add_object(create_test_location()).unwrap();
+    
+    // Create relationship
+    graph.connect_objects_str(char_id, loc_id, "located_at").unwrap();
+    
+    // Query relationships
+    let outgoing = graph.get_outgoing_edges(char_id).unwrap();
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].edge_type, EdgeType::from_str("located_at"));
+}
+```

@@ -12,15 +12,15 @@ export WEBKIT_DISABLE_DMABUF_RENDERER=1
 # Optional: Set default paths for data ingestion
 # These can be overridden by setting these environment variables
 # For development with Tauri:
-export UFORGE_SCHEMA_DIR="./examples/schemas"
-export UFORGE_DATA_FILE="./examples/data/memory.json"
+export UFORGE_SCHEMA_DIR="./defaults/schemas"
+export UFORGE_DATA_FILE="./defaults/data/memory.json"
 
 # For development with backend CLI:
 # export UFORGE_SCHEMA_DIR="${UFORGE_SCHEMA_DIR:-./examples/schemas}"
 # export UFORGE_DATA_FILE="${UFORGE_DATA_FILE:-./examples/data/memory.json}"
 
 # FastEmbed cache directory for consistent model caching across all operations
-export FASTEMBED_CACHE_PATH="$(pwd)/target/test_model_cache"
+export FASTEMBED_CACHE_PATH="$(pwd)/defaults/default_model_cache"
 mkdir -p "$FASTEMBED_CACHE_PATH"
 
 # Colors for output

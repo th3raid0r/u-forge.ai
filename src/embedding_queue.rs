@@ -8,7 +8,7 @@ use crate::embeddings::EmbeddingProvider;
 use crate::types::{ChunkId, ObjectId};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::PathBuf;
+
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task;
@@ -494,6 +494,7 @@ impl Default for EmbeddingQueueBuilder {
 mod tests {
     use super::*;
     use crate::embeddings::EmbeddingManager;
+    use std::path::PathBuf;
     use tokio::time::{timeout, Duration};
 
     async fn create_test_queue() -> EmbeddingQueue {
