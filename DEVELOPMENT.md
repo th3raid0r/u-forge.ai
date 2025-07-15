@@ -29,25 +29,7 @@ u-forge.ai/
 │   │   └── data_ingestion.rs      # JSON data import
 │   └── examples/
 │       └── cli_demo.rs            # CLI demonstration app
-├──
-├── src-tauri/                     # Tauri desktop application
-│   ├── Cargo.toml
-│   ├── src/
-│   │   └── main.rs                # Tauri commands and app logic
-│   ├── tauri.conf.json
-│   └── icons/
-├──
-└── frontend/                      # Svelte frontend
-    ├── package.json
-    ├── vite.config.ts
-    ├── svelte.config.js
-    ├── tsconfig.json
-    ├── index.html
-    └── src/
-        ├── main.ts                # Frontend entry point
-        ├── App.svelte             # Main app component
-        ├── app.css                # Global styles
-        └── lib/                   # Svelte components and stores
+
 ```
 
 ## 🚨 CRITICAL: Environment Variables

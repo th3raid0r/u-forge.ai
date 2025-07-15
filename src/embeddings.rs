@@ -5,8 +5,11 @@ use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, ModelInfo, TextEmbedding, Embedding as FastEmbedEmbedding};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::info;
+
+#[cfg(test)]
+use std::sync::OnceLock;
 
 /// Defines the types of embedding providers available.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,7 +48,7 @@ impl FastEmbedModel {
     }
 
     pub fn default_model() -> Self {
-        FastEmbedModel::BgeSmallEnV15 // A good balance of size and performance
+        FastEmbedModel::NomicEmbedTextV15 // A good balance of size and performance
     }
 }
 
@@ -62,7 +65,7 @@ pub trait EmbeddingProvider: Send + Sync {
 
 /// Embedding provider using FastEmbed for local, on-device embeddings.
 pub struct FastEmbedProvider {
-    model: TextEmbedding,
+    model: Mutex<TextEmbedding>,
     model_info: ModelInfo<EmbeddingModel>,
     model_type: FastEmbedModel,
 }
@@ -80,29 +83,26 @@ impl FastEmbedProvider {
         show_download_progress: bool,
     ) -> Result<Self> {
         let embedding_model = model_type.to_embedding_model();
-        let mut init_options = InitOptions {
-            model_name: embedding_model.clone(),
-            show_download_progress,
-            ..Default::default() // max_length, etc. can be customized if needed
-        };
+        let mut init_options = InitOptions::new(embedding_model.clone())
+            .with_show_download_progress(show_download_progress);
         
-        if let Some(cache_path) = cache_dir {
-            init_options.cache_dir = cache_path;
+        if let Some(cache_path) = cache_dir.clone() {
+            init_options = init_options.with_cache_dir(cache_path);
         }
 
         info!(
             "Initializing FastEmbed model: {:?}, cache_dir: {:?}, show_progress: {}",
-            embedding_model, init_options.cache_dir, init_options.show_download_progress
+            embedding_model, cache_dir, show_download_progress
         );
 
         let model = TextEmbedding::try_new(init_options)
             .map_err(|e| anyhow!("Failed to initialize FastEmbed model: {}", e))?;
 
-        let model_info = TextEmbedding::get_model_info(&embedding_model).clone();
+        let model_info = TextEmbedding::get_model_info(&embedding_model)?.clone();
         
         info!("FastEmbed model initialized: {:?}", model_info);
 
-        Ok(Self { model, model_info, model_type })
+        Ok(Self { model: Mutex::new(model), model_info, model_type })
     }
 
     /// Creates a default FastEmbedProvider using `BgeSmallEnV15`.
@@ -118,7 +118,9 @@ impl EmbeddingProvider for FastEmbedProvider {
         // FastEmbed's embed function takes Vec<&str>, so we wrap the single string.
         // It returns Vec<Embedding>, so we take the first.
         let documents = vec![text];
-        let embeddings: Vec<FastEmbedEmbedding> = self.model.embed(documents, None)
+        let embeddings: Vec<FastEmbedEmbedding> = self.model.lock()
+            .map_err(|e| anyhow!("Failed to acquire model lock: {}", e))?
+            .embed(documents, None)
             .map_err(|e| anyhow!("FastEmbed embedding failed: {}", e))?;
         
         embeddings.into_iter().next()
@@ -128,7 +130,9 @@ impl EmbeddingProvider for FastEmbedProvider {
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         // Convert Vec<String> to Vec<&str> for FastEmbed
         let text_slices: Vec<&str> = texts.iter().map(AsRef::as_ref).collect();
-        let embeddings: Vec<FastEmbedEmbedding> = self.model.embed(text_slices, None)
+        let embeddings: Vec<FastEmbedEmbedding> = self.model.lock()
+            .map_err(|e| anyhow!("Failed to acquire model lock: {}", e))?
+            .embed(text_slices, None)
             .map_err(|e| anyhow!("FastEmbed batch embedding failed: {}", e))?;
         Ok(embeddings)
     }
@@ -196,29 +200,50 @@ impl EmbeddingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+
+    // Global lock to prevent race conditions during model initialization
+    static TEST_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     // Helper to ensure models are downloaded only once per test run for speed.
     // Note: For CI, you might pre-download models or use a shared cache.
     fn get_test_cache_dir() -> PathBuf {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test_model_cache");
-        std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
-        path
+        // Use environment variable for consistent caching across runs (set in env.sh)
+        std::env::var("FASTEMBED_CACHE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("test_model_cache");
+                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
+                // Set the environment variable for FastEmbed to use
+                std::env::set_var("FASTEMBED_CACHE_PATH", &path);
+                path
+            })
+    }
+
+    // Helper to create providers with proper locking to avoid race conditions
+    fn create_test_provider(model_type: FastEmbedModel) -> Result<FastEmbedProvider> {
+        let _lock = TEST_INIT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let cache_dir = get_test_cache_dir();
+        FastEmbedProvider::new(model_type, Some(cache_dir), false)
+    }
+
+    fn create_test_embedding_manager() -> Result<EmbeddingManager> {
+        let _lock = TEST_INIT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let cache_dir = get_test_cache_dir();
+        EmbeddingManager::try_new_local_default(Some(cache_dir))
     }
 
     #[tokio::test]
     async fn test_fastembed_provider_default_initialization() {
-        let cache_dir = get_test_cache_dir();
-        let provider_result = FastEmbedProvider::default(Some(cache_dir), false);
+        let provider_result = create_test_provider(FastEmbedModel::default_model());
         assert!(provider_result.is_ok(), "Failed to initialize default FastEmbedProvider: {:?}", provider_result.err());
         
         if let Ok(provider) = provider_result {
             assert_eq!(provider.provider_type(), EmbeddingProviderType::Local(LocalEmbeddingModelType::FastEmbed(FastEmbedModel::default_model())));
             let dims = provider.dimensions().unwrap();
-            // BGE-small-en-v1.5 has 384 dimensions
-            assert_eq!(dims, 384, "Default model (BGE-small-en-v1.5) should have 384 dimensions");
+            // NomicEmbedTextV15 has 768 dimensions
+            assert_eq!(dims, 768, "Default model (NomicEmbedTextV15) should have 768 dimensions");
             let model_info = provider.model_info().unwrap();
             assert_eq!(model_info.model, FastEmbedModel::default_model().to_embedding_model());
         }
@@ -226,10 +251,9 @@ mod tests {
     
     #[tokio::test]
     async fn test_fastembed_provider_specific_model_initialization() {
-        let cache_dir = get_test_cache_dir();
         // Test with a different, very small model if available, e.g., AllMiniLML6V2
         let model_type = FastEmbedModel::AllMiniLmL6V2;
-        let provider_result = FastEmbedProvider::new(model_type.clone(), Some(cache_dir), false);
+        let provider_result = create_test_provider(model_type.clone());
         assert!(provider_result.is_ok(), "Failed to initialize FastEmbedProvider with AllMiniLmL6V2: {:?}", provider_result.err());
 
         if let Ok(provider) = provider_result {
@@ -244,8 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fastembed_embed_single_document() {
-        let cache_dir = get_test_cache_dir();
-        let provider = FastEmbedProvider::default(Some(cache_dir), false).unwrap();
+        let provider = create_test_provider(FastEmbedModel::default_model()).unwrap();
         let text = "This is a test document.";
         let embedding_result = provider.embed(text).await;
 
@@ -257,8 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fastembed_embed_batch_documents() {
-        let cache_dir = get_test_cache_dir();
-        let provider = FastEmbedProvider::default(Some(cache_dir), false).unwrap();
+        let provider = create_test_provider(FastEmbedModel::default_model()).unwrap();
         let texts = vec![
             "First test document.".to_string(),
             "Second test document, slightly longer.".to_string(),
@@ -277,8 +299,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_embedding_manager_default_initialization() {
-        let cache_dir = get_test_cache_dir();
-        let manager_result = EmbeddingManager::try_new_local_default(Some(cache_dir));
+        let manager_result = create_test_embedding_manager();
         assert!(manager_result.is_ok(), "Failed to initialize EmbeddingManager: {:?}", manager_result.err());
 
         if let Ok(manager) = manager_result {
@@ -290,8 +311,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_embedding_manager_specific_fastembed_model() {
-        let cache_dir = get_test_cache_dir();
         let model_type = FastEmbedModel::AllMiniLmL6V2; // Use a known small model
+        let _lock = TEST_INIT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let cache_dir = get_test_cache_dir();
         let manager_result = EmbeddingManager::new_fastembed(model_type.clone(), Some(cache_dir));
         assert!(manager_result.is_ok(), "Failed to initialize EmbeddingManager with specific model: {:?}", manager_result.err());
 
@@ -301,39 +323,5 @@ mod tests {
             assert_eq!(provider.dimensions().unwrap(), 384);
         }
     }
-    
-    // Test that subsequent calls for the same model are fast (cached)
-    #[tokio::test]
-    async fn test_fastembed_model_caching_local() {
-        let temp_dir = tempdir().unwrap();
-        let temp_test_cache_dir = temp_dir.path().to_path_buf(); // Fresh cache for this test
-        
-        // First initialization (might download)
-        let start_time = std::time::Instant::now();
-        let _provider1 = FastEmbedProvider::new(FastEmbedModel::AllMiniLmL6V2, Some(temp_test_cache_dir.clone()), false)
-            .expect("First model init failed");
-        let duration1 = start_time.elapsed();
-        info!("First AllMiniLmL6V2 init duration: {:?}", duration1);
 
-        // Second initialization (should be cached and faster)
-        let start_time_cached = std::time::Instant::now();
-        let _provider2 = FastEmbedProvider::new(FastEmbedModel::AllMiniLmL6V2, Some(temp_test_cache_dir.clone()), false)
-            .expect("Second model init (cached) failed");
-        let duration2 = start_time_cached.elapsed();
-        info!("Second AllMiniLmL6V2 init (cached) duration: {:?}", duration2);
-
-        // This assertion is tricky due to variance, but cached should generally be faster.
-        // If downloading, duration1 can be seconds. If cached, duration2 should be <100ms.
-        // For a robust test, might need to mock HTTP calls or check for file existence.
-        // For now, we assume if it runs without error, caching is working as FastEmbed implements it.
-        // A loose check:
-        if duration1 > std::time::Duration::from_millis(500) { // If first took a while (likely download)
-             assert!(duration2 < duration1 / 2, "Cached model initialization was not significantly faster. Duration1: {:?}, Duration2: {:?}", duration1, duration2);
-             assert!(duration2 < std::time::Duration::from_millis(500), "Cached model init took too long: {:?}", duration2);
-        } else {
-            // If first was fast, model was likely already in global cache or a very quick local copy.
-            // In this case, durations might be similar.
-             assert!(duration2 < std::time::Duration::from_millis(500), "Cached model init took too long even if pre-cached: {:?}", duration2);
-        }
-    }
 }

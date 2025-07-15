@@ -34,30 +34,6 @@ cargo run --example cli_demo custom.json ./schemas             # Custom data and
 cargo run --example cli_demo /abs/path/data.json /abs/path/schemas  # Absolute paths
 ```
 
-### 3. Tauri Commands (GUI Application)
-
-The Tauri application provides commands for path configuration:
-
-```javascript
-// Get current path configuration
-const config = await invoke('get_path_configuration');
-
-// Set custom paths programmatically
-await invoke('set_path_configuration', {
-  schemaDir: '/path/to/schemas',
-  dataFile: '/path/to/data.json'
-});
-
-// Import with specific paths
-await invoke('import_sample_data', {
-  dataFilePath: '/custom/data.json',
-  schemaDirPath: '/custom/schemas'
-});
-
-// Use environment variables or auto-detection
-await invoke('import_default_data');
-```
-
 ## Default Path Resolution
 
 The system tries paths in this order:
@@ -85,16 +61,6 @@ export UFORGE_DATA_FILE="./examples/data/memory.json"
 source env.sh
 cd backend
 cargo run --example cli_demo
-```
-
-### Tauri Development
-
-```bash
-# Set environment for Tauri development
-export UFORGE_SCHEMA_DIR="./src-tauri/examples/schemas" 
-export UFORGE_DATA_FILE="./src-tauri/examples/data/memory.json"
-source env.sh
-./dev.sh
 ```
 
 ### Custom Data Development
@@ -132,38 +98,6 @@ export UFORGE_DATA_FILE="./data/world.json"
 ./my-app
 ```
 
-### Docker/Container Deployment
-
-```dockerfile
-# Dockerfile example
-FROM ubuntu:22.04
-COPY target/release/my-app /usr/local/bin/
-COPY examples/schemas /app/schemas
-COPY examples/data /app/data
-ENV UFORGE_SCHEMA_DIR=/app/schemas
-ENV UFORGE_DATA_FILE=/app/data/memory.json
-WORKDIR /app
-CMD ["my-app"]
-```
-
-### System Service
-
-```ini
-# systemd service file
-[Unit]
-Description=u-forge.ai Service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/my-app
-Environment=UFORGE_SCHEMA_DIR=/etc/my-app/schemas
-Environment=UFORGE_DATA_FILE=/var/lib/my-app/world.json
-User=my-app
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
 
 ## Data File Format
 
@@ -221,42 +155,6 @@ RUST_LOG=debug cargo run --example cli_demo
 echo "Schema: $UFORGE_SCHEMA_DIR"
 echo "Data: $UFORGE_DATA_FILE"
 ```
-
-### Tauri Debug
-
-```javascript
-// In Tauri frontend console
-invoke('get_path_configuration').then(console.log);
-```
-
-## Migration Guide
-
-### From Hardcoded Paths
-
-1. **Identify current paths** in your configuration
-2. **Set environment variables** before running:
-   ```bash
-   export UFORGE_SCHEMA_DIR="/old/schema/path"
-   export UFORGE_DATA_FILE="/old/data/path"
-   ```
-3. **Test** that the application finds your data
-4. **Update deployment scripts** to set these variables
-
-### From Command Line Args Only
-
-1. **Replace CLI args** with environment variables in scripts:
-   ```bash
-   # Old way
-   ./my-app data.json schemas/
-   
-   # New way  
-   export UFORGE_DATA_FILE="data.json"
-   export UFORGE_SCHEMA_DIR="schemas/"
-   ./my-app
-   ```
-
-2. **Update CI/CD** to set environment variables
-3. **Document** the new configuration for your team
 
 ## Best Practices
 

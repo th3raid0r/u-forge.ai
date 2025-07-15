@@ -297,11 +297,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn get_test_embedding_cache_dir() -> PathBuf {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("lib_test_model_cache");
-        std::fs::create_dir_all(&path).expect("Failed to create test model cache dir for lib.rs");
-        path
+        std::env::var("FASTEMBED_CACHE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("test_model_cache");
+                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir for lib.rs");
+                path
+            })
     }
 
     fn create_test_graph() -> (KnowledgeGraph, TempDir) {

@@ -34,7 +34,7 @@ pub struct VectorSearchConfig {
 impl Default for VectorSearchConfig {
     fn default() -> Self {
         Self {
-            dimensions: 384, // Common embedding dimension
+            dimensions: 768, // Updated for NomicEmbedTextV15 default model
             hnsw_m: 16,
             hnsw_ef_construction: 200,
             hnsw_ef_search: 50,
@@ -517,9 +517,15 @@ mod tests {
     }
 
     fn create_real_embedding_manager() -> Result<crate::embeddings::EmbeddingManager> {
-        let cache_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("vector_search_test_cache");
+        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("test_model_cache");
+                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
+                path
+            });
         crate::embeddings::EmbeddingManager::try_new_local_default(Some(cache_dir))
     }
 

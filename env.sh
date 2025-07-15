@@ -19,6 +19,10 @@ export UFORGE_DATA_FILE="./examples/data/memory.json"
 # export UFORGE_SCHEMA_DIR="${UFORGE_SCHEMA_DIR:-./examples/schemas}"
 # export UFORGE_DATA_FILE="${UFORGE_DATA_FILE:-./examples/data/memory.json}"
 
+# FastEmbed cache directory for consistent model caching across all operations
+export FASTEMBED_CACHE_PATH="$(pwd)/target/test_model_cache"
+mkdir -p "$FASTEMBED_CACHE_PATH"
+
 # Colors for output
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -33,6 +37,7 @@ echo ""
 echo -e "${YELLOW}📁 Data Paths:${NC}"
 echo "   UFORGE_SCHEMA_DIR=$UFORGE_SCHEMA_DIR"
 echo "   UFORGE_DATA_FILE=$UFORGE_DATA_FILE"
+echo "   FASTEMBED_CACHE_PATH=$FASTEMBED_CACHE_PATH"
 echo ""
 echo -e "${YELLOW}💡 Usage examples:${NC}"
 echo "   cargo build                    # Build with correct environment"

@@ -8,6 +8,7 @@ use crate::embeddings::EmbeddingProvider;
 use crate::types::{ChunkId, ObjectId};
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task;
@@ -493,12 +494,21 @@ impl Default for EmbeddingQueueBuilder {
 mod tests {
     use super::*;
     use crate::embeddings::EmbeddingManager;
-    use tempfile::TempDir;
     use tokio::time::{timeout, Duration};
 
     async fn create_test_queue() -> EmbeddingQueue {
-        let temp_dir = TempDir::new().unwrap();
-        let embedding_manager = EmbeddingManager::try_new_local_default(Some(temp_dir.path().to_path_buf()))
+        // Use cache directory from environment variable (set in env.sh)
+        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("test_model_cache");
+                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
+                path
+            });
+        
+        let embedding_manager = EmbeddingManager::try_new_local_default(Some(cache_dir))
             .expect("Failed to create embedding manager");
         
         EmbeddingQueue::new(embedding_manager.get_provider())
@@ -523,7 +533,20 @@ mod tests {
             .expect("Failed to receive response")
             .expect("Embedding failed");
 
-        assert_eq!(result.len(), 384); // BGE-small-en-v1.5 dimensions
+        // Get expected dimensions from a separate embedding manager
+        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("test_model_cache");
+                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
+                path
+            });
+        let embedding_manager = EmbeddingManager::try_new_local_default(Some(cache_dir)).unwrap();
+        let expected_dims = embedding_manager.get_provider().dimensions().unwrap();
+        
+        assert_eq!(result.len(), expected_dims);
     }
 
     #[tokio::test]
@@ -551,9 +574,22 @@ mod tests {
             .expect("Failed to receive batch response")
             .expect("Batch embedding failed");
 
+        // Get expected dimensions from a separate embedding manager
+        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("test_model_cache");
+                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
+                path
+            });
+        let embedding_manager = EmbeddingManager::try_new_local_default(Some(cache_dir)).unwrap();
+        let expected_dims = embedding_manager.get_provider().dimensions().unwrap();
+        
         assert_eq!(result.len(), texts.len());
         for embedding in result {
-            assert_eq!(embedding.len(), 384);
+            assert_eq!(embedding.len(), expected_dims);
         }
     }
 
