@@ -1,0 +1,100 @@
+---
+globs: defaults/data/*.json,defaults/schemas/*.json,*.json
+---
+
+# JSON Data Formats
+
+## JSONL Data Files (defaults/data/)
+
+Line-delimited JSON. Two entry types:
+
+### Node
+```json
+{"type":"node","name":"Hari Seldon","nodeType":"npc","metadata":["role:psychohistorian","Description: Creator of psychohistory"]}
+```
+
+Fields:
+- `type`: always `"node"`
+- `name`: object name (used for edge resolution by name)
+- `nodeType`: must match a schema type (npc, location, faction, quest, artifact, etc.)
+- `metadata`: array of strings. `"key:value"` → property. Bare string → tag. `"Description: ..."` → description.
+
+### Edge
+```json
+{"type":"edge","from":"Hari Seldon","to":"Trantor","edgeType":"lived_on"}
+```
+
+Fields:
+- `type`: always `"edge"`
+- `from`: source node name (must exist in same or prior import — see BUG-7)
+- `to`: target node name
+- `edgeType`: string-based relationship type (flexible, no enum restriction)
+
+### Supported Node Types
+npc, player_character, location, faction, quest, artifact, currency, skills, temporal, setting_reference, system_reference, transportation, inventory
+
+### Import Pipeline (data_ingestion.rs)
+Two-pass: collect all nodes → create objects with name→ID map → resolve edge names → create edges.
+
+**Known bugs:**
+- BUG-6: No deduplication — re-importing creates duplicates
+- BUG-7: Edge resolution only works within a single import session (in-memory name→ID map)
+
+## Schema Files (defaults/schemas/)
+
+Named `*.schema.json`. Define object types and validation rules.
+
+```json
+{
+  "name": "add_npc",
+  "description": "Add a new NPC to the knowledge graph",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "NPC name",
+      "required": true,
+      "validation": { "min_length": 1, "max_length": 100 }
+    },
+    "role": {
+      "type": "string",
+      "description": "NPC role",
+      "required": true,
+      "validation": { "allowed_values": ["merchant", "guard", "noble"] }
+    },
+    "currentLocation": {
+      "type": "string",
+      "description": "Current location",
+      "relationship": {
+        "edgeType": "located_in",
+        "targetType": "location"
+      }
+    }
+  }
+}
+```
+
+### Property types
+`string`, `text`, `number`, `boolean`, `array`, `object`, `reference`
+
+### Validation rules
+`min_length`, `max_length`, `min_value`, `max_value`, `pattern` (regex), `allowed_values`, `required`
+
+### Naming convention
+Files use `add_` prefix in `name` field (MCP tool convention). `SchemaIngestion` strips the prefix — `add_npc` becomes `npc` internally.
+
+## Validation Commands
+
+```bash
+# Check JSON syntax
+cat file.json | jq .
+
+# Count nodes by type
+jq -c 'select(.type == "node") | .nodeType' defaults/data/memory.json | sort | uniq -c
+
+# Find edges
+jq -c 'select(.type == "edge")' defaults/data/memory.json | head
+```
+
+## Sample Data
+
+`defaults/data/memory.json`: ~220 nodes + ~312 edges from Isaac Asimov's Foundation universe. Used by CLI demo.

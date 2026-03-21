@@ -1,0 +1,57 @@
+---
+alwaysApply: true
+---
+
+# u-forge.ai Project Structure Guide
+
+Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs. Built in Rust.
+
+**Status:** Early prototype. CLI demo only. Migrating to Lemonade Server + SQLite + web UI.
+
+## Architecture Overview
+
+Read [ARCHITECTURE.md](mdc:ARCHITECTURE.md) for full details (module map, data model, known bugs, design decisions).
+Read [migration.md](mdc:migration.md) for the phased migration plan.
+
+## Current Architecture
+
+- **Facade**: [src/lib.rs](mdc:src/lib.rs) — `KnowledgeGraph` struct (owns storage, embeddings, schemas) + `ObjectBuilder`
+- **Storage**: [src/storage.rs](mdc:src/storage.rs) — RocksDB with 5 column families (nodes, edges, chunks, names, schemas)
+- **Embeddings**: [src/embeddings.rs](mdc:src/embeddings.rs) — `EmbeddingProvider` trait + `FastEmbedProvider` (being replaced by `LemonadeProvider`)
+- **Vector Search**: [src/vector_search.rs](mdc:src/vector_search.rs) — HNSW + FST hybrid (being replaced by sqlite-vec + FTS5)
+- **Schemas**: [src/schema.rs](mdc:src/schema.rs) + [src/schema_manager.rs](mdc:src/schema_manager.rs) + [src/schema_ingestion.rs](mdc:src/schema_ingestion.rs)
+- **Data Import**: [src/data_ingestion.rs](mdc:src/data_ingestion.rs) — JSONL two-pass import
+- **Embedding Queue**: [src/embedding_queue.rs](mdc:src/embedding_queue.rs) — async background worker (not yet integrated)
+
+## Migration Direction
+
+Standardizing on **[Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
+- Embeddings: `POST /api/v1/embeddings` replaces FastEmbed
+- Reranking: `POST /api/v1/reranking` (new capability)
+- Chat: `POST /api/v1/chat/completions` (future)
+
+Storage migrating from RocksDB → **SQLite + FTS5 + sqlite-vec**.
+UI via **axum** HTTP/WebSocket server.
+
+## Key Integration Point
+
+The `EmbeddingProvider` trait in [src/embeddings.rs](mdc:src/embeddings.rs) is the primary abstraction for AI capabilities. New providers (Lemonade, etc.) implement this trait. Do NOT bypass it.
+
+## Known Bugs (see ARCHITECTURE.md for details)
+
+- BUG-1: HNSW persistence broken (always rebuilds on startup)
+- BUG-2: `similarity = 1.0 - distance` wrong for L2 (can go negative)
+- BUG-3: Node deletion is O(N) across entire edge column family
+- BUG-4: `get_stats()` is O(N) full table scan
+- BUG-5: `Mutex<TextEmbedding>` blocks Tokio thread
+- BUG-6: No import deduplication
+- BUG-7: In-memory-only edge resolution during import
+
+## Important Files
+
+- [env.sh](mdc:env.sh) — MUST source before cargo commands (sets CC=gcc-13 for RocksDB)
+- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work
+- [migration.md](mdc:migration.md) — Phased migration plan with execution sequence
+- [examples/cli_demo.rs](mdc:examples/cli_demo.rs) — The only runnable entry point
+- [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files
+- [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data

@@ -1,0 +1,107 @@
+---
+description: Development workflow and setup guide
+---
+
+# Development Workflow
+
+## Quick Reference
+
+```bash
+source env.sh                           # ALWAYS first (sets CC=gcc-13 for RocksDB)
+cargo build                             # Build library + examples
+cargo test                              # Run all tests
+cargo run --example cli_demo            # Run CLI demo with Foundation data
+cargo run --example cli_demo ./data.json ./schemas/  # Custom data
+```
+
+## First Time Setup
+
+1. **Install prerequisites:**
+   - Rust stable toolchain
+   - GCC 13+ (`apt install gcc-13 g++-13` on Ubuntu)
+   - Optional: [Lemonade Server](https://github.com/lemonade-sdk/lemonade) for hardware-accelerated AI
+
+2. **Build:**
+   ```bash
+   source env.sh
+   cargo build       # ~10 min first time (RocksDB C++ compilation)
+   ```
+
+3. **Run tests:**
+   ```bash
+   cargo test        # FastEmbed models download on first run (~133MB)
+   ```
+
+## Architecture Context
+
+Before making changes, read:
+- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — Current state, bugs, design decisions
+- [migration.md](mdc:migration.md) — Phased plan (Lemonade Server + SQLite + UI)
+
+**Migration phases in progress:**
+1. **Phase 1:** Replace FastEmbed with Lemonade Server HTTP provider
+2. **Phase 2:** Replace RocksDB + HNSW + FST with SQLite + sqlite-vec + FTS5
+3. **Phase 3:** Add axum HTTP/WebSocket server for web UI
+4. **Phase 4:** Add reranking via Lemonade
+5. **Phase 5:** Cargo workspace split
+
+## Development Patterns
+
+### Adding a new EmbeddingProvider
+1. Implement the `EmbeddingProvider` trait in `src/embeddings.rs`
+2. Add factory method to `EmbeddingManager`
+3. Add tests with mock and real providers
+4. Update `KnowledgeGraph::new` if changing the default
+
+### Adding a new schema type
+1. Create `{type}.schema.json` in `defaults/schemas/`
+2. Test with CLI demo: `cargo run --example cli_demo`
+3. Schema is auto-loaded by `SchemaIngestion`
+
+### Bug fix workflow
+1. Check [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for the bug ID and description
+2. Reference the migration phase that addresses it
+3. Write a test that reproduces the bug
+4. Fix and verify
+
+## Lemonade Server Development
+
+When Lemonade Server is running, u-forge.ai auto-connects:
+
+```bash
+# Start Lemonade (separate terminal)
+lemonade-server serve
+
+# Verify it's running
+curl http://localhost:8000/api/v1/health
+
+# Pull required models
+lemonade-server pull nomic-embed-text
+```
+
+Set `LEMONADE_URL` to override the default endpoint:
+```bash
+export LEMONADE_URL="http://localhost:8000/api/v1"
+```
+
+## Testing
+
+```bash
+cargo test                              # All tests
+cargo test storage                      # Module-specific
+cargo test -- --nocapture               # With stdout
+RUST_LOG=debug cargo test -- --nocapture  # With debug logging
+cargo test --features cloud-apis        # With optional features
+```
+
+Tests use `tempfile::TempDir` for isolation — each test gets its own RocksDB instance. Model cache is shared via `FASTEMBED_CACHE_PATH`.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| RocksDB compilation errors | `source env.sh && cargo clean && cargo build` |
+| FastEmbed model download fails | Check network, check `$FASTEMBED_CACHE_PATH` disk space |
+| Lemonade connection refused | `lemonade-server serve` in another terminal |
+| Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files |
+| Dimension mismatch | Ensure embedding model matches config (768 for NomicEmbedTextV15) |

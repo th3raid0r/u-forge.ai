@@ -1,0 +1,113 @@
+---
+globs: env.sh,dev.sh,*.toml,*.yaml,*.yml,config.*
+---
+
+# Environment and Configuration
+
+## Current Setup (RocksDB era — will simplify after SQLite migration)
+
+**MUST source before any cargo commands:**
+```bash
+source env.sh
+```
+
+This sets:
+- `CC=gcc-13`, `CXX=g++-13` (required for RocksDB compilation)
+- `WEBKIT_DISABLE_DMABUF_RENDERER=1`
+- `FASTEMBED_CACHE_PATH` (model cache location)
+
+**After Phase 2 (SQLite migration):** `env.sh` will only set optional variables. The gcc-13 requirement is eliminated.
+
+## Environment Variables
+
+### Required Now
+```bash
+export CC=gcc-13           # RocksDB compilation
+export CXX=g++-13          # RocksDB compilation
+```
+
+### Optional / Configurable
+```bash
+export UFORGE_SCHEMA_DIR="./defaults/schemas"          # Schema JSON files
+export UFORGE_DATA_FILE="./defaults/data/memory.json"  # JSONL data file
+export FASTEMBED_CACHE_PATH="$(pwd)/defaults/default_model_cache"
+export LEMONADE_URL="http://localhost:8000/api/v1"      # Lemonade Server (Phase 1+)
+export RUST_LOG=info                                    # Logging level
+```
+
+### Module-Specific Logging
+```bash
+export RUST_LOG=u_forge_ai::storage=debug,u_forge_ai::embeddings=info
+```
+
+## Path Resolution
+
+### Schema Directory (checked in order)
+1. `$UFORGE_SCHEMA_DIR`
+2. `./defaults/schemas`
+3. `../defaults/schemas`
+
+### Data File (checked in order)
+1. `$UFORGE_DATA_FILE`
+2. `./defaults/data/memory.json`
+3. `../defaults/data/memory.json`
+
+## Lemonade Server Configuration (Phase 1+)
+
+When Lemonade Server is available, u-forge.ai connects via HTTP:
+
+```bash
+# Default Lemonade Server location
+export LEMONADE_URL="http://localhost:8000/api/v1"
+
+# Install on Linux
+sudo snap install lemonade-server
+
+# Pull required models
+lemonade-server pull nomic-embed-text
+lemonade-server pull bge-reranker-v2-m3
+```
+
+The `EmbeddingManager::try_new_auto()` factory tries Lemonade first, falls back to local FastEmbed.
+
+## Planned Configuration (Phase 3 — config.toml)
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[lemonade]
+url = "http://localhost:8000/api/v1"
+embedding_model = "nomic-embed-text"
+rerank_model = "bge-reranker-v2-m3"
+
+[database]
+path = "data/knowledge.db"
+```
+
+## Build Commands
+
+```bash
+source env.sh                           # Set environment
+cargo build                             # Build (~10 min first time, RocksDB)
+cargo test                              # Run all tests
+cargo run --example cli_demo            # Run CLI demo
+cargo test -- --nocapture               # Tests with stdout
+RUST_LOG=debug cargo test -- --nocapture  # Tests with debug logging
+```
+
+## Cross-Platform
+
+| OS | RocksDB Compiler | Lemonade Install |
+|---|---|---|
+| Ubuntu/Debian | `apt install gcc-13 g++-13` | `snap install lemonade-server` |
+| macOS | `brew install gcc@13` | `.pkg` from releases |
+| Windows | WSL2 recommended | `.exe` installer from releases |
+
+## Troubleshooting
+
+1. **RocksDB compilation errors** → `source env.sh && cargo clean && cargo build`
+2. **Model download failures** → Check `$FASTEMBED_CACHE_PATH`, check disk space
+3. **Lemonade connection refused** → Ensure `lemonade-server serve` is running
+4. **Schema not found** → Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist

@@ -8,294 +8,134 @@
 
 ## What is u-forge.ai?
 
-u-forge.ai (Universe Forge) is an **early prototype** of a local-first TTRPG worldbuilding tool. Currently in very early development, it demonstrates core concepts for AI-powered knowledge management while keeping your data completely local and under your control.
+u-forge.ai (Universe Forge) is a **local-first TTRPG worldbuilding tool** that gives game masters a private, AI-assisted knowledge graph for managing worlds — characters, locations, factions, quests, and their relationships — with semantic and exact-name search.
 
-**⚠️ Current Status: This is a bare-bones proof-of-concept, not a production application.**
+**⚠️ Status: Early prototype. No GUI yet; everything runs as a CLI demo.**
 
-### 🎯 Vision for Game Masters:
+### Vision
+
 - Build rich, interconnected worlds with characters, locations, factions, and lore
-- Never lose track of campaign details with AI-powered semantic search
-- Capture session notes automatically through audio transcription (*planned*)
-- Visualize relationships between story elements in an interactive graph (*planned*)
-- Keep their data private without relying on cloud services
+- AI-powered semantic search across your entire world
+- Session capture with automatic transcription *(planned)*
+- Interactive graph visualization *(planned)*
+- All data stays local — no cloud dependency
 
-**Note: Most features are planned for future development. See "Current Prototype Features" below.**
+## Current Prototype Features
 
-## 🚧 Current Prototype Features
+**What works today:**
+- RocksDB-backed knowledge graph with 5 column families (nodes, edges, chunks, names, schemas)
+- Local text embeddings via FastEmbed (NomicEmbedTextV15, 768-dim) — **being replaced by Lemonade Server**
+- HNSW approximate nearest-neighbor semantic search — **being replaced by sqlite-vec**
+- FST-based exact/prefix name matching
+- Flexible JSON schema system with validation (13 TTRPG schemas included)
+- JSONL data ingestion with two-pass node+edge import
+- Async embedding background queue (well-architected but not yet integrated)
+- `ObjectBuilder` fluent API for constructing graph objects
+- CLI demo with Foundation universe (Asimov) sample data
 
-**What Actually Works Today:**
-- Basic RocksDB-backed knowledge graph storage
-- Local text embeddings using FastEmbed (BGE-small-en-v1.5)
-- Simple semantic search with cosine similarity
-- FST-based exact name matching
-- Basic CRUD operations for worldbuilding objects
-- Command-line demo application
+**Known bugs — see [ARCHITECTURE.md](ARCHITECTURE.md) §Known Bugs for the full list.**
 
-**⚠️ What's Missing (Planned for Future):**
-- Visual graph interface
-- Advanced vector search (HNSW integration)
-- Audio transcription
-- Content generation
-- Cross-platform GUI
-- Most features described in the vision above
+## Architecture Direction
 
-## 🔮 Planned Features
+We are migrating away from in-process AI dependencies toward **[Lemonade Server](https://github.com/lemonade-sdk/lemonade)** — an open-source, OpenAI-compatible local AI inference server by AMD that provides hardware-tuned LLM runtimes for Mac, Linux, and Windows.
 
-### 🏠 Local-First & Private
-- All your worldbuilding data stays on your device
-- No subscriptions, no servers, no data harvesting
-- You own your API keys and control your AI usage
-- Works completely offline (with reduced AI features)
+| Current | Target |
+|---|---|
+| FastEmbed (in-process ONNX) | Lemonade Server `/api/v1/embeddings` |
+| HNSW (`hnsw_rs`) with broken persistence | SQLite + `sqlite-vec` |
+| FST prefix matching only | SQLite FTS5 (full-text search) |
+| RocksDB (requires gcc-13) | SQLite (bundled, zero system deps) |
+| No reranking | Lemonade Server `/api/v1/reranking` |
+| No LLM integration | Lemonade Server `/api/v1/chat/completions` |
+| CLI demo only | axum HTTP/WebSocket server → web UI |
 
-### 🧠 AI-Powered Worldbuilding
-- **Local-First Embeddings**: Built-in semantic search using FastEmbed-rs (no external APIs required)
-- **Multiple Model Options**: Choose from 15+ pre-trained models based on your quality/size preferences
-- **Hybrid Search**: Combine semantic similarity with exact name matching for comprehensive retrieval
-- **Context-aware Content Generation**: Using your world's established lore with optional cloud AI integration
-- **Automatic Entity Detection**: AI-powered relationship mapping between story elements
-- **Optional Cloud Integration**: Add OpenAI/Anthropic API keys for enhanced generation capabilities
-- **Ollama Support**: Seamless integration if you're already using Ollama for local LLMs
+**See [migration.md](migration.md) for the phased implementation plan.**
 
-### 🕸️ Visual Knowledge Graph
-- Interactive graph canvas showing connections between story elements
-- TTRPG-specific schemas for characters, locations, factions, items, and events
-- Zoom from high-level campaign overview to detailed character relationships
-- Real-time updates as you build your world
+## Technical Stack
 
-### 🎙️ Session Capture & Notes (*Future Development*)
-- Record in-person game sessions with automatic speech-to-text transcription
-- AI automatically detects and promotes important story beats to permanent campaign notes
-- Smart speaker identification for tracking who said what around the table
-- Link session events directly to characters, locations, and plot threads in your world graph
+### Current
+- **Language:** Rust (single crate, lib + example)
+- **Storage:** RocksDB 0.23 with 5 column families
+- **Embeddings:** FastEmbed 5.0 (NomicEmbedTextV15, 768-dim)
+- **Vector Search:** hnsw_rs 0.3 (DistL2) + FST 0.4
+- **Async:** Tokio 1.45
+- **Serialization:** bincode 1.3 (nodes, edges, chunks) + serde_json (schemas)
 
-### 🏪 U-Store (*Future Development*)
-- Official licensed content from major publishers with pre-built knowledge graphs
-- Integration with physical book purchases
-- Drop-in ready campaigns and official campaign settings
+### Target
+- **Language:** Rust (cargo workspace)
+- **Storage:** SQLite + FTS5 + sqlite-vec
+- **AI Backend:** Lemonade Server (OpenAI-compatible HTTP API)
+- **Server:** axum with REST + WebSocket
+- **UI:** Web-based (React or Svelte)
 
-### 🚀 Premium Integrations (*Future Development*)
-- Virtual session recording with multi-platform correlation
-- Unified session capture across platforms
-- Cloud sync and collaboration features
+## Development Setup
 
-### ⚡ Performance Goals
-- Sub-second search across large datasets (*in development*)
-- Native application performance with Rust + Tauri (*planned*)
-- Efficient memory usage (*basic implementation complete*)
-- Responsive UI (*planned*)
+### Prerequisites
+- Rust toolchain (stable)
+- GCC 13+ (for RocksDB — **will be eliminated after SQLite migration**)
+- [Lemonade Server](https://github.com/lemonade-sdk/lemonade) running locally (optional — falls back to FastEmbed)
 
-## 🛠️ Development Setup
-
-> **⚠️ This is a prototype for developers only. No end-user releases are available.**
-
-### System Requirements
-- RAM: 4GB minimum for development
-- Storage: 2GB for Rust toolchain + dependencies
-- OS: Linux (primary), macOS, Windows (all require development setup)
-- GCC 13+ (for RocksDB compilation)
-
-### Current Model Support
-- BGE-small-en-v1.5 (133MB) - Default local embedding model
-- Other FastEmbed models available but not pre-configured
-
-### Development Installation
-
-**Prerequisites:**
+### Quick Start
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# Set environment (required for RocksDB compilation)
+source env.sh
 
-# Linux: Install GCC 13
-sudo apt install gcc-13 g++-13  # Ubuntu/Debian
-# or your distribution's equivalent
-
-# Set environment variables
-export CC=gcc-13
-export CXX=g++-13
-```
-
-**Build and Run:**
-```bash
-git clone https://github.com/your-org/u-forge.ai.git
-cd u-forge.ai
-
-# Build (first build takes ~10 minutes due to RocksDB compilation)
+# Build (~10 min first time due to RocksDB)
 cargo build
 
-# Run the demo with default schemas
-cargo run --bin u-forge-ai
+# Run tests
+cargo test
 
-# Or load a specific JSON dataset
-cargo run --bin u-forge-ai -- ./examples/data/memory.json
+# Run CLI demo
+cargo run --example cli_demo
 ```
 
-### Loading JSON Data
-
-The main application can now load structured JSON datasets instead of the hardcoded demo data:
-
-**JSON Format:**
-```json
-{"type":"node","name":"Object Name","nodeType":"location","metadata":["Key: Value","Description: Object description"]}
-{"type":"edge","from":"Source Object","to":"Target Object","edgeType":"relationship_type"}
-```
-
-**Supported Node Types:**
-- `location` - Places, planets, systems
-- `npc` - Non-player characters  
-- `player_character` - Player characters
-- `faction` - Organizations, governments
-- `quest` - Missions, events, storylines
-- `artifact` - Items, equipment, vehicles
-- `currency` - Money, resources
-- `skills` - Abilities, spells, powers
-- `temporal` - Events, timelines
-- `setting_reference` - Rules, lore
-- `system_reference` - Game mechanics
-
-**Edge Types (Relationships):**
-All edge types are now string-based for maximum schema flexibility:
-- Use any descriptive relationship name: `"led_by"`, `"governs"`, `"trades_with"`
-- No need to map to predefined enums - just use meaningful names
-- Schema system can define valid edge types and constraints
-
-**Example Usage:**
+### Environment Variables
 ```bash
-# Load Foundation universe data (included)
-cargo run -- ./examples/data/memory.json
-
-# Load your own dataset
-cargo run -- /path/to/your/data.json
+source env.sh                              # Sets CC, CXX, cache paths
+export UFORGE_SCHEMA_DIR="./defaults/schemas"    # Schema directory
+export UFORGE_DATA_FILE="./defaults/data/memory.json"  # Data file
+export LEMONADE_URL="http://localhost:8000/api/v1"     # Lemonade Server (when available)
 ```
 
-### What the Demo Shows
+## Project Layout
 
-The current demo loads structured worldbuilding data and demonstrates:
-1. JSON parsing and object creation from metadata
-2. **Flexible string-based relationship types** (no enum constraints)
-3. Schema-based object validation
-4. Text embedding generation for all content
-5. Semantic search across the knowledge graph
-6. Exact name matching with FST
-7. Hybrid search combining both approaches
+```
+u-forge.ai/
+├── src/
+│   ├── lib.rs              # KnowledgeGraph facade + ObjectBuilder
+│   ├── types.rs            # Domain types (ObjectMetadata, Edge, TextChunk, etc.)
+│   ├── storage.rs          # RocksDB persistence (5 column families)
+│   ├── embeddings.rs       # EmbeddingProvider trait + FastEmbed impl
+│   ├── vector_search.rs    # HNSW + FST hybrid search engine
+│   ├── schema.rs           # Schema definition types
+│   ├── schema_manager.rs   # Schema load/validate/cache
+│   ├── schema_ingestion.rs # JSON schema files → internal schema
+│   ├── data_ingestion.rs   # JSONL import pipeline
+│   └── embedding_queue.rs  # Async embedding background queue
+├── examples/cli_demo.rs    # CLI demo (the only runnable entry point)
+├── defaults/
+│   ├── data/memory.json    # Foundation universe JSONL dataset (~220 nodes, ~312 edges)
+│   └── schemas/            # 13 TTRPG JSON schema files
+├── ARCHITECTURE.md          # Detailed architecture, bugs, and design decisions
+├── migration.md            # Phased migration plan (Lemonade + SQLite + UI)
+├── Cargo.toml
+├── env.sh                  # CRITICAL: source before building
+└── dev.sh                  # Dev runner script
+```
 
-**Note: This is a single-shot CLI demo, not an interactive application.**
+## Key Documentation
 
-## 🎯 Intended Use Cases (*When Complete*)
+| Document | Purpose |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Current architecture, known bugs, design decisions |
+| [migration.md](migration.md) | Phased migration plan to Lemonade Server + SQLite + web UI |
+| [.cursor/rules/](/.cursor/rules/) | AI assistant context rules (7 files) |
 
-### For In-Person Campaign Management
-- Track complex political relationships between factions with visual connections
-- Remember which NPCs know which secrets and when they revealed them
-- Quickly find story elements using semantic search
-- Generate consistent lore that builds on established facts
-- Work completely offline with local models
+## Sample Data
 
-### For Worldbuilding Authors
-- Maintain consistency across large fictional universes
-- Find related concepts instantly through semantic search
-- Visualize how different story elements connect
-- Export world data for use in other tools
+The included Foundation universe dataset (`defaults/data/memory.json`) contains ~220 nodes and ~312 edges modeling Isaac Asimov's Foundation series — characters, locations, factions, quests, and artifacts with rich metadata.
 
-### For Content Creators
-- Build comprehensive campaign settings for publication
-- Create interconnected adventure modules
-- Maintain series continuity across multiple works
+## License
 
-**Note: These are planned capabilities. Current prototype only demonstrates basic storage and search.**
-
-## 🛠️ Technical Architecture
-
-**Current Implementation:**
-- Core Engine: Rust (performance and memory safety)
-- Database: RocksDB (storage and crash recovery)
-- Embeddings: FastEmbed-rs (local text embeddings)
-- Vector Search: Simple cosine similarity (*HNSW integration pending*)
-- Name Search: FST (finite state transducers)
-
-**Planned Additions:**
-- UI Framework: Tauri + Svelte
-- Advanced vector search with HNSW
-- Multi-provider AI integration
-- Audio transcription pipeline
-
-### Known Technical Challenges
-
-**HNSW Integration Issues:**
-The current implementation uses a simplified vector search due to significant API compatibility issues with `hnsw_rs` v0.3.x. The HNSW crate underwent major breaking changes that affected:
-- Method signatures (`nb_elements` → `get_nb_point`, etc.)
-- Struct field names in search results
-- Serialization/deserialization support
-- Lifetime parameter requirements
-
-This forced a fallback to basic cosine similarity search. Proper HNSW integration requires either:
-1. Extensive API migration work, or
-2. Evaluating alternative vector search libraries
-
-See `CLAUDE.MD` for detailed technical documentation of these issues.
-
-### Contributing
-
-This is an early prototype. Contributions welcome, but expect significant API changes.
-
-## 🗺️ Development Roadmap
-
-### Current State - Foundation Prototype
-- [x] Core storage engine with RocksDB
-- [x] Basic text embeddings (FastEmbed)
-- [x] Simple semantic search
-- [x] FST-based exact matching
-- [x] Command-line demo
-- [x] HNSW vector search integration
-- [ ] Basic GUI interface
-- [ ] Cross-platform packaging
-
-### Next Phase - Minimal Viable Product
-- [ ] Tauri-based desktop application
-- [ ] Visual knowledge graph interface
-- [ ] Improved vector search performance
-- [ ] Basic content generation features
-- [ ] Import/export capabilities
-
-### Future Development
-- [ ] Audio transcription pipeline
-- [ ] Advanced graph layouts and filtering
-- [ ] Multi-platform session recording
-- [ ] Cloud integration options
-- [ ] Publisher content marketplace
-
-**Timeline: No specific dates. This is exploratory development.**
-
-## 🤝 Community
-
-- Discord: [Join our community](https://discord.gg/u-forge-ai) for discussions and support
-- Issues: Report bugs and request features on [GitHub Issues](https://github.com/your-org/u-forge.ai/issues)
-- Documentation: Full guides and API docs at [docs.u-forge.ai](https://docs.u-forge.ai)
-
-## 📄 License
-
-The core u-forge.ai application is released under the [MIT License](LICENSE). Your worlds belong to you.
-
-Premium integrations and cloud services are available under separate commercial licenses.
-
-## 💼 Future Business Model
-
-**Current Status: Open source prototype (MIT License)**
-
-Planned approach if development continues:
-- Core Application: Free and open source (MIT License)
-- Premium Features: Enhanced integrations and cloud services
-- Content Marketplace: Official licensed knowledge graphs
-- Your Data: Always yours, regardless of tier
-
-**Note: No commercial features exist yet. This is purely conceptual.**
-
-## 🙏 Acknowledgments
-
-- Built for the TTRPG community, by the TTRPG community
-- Inspired by tools like Obsidian, World Anvil, and Kanka
-- Powered by open-source AI and database technologies
-
----
-
-**Interested in local-first TTRPG tools?** Star this repo to follow early development progress! 🌟
-
-**⚠️ Reminder: This is an early prototype, not a usable application.**
+MIT License. Your worlds belong to you.

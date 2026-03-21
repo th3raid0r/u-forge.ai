@@ -1,0 +1,160 @@
+---
+description: Testing and debugging patterns
+---
+
+# Testing and Debugging
+
+## Test Environment
+
+All tests use temporary directories for isolation:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup_test_storage() -> (KnowledgeGraph, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = get_test_cache_dir();
+        let kg = KnowledgeGraph::new(temp_dir.path(), Some(&cache_dir)).unwrap();
+        (kg, temp_dir)
+    }
+
+    fn get_test_cache_dir() -> PathBuf {
+        std::env::var("FASTEMBED_CACHE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("test_model_cache")
+            })
+    }
+}
+```
+
+## Running Tests
+
+```bash
+source env.sh                              # Required for RocksDB
+cargo test                                 # All tests
+cargo test storage                         # Module-specific
+cargo test -- --nocapture                  # With stdout
+RUST_LOG=debug cargo test -- --nocapture   # Debug logging
+cargo test test_name -- --exact            # Single test
+```
+
+## Mock vs Real Providers
+
+### Mock (fast, deterministic — use for unit tests)
+```rust
+struct MockEmbeddingProvider { dimensions: usize }
+
+#[async_trait]
+impl EmbeddingProvider for MockEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let mut v = vec![0.1; self.dimensions];
+        v[0] = text.len() as f32 / 100.0;
+        Ok(v)
+    }
+    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        texts.iter().map(|t| self.embed(t)).collect() // simplified
+    }
+    fn dimensions(&self) -> Result<usize> { Ok(self.dimensions) }
+    fn max_tokens(&self) -> Result<usize> { Ok(512) }
+    fn provider_type(&self) -> EmbeddingProviderType { /* mock */ }
+    fn model_info(&self) -> Option<ModelInfo<EmbeddingModel>> { None }
+}
+```
+
+### Real FastEmbed (integration tests — slower, requires model download)
+```rust
+fn create_real_embedding_manager() -> Result<EmbeddingManager> {
+    let cache_dir = get_test_cache_dir();
+    EmbeddingManager::try_new_local_default(Some(cache_dir))
+}
+```
+
+### Lemonade Server (integration tests — requires running server)
+```rust
+async fn create_lemonade_manager() -> Result<EmbeddingManager> {
+    EmbeddingManager::try_new_lemonade(
+        "http://localhost:8000/api/v1",
+        "nomic-embed-text"
+    ).await
+}
+```
+
+## Known Bug Testing
+
+When fixing bugs from ARCHITECTURE.md, write regression tests:
+
+```rust
+#[test]
+fn test_bug6_import_deduplication() {
+    let (graph, _temp) = setup_test_storage();
+    // Import same data twice
+    // Assert object count doesn't double
+}
+
+#[test]
+fn test_bug2_similarity_bounded() {
+    // Ensure similarity is always in [0, 1]
+    let similarity = 1.0 / (1.0 + large_distance);
+    assert!(similarity >= 0.0 && similarity <= 1.0);
+}
+```
+
+## Debugging
+
+### Logging levels
+```bash
+RUST_LOG=trace                          # Everything
+RUST_LOG=debug                          # Development
+RUST_LOG=info                           # Normal operation
+RUST_LOG=u_forge_ai::storage=debug      # Single module
+```
+
+### Structured logging in code
+```rust
+tracing::info!(
+    operation = "create_object",
+    object_type = %obj_type,
+    duration_ms = start.elapsed().as_millis(),
+    "Object created"
+);
+```
+
+### Common issues
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| RocksDB compile error | Missing gcc-13 | `source env.sh` |
+| Dimension mismatch panic | Wrong embedding model | Check provider dimensions match VectorSearchConfig |
+| Search returns empty | HNSW not populated | Ensure add_chunk called before search |
+| Negative similarity scores | BUG-2 | Fix: `1.0 / (1.0 + distance)` |
+| Duplicate objects after import | BUG-6 | Add find_by_name check before insert |
+| Edge references unresolved | BUG-7 | Query storage before session map |
+
+## Performance Testing
+
+```rust
+#[tokio::test]
+async fn test_embedding_throughput() {
+    let start = Instant::now();
+    let provider = create_real_embedding_manager().unwrap();
+    let texts: Vec<String> = (0..100).map(|i| format!("Test text {}", i)).collect();
+    let _ = provider.get_provider().embed_batch(texts).await.unwrap();
+    println!("100 embeddings in {:?}", start.elapsed());
+}
+```
+
+## CI Commands
+
+```bash
+source env.sh
+cargo fmt --check
+cargo clippy --all-features -- -D warnings
+cargo test --all-features
+cargo doc --no-deps
+cargo run --example cli_demo
+```

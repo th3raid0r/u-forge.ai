@@ -1,0 +1,118 @@
+---
+description: Schema system usage and patterns
+---
+
+# Schema System
+
+The schema system is one of u-forge.ai's strengths and is **retained through all migration phases**.
+
+## Architecture
+
+Three files implement the schema system:
+- [src/schema.rs](mdc:src/schema.rs) — Type definitions (`SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema`, validation types)
+- [src/schema_manager.rs](mdc:src/schema_manager.rs) — Runtime load/validate/cache via `DashMap`, persists to storage
+- [src/schema_ingestion.rs](mdc:src/schema_ingestion.rs) — Reads `.schema.json` files from disk, strips `add_` prefix, adds 24 common TTRPG edge types
+
+## Schema File Format
+
+Files live in `defaults/schemas/` (or `$UFORGE_SCHEMA_DIR`). Named `{type}.schema.json`:
+
+```json
+{
+  "name": "add_npc",
+  "description": "Add a new NPC to the knowledge graph",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "NPC name",
+      "required": true,
+      "validation": { "min_length": 1, "max_length": 100 }
+    },
+    "role": {
+      "type": "string",
+      "description": "NPC's role",
+      "required": true,
+      "validation": { "allowed_values": ["merchant", "guard", "noble", "commoner"] }
+    },
+    "level": {
+      "type": "number",
+      "description": "NPC level",
+      "validation": { "min_value": 1, "max_value": 20 }
+    },
+    "currentLocation": {
+      "type": "string",
+      "description": "Current location",
+      "relationship": {
+        "edgeType": "located_in",
+        "targetType": "location",
+        "description": "Where the NPC currently is"
+      }
+    }
+  }
+}
+```
+
+**Note:** Schema files use `add_` prefix in the `name` field (MCP tool naming convention). `SchemaIngestion` strips this prefix automatically — internal type name becomes `npc`.
+
+## Property Types
+
+| Type | Description | Validation |
+|---|---|---|
+| `string` | Short text | `min_length`, `max_length`, `pattern`, `allowed_values` |
+| `text` | Long text | Same as string |
+| `number` | Numeric | `min_value`, `max_value` |
+| `boolean` | True/false | — |
+| `array` | Collection | Nested type via `Array(Box<PropertyType>)` |
+| `object` | Nested object | Nested property schemas |
+| `reference` | Object reference | Target type name |
+| `enum` | Predefined values | `allowed_values` list |
+
+## Validation
+
+`SchemaManager::validate_object()` checks:
+1. Object type exists in schema
+2. Required properties present
+3. Property types match (with coercion: number stored as string)
+4. Validation rules pass (length, range, regex `pattern`, `allowed_values`)
+5. Unknown properties generate warnings (not errors)
+
+## Using the Schema System
+
+```rust
+// Load schemas from directory
+let schemas = SchemaIngestion::load_default_schemas()?;
+let schema_manager = graph.get_schema_manager();
+schema_manager.save_schema(schemas).await?;
+
+// Validate an object
+let result = schema_manager.validate_object(&object).await?;
+if result.is_valid() {
+    graph.add_object(object)?;
+} else {
+    for error in result.errors { /* handle */ }
+}
+
+// Register new type at runtime
+schema_manager.register_object_type("default", "spell", spell_schema).await?;
+```
+
+## Edge Type Schemas
+
+Define relationship constraints:
+```rust
+let edge_schema = EdgeTypeSchema::new("learned_spell", "Character spell knowledge")
+    .with_source_types(vec!["character"])
+    .with_target_types(vec!["spell"]);
+```
+
+`SchemaIngestion` auto-adds 24 common TTRPG edge types (owned_by, led_by, allied_with, located_in, etc.).
+
+## Included Schema Types (13 files)
+
+npc, player_character, location, faction, quest, artifact, currency, inventory, skills, temporal, setting_reference, system_reference, transportation
+
+## Known Limitations
+
+- `inheritance` field exists in `ObjectTypeSchema` but is stored and never acted on
+- Schema files use `add_` prefix naming (MCP convention leak)
+- Async methods on `SchemaManager` contain no `.await` points (unnecessary async wrapper)

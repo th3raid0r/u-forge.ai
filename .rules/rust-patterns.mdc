@@ -1,0 +1,185 @@
+---
+globs: src/*.rs,examples/*.rs
+---
+
+# Rust Code Patterns for u-forge.ai
+
+## Error Handling
+
+Use `anyhow::Result` for application-level errors:
+```rust
+use anyhow::{anyhow, Result};
+
+pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    let resp = self.client.post(&url)
+        .json(&body)
+        .send().await
+        .map_err(|e| anyhow!("Lemonade request failed: {}", e))?;
+    // ...
+}
+```
+
+## Key Trait: EmbeddingProvider
+
+This is the central abstraction for all AI embedding work. **All new AI providers must implement this trait.** Do not bypass it.
+
+```rust
+#[async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>>;
+    fn dimensions(&self) -> Result<usize>;
+    fn max_tokens(&self) -> Result<usize>;
+    fn provider_type(&self) -> EmbeddingProviderType;
+    fn model_info(&self) -> Option<ModelInfo<EmbeddingModel>>;
+}
+```
+
+**Current implementations:**
+- `FastEmbedProvider` — in-process ONNX (being replaced)
+- `LemonadeProvider` — HTTP to Lemonade Server (target)
+
+**Pattern for new HTTP-based providers:**
+```rust
+pub struct LemonadeProvider {
+    client: reqwest::Client,
+    base_url: String,
+    model: String,
+    dimensions: usize,
+}
+
+#[async_trait]
+impl EmbeddingProvider for LemonadeProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let resp: EmbeddingResponse = self.client
+            .post(format!("{}/embeddings", &self.base_url))
+            .header("Authorization", "Bearer lemonade")
+            .json(&EmbeddingRequest { model: self.model.clone(), input: vec![text.to_string()] })
+            .send().await?
+            .json().await?;
+        resp.data.into_iter().next()
+            .map(|d| d.embedding)
+            .ok_or_else(|| anyhow!("No embedding returned"))
+    }
+}
+```
+
+## ObjectBuilder Pattern
+
+Fluent API for constructing graph objects:
+```rust
+let id = ObjectBuilder::character("Gandalf".to_string())
+    .with_description("A wise wizard".to_string())
+    .with_property("level".to_string(), "20".to_string())
+    .with_json_property("abilities".to_string(), json!(["magic", "wisdom"]))
+    .with_tag("wizard".to_string())
+    .add_to_graph(&graph)?;
+```
+
+## String-Based Edge Types
+
+Always use descriptive strings for relationships:
+```rust
+graph.connect_objects_str(character_id, location_id, "located_in")?;
+graph.connect_objects_str(faction_id, territory_id, "controls")?;
+graph.connect_objects_str(npc_id, quest_id, "offers")?;
+```
+
+The `EdgeType` enum's deprecated variants (`Contains`, `OwnedBy`, `LocatedIn`, `MemberOf`) exist only for backward compatibility. Always use `EdgeType::Custom(String)`.
+
+## Storage Patterns
+
+### Current (RocksDB)
+```rust
+// Column families for data separation
+const CF_NODES: &str = "nodes";
+const CF_EDGES: &str = "edges";  // AdjacencyList per node (edges stored twice)
+const CF_CHUNKS: &str = "chunks";
+const CF_NAMES: &str = "names";
+const CF_SCHEMAS: &str = "schemas";
+
+// Atomic writes via WriteBatch
+let mut batch = WriteBatch::default();
+batch.put_cf(&cf_nodes, key, value);
+batch.put_cf(&cf_names, name_key, id_bytes);
+db.write(batch)?;
+```
+
+### Target (SQLite — Phase 2)
+```rust
+// Use rusqlite with bundled SQLite + extensions
+// Transactions for atomicity
+// Parameterized queries for safety
+conn.execute(
+    "INSERT INTO nodes (id, object_type, name, properties) VALUES (?1, ?2, ?3, ?4)",
+    params![id, obj_type, name, properties_json],
+)?;
+```
+
+## Async Patterns
+
+### Correct: HTTP-based provider (fully async)
+```rust
+async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    let resp = self.client.post(&url).json(&body).send().await?.json().await?;
+    Ok(resp.embedding)
+}
+```
+
+### Anti-pattern: Mutex in async context (BUG-5)
+```rust
+// DON'T DO THIS — blocks the Tokio thread
+async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    let model = self.model.lock().unwrap();  // Blocks!
+    model.embed(vec![text], None)            // CPU-bound while holding lock!
+}
+```
+
+If you must use synchronous code in async context, use `tokio::task::spawn_blocking`.
+
+## Testing Patterns
+
+### Isolated tests with temp directories
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup_test_storage() -> (KnowledgeGraph, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let kg = KnowledgeGraph::new(temp_dir.path(), None).unwrap();
+        (kg, temp_dir)
+    }
+}
+```
+
+### Mock embedding provider for fast tests
+```rust
+struct MockEmbeddingProvider { dimensions: usize }
+
+#[async_trait]
+impl EmbeddingProvider for MockEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let mut v = vec![0.1; self.dimensions];
+        v[0] = text.len() as f32 / 100.0;
+        Ok(v)
+    }
+    // ... other methods return defaults
+}
+```
+
+## Performance Instrumentation
+
+```rust
+use std::time::Instant;
+
+let start = Instant::now();
+let result = operation().await?;
+tracing::debug!(
+    operation = "search",
+    duration_ms = start.elapsed().as_millis(),
+    results = result.len(),
+    "Search completed"
+);
+```
