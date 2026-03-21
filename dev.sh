@@ -2,6 +2,15 @@
 
 # u-forge.ai Consolidated Development Script
 # Enhanced logging, process management, and multi-mode support
+#
+# Integration tests auto-discover a running Lemonade Server by probing
+# http://localhost:8000/api/v1/health before falling back to the LEMONADE_URL
+# environment variable.  No env var is required when the server is on the
+# default port.
+#
+# Tests are ALWAYS run with --test-threads=1.  Integration tests hit a shared
+# Lemonade Server (NPU/GPU hardware); parallel execution causes resource
+# contention across modules and produces intermittent failures.
 
 set -e  # Exit on any error
 
@@ -212,12 +221,21 @@ case $MODE in
         echo ""
         print_system "Available commands:"
         print_system "  cargo run --example cli_demo    # Run CLI demo"
-        print_system "  cargo test                      # Run tests"
-        print_system "  cargo doc --open               # Open documentation"
+        print_system "  cargo test -- --test-threads=1  # Run tests"
+        print_system "  cargo doc --open                # Open documentation"
         print_system "  cargo run --bin <binary>        # Run specific binary"
         echo ""
         print_system "Press Ctrl+C to exit"
-        cargo test
+        # Always single-threaded: integration tests share a Lemonade Server
+        # (NPU/GPU hardware) and produce intermittent failures when run in
+        # parallel.  The server is auto-discovered on localhost:8000; set
+        # LEMONADE_URL only to point at a non-default or remote server.
+        if [ -n "$LEMONADE_URL" ]; then
+            print_system "LEMONADE_URL=$LEMONADE_URL — using explicit server URL"
+        else
+            print_system "Probing http://localhost:8000/api/v1/health for Lemonade Server..."
+        fi
+        cargo test -- --test-threads=1
         cargo run --example cli_demo
 
         # Keep the script running for backend development
@@ -232,4 +250,3 @@ case $MODE in
         exit 1
 
 esac
-

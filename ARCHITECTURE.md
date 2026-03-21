@@ -1,28 +1,38 @@
 # u-forge.ai — Architecture Reference
 
 > This document describes the **current** state of the codebase after completing
-> Phase 1 (Lemonade Provider), Phase 2 (SQLite migration), and the extended
+> Phase 1 (Lemonade Provider), Phase 2 (SQLite migration), the extended
 > Lemonade integration (`src/lemonade.rs` — model registry, GPU resource manager,
-> TTS/STT/Chat providers).
-> For planned future work, see the Remaining Roadmap section at the bottom.
+> TTS/STT/Chat providers), and the hardware re-architecture session that:
+>
+> - Moved all transcription types out of `embeddings.rs` into `src/transcription.rs`
+> - Added `src/hardware/` (NPU, GPU, CPU device abstractions)
+> - Added `src/inference_queue.rs` — a unified MPMC work queue that routes
+>   embedding, STT, and TTS jobs to any available capable device
+>
+> For planned future work see the Remaining Roadmap section at the bottom.
 
 ## Module Map
 
-| File | Lines | Role | Key Types |
-|---|---|---|---|
-| `src/lib.rs` | ~300 | Facade + ObjectBuilder + tests | `KnowledgeGraph`, `ObjectBuilder` |
-| `src/types.rs` | ~260 | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
-| `src/storage.rs` | ~700 | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats` |
-| `src/embeddings.rs` | ~480 | Lemonade HTTP embedding provider | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
-| `src/lemonade.rs` | ~960 | Extended Lemonade integration | `LemonadeModelRegistry`, `GpuResourceManager`, `SttGuard`, `LlmGuard`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack` |
-| `src/schema.rs` | ~590 | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
-| `src/schema_manager.rs` | ~560 | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
-| `src/schema_ingestion.rs` | ~530 | JSON schema file → internal | `SchemaIngestion` |
-| `src/data_ingestion.rs` | ~280 | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
-| `src/embedding_queue.rs` | ~650 | Async background queue | `EmbeddingQueue`, `EmbeddingQueueBuilder` |
-| `examples/cli_demo.rs` | — | Only runnable entry point | — |
-
-**Total: ~5,300 lines of Rust across 11 source files.**
+| File | Role | Key Types |
+|---|---|---|
+| `src/lib.rs` | Facade + ObjectBuilder + tests | `KnowledgeGraph`, `ObjectBuilder` |
+| `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
+| `src/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats` |
+| `src/embeddings.rs` | Lemonade HTTP embedding providers only | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
+| `src/transcription.rs` | Audio-to-text providers (split from embeddings) | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager`, `mime_for_filename` |
+| `src/hardware/mod.rs` | Device abstraction layer | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait) |
+| `src/hardware/npu.rs` | AMD NPU device (embedding + STT) | `NpuDevice` |
+| `src/hardware/gpu.rs` | AMD GPU ROCm device (STT + LLM) | `GpuDevice` |
+| `src/hardware/cpu.rs` | CPU device (TTS) | `CpuDevice` |
+| `src/inference_queue.rs` | Unified MPMC capability-based dispatch queue | `InferenceQueue`, `InferenceQueueBuilder`, `QueueStats` |
+| `src/lemonade.rs` | Extended Lemonade integration (GPU-managed stack) | `LemonadeModelRegistry`, `GpuResourceManager`, `SttGuard`, `LlmGuard`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack` |
+| `src/schema.rs` | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
+| `src/schema_manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
+| `src/schema_ingestion.rs` | JSON schema file → internal | `SchemaIngestion` |
+| `src/data_ingestion.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
+| `src/embedding_queue.rs` | Embedding-only async background queue (legacy) | `EmbeddingQueue`, `EmbeddingQueueBuilder` |
+| `examples/cli_demo.rs` | Only runnable entry point | — |
 
 > **Removed:** `src/vector_search.rs` — `VectorSearchEngine`, `HnswVectorStore`,
 > `VectorSearchConfig`, `HybridSearchResult`, `SemanticSearchResult`, and
@@ -164,19 +174,141 @@ Unchanged from the previous architecture. Key types:
 
 ---
 
+## Hardware & Inference Architecture
+
+### Overview
+
+AI inference is split across three hardware tiers, each isolated in its own module
+under `src/hardware/`. A unified `InferenceQueue` in `src/inference_queue.rs`
+routes jobs to whichever device is both capable and free.
+
+```
+caller                InferenceQueue             device workers (Tokio tasks)
+──────                ──────────────             ────────────────────────────
+
+embed(text)  ───────► embed_queue   ───────────► NpuDevice  (embed-gemma-300m-FLM)
+
+transcribe() ───────► transcribe_queue ─────────► NpuDevice  (whisper-v3-turbo-FLM)
+                                       ─────────► GpuDevice  (Whisper-Large-v3-Turbo)
+
+synthesize() ───────► synthesize_queue ─────────► CpuDevice  (kokoro-v1)
+```
+
+Both whisper workers (NPU and GPU) listen on the **same** `transcribe_queue`.
+Whichever is free first picks up the job — natural work-stealing with no
+coordination overhead.
+
+### DeviceCapability / HardwareBackend / DeviceWorker
+
+`src/hardware/mod.rs` defines the shared vocabulary:
+
+- **`DeviceCapability`** — `Embedding`, `Transcription`, `TextGeneration`,
+  `TextToSpeech`, `Reranking`
+- **`HardwareBackend`** — `Npu`, `GpuRocm`, `GpuCuda`, `Cpu`, `Remote`
+- **`DeviceWorker`** trait — `name()`, `backend()`, `capabilities()`, `supports()`,
+  `summary()`
+
+The queue uses only `DeviceCapability` for routing; `HardwareBackend` is
+informational (logs, metrics).
+
+### NpuDevice (`src/hardware/npu.rs`)
+
+Wraps a `LemonadeProvider` (embedding) and an optional `LemonadeTranscriptionProvider`
+(STT), both routed to FLM models on the AMD NPU via Lemonade Server.
+
+| Default model | Capability |
+|---|---|
+| `embed-gemma-300m-FLM` | `Embedding` |
+| `whisper-v3-turbo-FLM` | `Transcription` |
+
+**No resource contention** — the NPU is dedicated silicon, separate from the GPU.
+Multiple embedding and transcription calls may be in flight simultaneously.
+
+Constructors: `NpuDevice::new()` (both), `NpuDevice::embedding_only()`,
+`NpuDevice::transcription_only()`.
+
+### GpuDevice (`src/hardware/gpu.rs`)
+
+Wraps `LemonadeSttProvider` and/or `LemonadeChatProvider`, both sharing a single
+`Arc<GpuResourceManager>` that enforces the GPU scheduling policy (see
+[GpuResourceManager](#gpuresourcemanager) below).
+
+| Default model | Capability |
+|---|---|
+| `Whisper-Large-v3-Turbo` | `Transcription` |
+| `GLM-4.7-Flash-GGUF` | `TextGeneration` |
+
+Constructors: `GpuDevice::from_registry()`, `GpuDevice::new()`,
+`GpuDevice::stt_only()`, `GpuDevice::llm_only()`.
+
+### CpuDevice (`src/hardware/cpu.rs`)
+
+Wraps `LemonadeTtsProvider` (Kokoro). No GPU or NPU resource contention.
+
+| Default model | Capability |
+|---|---|
+| `kokoro-v1` | `TextToSpeech` |
+
+Constructors: `CpuDevice::from_registry()`, `CpuDevice::new()`,
+`CpuDevice::new_with_voice()`, `CpuDevice::empty()`.
+
+Convenience methods: `speak(text)`, `speak_with_voice(text, voice)`.
+
+### InferenceQueue (`src/inference_queue.rs`)
+
+MPMC work queue built from `parking_lot::Mutex<VecDeque<T>> + tokio::sync::Notify`
+per capability type — no additional crate dependencies.
+
+**Public API:**
+
+```rust
+// Build the queue
+let queue = InferenceQueueBuilder::new()
+    .with_npu_device(npu)   // Embedding + Transcription
+    .with_gpu_device(gpu)   // Transcription (GPU STT competes with NPU whisper)
+    .with_cpu_device(cpu)   // TextToSpeech
+    .build();               // spawns background Tokio tasks
+
+// Submit jobs (all async, block until a worker picks them up)
+let vec:   Vec<f32>  = queue.embed("The kingdom fell at dawn.").await?;
+let vecs:  Vec<Vec<f32>> = queue.embed_many(texts).await?;
+let text:  String    = queue.transcribe(wav_bytes, "session.wav").await?;
+let audio: Vec<u8>   = queue.synthesize("Roll for initiative.", None).await?;
+
+// Monitoring
+let stats: QueueStats = queue.stats(); // pending_{embeddings,transcriptions,syntheses}
+```
+
+`InferenceQueue` is `Clone` (Arc internals) — hand copies to as many callers as
+needed.
+
+**Race-free worker wakeup:** each worker loop registers a `Notify::notified()`
+future *before* checking the deque, preventing lost-wakeup races when a push
+arrives between the check and the sleep.
+
+**Integration test parallelism:** integration tests from multiple modules hit the
+same Lemonade Server concurrently, causing intermittent GPU/NPU resource contention
+on the server side. Always run the full test suite with `--test-threads=1`.
+`dev.sh` sets this unconditionally. Integration tests auto-discover a running server
+on `localhost:8000` via `GET /api/v1/health` — no `LEMONADE_URL` env var required.
+
+---
+
 ## Embeddings (embeddings.rs)
 
-### EmbeddingProvider Trait
+`src/embeddings.rs` now contains **only** the embedding pipeline. Transcription
+types were moved to `src/transcription.rs`; they are re-exported from
+`embeddings.rs` for backward compatibility.
 
-Unchanged interface (async_trait, Send + Sync):
+### EmbeddingProvider Trait
 
 ```rust
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>>;
-    fn dimensions(&self) -> usize;
-    fn max_tokens(&self) -> usize;
-    fn provider_type(&self) -> &str;
+    fn dimensions(&self) -> Result<usize>;
+    fn max_tokens(&self) -> Result<usize>;
+    fn provider_type(&self) -> EmbeddingProviderType;
     fn model_info(&self) -> Option<EmbeddingModelInfo>;
 }
 ```
@@ -190,9 +322,8 @@ The only concrete implementation of `EmbeddingProvider`. Makes HTTP requests to 
 running [Lemonade Server](https://github.com/lemonade-sdk/lemonade) instance.
 
 - Fully async — no blocking mutexes on the Tokio thread pool.
-- Endpoint: `POST {base_url}/api/v1/embeddings` with a JSON body.
-- `base_url` is read from the `LEMONADE_URL` environment variable by
-  `EmbeddingManager::try_new_auto`.
+- Endpoint: `POST {base_url}/embeddings` with a JSON body.
+- `base_url` is resolved by `EmbeddingManager::try_new_auto` (see below).
 - **Default model: `embed-gemma-300m-FLM`** (NPU-accelerated, 300 M parameter
   Gemma embedding model running via the FLM recipe on the NPU).
 
@@ -209,10 +340,101 @@ have been removed entirely.
 ### EmbeddingManager
 
 Holds a single `Arc<dyn EmbeddingProvider>`. `try_new_auto()` constructs a
-`LemonadeProvider` using `LEMONADE_URL`; defaults to model `embed-gemma-300m-FLM`
-when no model is specified. No `embedding_cache_dir` parameter.
+`LemonadeProvider` using the following resolution order:
+
+1. Explicit `lemonade_url` argument (if provided)
+2. `LEMONADE_URL` environment variable
+3. Localhost probe — `resolve_lemonade_url()` tries `http://localhost:8000` then
+   `http://127.0.0.1:8000` via `GET /api/v1/health` (2 s timeout)
+4. Hard error — no server could be found
+
+Defaults to model `embed-gemma-300m-FLM` when no model is specified.
+No `embedding_cache_dir` parameter.
 
 ---
+
+---
+
+## Transcription (transcription.rs)
+
+`src/transcription.rs` is the single home for all speech-to-text and voice-to-text
+concerns. It was split out of `embeddings.rs` so that embedding and transcription
+can evolve independently and be routed to different hardware by the
+`InferenceQueue`.
+
+### TranscriptionProvider Trait
+
+```rust
+#[async_trait]
+pub trait TranscriptionProvider: Send + Sync {
+    async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> Result<String>;
+    fn model_name(&self) -> &str;
+}
+```
+
+`transcribe` returns the server's text trimmed of leading/trailing whitespace.
+MIME type is inferred from the filename extension via `mime_for_filename()`:
+
+| Extension | MIME |
+|---|---|
+| `.mp3` | `audio/mpeg` |
+| `.ogg` | `audio/ogg` |
+| `.flac` | `audio/flac` |
+| `.m4a` | `audio/mp4` |
+| anything else | `audio/wav` |
+
+### LemonadeTranscriptionProvider
+
+The concrete implementation:
+
+- Endpoint: `POST {base_url}/audio/transcriptions` as `multipart/form-data`.
+- Construction is **synchronous and cheap** — no probe request at construction.
+- Server-side `{"error": …}` responses are propagated as `anyhow::Error`.
+- Default model: `whisper-v3-turbo-FLM` (NPU FLM whisper).
+- Trims trailing slashes from `base_url` on construction.
+
+**Compared to `LemonadeSttProvider` in `lemonade.rs`:**
+
+| | `LemonadeTranscriptionProvider` | `LemonadeSttProvider` |
+|---|---|---|
+| GPU resource management | None — runs on NPU or caller manages | `GpuResourceManager` RAII guard |
+| Construction | Synchronous, no server probe | Requires `Arc<GpuResourceManager>` |
+| Used by | `NpuDevice`, `TranscriptionManager`, `InferenceQueue` NPU worker | `GpuDevice`, `LemonadeStack`, `InferenceQueue` GPU worker |
+
+### TranscriptionManager
+
+Mirrors `EmbeddingManager`. Holds a single `Arc<dyn TranscriptionProvider>`.
+
+```rust
+// Auto: reads LEMONADE_URL env var; defaults to "whisper-v3-turbo-FLM"
+let mgr = TranscriptionManager::try_new_auto(None, None)?;
+
+// Explicit
+let mgr = TranscriptionManager::new_lemonade(
+    "http://localhost:8000/api/v1",
+    "whisper-v3-turbo-FLM",
+);
+
+// From an arbitrary provider (useful in tests)
+let mgr = TranscriptionManager::from_provider(Arc::new(my_provider));
+
+let text = mgr.get_provider().transcribe(wav_bytes, "session.wav").await?;
+```
+
+`try_new_auto` is **synchronous**. Resolution order:
+1. `lemonade_url` argument (if `Some`)
+2. `LEMONADE_URL` environment variable
+3. Hard error — no silent fallback (transcription does not perform a localhost probe
+   at construction time; errors surface on the first `transcribe()` call)
+
+### Test Helper: `make_silence_wav`
+
+`transcription::tests::make_silence_wav(duration_secs: f32) -> Vec<u8>` builds a
+valid mono 16-bit 16 kHz PCM WAV file in memory with no external dependencies.
+Used in transcription tests and copied inline into `inference_queue` tests.
+
+---
+
 
 ## Extended Lemonade Integration (lemonade.rs)
 
@@ -346,11 +568,16 @@ just the current in-memory name→ID map.
 
 ## Embedding Queue (embedding_queue.rs)
 
-Well-implemented async background queue with `tokio::mpsc`, `DashMap` status
+Embedding-only async background queue with `tokio::mpsc`, `DashMap` status
 tracking, and a broadcast progress channel. Builder pattern. Not integrated into
 `KnowledgeGraph` — exists as an isolated utility that callers wire up manually.
 
-In tests, a `MockEmbeddingProvider` (zero-vector output) is used in place of
+**Superseded for new work by `InferenceQueue`**, which handles embedding,
+transcription, and TTS in a single unified queue with multi-device work-stealing.
+`EmbeddingQueue` is retained for callers that only need embedding with fine-grained
+per-request status tracking.
+
+In tests, a `MockEmbeddingProvider` (deterministic fake output) is used in place of
 `LemonadeProvider` so tests do not require a running Lemonade Server.
 
 ---
@@ -475,31 +702,28 @@ startup; the `add_` prefix is stripped before storage.
 
 ## Remaining Roadmap
 
-Phases 1 and 2 are complete. The extended Lemonade integration (`src/lemonade.rs`)
-is also complete. The following work remains:
+Phases 1 and 2, the extended Lemonade integration, hardware re-architecture,
+and the reranking provider are all complete. The following work remains:
 
-| Phase | Description | Status |
+| Item | Description | Status |
 |---|---|---|
-| 2 (partial) | sqlite-vec for vector/ANN semantic search | Deferred — FTS5 in place |
-| 3 | axum HTTP/WebSocket server | Not started |
-| 4 | Lemonade reranking integration (`bge-reranker-v2-m3-GGUF`) | Not started |
-| 5 | Cargo workspace split | Not started |
+| sqlite-vec | Vector/ANN semantic search via `vec0` virtual table | Deferred — FTS5 in place |
+| Phase 3 | axum HTTP/WebSocket server for web UI | Not started |
+| Phase 4 (pipeline) | Wire reranking into KG search (hybrid FTS5 + vec + rerank) | Not started |
+| Phase 4 (streaming) | Streaming LLM responses via `InferenceQueue` | Not started |
+| Phase 5 | Cargo workspace split | Not started |
 
-**sqlite-vec** is the highest-priority remaining item within the current phase.
-When added it will introduce a `vec0` virtual table in `storage.rs`, an embedding
-column on `chunks`, and a `search_chunks_semantic` method on `KnowledgeGraph`.
-The FTS5 keyword search path is retained alongside it.
+**sqlite-vec** is the highest-priority remaining storage item. When added it
+introduces a `vec0` virtual table in `storage.rs`, an embedding column on
+`chunks`, and a `search_chunks_semantic` method on `KnowledgeGraph`. The
+`InferenceQueue::embed()` path provides the embedding side; FTS5 is retained
+alongside it for keyword search.
 
-**Phase 3 (axum)** introduces a new binary crate (or feature gate) that wraps
-`KnowledgeGraph` behind HTTP and WebSocket endpoints. `KnowledgeGraph` itself
-requires no changes — it is already `Send + Sync` and `Arc`-wrapped. The
-`LemonadeStack` from `src/lemonade.rs` slots naturally into an `AppState` struct
-alongside the knowledge graph.
+**Phase 3 (axum)** wraps `KnowledgeGraph` behind HTTP and WebSocket endpoints.
+`KnowledgeGraph` is already `Send + Sync` and `Arc`-wrapped; `LemonadeStack`
+and `InferenceQueue` slot naturally into an `AppState` alongside it.
 
-**Phase 4 (reranking)** adds `LemonadeReranker` to `src/lemonade.rs`, calling
-`POST /api/v1/reranking` with `bge-reranker-v2-m3-GGUF`. This model is classified
-as `ModelRole::Reranker` by `LemonadeModelRegistry` and is already present in the
-server's model list. No GPU resource contention: reranking runs on the CPU via
-llamacpp.
-
-Do not implement any phase out of order without explicit instruction.
+**Phase 4 (search pipeline)** wires the existing `LemonadeRerankProvider` and
+`InferenceQueue::rerank()` into `KnowledgeGraph::search_*` methods. The provider
+is already implemented and demonstrated in `cli_demo`. What remains is the
+integrated FTS5 + sqlite-vec merge + rerank path on the `KnowledgeGraph` facade.

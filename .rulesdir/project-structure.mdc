@@ -6,7 +6,7 @@ alwaysApply: true
 
 Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs. Built in Rust.
 
-**Status:** Early prototype. CLI demo only. Phases 1 + 2 complete. Next: sqlite-vec (Phase 2 remainder), axum server (Phase 3).
+**Status:** Early prototype. CLI demo only. Phases 1 + 2 complete. Hardware re-architecture complete (inter-phase). LLM queuing + reranking infrastructure added (Phase 4 partial). Next: sqlite-vec (Phase 2 remainder), axum server (Phase 3).
 
 ## Architecture Overview
 
@@ -17,56 +17,93 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
 
 - **Facade**: [src/lib.rs](mdc:src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas) + `ObjectBuilder`
 - **Storage**: [src/storage.rs](mdc:src/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts`. `KnowledgeGraphStorage` is the only storage struct.
-- **Embeddings**: [src/embeddings.rs](mdc:src/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP). FastEmbed/ORT/ONNX have been removed. `EmbeddingManager::try_new_auto` reads `LEMONADE_URL` env var.
+- **Embeddings**: [src/embeddings.rs](mdc:src/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP) + `EmbeddingManager`. FastEmbed/ORT/ONNX have been removed. Transcription types have been moved to `src/transcription.rs`; they are re-exported from `embeddings.rs` for backward compatibility.
+- **Transcription**: [src/transcription.rs](mdc:src/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`. Split out of `embeddings.rs` so embedding and transcription can evolve independently and be routed to different hardware.
+- **Hardware Abstraction**: [src/hardware/mod.rs](mdc:src/hardware/mod.rs) — `DeviceCapability` enum, `HardwareBackend` enum, `DeviceWorker` trait. Sub-modules:
+  - [src/hardware/npu.rs](mdc:src/hardware/npu.rs) — `NpuDevice` (embedding + STT + **LLM** on AMD NPU via FLM; no GPU contention). `NpuDevice::new()` takes a 4th `llm_model: Option<&str>` arg. `NpuDevice::from_registry()` auto-discovers all three capabilities. `NpuDevice::llm_only()` is synchronous. `pub chat: Option<LemonadeChatProvider>` field (no `GpuResourceManager` — NPU is independent).
+  - [src/hardware/gpu.rs](mdc:src/hardware/gpu.rs) — `GpuDevice` (STT + LLM on AMD GPU via ROCm; shares `GpuResourceManager`)
+  - [src/hardware/cpu.rs](mdc:src/hardware/cpu.rs) — `CpuDevice` (TTS via Kokoro on host CPU)
+- **Inference Queue**: [src/inference_queue.rs](mdc:src/inference_queue.rs) — `InferenceQueue` + `InferenceQueueBuilder` + `QueueStats`. Unified MPMC capability-based dispatch queue. Five capability channels:
+  - `embed_queue` → NPU embedding workers
+  - `transcribe_queue` → NPU FLM whisper + GPU whispercpp workers compete (first-free wins)
+  - `synthesize_queue` → CPU Kokoro TTS workers
+  - `generate_queue` → NPU FLM LLM + GPU llamacpp workers compete (first-free wins). **Now wired** — the previous `// NOTE:` bypass comment has been removed.
+  - `rerank_queue` → `LemonadeRerankProvider` workers
+  - Public methods: `embed`, `embed_many`, `transcribe`, `synthesize`, `generate`, `ask` (convenience), `rerank`. Builder gains `with_reranker(LemonadeRerankProvider)`.
+- **Extended Lemonade Integration**: [src/lemonade.rs](mdc:src/lemonade.rs) — `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack`, **`LemonadeRerankProvider`**, **`SystemInfo`**, **`LemonadeCapabilities`**. GPU resource management for STT/LLM contention. `LemonadeChatProvider.gpu` is now `Option<Arc<GpuResourceManager>>` — `None` for NPU-backed providers (no locking needed), `Some(gpu)` for GPU-backed providers.
 - **Full-Text Search**: Built into `KnowledgeGraphStorage::search_chunks_fts` via SQLite FTS5. Exposed on `KnowledgeGraph` as `search_chunks_fts(query, limit)`. No separate search module.
 - **Vector Search**: `src/vector_search.rs` **has been deleted**. `VectorSearchEngine`, `HnswVectorStore`, `VectorSearchConfig`, `HybridSearchResult`, `SemanticSearchResult`, `ExactSearchResult` **no longer exist**. sqlite-vec ANN search is deferred (planned Phase 2 remainder).
 - **Schemas**: [src/schema.rs](mdc:src/schema.rs) + [src/schema_manager.rs](mdc:src/schema_manager.rs) + [src/schema_ingestion.rs](mdc:src/schema_ingestion.rs)
 - **Data Import**: [src/data_ingestion.rs](mdc:src/data_ingestion.rs) — JSONL two-pass import. BUG-6 (dedup) and BUG-7 (cross-session edge resolution) are fixed.
-- **Embedding Queue**: [src/embedding_queue.rs](mdc:src/embedding_queue.rs) — async background worker (not yet integrated into KnowledgeGraph)
+- **Embedding Queue**: [src/embedding_queue.rs](mdc:src/embedding_queue.rs) — embedding-only async background worker. Superseded for new work by `InferenceQueue`; retained for callers that need per-request status tracking.
 
 ## Migration Direction
 
-**Phases 1 and 2 are complete.**
+**Current state:** SQLite + FTS5, Lemonade embeddings, hardware abstraction, unified inference queue, `LemonadeRerankProvider`, and `cli_demo` FTS5→rerank pipeline are all complete. All nine tracked bugs resolved.
 
-- ✅ Phase 1: `LemonadeProvider` implemented. FastEmbed/ORT removed. BUG-2, BUG-6, BUG-7 fixed.
-- ✅ Phase 2: SQLite replaces RocksDB. FTS5 full-text search live. BUG-1, BUG-3, BUG-4, BUG-5, BUG-8, BUG-9 resolved. `src/vector_search.rs` deleted.
-- ⏳ Phase 2 (remainder): Add `sqlite-vec` extension for ANN vector search.
-- ⏳ Phase 3: `axum` HTTP/WebSocket server for web UI.
-- ⏳ Phase 4: Reranking via `POST /api/v1/reranking` on Lemonade Server.
-- ⏳ Phase 5: Cargo workspace split.
+- ⏳ **sqlite-vec** — ANN vector search (highest priority; FTS5 is the interim substitute)
+- ⏳ **Phase 3** — `axum` HTTP/WebSocket server for web UI
+- ⏳ **Phase 4 (pipeline)** — Wire reranking into `KnowledgeGraph` hybrid search (FTS5 + vec + rerank); streaming LLM responses
+- ⏳ **Phase 5** — Cargo workspace split
 
 **Standard on [Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
-- Embeddings: `POST /api/v1/embeddings` (implemented)
-- Reranking: `POST /api/v1/reranking` (Phase 4)
-- Chat: `POST /api/v1/chat/completions` (future)
+- Embeddings: `POST /api/v1/embeddings` (implemented — `LemonadeProvider` in `embeddings.rs`)
+- Transcription: `POST /api/v1/audio/transcriptions` (implemented — `LemonadeTranscriptionProvider` in `transcription.rs` for NPU/simple use; `LemonadeSttProvider` in `lemonade.rs` for GPU-managed use)
+- Reranking: `POST /api/v1/reranking` (**implemented** — `LemonadeRerankProvider` in `lemonade.rs`; wired into `InferenceQueue` via `rerank_queue`)
+- Chat/LLM: `POST /api/v1/chat/completions` (**fully queued** — `LemonadeChatProvider` in `lemonade.rs`; dispatched via `generate_queue` for both GPU llamacpp and NPU FLM models)
+- System info: `GET /system-info` (**implemented** — `SystemInfo::fetch()` in `lemonade.rs`; derives `LemonadeCapabilities` from installed recipe backends)
 
-## Key Integration Point
+**Linux hardware capability mapping** (derived from `/system-info`):
 
-The `EmbeddingProvider` trait in [src/embeddings.rs](mdc:src/embeddings.rs) is the primary abstraction for AI capabilities. Only `LemonadeProvider` currently implements it. Do NOT bypass the trait.
+| Hardware | Recipes/Backends | Capabilities |
+|---|---|---|
+| AMD NPU (XDNA2) | FLM | `Embedding`, `Transcription` (NpuStt), `TextGeneration` (NpuLlm) |
+| AMD iGPU (ROCm/Vulkan) | llamacpp:rocm, llamacpp:vulkan, whispercpp:vulkan | `Transcription` (GpuStt), `TextGeneration` (GpuLlm), `Reranking` |
+| CPU | kokoro | `TextToSpeech` |
 
-`KnowledgeGraph` does **not** hold an `EmbeddingManager`. Storage and schema operations are fully synchronous and require no running server. Embeddings are opt-in — construct an `EmbeddingManager` separately when needed.
+## Key Integration Points
+
+The `EmbeddingProvider` trait in [src/embeddings.rs](mdc:src/embeddings.rs) is the primary abstraction for embedding work. Only `LemonadeProvider` currently implements it. Do NOT bypass the trait.
+
+The `TranscriptionProvider` trait in [src/transcription.rs](mdc:src/transcription.rs) is the primary abstraction for STT work. Do NOT bypass the trait.
+
+The `DeviceWorker` trait in [src/hardware/mod.rs](mdc:src/hardware/mod.rs) is the abstraction for physical compute devices. New hardware backends must implement it.
+
+For new code that needs embedding, transcription, TTS, LLM generation, or reranking: use `InferenceQueueBuilder` to wire up devices and obtain an `InferenceQueue`. Do not call provider HTTP clients directly from business logic.
+
+`LemonadeChatProvider.gpu` is `Option<Arc<GpuResourceManager>>`. Always pass `Some(gpu)` for GPU-backed llamacpp models so they respect the GPU serialisation lock. Pass `None` (or use `new_npu()` / `from_registry_npu()`) for NPU FLM models — they run on dedicated silicon with no shared resource.
+
+`KnowledgeGraph` does **not** hold an `EmbeddingManager` or `InferenceQueue`. Storage and schema operations are fully synchronous and require no running server. All AI capabilities are opt-in — construct them separately when needed.
+
+## Integration Test Threading
+
+Integration tests hit a shared live Lemonade Server. When `LEMONADE_URL` is set,
+all modules' integration tests run concurrently by default, causing intermittent
+GPU/NPU resource contention on the server side.
+
+**Always run the full test suite with `--test-threads=1` when `LEMONADE_URL` is set.**
+`dev.sh` sets this flag automatically when it detects `LEMONADE_URL` in the environment.
+
+```bash
+# Correct — single-threaded to avoid server contention
+LEMONADE_URL=http://localhost:8000/api/v1 cargo test -- --test-threads=1
+
+# dev.sh handles this automatically
+export LEMONADE_URL=http://localhost:8000/api/v1
+./dev.sh --backend-only
+```
 
 ## Known Bugs — Current Status
 
-All originally listed bugs (BUG-1 through BUG-9) are **resolved**. See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) for resolution details.
-
-| Bug | Description | Resolution |
-|---|---|---|
-| BUG-1 | HNSW persistence broken | Resolved — HNSW eliminated (no more hnsw_rs) |
-| BUG-2 | `similarity = 1.0 - distance` wrong for L2 | Resolved — fixed formula, then HNSW removed |
-| BUG-3 | Node deletion O(N) across edge CF | Resolved — `ON DELETE CASCADE` with indexed FK |
-| BUG-4 | `get_stats()` O(N) full scan | Resolved — `SELECT COUNT(*)`/ `SUM()` in SQLite |
-| BUG-5 | `Mutex<TextEmbedding>` blocks Tokio thread | Resolved — FastEmbed removed; LemonadeProvider is fully async |
-| BUG-6 | No import deduplication | Resolved — `find_by_name` check before insert |
-| BUG-7 | In-memory-only edge resolution | Resolved — `find_by_name_only` storage fallback |
-| BUG-8 | `get_chunks_for_node` O(N) | Resolved — `idx_chunks_object` index |
-| BUG-9 | `'static` lifetime on Hnsw | Resolved — hnsw_rs removed |
+All bugs (BUG-1 through BUG-9) are **resolved**. There are no active tracked bugs.
+See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
 
 ## Important Files
 
 - [env.sh](mdc:env.sh) — Optional. Sets `UFORGE_*` path variables. **No longer required for compilation** (gcc-13 dependency eliminated with RocksDB).
-- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work. Contains current SQLite schema, module map, resolved bugs.
-- [migration.md](mdc:migration.md) — Phased migration plan with completion status.
+- [dev.sh](mdc:dev.sh) — Development runner. Automatically sets `--test-threads=1` when `LEMONADE_URL` is present.
+- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work. Contains current module map, SQLite schema, hardware architecture, inference queue design, resolved bugs.
+- [migration.md](mdc:migration.md) — Phased migration plan with completion status including hardware re-architecture session notes.
 - [examples/cli_demo.rs](mdc:examples/cli_demo.rs) — The only runnable entry point. Uses FTS5 search. No embedding server required.
 - [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files (unchanged).
 - [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data (~220 nodes, ~312 edges).
@@ -78,11 +115,36 @@ All originally listed bugs (BUG-1 through BUG-9) are **resolved**. See [ARCHITEC
 | `src/lib.rs` | Facade + ObjectBuilder | `KnowledgeGraph`, `ObjectBuilder` |
 | `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
 | `src/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats` |
-| `src/embeddings.rs` | Embedding providers | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
+| `src/embeddings.rs` | Embedding providers (transcription re-exported for compat) | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
+| `src/transcription.rs` | Audio-to-text providers | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager`, `mime_for_filename` |
+| `src/hardware/mod.rs` | Device abstraction layer | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait) |
+| `src/hardware/npu.rs` | AMD NPU device | `NpuDevice` |
+| `src/hardware/gpu.rs` | AMD GPU ROCm device | `GpuDevice` |
+| `src/hardware/cpu.rs` | CPU device | `CpuDevice` |
+| `src/inference_queue.rs` | Unified MPMC inference dispatch queue | `InferenceQueue`, `InferenceQueueBuilder`, `QueueStats` |
+| `src/lemonade.rs` | Extended Lemonade integration (GPU-managed stack) | `LemonadeModelRegistry`, `GpuResourceManager`, `SttGuard`, `LlmGuard`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `RerankDocument`, `SystemInfo`, `LemonadeCapabilities`, `RecipeBackendInfo`, `LemonadeStack` |
 | `src/schema.rs` | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
 | `src/schema_manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
 | `src/schema_ingestion.rs` | JSON schema files → internal | `SchemaIngestion` |
 | `src/data_ingestion.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
-| `src/embedding_queue.rs` | Async background queue | `EmbeddingQueue`, `EmbeddingQueueBuilder` |
+| `src/embedding_queue.rs` | Embedding-only async background queue (legacy) | `EmbeddingQueue`, `EmbeddingQueueBuilder` |
 
 **Deleted modules (do not reference):** `src/vector_search.rs` — removed in Phase 2.
+
+## ModelRole Classification (lemonade.rs)
+
+`LemonadeModelEntry::role()` classifies models. **FLM recipe is checked first** so NPU models are never misclassified as GPU variants:
+
+| Role | Recipe | Key Labels | Hardware |
+|---|---|---|---|
+| `NpuEmbedding` | `flm` | `embeddings` | AMD NPU |
+| `NpuStt` | `flm` | `audio` / `transcription` | AMD NPU |
+| `NpuLlm` | `flm` | `reasoning` / `tool-calling` / `coding` | AMD NPU |
+| `CpuTts` | `kokoro` | `tts` / `speech` | CPU |
+| `GpuStt` | `whispercpp` | `transcription` (non-FLM) | GPU/Vulkan |
+| `GpuLlm` | `llamacpp` | `reasoning` / `tool-calling` / `vision` / `coding` | GPU ROCm/Vulkan |
+| `CpuEmbedding` | `llamacpp` | `embeddings` | CPU/GPU |
+| `Reranker` | `llamacpp` | `reranking` | GPU/CPU |
+| `ImageGen` | `sd-cpp` | `image` | GPU |
+
+Registry selector methods: `npu_embedding_model()`, `npu_stt_model()`, `npu_llm_model()`, `tts_model()`, `stt_model()` (GpuStt only), `llm_model()` (GpuLlm only), `reranker_model()`, `cpu_embedding_model()`.

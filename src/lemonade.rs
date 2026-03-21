@@ -54,11 +54,17 @@ pub struct LemonadeModelEntry {
 /// Functional role assigned to a model based on its id suffix and labels.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelRole {
-    /// NPU-accelerated embedding (model id ends in `-FLM`, label `embeddings`).
+    /// NPU-accelerated embedding (`flm` recipe + `embeddings` label).
     NpuEmbedding,
+    /// NPU speech-to-text (`flm` recipe + `audio`/`transcription` label).
+    NpuStt,
+    /// NPU large language model (`flm` recipe + `reasoning`/`tool-calling` label).
+    NpuLlm,
     /// CPU text-to-speech (kokoro recipe).
     CpuTts,
-    /// GPU speech-to-text (whispercpp recipe or `transcription` label).
+    /// CPU/GPU embedding via llamacpp (`llamacpp` recipe + `embeddings` label).
+    CpuEmbedding,
+    /// GPU speech-to-text (whispercpp recipe or `transcription` label, non-FLM).
     GpuStt,
     /// GPU large language model (llamacpp recipe, reasoning/tool-calling labels).
     GpuLlm,
@@ -72,43 +78,62 @@ pub enum ModelRole {
 
 impl LemonadeModelEntry {
     /// Classify this entry into a [`ModelRole`] based on labels and recipe.
+    ///
+    /// FLM (NPU) models are checked first so that `whisper-v3-turbo-FLM` and
+    /// `qwen3-8b-FLM` are not misclassified as GPU models purely on label.
     pub fn role(&self) -> ModelRole {
-        let id_lower = self.id.to_lowercase();
         let labels: Vec<&str> = self.labels.iter().map(String::as_str).collect();
 
-        // NPU path: FLM recipe + embeddings label
-        if id_lower.ends_with("-flm") && labels.contains(&"embeddings") {
-            return ModelRole::NpuEmbedding;
+        // ── FLM (NPU) recipe — must be checked before generic label checks ──
+        if self.recipe == "flm" {
+            if labels.contains(&"embeddings") {
+                return ModelRole::NpuEmbedding;
+            }
+            if labels.contains(&"transcription") || labels.contains(&"audio") {
+                return ModelRole::NpuStt;
+            }
+            if labels.contains(&"reasoning")
+                || labels.contains(&"tool-calling")
+                || labels.contains(&"coding")
+            {
+                return ModelRole::NpuLlm;
+            }
         }
 
-        // TTS: kokoro recipe or explicit label
+        // ── TTS: kokoro recipe or explicit label ───────────────────────────
         if self.recipe == "kokoro" || labels.contains(&"tts") || labels.contains(&"speech") {
             return ModelRole::CpuTts;
         }
 
-        // STT / transcription
+        // ── STT / transcription (non-FLM) ─────────────────────────────────
         if self.recipe == "whispercpp"
-            || labels.contains(&"transcription")
+            || (labels.contains(&"transcription") && self.recipe != "flm")
             || (labels.contains(&"audio") && !labels.contains(&"tts"))
         {
             return ModelRole::GpuStt;
         }
 
-        // Image generation
+        // ── Image generation ───────────────────────────────────────────────
         if self.recipe == "sd-cpp" || labels.contains(&"image") {
             return ModelRole::ImageGen;
         }
 
-        // Reranking
+        // ── Reranking ──────────────────────────────────────────────────────
         if labels.contains(&"reranking") {
             return ModelRole::Reranker;
         }
 
-        // LLM: llamacpp recipe with cognitive labels
-        if (self.recipe == "llamacpp" || self.recipe == "flm")
+        // ── llamacpp embeddings ────────────────────────────────────────────
+        if self.recipe == "llamacpp" && labels.contains(&"embeddings") {
+            return ModelRole::CpuEmbedding;
+        }
+
+        // ── LLM: llamacpp recipe with cognitive labels ─────────────────────
+        if self.recipe == "llamacpp"
             && (labels.contains(&"reasoning")
                 || labels.contains(&"tool-calling")
-                || labels.contains(&"vision"))
+                || labels.contains(&"vision")
+                || labels.contains(&"coding"))
         {
             return ModelRole::GpuLlm;
         }
@@ -191,22 +216,74 @@ impl LemonadeModelRegistry {
 
     /// The GPU STT model (`Whisper-Large-v3-Turbo`), if available.
     ///
-    /// Falls back to any model classified as [`ModelRole::GpuStt`].
+    /// Only returns models classified as [`ModelRole::GpuStt`] (whispercpp recipe).
+    /// For the NPU FLM whisper, use [`npu_stt_model`](Self::npu_stt_model).
     pub fn stt_model(&self) -> Option<&LemonadeModelEntry> {
         self.models
             .iter()
-            .find(|m| m.id == "Whisper-Large-v3-Turbo")
+            .find(|m| m.id == "Whisper-Large-v3-Turbo" && m.role() == ModelRole::GpuStt)
             .or_else(|| self.by_role(&ModelRole::GpuStt).into_iter().next())
+    }
+
+    /// The NPU STT model (`whisper-v3-turbo-FLM`), if available.
+    ///
+    /// Only returns models classified as [`ModelRole::NpuStt`] (FLM recipe + audio label).
+    pub fn npu_stt_model(&self) -> Option<&LemonadeModelEntry> {
+        self.models
+            .iter()
+            .find(|m| m.id == "whisper-v3-turbo-FLM")
+            .or_else(|| self.by_role(&ModelRole::NpuStt).into_iter().next())
     }
 
     /// The primary GPU LLM (`GLM-4.7-Flash-GGUF`), if available.
     ///
-    /// Falls back to any model classified as [`ModelRole::GpuLlm`].
+    /// Only returns models classified as [`ModelRole::GpuLlm`] (llamacpp recipe).
+    /// For NPU FLM LLMs, use [`npu_llm_model`](Self::npu_llm_model).
     pub fn llm_model(&self) -> Option<&LemonadeModelEntry> {
         self.models
             .iter()
-            .find(|m| m.id == "GLM-4.7-Flash-GGUF")
+            .find(|m| m.id == "GLM-4.7-Flash-GGUF" && m.role() == ModelRole::GpuLlm)
             .or_else(|| self.by_role(&ModelRole::GpuLlm).into_iter().next())
+    }
+
+    /// The preferred NPU LLM model (`qwen3-8b-FLM`), if available.
+    ///
+    /// Prefers the lighter `qwen3-8b-FLM` for responsiveness; falls back to any
+    /// model classified as [`ModelRole::NpuLlm`] (FLM recipe + reasoning/tool-calling label).
+    pub fn npu_llm_model(&self) -> Option<&LemonadeModelEntry> {
+        self.models
+            .iter()
+            .find(|m| m.id == "qwen3-8b-FLM")
+            .or_else(|| {
+                // prefer smaller model over larger for latency
+                self.by_role(&ModelRole::NpuLlm).into_iter().min_by(|a, b| {
+                    a.size
+                        .unwrap_or(f64::MAX)
+                        .partial_cmp(&b.size.unwrap_or(f64::MAX))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            })
+    }
+
+    /// The preferred reranker model (`bge-reranker-v2-m3-GGUF`), if available.
+    ///
+    /// Falls back to any model classified as [`ModelRole::Reranker`].
+    pub fn reranker_model(&self) -> Option<&LemonadeModelEntry> {
+        self.models
+            .iter()
+            .find(|m| m.id == "bge-reranker-v2-m3-GGUF")
+            .or_else(|| self.by_role(&ModelRole::Reranker).into_iter().next())
+    }
+
+    /// The preferred CPU/GPU llamacpp embedding model, if available.
+    ///
+    /// Prefers `nomic-embed-text-v1-GGUF`; falls back to any
+    /// [`ModelRole::CpuEmbedding`] model.
+    pub fn cpu_embedding_model(&self) -> Option<&LemonadeModelEntry> {
+        self.models
+            .iter()
+            .find(|m| m.id == "nomic-embed-text-v1-GGUF")
+            .or_else(|| self.by_role(&ModelRole::CpuEmbedding).into_iter().next())
     }
 
     /// A human-readable summary of models grouped by role, for logging/diagnostics.
@@ -753,7 +830,12 @@ pub struct LemonadeChatProvider {
     /// The model id sent to the API (e.g. `"GLM-4.7-Flash-GGUF"`).
     pub model: String,
     /// Shared GPU resource manager — also held by [`LemonadeSttProvider`].
-    pub gpu: Arc<GpuResourceManager>,
+    ///
+    /// `None` when the provider targets the AMD NPU (FLM models), which runs on
+    /// dedicated silicon with no GPU resource contention.  When `Some`, the GPU
+    /// lock is acquired before every inference request via
+    /// [`GpuResourceManager::begin_llm`].
+    pub gpu: Option<Arc<GpuResourceManager>>,
     /// Default token limit used when no per-request override is given.
     pub default_max_tokens: u32,
     /// Default sampling temperature used when no per-request override is given.
@@ -761,8 +843,13 @@ pub struct LemonadeChatProvider {
 }
 
 impl LemonadeChatProvider {
-    /// Construct with an explicit base URL, model id, and GPU manager.
-    pub fn new(base_url: &str, model: &str, gpu: Arc<GpuResourceManager>) -> Self {
+    /// Construct with an explicit base URL, model id, and optional GPU manager.
+    ///
+    /// Pass `Some(gpu)` for GPU-backed llamacpp models (ROCm / Vulkan) so that
+    /// the GPU lock is acquired before each inference request.
+    /// Pass `None` for NPU-backed FLM models — the NPU is dedicated silicon
+    /// with no shared resource contention.
+    pub fn new(base_url: &str, model: &str, gpu: Option<Arc<GpuResourceManager>>) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -773,15 +860,37 @@ impl LemonadeChatProvider {
         }
     }
 
-    /// Construct using the LLM model discovered in `registry`.
+    /// Construct for NPU use — no GPU resource manager needed.
+    ///
+    /// FLM models run on the AMD NPU, which is physically separate from the
+    /// GPU.  No locking is required between NPU LLM and GPU STT/LLM requests.
+    pub fn new_npu(base_url: &str, model: &str) -> Self {
+        Self::new(base_url, model, None)
+    }
+
+    /// Construct using the GPU LLM model discovered in `registry`.
+    ///
+    /// Looks for [`ModelRole::GpuLlm`] (llamacpp recipe) models only — FLM NPU
+    /// LLMs are excluded.  Use [`from_registry_npu`](Self::from_registry_npu)
+    /// for NPU LLMs.
     pub fn from_registry(
         registry: &LemonadeModelRegistry,
-        gpu: Arc<GpuResourceManager>,
+        gpu: Option<Arc<GpuResourceManager>>,
     ) -> Result<Self> {
         let model = registry
             .llm_model()
-            .ok_or_else(|| anyhow!("No LLM model found in the Lemonade registry"))?;
+            .ok_or_else(|| anyhow!("No GPU LLM model found in the Lemonade registry"))?;
         Ok(Self::new(&registry.base_url, &model.id, gpu))
+    }
+
+    /// Construct using the NPU FLM LLM model discovered in `registry`.
+    ///
+    /// Looks for [`ModelRole::NpuLlm`] models only.  No GPU resource manager needed.
+    pub fn from_registry_npu(registry: &LemonadeModelRegistry) -> Result<Self> {
+        let model = registry
+            .npu_llm_model()
+            .ok_or_else(|| anyhow!("No NPU FLM LLM model found in the Lemonade registry"))?;
+        Ok(Self::new_npu(&registry.base_url, &model.id))
     }
 
     /// Override the default max tokens ceiling.
@@ -801,7 +910,13 @@ impl LemonadeChatProvider {
     /// This is the primary entry point when you need fine-grained control.
     pub async fn complete(&self, req: ChatRequest) -> Result<ChatCompletionResponse> {
         // Acquire the GPU — suspends if STT or another LLM is active.
-        let _guard = self.gpu.begin_llm().await;
+        // For NPU-backed providers (`gpu` is `None`), skip the lock entirely —
+        // the NPU runs independently of the GPU with no shared resource.
+        let _guard = if let Some(gpu) = &self.gpu {
+            Some(gpu.begin_llm().await)
+        } else {
+            None
+        };
 
         let start = std::time::Instant::now();
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
@@ -887,6 +1002,41 @@ pub struct LemonadeStack {
     pub chat: LemonadeChatProvider,
 }
 
+/// Resolve a reachable Lemonade Server base URL.
+///
+/// This is the canonical URL-discovery routine used both at application startup
+/// and in integration tests.  Resolution order:
+///
+/// 1. `http://localhost:8000/api/v1` — probed via `GET /api/v1/health` with a
+///    2-second timeout.  This is the default Lemonade Server port.
+/// 2. `http://127.0.0.1:8000/api/v1` — same probe against the explicit IPv4
+///    loopback address, in case `localhost` resolves to `::1` on the host.
+/// 3. The `LEMONADE_URL` environment variable — accepted as-is with no liveness
+///    check, allowing non-standard or remote servers to be configured.
+///
+/// Returns `None` when none of the above sources yield a reachable server.
+pub async fn resolve_lemonade_url() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+
+    for base in &["http://localhost:8000", "http://127.0.0.1:8000"] {
+        if client
+            .get(format!("{}/api/v1/health", base))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            return Some(format!("{}/api/v1", base));
+        }
+    }
+
+    // Fall back to an explicitly configured URL (e.g. a remote dev server).
+    std::env::var("LEMONADE_URL").ok()
+}
+
 impl LemonadeStack {
     /// Fetch the model registry and construct all providers sharing one GPU manager.
     pub async fn build(base_url: &str) -> Result<Self> {
@@ -895,7 +1045,7 @@ impl LemonadeStack {
 
         let tts = LemonadeTtsProvider::from_registry(&registry)?;
         let stt = LemonadeSttProvider::from_registry(&registry, Arc::clone(&gpu))?;
-        let chat = LemonadeChatProvider::from_registry(&registry, Arc::clone(&gpu))?;
+        let chat = LemonadeChatProvider::from_registry(&registry, Some(Arc::clone(&gpu)))?;
 
         info!(
             tts_model  = %tts.model,
@@ -925,17 +1075,362 @@ impl std::fmt::Debug for LemonadeStack {
     }
 }
 
+// ── Reranking ─────────────────────────────────────────────────────────────────
+
+/// A single ranked document returned by [`LemonadeRerankProvider::rerank`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankDocument {
+    /// Original zero-based index in the input `documents` slice.
+    pub index: usize,
+    /// Relevance score — higher is more relevant.
+    pub score: f32,
+    /// The original document text, if the server echoed it back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+}
+
+/// Reranker via `POST /api/v1/reranking` on Lemonade Server.
+///
+/// Unlike the GPU/NPU providers there is no shared-resource contention for
+/// reranking — requests are sent directly to Lemonade Server which serialises
+/// them internally.
+#[derive(Debug, Clone)]
+pub struct LemonadeRerankProvider {
+    client: reqwest::Client,
+    base_url: String,
+    /// The reranker model id (e.g. `"bge-reranker-v2-m3-GGUF"`).
+    pub model: String,
+}
+
+impl LemonadeRerankProvider {
+    /// Construct with an explicit base URL and model id.
+    pub fn new(base_url: &str, model: &str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    /// Construct using the reranker model discovered in `registry`.
+    pub fn from_registry(registry: &LemonadeModelRegistry) -> Result<Self> {
+        let model = registry
+            .reranker_model()
+            .ok_or_else(|| anyhow!("No reranker model found in the Lemonade registry"))?;
+        Ok(Self::new(&registry.base_url, &model.id))
+    }
+
+    /// Rerank `documents` by relevance to `query`.
+    ///
+    /// # Arguments
+    ///
+    /// * `query`     — The search query or reference text.
+    /// * `documents` — Candidate documents to score and rank.
+    /// * `top_n`     — If `Some(n)`, only the top-n results are returned.
+    ///   Pass `None` to return scores for every document.
+    ///
+    /// Results are returned **sorted by descending score** (most relevant first).
+    pub async fn rerank(
+        &self,
+        query: &str,
+        documents: Vec<String>,
+        top_n: Option<usize>,
+    ) -> Result<Vec<RerankDocument>> {
+        let mut body = serde_json::json!({
+            "model":     self.model,
+            "query":     query,
+            "documents": documents,
+            "return_documents": true,
+        });
+        if let Some(n) = top_n {
+            body["top_n"] = serde_json::json!(n);
+        }
+
+        let start = std::time::Instant::now();
+
+        #[derive(Deserialize)]
+        struct RerankResponseItem {
+            index: usize,
+            relevance_score: f32,
+            #[serde(default)]
+            document: Option<serde_json::Value>,
+        }
+        #[derive(Deserialize)]
+        struct RerankResponse {
+            results: Vec<RerankResponseItem>,
+        }
+
+        let resp: RerankResponse = self
+            .client
+            .post(format!("{}/reranking", self.base_url))
+            .header("Authorization", "Bearer lemonade")
+            .json(&body)
+            .send()
+            .await
+            .context("Rerank HTTP request failed")?
+            .error_for_status()
+            .context("Lemonade /reranking returned an error status")?
+            .json()
+            .await
+            .context("Failed to parse reranking response")?;
+
+        let mut results: Vec<RerankDocument> = resp
+            .results
+            .into_iter()
+            .map(|item| {
+                let document = item.document.and_then(|v| match v {
+                    serde_json::Value::String(s) => Some(s),
+                    serde_json::Value::Object(ref o) => {
+                        o.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                    }
+                    _ => None,
+                });
+                RerankDocument {
+                    index: item.index,
+                    score: item.relevance_score,
+                    document,
+                }
+            })
+            .collect();
+
+        // Sort by descending relevance score.
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        debug!(
+            model = %self.model,
+            n_docs = results.len(),
+            duration_ms = start.elapsed().as_millis(),
+            "Rerank complete"
+        );
+
+        Ok(results)
+    }
+}
+
+// ── System info ───────────────────────────────────────────────────────────────
+
+/// Capabilities derived from a [`SystemInfo`] snapshot.
+///
+/// Use [`SystemInfo::lemonade_capabilities`] to build this from a live server.
+#[derive(Debug, Clone, Default)]
+pub struct LemonadeCapabilities {
+    // ── Device availability ───────────────────────────────────────────────
+    /// AMD NPU (XDNA or similar) is present and accessible.
+    pub npu_available: bool,
+    /// AMD integrated GPU is present (iGPU shared memory).
+    pub igpu_available: bool,
+
+    // ── Installed recipe backends ─────────────────────────────────────────
+    /// FLM (FastFlowLM) backend installed for NPU — enables embedding, NPU
+    /// whisper, and NPU LLM.
+    pub flm_npu_installed: bool,
+    /// Kokoro TTS backend installed on CPU.
+    pub kokoro_cpu_installed: bool,
+    /// llama.cpp ROCm backend installed (iGPU via ROCm).
+    pub llamacpp_rocm_installed: bool,
+    /// llama.cpp Vulkan backend installed (iGPU or CPU via Vulkan).
+    pub llamacpp_vulkan_installed: bool,
+    /// whisper.cpp Vulkan backend installed.
+    pub whispercpp_vulkan_installed: bool,
+    /// whisper.cpp CPU backend installed.
+    pub whispercpp_cpu_installed: bool,
+
+    // ── Derived capability flags ──────────────────────────────────────────
+    /// NPU embedding is possible (FLM + NPU).
+    pub can_embed_npu: bool,
+    /// NPU speech-to-text is possible (FLM + NPU).
+    pub can_stt_npu: bool,
+    /// NPU LLM inference is possible (FLM + NPU).
+    pub can_llm_npu: bool,
+    /// GPU speech-to-text is possible (whispercpp + iGPU).
+    pub can_stt_gpu: bool,
+    /// GPU LLM inference is possible (llamacpp ROCm or Vulkan + iGPU).
+    pub can_llm_gpu: bool,
+    /// CPU TTS is possible (Kokoro).
+    pub can_tts_cpu: bool,
+}
+
+/// Raw device info from the `devices` section of `/system-info`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SystemDeviceInfo {
+    pub available: bool,
+    #[serde(default)]
+    pub family: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Info for a single recipe backend (e.g. `llamacpp.rocm`).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RecipeBackendInfo {
+    /// Installation state: `"installed"`, `"installable"`, `"unsupported"`, etc.
+    #[serde(default)]
+    pub state: String,
+    /// Lemonade device ids this backend runs on (e.g. `["amd_igpu"]`).
+    #[serde(default)]
+    pub devices: Vec<String>,
+}
+
+/// Snapshot of the Lemonade server's hardware and recipe state.
+///
+/// Fetched from `GET {base_url}/../system-info` (one path level above the
+/// `/api/v1` prefix).
+///
+/// Use [`SystemInfo::fetch`] to obtain a live snapshot, then
+/// [`SystemInfo::lemonade_capabilities`] to derive which inference paths are
+/// available and testable.
+#[derive(Debug, Clone)]
+pub struct SystemInfo {
+    /// CPU/APU model string reported by the OS.
+    pub processor: String,
+    /// Physical RAM as a human-readable string (e.g. `"94.07 GB"`).
+    pub physical_memory: String,
+    /// OS version string.
+    pub os_version: String,
+    /// AMD NPU device info, if present.
+    pub npu: Option<SystemDeviceInfo>,
+    /// AMD integrated GPU device info, if present.
+    pub igpu: Option<SystemDeviceInfo>,
+    /// Recipe backend states, keyed by `"<recipe>/<backend>"`.
+    /// E.g. `"flm/npu"`, `"llamacpp/rocm"`, `"whispercpp/vulkan"`.
+    pub backends: std::collections::HashMap<String, RecipeBackendInfo>,
+}
+
+impl SystemInfo {
+    /// Fetch system info from `GET {base_url}/system-info`.
+    ///
+    /// The Lemonade system-info endpoint lives at `/api/v1/system-info`.
+    /// Pass the `/api/v1` base URL directly (e.g. `http://localhost:8000/api/v1`)
+    /// and this function will append `/system-info` to it.
+    pub async fn fetch(base_url: &str) -> Result<Self> {
+        let client = reqwest::Client::new();
+        // The system-info endpoint lives at /api/v1/system-info — keep the
+        // /api/v1 prefix intact and just append /system-info.
+        let base = base_url.trim_end_matches('/');
+        let url = format!("{base}/system-info");
+
+        let raw: serde_json::Value = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to reach Lemonade system-info at {url}"))?
+            .error_for_status()
+            .context("Lemonade /system-info returned an error status")?
+            .json()
+            .await
+            .context("Failed to parse /system-info JSON")?;
+
+        let processor = raw
+            .get("Processor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let physical_memory = raw
+            .get("Physical Memory")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let os_version = raw
+            .get("OS Version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Parse device availability.
+        let npu = raw
+            .pointer("/devices/amd_npu")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let igpu = raw
+            .pointer("/devices/amd_igpu")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        // Flatten all recipe/backend combinations into a single map.
+        let mut backends = std::collections::HashMap::new();
+        if let Some(recipes) = raw.get("recipes").and_then(|v| v.as_object()) {
+            for (recipe, recipe_val) in recipes {
+                if let Some(bmap) = recipe_val.get("backends").and_then(|v| v.as_object()) {
+                    for (backend, bval) in bmap {
+                        let key = format!("{recipe}/{backend}");
+                        if let Ok(info) = serde_json::from_value::<RecipeBackendInfo>(bval.clone())
+                        {
+                            backends.insert(key, info);
+                        }
+                    }
+                }
+            }
+        }
+
+        let info = Self {
+            processor,
+            physical_memory,
+            os_version,
+            npu,
+            igpu,
+            backends,
+        };
+
+        info!(
+            processor = %info.processor,
+            os = %info.os_version,
+            npu_available = info.npu.as_ref().map(|d| d.available).unwrap_or(false),
+            igpu_available = info.igpu.as_ref().map(|d| d.available).unwrap_or(false),
+            "Lemonade system-info loaded"
+        );
+
+        Ok(info)
+    }
+
+    /// Returns `true` if the given recipe/backend is installed and available.
+    pub fn is_installed(&self, recipe: &str, backend: &str) -> bool {
+        let key = format!("{recipe}/{backend}");
+        self.backends
+            .get(&key)
+            .map(|b| b.state == "installed")
+            .unwrap_or(false)
+    }
+
+    /// Derive a [`LemonadeCapabilities`] snapshot from this system-info.
+    pub fn lemonade_capabilities(&self) -> LemonadeCapabilities {
+        let npu_available = self.npu.as_ref().map(|d| d.available).unwrap_or(false);
+        let igpu_available = self.igpu.as_ref().map(|d| d.available).unwrap_or(false);
+
+        let flm_npu_installed = self.is_installed("flm", "npu");
+        let kokoro_cpu_installed = self.is_installed("kokoro", "cpu");
+        let llamacpp_rocm_installed = self.is_installed("llamacpp", "rocm");
+        let llamacpp_vulkan_installed = self.is_installed("llamacpp", "vulkan");
+        let whispercpp_vulkan_installed = self.is_installed("whispercpp", "vulkan");
+        let whispercpp_cpu_installed = self.is_installed("whispercpp", "cpu");
+
+        LemonadeCapabilities {
+            npu_available,
+            igpu_available,
+            flm_npu_installed,
+            kokoro_cpu_installed,
+            llamacpp_rocm_installed,
+            llamacpp_vulkan_installed,
+            whispercpp_vulkan_installed,
+            whispercpp_cpu_installed,
+            can_embed_npu: npu_available && flm_npu_installed,
+            can_stt_npu: npu_available && flm_npu_installed,
+            can_llm_npu: npu_available && flm_npu_installed,
+            can_stt_gpu: igpu_available
+                && (whispercpp_vulkan_installed || whispercpp_cpu_installed),
+            can_llm_gpu: igpu_available && (llamacpp_rocm_installed || llamacpp_vulkan_installed),
+            can_tts_cpu: kokoro_cpu_installed,
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Read `LEMONADE_URL` from the environment.  If absent, integration tests
-    // print a skip message and return early — they do not fail the CI build.
-    fn lemonade_url() -> Option<String> {
-        std::env::var("LEMONADE_URL").ok()
-    }
+    use crate::test_helpers::lemonade_url;
 
     // ── Unit: model role classification ──────────────────────────────────────
 
@@ -958,9 +1453,30 @@ mod tests {
 
     #[test]
     fn test_role_npu_embedding_only_if_label_present() {
-        // id ends in -FLM but no embeddings label → falls through to LLM check
+        // FLM recipe + reasoning label → NpuLlm (not GpuLlm — FLM runs on the NPU)
         let m = make_entry("qwen3-8b-FLM", &["reasoning", "tool-calling"], "flm");
-        assert_eq!(m.role(), ModelRole::GpuLlm);
+        assert_eq!(m.role(), ModelRole::NpuLlm);
+    }
+
+    #[test]
+    fn test_role_npu_stt() {
+        // FLM recipe + transcription label → NpuStt
+        let m = make_entry("whisper-v3-turbo-FLM", &["audio", "transcription"], "flm");
+        assert_eq!(m.role(), ModelRole::NpuStt);
+    }
+
+    #[test]
+    fn test_role_npu_llm_coding_label() {
+        // FLM recipe + coding label → NpuLlm
+        let m = make_entry("some-coder-FLM", &["coding"], "flm");
+        assert_eq!(m.role(), ModelRole::NpuLlm);
+    }
+
+    #[test]
+    fn test_role_cpu_embedding_llamacpp() {
+        // llamacpp recipe + embeddings label → CpuEmbedding
+        let m = make_entry("nomic-embed-text-v1-GGUF", &["embeddings"], "llamacpp");
+        assert_eq!(m.role(), ModelRole::CpuEmbedding);
     }
 
     #[test]
@@ -987,9 +1503,40 @@ mod tests {
 
     #[test]
     fn test_role_gpu_stt_transcription_label() {
-        let m = make_entry("whisper-v3-turbo-FLM", &["audio", "transcription"], "flm");
-        // Has transcription label — classified as STT even on flm recipe
+        // Non-FLM whispercpp with transcription label → GpuStt
+        let m = make_entry(
+            "Whisper-Large-v3-Turbo",
+            &["audio", "transcription", "hot"],
+            "whispercpp",
+        );
         assert_eq!(m.role(), ModelRole::GpuStt);
+    }
+
+    #[test]
+    fn test_role_gpu_stt_non_flm_transcription_label() {
+        // Non-FLM recipe with transcription label → GpuStt
+        let m = make_entry("some-whisper", &["transcription"], "whispercpp");
+        assert_eq!(m.role(), ModelRole::GpuStt);
+    }
+
+    #[test]
+    fn test_role_flm_not_misclassified_as_gpu_stt() {
+        // FLM recipe + transcription label must be NpuStt, NOT GpuStt
+        let m = make_entry("whisper-v3-turbo-FLM", &["audio", "transcription"], "flm");
+        assert_ne!(
+            m.role(),
+            ModelRole::GpuStt,
+            "FLM whisper must not be GpuStt"
+        );
+        assert_eq!(m.role(), ModelRole::NpuStt);
+    }
+
+    #[test]
+    fn test_role_flm_llm_not_misclassified_as_gpu_llm() {
+        // FLM recipe + reasoning label must be NpuLlm, NOT GpuLlm
+        let m = make_entry("gpt-oss-20b-FLM", &["reasoning"], "flm");
+        assert_ne!(m.role(), ModelRole::GpuLlm, "FLM LLM must not be GpuLlm");
+        assert_eq!(m.role(), ModelRole::NpuLlm);
     }
 
     #[test]
@@ -1190,8 +1737,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_fetch_returns_models() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("SKIP test_registry_fetch_returns_models — LEMONADE_URL not set");
+        let Some(url) = lemonade_url().await else {
+            eprintln!("SKIP test_registry_fetch_returns_models — Lemonade Server not available");
             return;
         };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
@@ -1204,7 +1751,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_identifies_npu_embedding_model() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let m = reg.npu_embedding_model();
         assert!(m.is_some(), "embed-gemma-300m-FLM should be present");
@@ -1217,7 +1766,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_identifies_tts_model() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let m = reg.tts_model();
         assert!(m.is_some(), "kokoro-v1 TTS model should be present");
@@ -1226,7 +1777,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_identifies_stt_model() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let m = reg.stt_model();
         assert!(m.is_some(), "Whisper STT model should be present");
@@ -1239,7 +1792,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_identifies_llm_model() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let m = reg.llm_model();
         assert!(m.is_some(), "GLM-4.7-Flash-GGUF LLM should be present");
@@ -1252,7 +1807,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_by_role_roundtrip() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
 
         let embeddings = reg.by_role(&ModelRole::NpuEmbedding);
@@ -1275,8 +1832,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tts_returns_audio_bytes() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("SKIP test_tts_returns_audio_bytes — LEMONADE_URL not set");
+        let Some(url) = lemonade_url().await else {
+            eprintln!("SKIP test_tts_returns_audio_bytes — Lemonade Server not available");
             return;
         };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
@@ -1289,7 +1846,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_tts_multiple_voices() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let tts = LemonadeTtsProvider::from_registry(&reg).unwrap();
 
@@ -1313,7 +1872,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_tts_long_text() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let tts = LemonadeTtsProvider::from_registry(&reg).unwrap();
 
@@ -1331,13 +1892,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_ask_returns_response() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("SKIP test_chat_ask_returns_response — LEMONADE_URL not set");
+        let Some(url) = lemonade_url().await else {
+            eprintln!("SKIP test_chat_ask_returns_response — Lemonade Server not available");
             return;
         };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, gpu).unwrap();
+        let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
 
         let response = chat
             .ask("Respond with exactly one word: pong")
@@ -1352,10 +1913,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_with_system_prompt() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, gpu).unwrap();
+        let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
 
         let response = chat
             .ask_with_system(
@@ -1373,10 +1936,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_multi_turn_conversation() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, gpu).unwrap();
+        let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
 
         let messages = vec![
             ChatMessage::system("You are a TTRPG dungeon master. Be concise."),
@@ -1392,10 +1957,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_request_with_overrides() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, gpu).unwrap();
+        let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
 
         let req = ChatRequest::new(vec![ChatMessage::user("Count to three.")])
             .with_max_tokens(64)
@@ -1409,9 +1976,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_queues_behind_simulated_stt_integration() {
-        let Some(url) = lemonade_url() else {
+        let Some(url) = lemonade_url().await else {
             eprintln!(
-                "SKIP test_llm_queues_behind_simulated_stt_integration — LEMONADE_URL not set"
+                "SKIP test_llm_queues_behind_simulated_stt_integration — Lemonade Server not available"
             );
             return;
         };
@@ -1419,7 +1986,7 @@ mod tests {
 
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, Arc::clone(&gpu)).unwrap();
+        let chat = LemonadeChatProvider::from_registry(&reg, Some(Arc::clone(&gpu))).unwrap();
 
         // Simulate an active STT session (no real audio upload needed).
         let stt_guard = gpu
@@ -1453,7 +2020,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stt_blocked_during_simulated_llm_integration() {
-        let Some(_url) = lemonade_url() else { return };
+        let Some(_url) = lemonade_url().await else {
+            return;
+        };
 
         // This is purely a policy test — no real LLM request needed.
         let gpu = GpuResourceManager::new();
@@ -1474,8 +2043,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stack_builds_successfully() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("SKIP test_stack_builds_successfully — LEMONADE_URL not set");
+        let Some(url) = lemonade_url().await else {
+            eprintln!("SKIP test_stack_builds_successfully — Lemonade Server not available");
             return;
         };
 
@@ -1488,7 +2057,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stack_tts_and_chat_share_nothing_on_gpu() {
-        let Some(url) = lemonade_url() else { return };
+        let Some(url) = lemonade_url().await else {
+            return;
+        };
 
         let stack = LemonadeStack::build(&url).await.unwrap();
         // TTS runs on CPU — should not touch the GPU manager.
@@ -1501,7 +2072,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stack_stt_and_chat_share_gpu_manager() {
-        let Some(_url) = lemonade_url() else { return };
+        let Some(_url) = lemonade_url().await else {
+            return;
+        };
 
         // Structural check: both stt and chat must hold the *same* Arc.
         // We verify this by acquiring via stt and seeing it reflected in chat's gpu.

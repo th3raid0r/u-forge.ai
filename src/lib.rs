@@ -13,14 +13,20 @@
 //! are *not* coupled to the storage layer, making it straightforward to use the graph
 //! without a running Lemonade Server (e.g. in tests).
 
+#[cfg(test)]
+pub(crate) mod test_helpers;
+
 pub mod data_ingestion;
 pub mod embedding_queue;
 pub mod embeddings;
+pub mod hardware;
+pub mod inference_queue;
 pub mod lemonade;
 pub mod schema;
 pub mod schema_ingestion;
 pub mod schema_manager;
 pub mod storage;
+pub mod transcription;
 pub mod types;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────

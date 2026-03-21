@@ -62,13 +62,14 @@ Lemonade is unavailable — it returns a clear error with instructions.
 sudo snap install lemonade-server
 
 # Pull required models
-lemonade-server pull nomic-embed-text        # embeddings (768-dim)
-lemonade-server pull bge-reranker-v2-m3      # reranking (Phase 4)
+lemonade-server pull embed-gemma-300m-FLM    # embeddings (NPU, 0.62 GB) — default embedding model
+lemonade-server pull whisper-v3-turbo-FLM    # transcription (NPU, 1.55 GB) — default transcription model
+lemonade-server pull bge-reranker-v2-m3      # reranking (Phase 4, not yet integrated)
 
 # Start the server
 lemonade-server serve
 
-# Verify health
+# Verify health (also shows which models are currently loaded in RAM)
 curl http://localhost:8000/api/v1/health
 
 # Point u-forge.ai at it
@@ -79,6 +80,30 @@ export LEMONADE_URL="http://localhost:8000/api/v1"
 1. The `lemonade_url` argument (if `Some`)
 2. `LEMONADE_URL` environment variable
 3. Hard error — no silent fallback
+
+`TranscriptionManager::try_new_auto(None, None)` uses the **same** resolution order
+and is **synchronous** (no probe request at construction). The default transcription
+model is `whisper-v3-turbo-FLM`. Errors surface only when `transcribe()` is called.
+
+### Lemonade API Endpoints in Use
+
+| Endpoint | Method | Provider | Phase |
+|---|---|---|---|
+| `/api/v1/embeddings` | POST (JSON) | `LemonadeProvider` (`embeddings.rs`) | ✅ Phase 1 |
+| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeTranscriptionProvider` (`embeddings.rs`) | ✅ Phase 1 |
+| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeSttProvider` (`lemonade.rs`, GPU-managed) | ✅ Phase 1 |
+| `/api/v1/audio/speech` | POST (JSON) | `LemonadeTtsProvider` (`lemonade.rs`) | ✅ Phase 1 |
+| `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` (`lemonade.rs`) | ✅ Phase 1 |
+| `/api/v1/reranking` | POST (JSON) | *(not yet implemented)* | ⏳ Phase 4 |
+| `/api/v1/models` | GET | `LemonadeModelRegistry` (`lemonade.rs`) | ✅ Phase 1 |
+| `/api/v1/health` | GET | *(manual verification only)* | — |
+
+> **Note on the two transcription providers:** `LemonadeTranscriptionProvider` in
+> `embeddings.rs` is a simple standalone provider with no GPU resource management —
+> suitable for one-off use and testing. `LemonadeSttProvider` in `lemonade.rs`
+> integrates with `GpuResourceManager` to prevent contention when LLM inference is
+> running concurrently on the same GPU. Use `LemonadeSttProvider` (via
+> `LemonadeStack`) in production.
 
 ## Database Location
 
@@ -141,3 +166,6 @@ RUST_LOG=debug cargo test -- --nocapture  # Tests with debug logging
 | Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
 | Database locked | Only one process should open the same `knowledge.db` at a time |
 | Dimension mismatch (future sqlite-vec) | Ensure embedding model matches vector column dimensions |
+| Transcription returns error immediately | Model not pulled — run `lemonade-server pull whisper-v3-turbo-FLM` |
+| Transcription error: "Could not open audio data" | Audio bytes are empty or the file is not a valid audio format |
+| Whisper not loaded in RAM | First transcription call triggers model load; subsequent calls are fast. Check `GET /api/v1/health` to see which models are in RAM. |

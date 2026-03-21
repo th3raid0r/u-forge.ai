@@ -52,7 +52,7 @@ pub trait EmbeddingProvider: Send + Sync {
 
 **Current implementations:**
 - `LemonadeProvider` — HTTP to Lemonade Server (`POST /api/v1/embeddings`). The only
-  active implementation. FastEmbed/ONNX have been removed.
+  active embedding implementation. FastEmbed/ONNX have been removed.
 
 **Pattern for adding a new HTTP-based provider:**
 ```rust
@@ -94,6 +94,75 @@ impl EmbeddingProvider for MyProvider {
 
 ---
 
+## TranscriptionProvider
+
+A second provider trait lives alongside `EmbeddingProvider` in `src/embeddings.rs`.
+It follows the same trait + manager pattern but targets audio-to-text.
+
+```rust
+#[async_trait]
+pub trait TranscriptionProvider: Send + Sync {
+    /// Transcribe raw audio bytes (WAV, MP3, OGG, …) to text.
+    /// `filename` is used as the multipart filename hint for MIME detection.
+    async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> Result<String>;
+
+    /// The model name this provider is configured to use.
+    fn model_name(&self) -> &str;
+}
+```
+
+`transcribe` returns the server's response text trimmed of leading/trailing whitespace.
+MIME type is inferred from the filename extension:
+- `.mp3` → `audio/mpeg`
+- `.ogg` → `audio/ogg`
+- anything else → `audio/wav`
+
+### LemonadeTranscriptionProvider
+
+Concrete implementation against `POST {base_url}/audio/transcriptions`:
+
+```rust
+// Construction is synchronous and cheap — no probe request is made.
+let provider = LemonadeTranscriptionProvider::new(
+    "http://localhost:8000/api/v1",
+    "whisper-v3-turbo-FLM",
+);
+
+let wav_bytes = std::fs::read("session.wav")?;
+let text = provider.transcribe(wav_bytes, "session.wav").await?;
+```
+
+**Key difference from `LemonadeSttProvider` in `lemonade.rs`:** this provider has
+no `GpuResourceManager` — it is intentionally simple and standalone. Use
+`LemonadeSttProvider` when you need the full GPU-managed `LemonadeStack` where LLM
+inference and STT may contend for the same GPU.
+
+### TranscriptionManager
+
+Mirrors `EmbeddingManager`. Holds an `Arc<dyn TranscriptionProvider>`:
+
+```rust
+// Auto: reads LEMONADE_URL env var; defaults to "whisper-v3-turbo-FLM"
+// Note: try_new_auto is SYNCHRONOUS — no probe request needed at construction.
+let mgr = TranscriptionManager::try_new_auto(None, None)?;
+
+// Explicit URL and model
+let mgr = TranscriptionManager::new_lemonade(
+    "http://localhost:8000/api/v1",
+    "whisper-v3-turbo-FLM",
+);
+
+let provider = mgr.get_provider();  // Arc<dyn TranscriptionProvider>
+let text = provider.transcribe(wav_bytes, "recording.wav").await?;
+```
+
+`try_new_auto` resolution order:
+1. `lemonade_url` argument (if `Some`)
+2. `LEMONADE_URL` environment variable
+3. Hard error — no silent fallback
+
+---
+
 ## EmbeddingManager
 
 `EmbeddingManager` is decoupled from `KnowledgeGraph`. Construct it separately when
@@ -113,7 +182,7 @@ let provider = mgr.get_provider();  // Arc<dyn EmbeddingProvider>
 let vec = provider.embed("Some text").await?;
 ```
 
-`try_new_auto` resolution order:
+`try_new_auto` resolution order (for embeddings):
 1. `lemonade_url` argument (if `Some`)
 2. `LEMONADE_URL` environment variable
 3. Hard error — there is **no** local fallback in this build
@@ -320,6 +389,43 @@ mod tests {
 }
 ```
 
+### Audio test helper: `make_silence_wav`
+
+The `embeddings` test module contains a private `make_silence_wav(duration_secs: f32) -> Vec<u8>`
+helper that builds a valid mono 16-bit 16 kHz PCM WAV file entirely in memory with no
+external dependencies. Copy this pattern into any test module that needs real audio bytes
+without shipping a binary fixture file:
+
+```rust
+fn make_silence_wav(duration_secs: f32) -> Vec<u8> {
+    let sample_rate: u32 = 16_000;
+    let num_channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let num_samples = (sample_rate as f32 * duration_secs) as u32;
+    let data_size = num_samples * (bits_per_sample as u32 / 8) * num_channels as u32;
+    let riff_size: u32 = 4 + 8 + 16 + 8 + data_size;
+
+    let mut buf: Vec<u8> = Vec::with_capacity((8 + riff_size) as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&riff_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&num_channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate: u32 = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    let block_align: u16 = num_channels * bits_per_sample / 8;
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_size.to_le_bytes());
+    buf.extend(std::iter::repeat(0u8).take(data_size as usize));
+    buf
+}
+```
+
 ### Mock embedding provider (for queue / search tests — no server required)
 
 ```rust
@@ -347,20 +453,37 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 
 ### Lemonade integration tests (skipped when server not available)
 
+Gate all live-server tests on the `LEMONADE_URL` environment variable so they
+silently skip in CI environments where no server is running:
+
 ```rust
 fn lemonade_url() -> Option<String> {
     std::env::var("LEMONADE_URL").ok()
 }
 
+// ── Embedding integration test ────────────────────────────────────────────────
 #[tokio::test]
 async fn test_real_embedding() {
     let Some(url) = lemonade_url() else {
         eprintln!("Skipping: LEMONADE_URL not set");
         return;
     };
-    let provider = LemonadeProvider::new(&url, "nomic-embed-text").await.unwrap();
+    let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM").await.unwrap();
     let vec = provider.embed("test").await.unwrap();
     assert_eq!(vec.len(), provider.dimensions().unwrap());
+}
+
+// ── Transcription integration test ───────────────────────────────────────────
+#[tokio::test]
+async fn test_real_transcription() {
+    let Some(url) = lemonade_url() else {
+        eprintln!("Skipping: LEMONADE_URL not set");
+        return;
+    };
+    let provider = LemonadeTranscriptionProvider::new(&url, "whisper-v3-turbo-FLM");
+    let wav = make_silence_wav(1.0);
+    let result = provider.transcribe(wav, "silence.wav").await;
+    assert!(result.is_ok(), "transcription failed: {:?}", result.err());
 }
 ```
 

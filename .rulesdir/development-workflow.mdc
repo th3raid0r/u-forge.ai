@@ -7,9 +7,9 @@ description: Development workflow and setup guide
 ## Quick Reference
 
 ```bash
-cargo build                             # Build library + examples
-cargo test                              # Run all tests (no server required)
-cargo run --example cli_demo            # Run CLI demo with Foundation data
+cargo build                                        # Build library + examples
+cargo test -- --test-threads=1                     # Run all tests (always single-threaded)
+cargo run --example cli_demo                       # Run CLI demo with Foundation data
 cargo run --example cli_demo ./data.json ./schemas/  # Custom data
 ```
 
@@ -32,7 +32,7 @@ cargo run --example cli_demo ./data.json ./schemas/  # Custom data
 
 3. **Run tests:**
    ```bash
-   cargo test        # All 52+ tests pass with no server required
+   cargo test -- --test-threads=1   # All 101+ tests pass with no server required
    ```
 
 4. **Run the CLI demo:**
@@ -48,21 +48,47 @@ Before making changes, read:
 - [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — Current state (SQLite schema, module map, resolved bugs)
 - [migration.md](mdc:migration.md) — Phased plan and completion status
 
-### Completed migration phases:
-- **Phase 1 ✅** — `LemonadeProvider` replaces FastEmbed. No in-process AI models.
-- **Phase 2 ✅** — SQLite + FTS5 replaces RocksDB + HNSW + FST. `src/vector_search.rs` deleted.
+### Current state (all complete):
+- SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware abstraction (`src/hardware/`), unified inference queue (`src/inference_queue.rs`), `LemonadeRerankProvider` + `InferenceQueue::rerank()` wired, `cli_demo` demonstrates FTS5 → rerank pipeline.
 
-### Remaining phases:
-- **Phase 2 (remainder)** — Add `sqlite-vec` extension for ANN vector search
+### Remaining work:
+- **sqlite-vec** — ANN vector search (highest priority storage item)
 - **Phase 3** — `axum` HTTP/WebSocket server for web UI
-- **Phase 4** — Lemonade reranking via `POST /api/v1/reranking`
+- **Phase 4 (pipeline)** — Wire reranking into `KnowledgeGraph` hybrid search (FTS5 + vec + rerank)
 - **Phase 5** — Cargo workspace split
-
-**Never implement a phase out of order without explicit instruction.**
 
 ---
 
 ## Development Patterns
+
+### Adding a new TranscriptionProvider
+
+1. Implement the `TranscriptionProvider` trait in `src/embeddings.rs`:
+
+```rust
+pub struct MyTranscriptionProvider { /* base_url, model, client */ }
+
+#[async_trait]
+impl TranscriptionProvider for MyTranscriptionProvider {
+    async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> Result<String> {
+        // Upload audio_bytes as multipart to the backend endpoint
+        // Return the transcribed text, trimmed
+        todo!()
+    }
+    fn model_name(&self) -> &str { &self.model }
+}
+```
+
+2. Add a factory method to `TranscriptionManager` (or expose construction directly).
+
+3. Gate live-server tests on `LEMONADE_URL` — see the existing
+   `test_lemonade_transcribe_*` tests in `embeddings.rs` for the pattern.
+
+4. **Do NOT add GPU resource management here** unless you are extending
+   `src/lemonade.rs`. The `TranscriptionProvider` trait is intentionally simple
+   and standalone. GPU contention belongs in `LemonadeSttProvider` / `GpuResourceManager`.
+
+---
 
 ### Adding a new EmbeddingProvider
 
@@ -86,8 +112,9 @@ impl EmbeddingProvider for MyProvider {
 
 3. Update `try_new_auto` if this provider should be auto-selected.
 
-4. Add tests — gate live-server tests on an environment variable (see `embeddings.rs`
-   pattern: `let Some(url) = lemonade_url() else { return; }`).
+4. Add tests — gate live-server tests using `crate::test_helpers::lemonade_url`
+   (see `embeddings.rs` pattern: `let Some(url) = lemonade_url().await else { return; }`).
+   The helper probes `localhost:8000` first, then falls back to `LEMONADE_URL`.
 
 5. **Do NOT add `Mutex<T>` around synchronous work in async embedding paths** (BUG-5
    pattern). Use `tokio::task::spawn_blocking` if CPU-bound work is unavoidable, or
@@ -133,7 +160,8 @@ SQLite file is created at `<db_path>/knowledge.db`.
 
 ## Lemonade Server Development
 
-When Lemonade Server is running, the embedding pipeline is fully operational:
+When Lemonade Server is running, both the embedding and transcription pipelines are
+fully operational:
 
 ```bash
 # Start Lemonade (separate terminal)
@@ -142,35 +170,68 @@ lemonade-server serve
 # Verify
 curl http://localhost:8000/api/v1/health
 
-# Pull required models
-lemonade-server pull nomic-embed-text
-lemonade-server pull bge-reranker-v2-m3   # needed for Phase 4
+# Pull models
+lemonade-server pull embed-gemma-300m-FLM        # embeddings (NPU, 0.62 GB) — default
+lemonade-server pull bge-reranker-v2-m3-GGUF     # reranking (GPU/CPU) — used by cli_demo
+lemonade-server pull whisper-v3-turbo-FLM        # transcription (NPU, 1.55 GB)
 
-# Point u-forge.ai at it
+# Point u-forge.ai at it (optional — localhost:8000 is auto-discovered)
 export LEMONADE_URL="http://localhost:8000/api/v1"
 ```
 
-`EmbeddingManager::try_new_auto(None, None)` reads `LEMONADE_URL`. If the variable
-is unset or the server is unreachable, it returns a descriptive error — there is no
-silent local fallback.
+`EmbeddingManager::try_new_auto(None, None)` is **async** and resolves the server
+URL in this order:
+1. Explicit argument passed to `try_new_auto`
+2. `LEMONADE_URL` environment variable
+3. Localhost probe — `GET http://localhost:8000/api/v1/health`, then `127.0.0.1:8000`
+   via `lemonade::resolve_lemonade_url()`
+
+Setting `LEMONADE_URL` is therefore **optional** when Lemonade Server is running on
+its default port. If no server can be found at all, a descriptive error is returned —
+there is no silent local fallback.
+
+`TranscriptionManager::try_new_auto(None, None)` also reads `LEMONADE_URL` but is
+**synchronous** — no probe request is made at construction. The default model is
+`whisper-v3-turbo-FLM`. Errors only surface when `transcribe()` is called.
+
+```rust
+// Embeddings (async construction — probes the server)
+let emb_mgr = EmbeddingManager::try_new_auto(None, None).await?;
+let vec = emb_mgr.get_provider().embed("A wise old wizard").await?;
+
+// Transcription (sync construction — no probe)
+let txn_mgr = TranscriptionManager::try_new_auto(None, None)?;
+let wav_bytes = std::fs::read("session.wav")?;
+let text = txn_mgr.get_provider().transcribe(wav_bytes, "session.wav").await?;
+```
+
+For production use where LLM inference and STT may contend for the same GPU, use
+the full `LemonadeStack` from `src/lemonade.rs` instead of the standalone
+`TranscriptionManager`. The stack wires `LemonadeSttProvider` to a shared
+`GpuResourceManager` that serialises access automatically.
 
 ---
 
 ## Testing
 
 ```bash
-cargo test                              # All tests (no server required)
-cargo test storage                      # Module-specific
-cargo test -- --nocapture               # With stdout
-RUST_LOG=debug cargo test -- --nocapture  # With debug logging
-cargo test test_name -- --exact         # Single test by name
+cargo test -- --test-threads=1                      # All tests (always single-threaded)
+cargo test storage -- --test-threads=1              # Module-specific
+cargo test -- --test-threads=1 --nocapture          # With stdout
+RUST_LOG=debug cargo test -- --test-threads=1 --nocapture  # With debug logging
+cargo test test_name -- --exact --test-threads=1    # Single test by name
 ```
 
 ### Test conventions
 
 - Every test gets its own `TempDir` → `KnowledgeGraph::new(temp_dir.path())`.
 - No model downloads in unit tests. Embedding tests use `MockEmbeddingProvider`
-  (deterministic fake vectors, defined inline) or skip when `LEMONADE_URL` is unset.
+  (deterministic fake vectors, defined inline) or skip when no Lemonade Server is
+  reachable (auto-probed via `test_helpers::lemonade_url`).
+- Transcription tests use `MockTranscriptionProvider` (returns a fixed string) for
+  unit tests, or skip when no server is reachable for integration tests.
+- Audio bytes in integration tests are generated by `make_silence_wav(secs)` — a
+  pure-Rust WAV builder in the `embeddings` test module. No binary fixture files.
 - Schema tests use `TempDir` for storage isolation.
 - FTS5 search tests: insert a chunk, call `search_chunks_fts`, assert result.
 
@@ -179,7 +240,7 @@ cargo test test_name -- --exact         # Single test by name
 ```bash
 cargo fmt --check
 cargo clippy -- -D warnings
-cargo test
+cargo test -- --test-threads=1
 cargo doc --no-deps
 cargo run --example cli_demo
 ```
@@ -191,7 +252,10 @@ cargo run --example cli_demo
 | Problem | Fix |
 |---|---|
 | `openssl-sys` build error | `apt install pkg-config libssl-dev` (Ubuntu) / `brew install openssl` (macOS) |
-| `Lemonade Server not available` error | Run `lemonade-server serve` and `export LEMONADE_URL=...` |
+| `Lemonade Server not available` error | Run `lemonade-server serve` — server on `localhost:8000` is auto-discovered; `LEMONADE_URL` only needed for non-default URLs |
+| Transcription error on first call | Model not loaded yet — first call triggers load; retry, or check `GET /api/v1/health` |
+| `transcribe()` returns error: "Could not open audio data" | Empty or corrupt audio bytes passed to provider |
+| `TranscriptionManager::try_new_auto` fails without server | No server on `localhost:8000` and `LEMONADE_URL` not set — construction is sync so this is a URL-resolution error, not a connectivity error |
 | Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
 | Dimension mismatch (future sqlite-vec) | Ensure embedding model matches vector column dimensions |
 | `database is locked` | Only one writer at a time; check for stale processes holding `knowledge.db` |
