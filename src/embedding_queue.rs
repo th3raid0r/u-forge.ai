@@ -272,7 +272,9 @@ impl EmbeddingQueue {
         {
             let status_map = request_status.read().await;
             if let Some(RequestStatus::Cancelled) = status_map.get(&request_id) {
-                let _ = request.response_sender.send(Err(anyhow::anyhow!("Request cancelled")));
+                let _ = request
+                    .response_sender
+                    .send(Err(anyhow::anyhow!("Request cancelled")));
                 return;
             }
         }
@@ -293,11 +295,9 @@ impl EmbeddingQueue {
         // Perform embedding in spawn_blocking to avoid blocking the async runtime
         let text = request.text;
         let provider_clone = provider.clone();
-        
+
         let result = task::spawn_blocking(move || {
-            tokio::runtime::Handle::current().block_on(async {
-                provider_clone.embed(&text).await
-            })
+            tokio::runtime::Handle::current().block_on(async { provider_clone.embed(&text).await })
         })
         .await;
 
@@ -369,7 +369,9 @@ impl EmbeddingQueue {
         {
             let status_map = request_status.read().await;
             if let Some(RequestStatus::Cancelled) = status_map.get(&request_id) {
-                let _ = request.response_sender.send(Err(anyhow::anyhow!("Request cancelled")));
+                let _ = request
+                    .response_sender
+                    .send(Err(anyhow::anyhow!("Request cancelled")));
                 return;
             }
         }
@@ -390,11 +392,10 @@ impl EmbeddingQueue {
         // Process batch in spawn_blocking
         let texts = request.texts;
         let provider_clone = provider.clone();
-        
+
         let result = task::spawn_blocking(move || {
-            tokio::runtime::Handle::current().block_on(async {
-                provider_clone.embed_batch(texts).await
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async { provider_clone.embed_batch(texts).await })
         })
         .await;
 
@@ -493,73 +494,83 @@ impl Default for EmbeddingQueueBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeddings::EmbeddingManager;
-    use std::path::PathBuf;
+    use crate::embeddings::{EmbeddingModelInfo, EmbeddingProviderType};
     use tokio::time::{timeout, Duration};
 
-    async fn create_test_queue() -> EmbeddingQueue {
-        // Use cache directory from environment variable (set in env.sh)
-        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .join("test_model_cache");
-                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
-                path
-            });
-        
-        let embedding_manager = EmbeddingManager::try_new_local_default(Some(cache_dir))
-            .expect("Failed to create embedding manager");
-        
-        EmbeddingQueue::new(embedding_manager.get_provider())
+    // ── Mock provider ─────────────────────────────────────────────────────────
+    // Used instead of FastEmbed / Lemonade so queue tests run with no server.
+
+    const MOCK_DIMS: usize = 16;
+
+    struct MockEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for MockEmbeddingProvider {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            // Deterministic fake embedding based on text length.
+            let v = (0..MOCK_DIMS)
+                .map(|i| (text.len() as f32 + i as f32) / 100.0)
+                .collect();
+            Ok(v)
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for t in &texts {
+                out.push(self.embed(t).await?);
+            }
+            Ok(out)
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(MOCK_DIMS)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
+    fn create_test_queue() -> EmbeddingQueue {
+        EmbeddingQueue::new(std::sync::Arc::new(MockEmbeddingProvider))
     }
 
     #[tokio::test]
     async fn test_single_embedding_request() {
-        let queue = create_test_queue().await;
-        
+        let queue = create_test_queue();
+
         let receiver = queue
-            .embed_text(
-                "Test document".to_string(),
-                None,
-                None,
-            )
+            .embed_text("Test document".to_string(), None, None)
             .await
             .expect("Failed to submit request");
 
-        let result = timeout(Duration::from_secs(10), receiver)
+        let result = timeout(Duration::from_secs(5), receiver)
             .await
             .expect("Request timed out")
             .expect("Failed to receive response")
             .expect("Embedding failed");
 
-        // Get expected dimensions from a separate embedding manager
-        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .join("test_model_cache");
-                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
-                path
-            });
-        let embedding_manager = EmbeddingManager::try_new_local_default(Some(cache_dir)).unwrap();
-        let expected_dims = embedding_manager.get_provider().dimensions().unwrap();
-        
-        assert_eq!(result.len(), expected_dims);
+        assert_eq!(result.len(), MOCK_DIMS);
     }
 
     #[tokio::test]
     async fn test_batch_embedding_request() {
-        let queue = create_test_queue().await;
-        
+        let queue = create_test_queue();
+
         let texts = vec![
             "First document".to_string(),
             "Second document".to_string(),
             "Third document".to_string(),
         ];
-        
+
         let receiver = queue
             .embed_batch(
                 texts.clone(),
@@ -569,41 +580,24 @@ mod tests {
             .await
             .expect("Failed to submit batch request");
 
-        let result = timeout(Duration::from_secs(15), receiver)
+        let result = timeout(Duration::from_secs(5), receiver)
             .await
             .expect("Batch request timed out")
             .expect("Failed to receive batch response")
             .expect("Batch embedding failed");
 
-        // Get expected dimensions from a separate embedding manager
-        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .join("test_model_cache");
-                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
-                path
-            });
-        let embedding_manager = EmbeddingManager::try_new_local_default(Some(cache_dir)).unwrap();
-        let expected_dims = embedding_manager.get_provider().dimensions().unwrap();
-        
         assert_eq!(result.len(), texts.len());
         for embedding in result {
-            assert_eq!(embedding.len(), expected_dims);
+            assert_eq!(embedding.len(), MOCK_DIMS);
         }
     }
 
     #[tokio::test]
     async fn test_request_status_tracking() {
-        let queue = create_test_queue().await;
-        
+        let queue = create_test_queue();
+
         let receiver = queue
-            .embed_text(
-                "Status test document".to_string(),
-                None,
-                None,
-            )
+            .embed_text("Status test document".to_string(), None, None)
             .await
             .expect("Failed to submit request");
 
@@ -622,14 +616,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_progress_updates() {
-        let queue = create_test_queue().await;
-        
+        let queue = create_test_queue();
+
         let _receiver = queue
-            .embed_text(
-                "Progress test document".to_string(),
-                None,
-                None,
-            )
+            .embed_text("Progress test document".to_string(), None, None)
             .await
             .expect("Failed to submit request");
 

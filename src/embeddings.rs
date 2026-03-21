@@ -1,327 +1,474 @@
-//! embeddings.rs - Handles text embedding generation using various providers.
+//! embeddings.rs - Text embedding providers for u-forge.ai.
+//!
+//! All embeddings are generated via Lemonade Server's OpenAI-compatible HTTP API.
+//! FastEmbed and ONNX Runtime have been removed — there are no in-process embedding
+//! models and no C++ compilation requirements.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! # use u_forge_ai::embeddings::EmbeddingManager;
+//! // Auto: reads LEMONADE_URL env var, connects to Lemonade Server
+//! # async fn example() {
+//! let mgr = EmbeddingManager::try_new_auto(None, None).await.unwrap();
+//! let embedding = mgr.get_provider().embed("Hello, world!").await.unwrap();
+//! println!("dims: {}", embedding.len());
+//! # }
+//! ```
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, InitOptions, ModelInfo, TextEmbedding, Embedding as FastEmbedEmbedding};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use tracing::info;
+use std::sync::Arc;
+use tracing::{info, warn};
 
-#[cfg(test)]
-use std::sync::OnceLock;
+// ─────────────────────────────────────────────────────────────────────────────
+// Provider type identifiers
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Defines the types of embedding providers available.
+/// Identifies which backend is powering an [`EmbeddingProvider`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EmbeddingProviderType {
-    Local(LocalEmbeddingModelType),
-    Ollama, // Placeholder for future Ollama integration
-    Cloud,  // Placeholder for future Cloud API integration
+    /// Lemonade Server HTTP provider (AMD OpenAI-compatible API).
+    Lemonade,
+    /// Placeholder for future Ollama integration.
+    Ollama,
+    /// Placeholder for future cloud API integration.
+    Cloud,
 }
 
-/// Specifies the type of local embedding model.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum LocalEmbeddingModelType {
-    FastEmbed(FastEmbedModel),
+// ─────────────────────────────────────────────────────────────────────────────
+// Model info (our own type — no fastembed dependency)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Human-readable metadata about an embedding model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingModelInfo {
+    /// Model identifier as understood by the backend (e.g. `"nomic-embed-text"`).
+    pub name: String,
+    /// Output vector dimensionality.
+    pub dimensions: usize,
+    /// Free-form description.
+    pub description: Option<String>,
 }
 
-/// Alias for specific FastEmbed models for easier configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FastEmbedModel {
-    AllMiniLmL6V2,      // sentence-transformers/all-MiniLM-L6-v2
-    BgeSmallEnV15,      // BAAI/bge-small-en-v1.5
-    BgeBaseEnV15,       // BAAI/bge-base-en-v1.5
-    BgeLargeEnV15,      // BAAI/bge-large-en-v1.5
-    NomicEmbedTextV15,  // nomic-ai/nomic-embed-text-v1.5
-    // Add more as needed
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// EmbeddingProvider trait
+// ─────────────────────────────────────────────────────────────────────────────
 
-impl FastEmbedModel {
-    pub fn to_embedding_model(&self) -> EmbeddingModel {
-        match self {
-            FastEmbedModel::AllMiniLmL6V2 => EmbeddingModel::AllMiniLML6V2,
-            FastEmbedModel::BgeSmallEnV15 => EmbeddingModel::BGESmallENV15,
-            FastEmbedModel::BgeBaseEnV15 => EmbeddingModel::BGEBaseENV15,
-            FastEmbedModel::BgeLargeEnV15 => EmbeddingModel::BGELargeENV15,
-            FastEmbedModel::NomicEmbedTextV15 => EmbeddingModel::NomicEmbedTextV15,
-        }
-    }
-
-    pub fn default_model() -> Self {
-        FastEmbedModel::NomicEmbedTextV15 // A good balance of size and performance
-    }
-}
-
-/// Trait for embedding providers.
+/// Core trait for all embedding backends.
+///
+/// Implementations must be `Send + Sync` so they can be shared across async tasks.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
+    /// Embed a single text string into a dense vector.
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Embed a batch of texts, returning one vector per input in the same order.
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>>;
+
+    /// Number of dimensions in each output vector.
     fn dimensions(&self) -> Result<usize>;
-    fn max_tokens(&self) -> Result<usize>; // Maximum tokens the model can handle in one go
+
+    /// Maximum number of tokens the model can process in one call.
+    fn max_tokens(&self) -> Result<usize>;
+
+    /// Which backend powers this provider.
     fn provider_type(&self) -> EmbeddingProviderType;
-    fn model_info(&self) -> Option<ModelInfo<EmbeddingModel>>;
+
+    /// Optional model metadata.  Returns `None` when unavailable.
+    fn model_info(&self) -> Option<EmbeddingModelInfo>;
 }
 
-/// Embedding provider using FastEmbed for local, on-device embeddings.
-pub struct FastEmbedProvider {
-    model: Mutex<TextEmbedding>,
-    model_info: ModelInfo<EmbeddingModel>,
-    model_type: FastEmbedModel,
+// ─────────────────────────────────────────────────────────────────────────────
+// LemonadeProvider
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Embedding provider backed by [Lemonade Server](https://github.com/lemonade-sdk/lemonade).
+///
+/// Uses the OpenAI-compatible `POST /api/v1/embeddings` endpoint.  The server
+/// must be running before this provider is constructed; `new` probes the
+/// dimensions by sending a single dummy request.
+///
+/// This provider is fully async — no Tokio threads are ever blocked (fixes BUG-5).
+pub struct LemonadeProvider {
+    client: reqwest::Client,
+    /// Base URL of the Lemonade Server API, e.g. `"http://localhost:8000/api/v1"`.
+    base_url: String,
+    /// Model identifier, e.g. `"nomic-embed-text"`.
+    model: String,
+    /// Probed on construction.
+    dimensions: usize,
 }
 
-impl FastEmbedProvider {
-    /// Creates a new FastEmbedProvider.
+impl LemonadeProvider {
+    /// Connect to a Lemonade Server instance and probe the embedding dimensions.
     ///
-    /// # Arguments
-    /// * `model_name` - The specific FastEmbed model to use.
-    /// * `cache_dir` - Optional directory to cache downloaded models.
-    /// * `show_download_progress` - Whether to display download progress.
-    pub fn new(
-        model_type: FastEmbedModel,
-        cache_dir: Option<PathBuf>,
-        show_download_progress: bool,
-    ) -> Result<Self> {
-        let embedding_model = model_type.to_embedding_model();
-        let mut init_options = InitOptions::new(embedding_model.clone())
-            .with_show_download_progress(show_download_progress);
-        
-        if let Some(cache_path) = cache_dir.clone() {
-            init_options = init_options.with_cache_dir(cache_path);
-        }
+    /// # Errors
+    /// Returns an error if the server is unreachable or the model is not loaded.
+    pub async fn new(base_url: &str, model: &str) -> Result<Self> {
+        let client = reqwest::Client::new();
 
-        info!(
-            "Initializing FastEmbed model: {:?}, cache_dir: {:?}, show_progress: {}",
-            embedding_model, cache_dir, show_download_progress
-        );
+        let resp = client
+            .post(format!("{}/embeddings", base_url))
+            .header("Authorization", "Bearer lemonade")
+            .json(&serde_json::json!({
+                "model": model,
+                "input": ["dimension probe"]
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to connect to Lemonade Server at {}: {}",
+                    base_url,
+                    e
+                )
+            })?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| anyhow!("Failed to parse Lemonade Server probe response: {}", e))?;
 
-        let model = TextEmbedding::try_new(init_options)
-            .map_err(|e| anyhow!("Failed to initialize FastEmbed model: {}", e))?;
+        let dimensions = resp["data"][0]["embedding"]
+            .as_array()
+            .map(|a| a.len())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to probe embedding dimensions from Lemonade Server — \
+                     check that model '{}' is loaded (run: lemonade-server pull {})",
+                    model,
+                    model
+                )
+            })?;
 
-        let model_info = TextEmbedding::get_model_info(&embedding_model)?.clone();
-        
-        info!("FastEmbed model initialized: {:?}", model_info);
+        info!(base_url, model, dimensions, "LemonadeProvider connected");
 
-        Ok(Self { model: Mutex::new(model), model_info, model_type })
-    }
-
-    /// Creates a default FastEmbedProvider using `BgeSmallEnV15`.
-    /// Recommended for most users.
-    pub fn default(cache_dir: Option<PathBuf>, show_download_progress: bool) -> Result<Self> {
-        Self::new(FastEmbedModel::default_model(), cache_dir, show_download_progress)
+        Ok(Self {
+            client,
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            dimensions,
+        })
     }
 }
 
 #[async_trait]
-impl EmbeddingProvider for FastEmbedProvider {
+impl EmbeddingProvider for LemonadeProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        // FastEmbed's embed function takes Vec<&str>, so we wrap the single string.
-        // It returns Vec<Embedding>, so we take the first.
-        let documents = vec![text];
-        let embeddings: Vec<FastEmbedEmbedding> = self.model.lock()
-            .map_err(|e| anyhow!("Failed to acquire model lock: {}", e))?
-            .embed(documents, None)
-            .map_err(|e| anyhow!("FastEmbed embedding failed: {}", e))?;
-        
-        embeddings.into_iter().next()
-            .ok_or_else(|| anyhow!("FastEmbed returned no embedding for a single document"))
+        let resp = self
+            .client
+            .post(format!("{}/embeddings", self.base_url))
+            .header("Authorization", "Bearer lemonade")
+            .json(&serde_json::json!({
+                "model": self.model,
+                "input": [text]
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Lemonade Server request failed: {}", e))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| anyhow!("Failed to parse Lemonade embed response: {}", e))?;
+
+        let embedding: Vec<f32> = resp["data"][0]["embedding"]
+            .as_array()
+            .ok_or_else(|| anyhow!("Lemonade Server returned no embedding in response"))?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+
+        Ok(embedding)
     }
 
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        // Convert Vec<String> to Vec<&str> for FastEmbed
-        let text_slices: Vec<&str> = texts.iter().map(AsRef::as_ref).collect();
-        let embeddings: Vec<FastEmbedEmbedding> = self.model.lock()
-            .map_err(|e| anyhow!("Failed to acquire model lock: {}", e))?
-            .embed(text_slices, None)
-            .map_err(|e| anyhow!("FastEmbed batch embedding failed: {}", e))?;
-        Ok(embeddings)
+        let resp = self
+            .client
+            .post(format!("{}/embeddings", self.base_url))
+            .header("Authorization", "Bearer lemonade")
+            .json(&serde_json::json!({
+                "model": self.model,
+                "input": texts
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Lemonade Server batch request failed: {}", e))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| anyhow!("Failed to parse Lemonade batch response: {}", e))?;
+
+        let data = resp["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("Lemonade Server returned no 'data' array in batch response"))?;
+
+        data.iter()
+            .map(|item| {
+                item["embedding"]
+                    .as_array()
+                    .ok_or_else(|| anyhow!("Missing 'embedding' field in Lemonade batch item"))
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                            .collect()
+                    })
+            })
+            .collect()
     }
 
     fn dimensions(&self) -> Result<usize> {
-        Ok(self.model_info.dim)
+        Ok(self.dimensions)
     }
 
     fn max_tokens(&self) -> Result<usize> {
-        // FastEmbed models typically have a max sequence length.
-        // Since ModelInfo doesn't expose max_length directly in the current version,
-        // we'll use a reasonable default based on common embedding models.
-        // BGE models, for example, often have 512.
-        Ok(512)
+        // nomic-embed-text and most Lemonade models support 8 K context.
+        Ok(8192)
     }
 
     fn provider_type(&self) -> EmbeddingProviderType {
-        EmbeddingProviderType::Local(LocalEmbeddingModelType::FastEmbed(self.model_type.clone()))
+        EmbeddingProviderType::Lemonade
     }
 
-    fn model_info(&self) -> Option<ModelInfo<EmbeddingModel>> {
-        Some(self.model_info.clone())
+    fn model_info(&self) -> Option<EmbeddingModelInfo> {
+        Some(EmbeddingModelInfo {
+            name: self.model.clone(),
+            dimensions: self.dimensions,
+            description: Some(format!("Lemonade Server model at {}", self.base_url)),
+        })
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EmbeddingManager
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Manages available embedding providers.
+/// Owns a single [`EmbeddingProvider`] and hands out `Arc` references to it.
+///
+/// Construct via [`EmbeddingManager::try_new_auto`] for production use, or
+/// [`EmbeddingManager::try_new_lemonade`] when the URL is known.
 pub struct EmbeddingManager {
     provider: Arc<dyn EmbeddingProvider>,
 }
 
-impl EmbeddingManager {
-    /// Creates a new EmbeddingManager, attempting to initialize the best available local provider.
-    pub fn try_new_local_default(cache_dir: Option<PathBuf>) -> Result<Self> {
-        // Attempt to initialize FastEmbedProvider as the default
-        match FastEmbedProvider::default(cache_dir.clone(), true) {
-            Ok(fastembed_provider) => {
-                info!("Successfully initialized FastEmbedProvider as default.");
-                Ok(Self {
-                    provider: Arc::new(fastembed_provider),
-                })
-            }
-            Err(e) => {
-                // In a real app, you might try other providers or return a "NoOpProvider"
-                // For now, we just error out if the default local can't be initialized.
-                Err(anyhow!("Failed to initialize default local embedding provider (FastEmbed): {}", e))
-            }
-        }
+impl std::fmt::Debug for EmbeddingManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingManager")
+            .field("provider_type", &self.provider.provider_type())
+            .field("dimensions", &self.provider.dimensions().ok())
+            .finish()
     }
-    
-    /// Creates an EmbeddingManager with a specific FastEmbed model.
-    pub fn new_fastembed(model_type: FastEmbedModel, cache_dir: Option<PathBuf>) -> Result<Self> {
-        let provider = FastEmbedProvider::new(model_type, cache_dir, true)?;
+}
+
+impl EmbeddingManager {
+    /// Connect directly to a Lemonade Server instance.
+    pub async fn try_new_lemonade(base_url: &str, model: &str) -> Result<Self> {
+        let provider = LemonadeProvider::new(base_url, model).await?;
+        info!(base_url, model, "EmbeddingManager: using Lemonade Server");
         Ok(Self {
             provider: Arc::new(provider),
         })
     }
 
+    /// Auto-select a provider.
+    ///
+    /// Resolution order:
+    /// 1. `lemonade_url` argument (if provided)
+    /// 2. `LEMONADE_URL` environment variable
+    /// 3. Hard error — there is no local fallback in this build
+    ///
+    /// `model` defaults to `"nomic-embed-text"` when `None`.
+    pub async fn try_new_auto(lemonade_url: Option<&str>, model: Option<&str>) -> Result<Self> {
+        let resolved_url = lemonade_url
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("LEMONADE_URL").ok());
+
+        match resolved_url {
+            Some(url) => {
+                let lemonade_model = model.unwrap_or("nomic-embed-text");
+                match Self::try_new_lemonade(&url, lemonade_model).await {
+                    Ok(mgr) => {
+                        info!(url, "Auto-selected Lemonade Server");
+                        Ok(mgr)
+                    }
+                    Err(e) => {
+                        warn!(url, error = %e, "Lemonade Server not available");
+                        Err(anyhow!(
+                            "Lemonade Server not available at {} ({}). \
+                             Ensure lemonade-server is running and the model is pulled:\n  \
+                             lemonade-server serve\n  \
+                             lemonade-server pull {}",
+                            url,
+                            e,
+                            lemonade_model
+                        ))
+                    }
+                }
+            }
+            None => Err(anyhow!(
+                "No Lemonade Server URL configured. Set the LEMONADE_URL environment \
+                 variable or pass a URL explicitly:\n  \
+                 export LEMONADE_URL=http://localhost:8000/api/v1"
+            )),
+        }
+    }
+
+    /// Return a clone of the inner provider, suitable for passing to async tasks.
     pub fn get_provider(&self) -> Arc<dyn EmbeddingProvider> {
         self.provider.clone()
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Global lock to prevent race conditions during model initialization
-    static TEST_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    // Helper to ensure models are downloaded only once per test run for speed.
-    // Note: For CI, you might pre-download models or use a shared cache.
-    fn get_test_cache_dir() -> PathBuf {
-        // Use environment variable for consistent caching across runs (set in env.sh)
-        std::env::var("FASTEMBED_CACHE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .join("test_model_cache");
-                std::fs::create_dir_all(&path).expect("Failed to create test model cache dir");
-                // Set the environment variable for FastEmbed to use
-                std::env::set_var("FASTEMBED_CACHE_PATH", &path);
-                path
-            })
+    /// Returns the Lemonade Server URL from the environment, or `None` if not set.
+    /// Tests that require a live server are skipped when this returns `None`.
+    fn lemonade_url() -> Option<String> {
+        std::env::var("LEMONADE_URL").ok()
     }
 
-    // Helper to create providers with proper locking to avoid race conditions
-    fn create_test_provider(model_type: FastEmbedModel) -> Result<FastEmbedProvider> {
-        let _lock = TEST_INIT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let cache_dir = get_test_cache_dir();
-        FastEmbedProvider::new(model_type, Some(cache_dir), false)
+    // ── Unit tests (no server required) ──────────────────────────────────────
+
+    #[test]
+    fn test_embedding_provider_type_serialize() {
+        let t = EmbeddingProviderType::Lemonade;
+        let json = serde_json::to_string(&t).unwrap();
+        let back: EmbeddingProviderType = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, back);
     }
 
-    fn create_test_embedding_manager() -> Result<EmbeddingManager> {
-        let _lock = TEST_INIT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let cache_dir = get_test_cache_dir();
-        EmbeddingManager::try_new_local_default(Some(cache_dir))
+    #[test]
+    fn test_embedding_model_info_fields() {
+        let info = EmbeddingModelInfo {
+            name: "nomic-embed-text".to_string(),
+            dimensions: 768,
+            description: Some("Test model".to_string()),
+        };
+        assert_eq!(info.name, "nomic-embed-text");
+        assert_eq!(info.dimensions, 768);
+        assert!(info.description.is_some());
     }
 
     #[tokio::test]
-    async fn test_fastembed_provider_default_initialization() {
-        let provider_result = create_test_provider(FastEmbedModel::default_model());
-        assert!(provider_result.is_ok(), "Failed to initialize default FastEmbedProvider: {:?}", provider_result.err());
-        
-        if let Ok(provider) = provider_result {
-            assert_eq!(provider.provider_type(), EmbeddingProviderType::Local(LocalEmbeddingModelType::FastEmbed(FastEmbedModel::default_model())));
-            let dims = provider.dimensions().unwrap();
-            // NomicEmbedTextV15 has 768 dimensions
-            assert_eq!(dims, 768, "Default model (NomicEmbedTextV15) should have 768 dimensions");
-            let model_info = provider.model_info().unwrap();
-            assert_eq!(model_info.model, FastEmbedModel::default_model().to_embedding_model());
+    async fn test_try_new_auto_fails_without_url() {
+        // Make sure LEMONADE_URL is not set for this sub-test
+        // (if it IS set, the test is skipped rather than asserting failure)
+        if std::env::var("LEMONADE_URL").is_ok() {
+            return; // live server might be available — skip the "no URL" path
         }
-    }
-    
-    #[tokio::test]
-    async fn test_fastembed_provider_specific_model_initialization() {
-        // Test with a different, very small model if available, e.g., AllMiniLML6V2
-        let model_type = FastEmbedModel::AllMiniLmL6V2;
-        let provider_result = create_test_provider(model_type.clone());
-        assert!(provider_result.is_ok(), "Failed to initialize FastEmbedProvider with AllMiniLmL6V2: {:?}", provider_result.err());
-
-        if let Ok(provider) = provider_result {
-            assert_eq!(provider.provider_type(), EmbeddingProviderType::Local(LocalEmbeddingModelType::FastEmbed(model_type)));
-            let dims = provider.dimensions().unwrap();
-            // AllMiniLmL6V2 has 384 dimensions
-            assert_eq!(dims, 384, "AllMiniLmL6V2 model should have 384 dimensions");
-             let model_info = provider.model_info().unwrap();
-            assert_eq!(model_info.model, FastEmbedModel::AllMiniLmL6V2.to_embedding_model());
-        }
+        let result = EmbeddingManager::try_new_auto(None, None).await;
+        assert!(
+            result.is_err(),
+            "Expected error when no URL is configured, got Ok"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("LEMONADE_URL"),
+            "Error message should mention LEMONADE_URL, got: {msg}"
+        );
     }
 
     #[tokio::test]
-    async fn test_fastembed_embed_single_document() {
-        let provider = create_test_provider(FastEmbedModel::default_model()).unwrap();
-        let text = "This is a test document.";
-        let embedding_result = provider.embed(text).await;
+    async fn test_try_new_lemonade_unreachable() {
+        let result =
+            EmbeddingManager::try_new_lemonade("http://127.0.0.1:19999/api/v1", "nomic-embed-text")
+                .await;
+        assert!(
+            result.is_err(),
+            "Expected connection error for unreachable server"
+        );
+    }
 
-        assert!(embedding_result.is_ok(), "Embedding failed: {:?}", embedding_result.err());
-        let embedding = embedding_result.unwrap();
-        assert_eq!(embedding.len(), provider.dimensions().unwrap(), "Embedding dimension mismatch");
-        assert!(embedding.iter().all(|&x| x.is_finite()), "Embedding contains non-finite values");
+    // ── Integration tests (require a running Lemonade Server) ─────────────────
+
+    #[tokio::test]
+    async fn test_lemonade_provider_connect_and_dimensions() {
+        let Some(url) = lemonade_url() else {
+            eprintln!("Skipping: LEMONADE_URL not set");
+            return;
+        };
+        let provider = LemonadeProvider::new(&url, "nomic-embed-text").await;
+        assert!(
+            provider.is_ok(),
+            "Failed to connect to Lemonade Server: {:?}",
+            provider.err()
+        );
+        let provider = provider.unwrap();
+        let dims = provider.dimensions().unwrap();
+        assert!(dims > 0, "Expected non-zero dimensions, got {dims}");
+        assert_eq!(provider.provider_type(), EmbeddingProviderType::Lemonade);
+        let info = provider.model_info().unwrap();
+        assert_eq!(info.name, "nomic-embed-text");
+        assert_eq!(info.dimensions, dims);
     }
 
     #[tokio::test]
-    async fn test_fastembed_embed_batch_documents() {
-        let provider = create_test_provider(FastEmbedModel::default_model()).unwrap();
+    async fn test_lemonade_embed_single() {
+        let Some(url) = lemonade_url() else {
+            eprintln!("Skipping: LEMONADE_URL not set");
+            return;
+        };
+        let provider = LemonadeProvider::new(&url, "nomic-embed-text")
+            .await
+            .expect("Connect to Lemonade");
+        let dims = provider.dimensions().unwrap();
+
+        let embedding = provider.embed("The quick brown fox").await;
+        assert!(embedding.is_ok(), "embed() failed: {:?}", embedding.err());
+        let embedding = embedding.unwrap();
+        assert_eq!(embedding.len(), dims, "Dimension mismatch");
+        assert!(
+            embedding.iter().all(|&x| x.is_finite()),
+            "Embedding contains non-finite values"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lemonade_embed_batch() {
+        let Some(url) = lemonade_url() else {
+            eprintln!("Skipping: LEMONADE_URL not set");
+            return;
+        };
+        let provider = LemonadeProvider::new(&url, "nomic-embed-text")
+            .await
+            .expect("Connect to Lemonade");
+        let dims = provider.dimensions().unwrap();
+
         let texts = vec![
-            "First test document.".to_string(),
-            "Second test document, slightly longer.".to_string(),
-            "Third one.".to_string(),
+            "First sentence.".to_string(),
+            "Second sentence, a bit longer.".to_string(),
+            "Third.".to_string(),
         ];
-        let embeddings_result = provider.embed_batch(texts.clone()).await;
-
-        assert!(embeddings_result.is_ok(), "Batch embedding failed: {:?}", embeddings_result.err());
-        let embeddings = embeddings_result.unwrap();
-        assert_eq!(embeddings.len(), texts.len(), "Number of embeddings does not match number of texts");
-        for embedding in embeddings {
-            assert_eq!(embedding.len(), provider.dimensions().unwrap(), "Embedding dimension mismatch in batch");
-            assert!(embedding.iter().all(|&x| x.is_finite()), "Batch embedding contains non-finite values");
-        }
-    }
-    
-    #[tokio::test]
-    async fn test_embedding_manager_default_initialization() {
-        let manager_result = create_test_embedding_manager();
-        assert!(manager_result.is_ok(), "Failed to initialize EmbeddingManager: {:?}", manager_result.err());
-
-        if let Ok(manager) = manager_result {
-            let provider = manager.get_provider();
-            assert_eq!(provider.provider_type(), EmbeddingProviderType::Local(LocalEmbeddingModelType::FastEmbed(FastEmbedModel::default_model())));
-            assert!(provider.dimensions().unwrap() > 0);
+        let embeddings = provider.embed_batch(texts.clone()).await;
+        assert!(
+            embeddings.is_ok(),
+            "embed_batch() failed: {:?}",
+            embeddings.err()
+        );
+        let embeddings = embeddings.unwrap();
+        assert_eq!(embeddings.len(), texts.len(), "Wrong number of embeddings");
+        for emb in &embeddings {
+            assert_eq!(emb.len(), dims, "Dimension mismatch in batch");
+            assert!(
+                emb.iter().all(|&x| x.is_finite()),
+                "Non-finite value in batch embedding"
+            );
         }
     }
 
     #[tokio::test]
-    async fn test_embedding_manager_specific_fastembed_model() {
-        let model_type = FastEmbedModel::AllMiniLmL6V2; // Use a known small model
-        let _lock = TEST_INIT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let cache_dir = get_test_cache_dir();
-        let manager_result = EmbeddingManager::new_fastembed(model_type.clone(), Some(cache_dir));
-        assert!(manager_result.is_ok(), "Failed to initialize EmbeddingManager with specific model: {:?}", manager_result.err());
-
-        if let Ok(manager) = manager_result {
-            let provider = manager.get_provider();
-            assert_eq!(provider.provider_type(), EmbeddingProviderType::Local(LocalEmbeddingModelType::FastEmbed(model_type)));
-            assert_eq!(provider.dimensions().unwrap(), 384);
-        }
+    async fn test_embedding_manager_try_new_auto() {
+        let Some(url) = lemonade_url() else {
+            eprintln!("Skipping: LEMONADE_URL not set");
+            return;
+        };
+        let mgr = EmbeddingManager::try_new_auto(Some(&url), None).await;
+        assert!(mgr.is_ok(), "try_new_auto failed: {:?}", mgr.err());
+        let provider = mgr.unwrap().get_provider();
+        assert_eq!(provider.provider_type(), EmbeddingProviderType::Lemonade);
+        assert!(provider.dimensions().unwrap() > 0);
     }
-
 }

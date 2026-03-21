@@ -123,7 +123,7 @@ impl<'a> DataIngestion<'a> {
             self.import_json_data(&data_file).await?;
         } else {
             return Err(anyhow::anyhow!(
-                "Data file not found: {}. Set UFORGE_DATA_FILE environment variable or place file at ./defaults/data/memory.json", 
+                "Data file not found: {}. Set UFORGE_DATA_FILE environment variable or place file at ./defaults/data/memory.json",
                 data_file
             ));
         }
@@ -149,6 +149,24 @@ impl<'a> DataIngestion<'a> {
                 metadata,
             } = entry
             {
+                // BUG-6 fix: Check for an existing object with the same type+name before
+                // inserting to prevent duplicate nodes on repeated imports.
+                match self.graph.find_by_name(&node_type, &name) {
+                    Ok(existing) if !existing.is_empty() => {
+                        let existing_id = existing[0].id;
+                        warn!(
+                            "Skipping duplicate object '{}' (type: '{}'), reusing existing id {}",
+                            name, node_type, existing_id
+                        );
+                        name_to_id.insert(name, existing_id);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Dedup check failed for '{}': {}", name, e);
+                    }
+                    _ => {}
+                }
+
                 let object_metadata = self
                     .create_object_by_type(&name, &node_type, &metadata)
                     .await?;
@@ -183,14 +201,22 @@ impl<'a> DataIngestion<'a> {
                 edge_type,
             } = entry
             {
-                if let (Some(&from_id), Some(&to_id)) = (name_to_id.get(&from), name_to_id.get(&to))
-                {
-                    match self.graph.connect_objects_str(from_id, to_id, &edge_type) {
-                        Ok(()) => self.stats.relationships_created += 1,
-                        Err(e) => error!("Failed to create edge {} -> {}: {}", from, to, e),
+                // BUG-7 fix: Resolve node names using the session map first, then fall back
+                // to a storage scan so edges referencing nodes from prior imports resolve
+                // correctly across sessions.
+                let from_id = self.resolve_node_id(&from, name_to_id);
+                let to_id = self.resolve_node_id(&to, name_to_id);
+
+                match (from_id, to_id) {
+                    (Some(fid), Some(tid)) => {
+                        match self.graph.connect_objects_str(fid, tid, &edge_type) {
+                            Ok(()) => self.stats.relationships_created += 1,
+                            Err(e) => error!("Failed to create edge {} -> {}: {}", from, to, e),
+                        }
                     }
-                } else {
-                    error!("Missing node reference for edge {} -> {}", from, to);
+                    _ => {
+                        error!("Missing node reference for edge {} -> {}", from, to);
+                    }
                 }
             }
         }
@@ -200,6 +226,40 @@ impl<'a> DataIngestion<'a> {
             self.stats.relationships_created
         );
         Ok(())
+    }
+
+    /// Resolve a node name to an ObjectId.
+    ///
+    /// Checks the in-session `name_to_id` map first (fast path), then falls back to a
+    /// storage name-index scan for nodes created in previous import sessions (BUG-7 fix).
+    fn resolve_node_id(
+        &self,
+        name: &str,
+        name_to_id: &HashMap<String, ObjectId>,
+    ) -> Option<ObjectId> {
+        // Fast path: current session
+        if let Some(&id) = name_to_id.get(name) {
+            return Some(id);
+        }
+
+        // Slow path: cross-session storage lookup (O(N) on CF_NAMES)
+        match self.graph.find_by_name_only(name) {
+            Ok(results) if !results.is_empty() => {
+                if results.len() > 1 {
+                    warn!(
+                        "Ambiguous node name '{}' matched {} objects in storage; using first match",
+                        name,
+                        results.len()
+                    );
+                }
+                Some(results[0].id)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Storage lookup failed for node '{}': {}", name, e);
+                None
+            }
+        }
     }
 
     async fn create_object_by_type(
@@ -306,7 +366,7 @@ mod tests {
 
     fn create_test_graph() -> (TempDir, KnowledgeGraph) {
         let temp_dir = TempDir::new().unwrap();
-        let graph = KnowledgeGraph::new(temp_dir.path(), None).unwrap();
+        let graph = KnowledgeGraph::new(temp_dir.path()).unwrap();
         (temp_dir, graph)
     }
 
