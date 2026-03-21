@@ -9,58 +9,45 @@ keywords = ["ttrpg", "worldbuilding", "ai", "knowledge-graph", "local-first"]
 categories = ["games", "text-processing"]
 
 [dependencies]
-# Database and storage
-rocksdb = "0.23"
+# Database and storage (SQLite — no C++ compiler required)
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-bincode = "1.3"
 
-# Async runtime and utilities
+# Async runtime
 tokio = { version = "1.45", features = ["full"] }
+
+# Identifiers
 uuid = { version = "1.17", features = ["v4", "serde"] }
 
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
 
-# Date/time handling
+# Date/time
 chrono = { version = "0.4", features = ["serde"] }
 
-# Logging
+# Logging / tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Graph processing (for future use)
-petgraph = "0.8"
-
-# Vector search and embeddings
-fastembed = { version = "5.0" }
-hnsw_rs = "0.3"
-fst = "0.4"
-memmap2 = "0.9"
-
-# Parallel processing
-rayon = "1.8"
 
 # Async traits
 async-trait = "0.1"
 
-# HTTP client for optional cloud APIs
-reqwest = { version = "0.12", features = ["json"], optional = true }
+# HTTP client (required for Lemonade Server embedding/reranking API)
+reqwest = { version = "0.12", features = ["json"] }
 
 # Concurrent data structures
 dashmap = "6.1"
 parking_lot = "0.12"
 
-# Temp directories for examples
-tempfile = "3.20"
-
-# Regular expressions for pattern validation
+# Regular expressions (schema property validation)
 regex = "1.10"
 
-# ORT Override
-ort-sys = { version = "=2.0.0-rc.10", default-features = false }
-ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }
+# Temp directories (tests + examples)
+tempfile = "3.20"
 
 [dev-dependencies]
 tempfile = "3.20"
@@ -71,4 +58,3 @@ path = "examples/cli_demo.rs"
 
 [features]
 default = []
-cloud-apis = ["reqwest"]

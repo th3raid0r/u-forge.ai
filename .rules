@@ -1,0 +1,113 @@
+# u-forge.ai — LLM Rules Entrypoint
+
+This file is your routing guide. Before proceeding with any task in this project,
+read the rule files listed under the matching section(s) below. Rule files live in
+`.rulesdir/` and contain authoritative patterns, constraints, and context you must
+follow.
+
+---
+
+## Always Read First
+
+> **`.rulesdir/project-structure.mdc`**
+
+Read this for every task. It covers the project's purpose, current architecture,
+migration direction, module map, and the active known-bug list (BUG-1 through BUG-7).
+Never make architectural decisions without it.
+
+---
+
+## Task-Based Routing
+
+### Setting up the environment / running builds or tests
+→ Read **`.rulesdir/environment-config.mdc`**
+→ Read **`.rulesdir/development-workflow.mdc`**
+
+Covers: `source env.sh` requirement, compiler variables (CC/CXX), environment
+variable resolution order, build commands, Lemonade Server setup, and
+cross-platform notes. You must source `env.sh` before any `cargo` command.
+
+---
+
+### Writing or modifying Rust source code (`src/*.rs`, `examples/*.rs`)
+→ Read **`.rulesdir/rust-patterns.mdc`**
+
+Covers: error handling with `anyhow`, the `EmbeddingProvider` trait (the central AI
+abstraction — do NOT bypass it), the `ObjectBuilder` fluent API, string-based edge
+types, RocksDB vs SQLite storage patterns, async anti-patterns (BUG-5), and
+performance instrumentation.
+
+---
+
+### Adding, editing, or validating schema files (`defaults/schemas/*.schema.json`)
+→ Read **`.rulesdir/schema-system.mdc`**
+→ Read **`.rulesdir/json-data-formats.mdc`**
+
+Covers: schema file format, the `add_` prefix convention and how `SchemaIngestion`
+strips it, property types, validation rules, edge type schemas, and the 13 built-in
+TTRPG types. Also covers how schemas relate to the JSONL import format.
+
+---
+
+### Working with data files (`defaults/data/*.json`) or the import pipeline
+→ Read **`.rulesdir/json-data-formats.mdc`**
+
+Covers: JSONL node and edge record format, supported `nodeType` values, the two-pass
+import pipeline in `data_ingestion.rs`, and the active data bugs (BUG-6 deduplication,
+BUG-7 in-session-only edge resolution).
+
+---
+
+### Writing, running, or debugging tests
+→ Read **`.rulesdir/testing-debugging.mdc`**
+→ Read **`.rulesdir/rust-patterns.mdc`** (testing patterns section)
+
+Covers: isolated `TempDir`-based test setup, mock vs real `EmbeddingProvider`
+selection, Lemonade integration test setup, regression test patterns for known bugs,
+`RUST_LOG` levels, structured tracing, common symptom→cause→fix table, and CI
+commands.
+
+---
+
+### Adding a new embedding provider or AI integration
+→ Read **`.rulesdir/rust-patterns.mdc`** (EmbeddingProvider section)
+→ Read **`.rulesdir/development-workflow.mdc`** (Adding a new EmbeddingProvider)
+→ Read **`.rulesdir/environment-config.mdc`** (Lemonade Server Configuration)
+
+New providers must implement the `EmbeddingProvider` trait. The Lemonade Server HTTP
+provider is the target pattern. Do not use `Mutex<T>` in async embedding paths.
+
+---
+
+### Fixing a known bug (BUG-1 through BUG-7)
+→ Read **`.rulesdir/project-structure.mdc`** (Known Bugs section)
+→ Read **`.rulesdir/development-workflow.mdc`** (Bug fix workflow)
+→ Read **`.rulesdir/testing-debugging.mdc`** (Known Bug Testing)
+
+Always check `ARCHITECTURE.md` for the bug ID's full description and which migration
+phase addresses it. Write a regression test before applying the fix.
+
+---
+
+### Planning or executing any migration phase work
+→ Read **`.rulesdir/project-structure.mdc`** (Migration Direction)
+→ Read **`.rulesdir/development-workflow.mdc`** (Architecture Context)
+→ Read **`.rulesdir/environment-config.mdc`** (Planned Configuration)
+
+Migration phases: (1) Lemonade embeddings, (2) SQLite + sqlite-vec + FTS5,
+(3) axum HTTP/WebSocket server, (4) reranking, (5) Cargo workspace split.
+Never implement a phase out of order without explicit instruction.
+
+---
+
+## Quick Reference: File → Topic
+
+| File | Primary Topics |
+|---|---|
+| `project-structure.mdc` | Architecture, module map, migration direction, known bugs |
+| `development-workflow.mdc` | Build/run commands, adding providers/schemas, bug workflow |
+| `environment-config.mdc` | `env.sh`, env vars, path resolution, Lemonade setup |
+| `rust-patterns.mdc` | Error handling, traits, storage, async, ObjectBuilder |
+| `schema-system.mdc` | Schema format, validation, property types, edge schemas |
+| `json-data-formats.mdc` | JSONL node/edge format, import pipeline, data bugs |
+| `testing-debugging.mdc` | Test setup, mocks, logging, CI commands, debug table |

@@ -1,320 +1,274 @@
-//! u-forge.ai - Universe Forge
-//! 
-//! A demonstration of the core knowledge graph functionality including vector search
+//! u-forge.ai — CLI demo
+//!
+//! Loads the Foundation universe sample data and schemas, then demonstrates
+//! graph queries and FTS5 full-text search.  No embedding model or Lemonade
+//! Server is required to run this demo.
+//!
+//! Usage:
+//!   cargo run --example cli_demo
+//!   cargo run --example cli_demo [DATA_FILE] [SCHEMA_DIR]
 
 use anyhow::Result;
 use std::env;
 use u_forge_ai::{
-    KnowledgeGraph,
-    VectorSearchEngine, VectorSearchConfig,
-    data_ingestion::DataIngestion,
-    SchemaIngestion,
+    data_ingestion::DataIngestion, ChunkType, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
 };
-
-#[derive(Debug)]
-struct TextToIndex {
-    chunk_id: u_forge_ai::ForgeUuid,
-    object_id: u_forge_ai::ObjectId,
-    object_type: String,
-    content: String,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Initialise structured logging (RUST_LOG controls verbosity)
     tracing_subscriber::fmt::init();
-    
-    // Parse command line arguments
+
     let args: Vec<String> = env::args().collect();
-    
-    // Show usage if --help is provided
-    if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
-        println!("🌟 u-forge.ai CLI Demo 🌟");
-        println!();
-        println!("Usage: {} [DATA_FILE] [SCHEMA_DIR]", args[0]);
-        println!("       {} --help", args[0]);
-        println!();
-        println!("Arguments:");
-        println!("  DATA_FILE   Path to JSON data file (default: ./defaults/data/memory.json)");
-        println!("  SCHEMA_DIR  Path to schema directory (default: ./defaults/schemas)");
-        println!();
-        println!("Examples:");
-        println!("  {}                                    # Use defaults", args[0]);
-        println!("  {} custom.json                       # Custom data file", args[0]);
-        println!("  {} custom.json ./schemas             # Custom data and schema", args[0]);
-        println!("  {} ../defaults/data/memory.json ../defaults/schemas  # Relative paths", args[0]);
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage(&args[0]);
         return Ok(());
     }
-    
-    let data_file = if args.len() > 1 {
-        args[1].clone()
-    } else {
-        std::env::var("UFORGE_DATA_FILE").unwrap_or_else(|_| "./defaults/data/memory.json".to_string())
-    };
-    
-    let schema_dir = if args.len() > 2 {
-        args[2].clone()
-    } else {
-        std::env::var("UFORGE_SCHEMA_DIR").unwrap_or_else(|_| "./defaults/schemas".to_string())
-    };
-    
-    println!("🌟 Welcome to u-forge.ai (Universe Forge) 🌟");
-    println!("Loading data from: {}", data_file);
-    println!("Loading schemas from: {}", schema_dir);
-    println!("Creating knowledge graph from JSON data...\n");
 
-    // Create a temporary knowledge graph for demonstration
+    let data_file = args
+        .get(1)
+        .cloned()
+        .or_else(|| env::var("UFORGE_DATA_FILE").ok())
+        .unwrap_or_else(|| "./defaults/data/memory.json".to_string());
+
+    let schema_dir = args
+        .get(2)
+        .cloned()
+        .or_else(|| env::var("UFORGE_SCHEMA_DIR").ok())
+        .unwrap_or_else(|| "./defaults/schemas".to_string());
+
+    println!("🌟 u-forge.ai — Universe Forge 🌟");
+    println!("   Data   : {data_file}");
+    println!("   Schemas: {schema_dir}");
+    println!("   Storage: SQLite (bundled, no system libs required)\n");
+
+    // ── Database ──────────────────────────────────────────────────────────────
+
     let temp_dir = tempfile::TempDir::new()?;
-    let db_path = temp_dir.path().join("db");
+    let db_path = temp_dir.path().join("kg");
     std::fs::create_dir_all(&db_path)?;
-    
-    // Use persistent cache directory from environment variable instead of temp dir
-    let embedding_cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let path = std::path::PathBuf::from("./defaults/default_model_cache");
-            std::fs::create_dir_all(&path).expect("Failed to create default model cache dir");
-            path
-        });
-    
-    println!("📦 Using embedding cache directory: {}", embedding_cache_dir.display());
 
-    println!("🧠 Initializing KnowledgeGraph with local embedding models (FastEmbed)...");
-    let graph_result = KnowledgeGraph::new(&db_path, Some(&embedding_cache_dir));
-    
-    let graph = match graph_result {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("🚨 Failed to initialize KnowledgeGraph: {}", e);
-            eprintln!("This may be due to model download issues or other initialization errors.");
-            eprintln!("The application will now exit.");
-            return Err(e);
-        }
-    };
-    println!("KnowledgeGraph initialized successfully.");
+    println!("🗄️  Opening knowledge graph…");
+    let graph = KnowledgeGraph::new(&db_path)?;
+    println!("    ✅ Ready\n");
 
-    // Use the new ingestion system
-    let mut ingestion = DataIngestion::new(&graph);
-    
-    // Load schemas from directory using SchemaIngestion
-    println!("\n📚 Loading Custom Schemas");
-    println!("=========================");
-    let schema_name = "imported_schemas";
-    let schema_version = "1.0.0";
-    
-    match SchemaIngestion::load_schemas_from_directory(&schema_dir, schema_name, schema_version) {
-        Ok(schema_definition) => {
-            let schema_manager = graph.get_schema_manager();
-            match schema_manager.save_schema(&schema_definition).await {
+    // ── Schemas ───────────────────────────────────────────────────────────────
+
+    println!("📚 Loading schemas from {schema_dir}");
+    match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0") {
+        Ok(schema_def) => {
+            let mgr = graph.get_schema_manager();
+            match mgr.save_schema(&schema_def).await {
                 Ok(()) => {
-                    println!("✅ Successfully loaded {} object types from {}", 
-                             schema_definition.object_types.len(), schema_dir);
-                    for (type_name, _) in &schema_definition.object_types {
-                        println!("   • {}", type_name);
+                    println!(
+                        "    ✅ Loaded {} object types:",
+                        schema_def.object_types.len()
+                    );
+                    let mut names: Vec<_> = schema_def.object_types.keys().collect();
+                    names.sort();
+                    for name in names {
+                        println!("       • {name}");
                     }
                 }
-                Err(e) => {
-                    eprintln!("❌ Failed to save schema: {}", e);
-                    eprintln!("Continuing with default schemas...\n");
-                }
+                Err(e) => eprintln!("    ⚠️  Could not save schemas: {e}"),
             }
         }
-        Err(e) => {
-            eprintln!("❌ Failed to load schemas from {}: {}", schema_dir, e);
-            eprintln!("Continuing with default schemas...\n");
-        }
+        Err(e) => eprintln!("    ⚠️  Could not load schemas from {schema_dir}: {e}"),
     }
+    println!();
 
-    // Import JSON data
-    println!("\n📄 Importing JSON Data");
-    println!("======================");
+    // ── Data import ───────────────────────────────────────────────────────────
+
+    println!("📄 Importing data from {data_file}");
+    let mut ingestion = DataIngestion::new(&graph);
     if let Err(e) = ingestion.import_json_data(&data_file).await {
-        eprintln!("❌ Failed to import data: {}", e);
+        eprintln!("    ❌ Import failed: {e}");
         return Err(e);
     }
 
     let stats = ingestion.get_stats();
-    println!("\n📊 Import Summary");
-    println!("=================");
-    println!("✅ Objects created: {}", stats.objects_created);
-    println!("✅ Relationships created: {}", stats.relationships_created);
-    println!("✅ Schema system: Enabled with validation");
+    println!("    ✅ Objects   : {}", stats.objects_created);
+    println!("    ✅ Edges     : {}", stats.relationships_created);
     if stats.parse_errors > 0 {
-        println!("⚠️  Parse errors: {}", stats.parse_errors);
+        println!("    ⚠️  Parse errors: {}", stats.parse_errors);
+    }
+    println!();
+
+    // ── Index text chunks for FTS5 ────────────────────────────────────────────
+    // Walk every imported object and add its name + description as a searchable
+    // chunk so that the FTS demo below returns useful results.
+
+    println!("🔍 Indexing text for full-text search…");
+    let all_objects = graph.get_all_objects()?;
+    let mut indexed = 0usize;
+
+    for obj in &all_objects {
+        // Name
+        graph.add_text_chunk(obj.id, obj.name.clone(), ChunkType::Description)?;
+        indexed += 1;
+
+        // Description (if present)
+        if let Some(desc) = &obj.description {
+            if !desc.is_empty() {
+                graph.add_text_chunk(obj.id, desc.clone(), ChunkType::Description)?;
+                indexed += 1;
+            }
+        }
+
+        // String-valued properties
+        if let Some(props) = obj.properties.as_object() {
+            for (_key, val) in props {
+                if let Some(s) = val.as_str() {
+                    if !s.is_empty() {
+                        graph.add_text_chunk(obj.id, s.to_string(), ChunkType::Imported)?;
+                        indexed += 1;
+                    }
+                }
+            }
+        }
     }
 
-    // Set up vector search engine
-    let embedding_provider = graph.get_embedding_provider();
-    let dimensions = embedding_provider.dimensions()?;
-    let mut vector_config = VectorSearchConfig::default();
-    vector_config.dimensions = dimensions;
-    
-    let index_dir = temp_dir.path().join("index");
-    std::fs::create_dir_all(&index_dir)?;
-    let mut search_engine = VectorSearchEngine::new(vector_config, embedding_provider.clone(), index_dir)?;
-    search_engine.initialize().await?;
+    println!("    ✅ {indexed} text chunks indexed\n");
 
-    println!("\n🔍 Vector Search Ready");
-    println!("======================");
-    println!("Embedding provider initialized with {} dimensions", dimensions);
+    // ── Graph statistics ──────────────────────────────────────────────────────
 
-    // Demo some searches
-    demo_searches(&graph, &mut search_engine).await?;
+    let gs = graph.get_stats()?;
+    println!("📊 Graph statistics");
+    println!("   Nodes   : {}", gs.node_count);
+    println!("   Edges   : {}", gs.edge_count);
+    println!("   Chunks  : {}", gs.chunk_count);
+    println!("   Tokens  : {}", gs.total_tokens);
+    println!();
+
+    // ── FTS5 search demo ──────────────────────────────────────────────────────
+
+    println!("🔎 Full-text search demos (SQLite FTS5)");
+    println!("========================================\n");
+
+    let queries = [
+        "empire",
+        "foundation",
+        "terminus",
+        "psychohistory",
+        "robot",
+        "galaxy",
+    ];
+
+    for query in &queries {
+        println!("  Query: \"{query}\"");
+        let results = graph.search_chunks_fts(query, 3)?;
+        if results.is_empty() {
+            println!("    (no matches)\n");
+            continue;
+        }
+        for (i, (_chunk_id, obj_id, snippet)) in results.iter().enumerate() {
+            let label = graph
+                .get_object(*obj_id)?
+                .map(|o| format!("{} [{}]", o.name, o.object_type))
+                .unwrap_or_else(|| obj_id.to_string());
+            let preview = if snippet.len() > 80 {
+                format!("{}…", &snippet[..77])
+            } else {
+                snippet.clone()
+            };
+            println!("    {}. {} — \"{}\"", i + 1, label, preview);
+        }
+        println!();
+    }
+
+    // ── Relationship exploration ───────────────────────────────────────────────
+
+    // Find the first character and explore their neighbourhood.
+    let sample = all_objects.iter().find(|o| {
+        o.object_type == "npc"
+            || o.object_type == "character"
+            || o.object_type == "player_character"
+    });
+
+    if let Some(character) = sample {
+        println!("👥 Exploring connections for '{}'", character.name);
+        println!("   Type: {}", character.object_type);
+
+        let neighbours = graph.get_neighbors(character.id)?;
+        println!("   Direct connections: {}", neighbours.len());
+
+        let edges = graph.get_relationships(character.id)?;
+        println!("   Relationships ({} total):", edges.len());
+        for edge in edges.iter().take(8) {
+            let from_name = graph
+                .get_object(edge.from)?
+                .map(|o| o.name)
+                .unwrap_or_else(|| "?".to_string());
+            let to_name = graph
+                .get_object(edge.to)?
+                .map(|o| o.name)
+                .unwrap_or_else(|| "?".to_string());
+            println!(
+                "      {} --[{}]--> {}",
+                from_name,
+                edge.edge_type.as_str(),
+                to_name
+            );
+        }
+        if edges.len() > 8 {
+            println!("      … and {} more", edges.len() - 8);
+        }
+        println!();
+
+        // 2-hop subgraph
+        let subgraph = graph.query_subgraph(character.id, 2)?;
+        println!(
+            "   2-hop subgraph: {} objects, {} edges, {} chunks",
+            subgraph.objects.len(),
+            subgraph.edges.len(),
+            subgraph.chunks.len(),
+        );
+        println!();
+    }
+
+    // ── ObjectBuilder demo ────────────────────────────────────────────────────
+
+    println!("🛠️  ObjectBuilder demo");
+    let custom_id = ObjectBuilder::character("Hari Seldon".to_string())
+        .with_description("Mathematician and founder of psychohistory.".to_string())
+        .with_property("affiliation".to_string(), "Galactic Empire".to_string())
+        .with_tag("mathematician".to_string())
+        .with_tag("founder".to_string())
+        .add_to_graph(&graph)?;
+
+    let retrieved = graph.get_object(custom_id)?.unwrap();
+    println!(
+        "   Created : {} [{}]",
+        retrieved.name, retrieved.object_type
+    );
+    println!("   Tags    : {}", retrieved.tags.join(", "));
+    println!(
+        "   Property: affiliation = {}",
+        retrieved.get_property("affiliation").unwrap_or_default()
+    );
+    println!();
+
+    println!("✨ Demo complete.");
+    println!("   Storage: SQLite — no RocksDB, no FastEmbed, no gcc-13 required.");
+    println!("   Embeddings: connect Lemonade Server (set LEMONADE_URL) for semantic search.");
 
     Ok(())
 }
 
-async fn demo_searches(graph: &KnowledgeGraph, search_engine: &mut VectorSearchEngine) -> Result<()> {
-    println!("\n🔍 Search Demonstrations");
-    println!("========================\n");
-
-    // Get all objects for indexing
-    let all_objects = graph.get_all_objects()?;
-    
-    // Populate the vector search index
-    println!("⚡ Populating vector search index...");
-    let mut texts_to_index = Vec::new();
-    
-    for obj_meta in &all_objects {
-        let chunks = graph.get_text_chunks(obj_meta.id)?;
-        for chunk in chunks {
-            texts_to_index.push(TextToIndex {
-                chunk_id: chunk.id,
-                object_id: obj_meta.id,
-                object_type: obj_meta.object_type.clone(),
-                content: chunk.content,
-            });
-        }
-        
-        // Add object name and description to index as well
-        if let Some(desc) = &obj_meta.description {
-            texts_to_index.push(TextToIndex {
-                chunk_id: u_forge_ai::ForgeUuid::new_v4(),
-                object_id: obj_meta.id,
-                object_type: obj_meta.object_type.clone(),
-                content: desc.clone(),
-            });
-        }
-        texts_to_index.push(TextToIndex {
-            chunk_id: u_forge_ai::ForgeUuid::new_v4(),
-            object_id: obj_meta.id,
-            object_type: obj_meta.object_type.clone(),
-            content: obj_meta.name.clone(),
-        });
-    }
-
-    let texts_count = texts_to_index.len();
-    
-    for item_to_index in texts_to_index {
-        search_engine.add_chunk(
-            item_to_index.chunk_id,
-            item_to_index.object_id,
-            &item_to_index.content,
-        ).await?;
-    }
-    
-    // Rebuild name index for FST
-    let names_for_fst: Vec<(u_forge_ai::ObjectId, String, String)> = all_objects.iter()
-        .map(|obj| (obj.id, obj.name.clone(), obj.object_type.clone()))
-        .collect();
-    search_engine.rebuild_name_index(names_for_fst)?;
-    println!("Vector search index populated with {} items.\n", texts_count);
-
-    // Get statistics
-    let stats = graph.get_stats()?;
-    println!("📊 Graph Statistics:");
-    println!("   • Nodes: {}", stats.node_count);
-    println!("   • Edges: {}", stats.edge_count);
-    println!("   • Text chunks: {}", stats.chunk_count);
-    println!("   • Total tokens: {}", stats.total_tokens);
-
-    // Example searches
-    let search_queries = vec![
-        "ancient temple",
-        "magical artifact",
-        "political intrigue",
-        "dangerous creature",
-        "emperor galactic empire",
-        "foundation terminus",
-    ];
-
-    for query in search_queries {
-        println!("\n🔎 Searching for: '{}'", query);
-        
-        // Hybrid search combining exact and semantic matching
-        let search_results = search_engine.search_hybrid(query, 3, 3).await?;
-        
-        if !search_results.semantic_results.is_empty() {
-            println!("   Semantic matches:");
-            for (i, result) in search_results.semantic_results.iter().enumerate() {
-                if let Some(obj) = graph.get_object(result.object_id)? {
-                    println!(
-                        "      {}. {} ({:.1}%) - {}",
-                        i + 1,
-                        obj.name,
-                        result.similarity * 100.0,
-                        obj.object_type.as_str()
-                    );
-                }
-            }
-        }
-        
-        if !search_results.exact_results.is_empty() {
-            println!("   Exact matches:");
-            for (i, result) in search_results.exact_results.iter().enumerate() {
-                println!(
-                    "      {}. {} - {}",
-                    i + 1,
-                    result.name,
-                    result.object_type.as_str()
-                );
-            }
-        }
-        
-        if search_results.semantic_results.is_empty() && search_results.exact_results.is_empty() {
-            println!("   No matches found.");
-        }
-    }
-
-    // Find a sample character to explore relationships
-    let sample_character = all_objects.iter()
-        .find(|obj| obj.object_type == "character" || obj.object_type == "npc" || obj.object_type == "player_character");
-
-    if let Some(character) = sample_character {
-        let character_id = character.id;
-        let character_name = &character.name;
-        
-        println!("\n👥 Exploring {}'s connections:", character_name);
-        
-        // Find character's neighbors
-        let neighbors = graph.get_neighbors(character_id)?;
-        println!("   • Direct connections: {} entities", neighbors.len());
-
-        // Show some relationships
-        let relationships = graph.get_relationships(character_id)?;
-        println!("   • Relationships: {}", relationships.len());
-        for edge in relationships.iter().take(5) {
-            if let (Some(from_obj), Some(to_obj)) = (
-                graph.get_object(edge.from).ok().flatten(),
-                graph.get_object(edge.to).ok().flatten(),
-            ) {
-                let (from_name, to_name) = if edge.from == character_id {
-                    (character_name.clone(), to_obj.name)
-                } else {
-                    (from_obj.name, character_name.clone())
-                };
-                println!("      • {} --[{}]--> {}", from_name, edge.edge_type.as_str(), to_name);
-            }
-        }
-    }
-
-    println!("\n✨ Knowledge graph demonstration complete!");
-    println!("📈 Summary:");
-    println!("   • Objects: {}", stats.node_count);
-    println!("   • Relationships: {}", stats.edge_count);
-    println!("   • Vector embeddings: {} indexed", texts_count);
-    println!("   • Storage: RocksDB with FastEmbed semantic search");
-    println!("\nThis showcases u-forge.ai's ability to load TTRPG datasets and perform intelligent search.");
-
-    Ok(())
+fn print_usage(prog: &str) {
+    println!("u-forge.ai CLI Demo");
+    println!();
+    println!("Usage:");
+    println!("  {prog} [DATA_FILE] [SCHEMA_DIR]");
+    println!();
+    println!("Arguments:");
+    println!("  DATA_FILE   JSONL data file  (default: ./defaults/data/memory.json)");
+    println!("  SCHEMA_DIR  schema directory (default: ./defaults/schemas)");
+    println!();
+    println!("Environment:");
+    println!("  UFORGE_DATA_FILE   override DATA_FILE");
+    println!("  UFORGE_SCHEMA_DIR  override SCHEMA_DIR");
+    println!("  LEMONADE_URL       Lemonade Server URL for semantic embeddings");
+    println!("  RUST_LOG           log level (error/warn/info/debug/trace)");
 }
