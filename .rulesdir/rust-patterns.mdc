@@ -6,24 +6,38 @@ globs: src/*.rs,examples/*.rs
 
 ## Error Handling
 
-Use `anyhow::Result` for application-level errors:
+Use `anyhow::Result` for application-level errors throughout the codebase:
+
 ```rust
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-    let resp = self.client.post(&url)
+    let resp = self.client
+        .post(format!("{}/embeddings", self.base_url))
+        .header("Authorization", "Bearer lemonade")
         .json(&body)
         .send().await
-        .map_err(|e| anyhow!("Lemonade request failed: {}", e))?;
+        .map_err(|e| anyhow!("Lemonade request failed: {}", e))?
+        .json::<serde_json::Value>().await
+        .context("Failed to parse Lemonade response")?;
     // ...
 }
 ```
 
+Use `.context()` for wrapping lower-level errors (e.g. SQLite, I/O).
+Use `anyhow!(...)` for constructing new errors with formatting.
+
+---
+
 ## Key Trait: EmbeddingProvider
 
-This is the central abstraction for all AI embedding work. **All new AI providers must implement this trait.** Do not bypass it.
+This is the central abstraction for all AI embedding work. **All new AI providers
+must implement this trait.** Do not bypass it by calling HTTP clients or model APIs
+directly from business logic.
 
 ```rust
+use crate::embeddings::EmbeddingModelInfo;
+
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
@@ -31,143 +45,326 @@ pub trait EmbeddingProvider: Send + Sync {
     fn dimensions(&self) -> Result<usize>;
     fn max_tokens(&self) -> Result<usize>;
     fn provider_type(&self) -> EmbeddingProviderType;
-    fn model_info(&self) -> Option<ModelInfo<EmbeddingModel>>;
+    /// Returns our own EmbeddingModelInfo type — NOT fastembed's ModelInfo.
+    fn model_info(&self) -> Option<EmbeddingModelInfo>;
 }
 ```
 
 **Current implementations:**
-- `FastEmbedProvider` — in-process ONNX (being replaced)
-- `LemonadeProvider` — HTTP to Lemonade Server (target)
+- `LemonadeProvider` — HTTP to Lemonade Server (`POST /api/v1/embeddings`). The only
+  active implementation. FastEmbed/ONNX have been removed.
 
-**Pattern for new HTTP-based providers:**
+**Pattern for adding a new HTTP-based provider:**
 ```rust
-pub struct LemonadeProvider {
+pub struct MyProvider {
     client: reqwest::Client,
     base_url: String,
     model: String,
-    dimensions: usize,
+    dimensions: usize,  // probe on construction
 }
 
 #[async_trait]
-impl EmbeddingProvider for LemonadeProvider {
+impl EmbeddingProvider for MyProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let resp: EmbeddingResponse = self.client
-            .post(format!("{}/embeddings", &self.base_url))
-            .header("Authorization", "Bearer lemonade")
-            .json(&EmbeddingRequest { model: self.model.clone(), input: vec![text.to_string()] })
+        let resp: serde_json::Value = self.client
+            .post(format!("{}/embeddings", self.base_url))
+            .header("Authorization", "Bearer token")
+            .json(&serde_json::json!({ "model": self.model, "input": [text] }))
             .send().await?
             .json().await?;
-        resp.data.into_iter().next()
-            .map(|d| d.embedding)
-            .ok_or_else(|| anyhow!("No embedding returned"))
+        let embedding = resp["data"][0]["embedding"]
+            .as_array()
+            .ok_or_else(|| anyhow!("No embedding in response"))?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+        Ok(embedding)
     }
+
+    fn model_info(&self) -> Option<EmbeddingModelInfo> {
+        Some(EmbeddingModelInfo {
+            name: self.model.clone(),
+            dimensions: self.dimensions,
+            description: None,
+        })
+    }
+    // ... other methods
 }
 ```
+
+---
+
+## EmbeddingManager
+
+`EmbeddingManager` is decoupled from `KnowledgeGraph`. Construct it separately when
+embeddings are needed; do not expect the graph to own one.
+
+```rust
+// Auto: reads LEMONADE_URL env var; errors clearly if not set
+let mgr = EmbeddingManager::try_new_auto(None, None).await?;
+
+// Explicit URL
+let mgr = EmbeddingManager::try_new_lemonade(
+    "http://localhost:8000/api/v1",
+    "nomic-embed-text",
+).await?;
+
+let provider = mgr.get_provider();  // Arc<dyn EmbeddingProvider>
+let vec = provider.embed("Some text").await?;
+```
+
+`try_new_auto` resolution order:
+1. `lemonade_url` argument (if `Some`)
+2. `LEMONADE_URL` environment variable
+3. Hard error — there is **no** local fallback in this build
+
+---
+
+## KnowledgeGraph
+
+`KnowledgeGraph::new` is **synchronous** and takes **one argument** (the database
+directory path). No embedding cache dir, no async, no server required.
+
+```rust
+// Correct
+let graph = KnowledgeGraph::new("./data/my_world")?;
+
+// Also correct with a TempDir (tests)
+let temp = tempfile::TempDir::new()?;
+let graph = KnowledgeGraph::new(temp.path())?;
+```
+
+The database file is created at `<db_path>/knowledge.db`. The directory is created
+automatically if it does not exist.
+
+**`KnowledgeGraph` does NOT have:**
+- `embedding_manager` field
+- `get_embedding_provider()` method
+- `embedding_cache_dir` constructor parameter
+- Any dependency on Lemonade Server being available
+
+---
 
 ## ObjectBuilder Pattern
 
 Fluent API for constructing graph objects:
+
 ```rust
 let id = ObjectBuilder::character("Gandalf".to_string())
     .with_description("A wise wizard".to_string())
-    .with_property("level".to_string(), "20".to_string())
-    .with_json_property("abilities".to_string(), json!(["magic", "wisdom"]))
+    .with_property("race".to_string(), "Maiar".to_string())
+    .with_json_property("level".to_string(), serde_json::json!(20))
     .with_tag("wizard".to_string())
     .add_to_graph(&graph)?;
 ```
 
+Convenience constructors: `character`, `location`, `faction`, `item`, `event`,
+`session`, `custom(type, name)`.
+
+---
+
 ## String-Based Edge Types
 
-Always use descriptive strings for relationships:
+Always use descriptive string literals for relationships. The deprecated enum
+variants (`Contains`, `OwnedBy`, `LocatedIn`, `MemberOf`) exist only for backward
+compatibility — never use them in new code.
+
 ```rust
+// Correct
 graph.connect_objects_str(character_id, location_id, "located_in")?;
 graph.connect_objects_str(faction_id, territory_id, "controls")?;
 graph.connect_objects_str(npc_id, quest_id, "offers")?;
+graph.connect_objects_weighted_str(sauron_id, frodo_id, "enemy_of", 0.9)?;
 ```
 
-The `EdgeType` enum's deprecated variants (`Contains`, `OwnedBy`, `LocatedIn`, `MemberOf`) exist only for backward compatibility. Always use `EdgeType::Custom(String)`.
+---
 
-## Storage Patterns
+## Storage Patterns (SQLite — current)
 
-### Current (RocksDB)
+Storage is `KnowledgeGraphStorage` in `src/storage.rs`, backed by SQLite via
+`rusqlite` with bundled SQLite. Thread safety: `Arc<Mutex<Connection>>`.
+
 ```rust
-// Column families for data separation
-const CF_NODES: &str = "nodes";
-const CF_EDGES: &str = "edges";  // AdjacencyList per node (edges stored twice)
-const CF_CHUNKS: &str = "chunks";
-const CF_NAMES: &str = "names";
-const CF_SCHEMAS: &str = "schemas";
-
-// Atomic writes via WriteBatch
-let mut batch = WriteBatch::default();
-batch.put_cf(&cf_nodes, key, value);
-batch.put_cf(&cf_names, name_key, id_bytes);
-db.write(batch)?;
-```
-
-### Target (SQLite — Phase 2)
-```rust
-// Use rusqlite with bundled SQLite + extensions
-// Transactions for atomicity
-// Parameterized queries for safety
+// Parameterised inserts — always use params![] macro
 conn.execute(
-    "INSERT INTO nodes (id, object_type, name, properties) VALUES (?1, ?2, ?3, ?4)",
-    params![id, obj_type, name, properties_json],
+    "INSERT OR REPLACE INTO nodes
+     (id, object_type, name, properties, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    params![
+        id.to_string(),
+        object_type,
+        name,
+        serde_json::to_string(&properties)?,
+        created_at.to_rfc3339(),
+        updated_at.to_rfc3339(),
+    ],
 )?;
+
+// Optional query row
+let result: Option<String> = conn.query_row(
+    "SELECT definition FROM schemas WHERE name = ?1",
+    params![name],
+    |row| row.get(0),
+).optional()?;
+
+// Collecting multiple rows
+let mut stmt = conn.prepare("SELECT * FROM nodes WHERE object_type = ?1")?;
+let rows = stmt.query_map(params![object_type], row_to_object_metadata)?;
+let objects: Vec<ObjectMetadata> = rows.collect::<Result<_, _>>()?;
 ```
+
+**Key design decisions in the current schema:**
+- `INSERT OR REPLACE` on `nodes` — OK because nodes have no cascading rowid
+  dependencies that must be preserved.
+- `ON CONFLICT DO UPDATE` on `chunks` — required to preserve the implicit SQLite
+  `rowid` that `chunks_fts` references.
+- `ON DELETE CASCADE` on `edges` and `chunks` — node deletion is O(log N), not O(N).
+- Edge uniqueness: `UNIQUE(source_id, target_id, edge_type)`.
+- All complex fields (tags, properties, metadata) are stored as JSON text.
+- UUIDs stored as hyphenated text strings (not BLOB).
+- Datetimes stored as RFC 3339 text.
+
+**Removed patterns (do not use):**
+```rust
+// ❌ RocksDB — removed in Phase 2
+let cf = self.get_cf(CF_NODES)?;
+let mut batch = WriteBatch::default();
+batch.put_cf(&cf, key, bincode::serialize(&value)?);
+db.write(batch)?;
+
+// ❌ bincode — removed; use serde_json for all serialisation
+bincode::serialize(&adjacency_list)?
+```
+
+---
+
+## Full-Text Search
+
+FTS5 is built into SQLite. Search chunks via `KnowledgeGraph::search_chunks_fts`:
+
+```rust
+// Returns Vec<(ChunkId, ObjectId, content_text)> ordered by relevance rank
+let results = graph.search_chunks_fts("psychohistory", 10)?;
+
+for (chunk_id, obj_id, content) in results {
+    if let Some(obj) = graph.get_object(obj_id)? {
+        println!("{}: {}", obj.name, content);
+    }
+}
+```
+
+FTS5 query syntax supports: phrase (`"hari seldon"`), prefix (`found*`), boolean
+(`empire AND foundation`), and column filters. See SQLite FTS5 docs for full syntax.
+
+**The `chunks_fts` virtual table is kept in sync automatically** by three DML
+triggers defined in `SQL_SCHEMA` in `storage.rs`. Never manually INSERT into
+`chunks_fts` — always go through `upsert_chunk`.
+
+---
 
 ## Async Patterns
 
-### Correct: HTTP-based provider (fully async)
+### Correct: fully async HTTP provider (no thread blocking)
 ```rust
 async fn embed(&self, text: &str) -> Result<Vec<f32>> {
     let resp = self.client.post(&url).json(&body).send().await?.json().await?;
-    Ok(resp.embedding)
+    Ok(parse_embedding(resp)?)
 }
 ```
 
-### Anti-pattern: Mutex in async context (BUG-5)
+### When wrapping sync work in async context
+Use `tokio::task::spawn_blocking` — do not call blocking code directly in an async fn:
+
 ```rust
-// DON'T DO THIS — blocks the Tokio thread
+let text = text.to_string();
+let result = tokio::task::spawn_blocking(move || {
+    // CPU-bound or blocking sync work here
+    do_sync_work(&text)
+}).await??;
+```
+
+**Anti-pattern removed (was BUG-5):**
+```rust
+// ❌ DON'T — locks a std::sync::Mutex inside an async fn, blocking the Tokio thread
 async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-    let model = self.model.lock().unwrap();  // Blocks!
-    model.embed(vec![text], None)            // CPU-bound while holding lock!
+    let model = self.model.lock().unwrap();  // blocks executor thread!
+    model.embed(vec![text], None)
 }
 ```
 
-If you must use synchronous code in async context, use `tokio::task::spawn_blocking`.
+---
 
 ## Testing Patterns
 
-### Isolated tests with temp directories
+### Isolated tests with TempDir (standard pattern)
+
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn setup_test_storage() -> (KnowledgeGraph, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let kg = KnowledgeGraph::new(temp_dir.path(), None).unwrap();
-        (kg, temp_dir)
+    fn create_test_graph() -> (KnowledgeGraph, TempDir) {
+        let temp = TempDir::new().unwrap();
+        // KnowledgeGraph::new takes ONE argument — the db directory path
+        let graph = KnowledgeGraph::new(temp.path()).unwrap();
+        (graph, temp)
+    }
+
+    #[test]
+    fn test_something() {
+        let (graph, _tmp) = create_test_graph();
+        // _tmp must stay alive — TempDir deletes on drop
+        // ...
     }
 }
 ```
 
-### Mock embedding provider for fast tests
+### Mock embedding provider (for queue / search tests — no server required)
+
 ```rust
 struct MockEmbeddingProvider { dimensions: usize }
 
 #[async_trait]
 impl EmbeddingProvider for MockEmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let mut v = vec![0.1; self.dimensions];
-        v[0] = text.len() as f32 / 100.0;
-        Ok(v)
+        // Deterministic fake: varies by text length so results differ
+        Ok((0..self.dimensions)
+            .map(|i| (text.len() as f32 + i as f32) / 1000.0)
+            .collect())
     }
-    // ... other methods return defaults
+    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::new();
+        for t in &texts { out.push(self.embed(t).await?); }
+        Ok(out)
+    }
+    fn dimensions(&self) -> Result<usize> { Ok(self.dimensions) }
+    fn max_tokens(&self) -> Result<usize> { Ok(512) }
+    fn provider_type(&self) -> EmbeddingProviderType { EmbeddingProviderType::Lemonade }
+    fn model_info(&self) -> Option<EmbeddingModelInfo> { None }
 }
 ```
+
+### Lemonade integration tests (skipped when server not available)
+
+```rust
+fn lemonade_url() -> Option<String> {
+    std::env::var("LEMONADE_URL").ok()
+}
+
+#[tokio::test]
+async fn test_real_embedding() {
+    let Some(url) = lemonade_url() else {
+        eprintln!("Skipping: LEMONADE_URL not set");
+        return;
+    };
+    let provider = LemonadeProvider::new(&url, "nomic-embed-text").await.unwrap();
+    let vec = provider.embed("test").await.unwrap();
+    assert_eq!(vec.len(), provider.dimensions().unwrap());
+}
+```
+
+---
 
 ## Performance Instrumentation
 
@@ -175,11 +372,15 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 use std::time::Instant;
 
 let start = Instant::now();
-let result = operation().await?;
+let result = operation()?;
 tracing::debug!(
-    operation = "search",
-    duration_ms = start.elapsed().as_millis(),
+    operation = "fts_search",
+    query = %query,
     results = result.len(),
+    duration_ms = start.elapsed().as_millis(),
     "Search completed"
 );
 ```
+
+Use structured fields (`key = value`) rather than format strings so logs are
+machine-parseable. The `%` sigil calls `Display`; `?` calls `Debug`.

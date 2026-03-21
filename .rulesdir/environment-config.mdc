@@ -4,38 +4,37 @@ globs: env.sh,dev.sh,*.toml,*.yaml,*.yml,config.*
 
 # Environment and Configuration
 
-## Current Setup (RocksDB era — will simplify after SQLite migration)
+## Current Setup (Post-SQLite Migration)
 
-**MUST source before any cargo commands:**
+`env.sh` is **optional** after the Phase 2 migration. It no longer sets compiler
+variables — bundled SQLite compiles with any standard C compiler. Source it only if
+you want the convenience path exports.
+
 ```bash
-source env.sh
+source env.sh   # optional — sets UFORGE_* path variables
 ```
 
-This sets:
-- `CC=gcc-13`, `CXX=g++-13` (required for RocksDB compilation)
-- `WEBKIT_DISABLE_DMABUF_RENDERER=1`
-- `FASTEMBED_CACHE_PATH` (model cache location)
-
-**After Phase 2 (SQLite migration):** `env.sh` will only set optional variables. The gcc-13 requirement is eliminated.
+> **Before Phase 2** `env.sh` was required to set `CC=gcc-13` for RocksDB.
+> That requirement is gone. Plain `gcc` / `g++` (any version) is sufficient for
+> the `openssl-sys` transitive dependency brought in by `reqwest`.
 
 ## Environment Variables
 
-### Required Now
+### Build-time (no longer required)
 ```bash
-export CC=gcc-13           # RocksDB compilation
-export CXX=g++-13          # RocksDB compilation
+# CC / CXX — no longer need to be set to gcc-13.
+# Any C/C++ compiler found on PATH works.
 ```
 
-### Optional / Configurable
+### Runtime / Optional
 ```bash
-export UFORGE_SCHEMA_DIR="./defaults/schemas"          # Schema JSON files
-export UFORGE_DATA_FILE="./defaults/data/memory.json"  # JSONL data file
-export FASTEMBED_CACHE_PATH="$(pwd)/defaults/default_model_cache"
-export LEMONADE_URL="http://localhost:8000/api/v1"      # Lemonade Server (Phase 1+)
-export RUST_LOG=info                                    # Logging level
+export LEMONADE_URL="http://localhost:8000/api/v1"  # Lemonade Server for embeddings
+export UFORGE_SCHEMA_DIR="./defaults/schemas"       # Override schema directory
+export UFORGE_DATA_FILE="./defaults/data/memory.json" # Override data file
+export RUST_LOG=info                                # Log verbosity
 ```
 
-### Module-Specific Logging
+### Module-specific logging
 ```bash
 export RUST_LOG=u_forge_ai::storage=debug,u_forge_ai::embeddings=info
 ```
@@ -52,23 +51,47 @@ export RUST_LOG=u_forge_ai::storage=debug,u_forge_ai::embeddings=info
 2. `./defaults/data/memory.json`
 3. `../defaults/data/memory.json`
 
-## Lemonade Server Configuration (Phase 1+)
+## Lemonade Server Configuration (Phase 1 — active)
 
-When Lemonade Server is available, u-forge.ai connects via HTTP:
+Lemonade Server provides embeddings (and future reranking / chat) via an
+OpenAI-compatible HTTP API.  u-forge.ai does **not** fall back to a local model if
+Lemonade is unavailable — it returns a clear error with instructions.
 
 ```bash
-# Default Lemonade Server location
-export LEMONADE_URL="http://localhost:8000/api/v1"
-
-# Install on Linux
+# Install on Linux (snap)
 sudo snap install lemonade-server
 
 # Pull required models
-lemonade-server pull nomic-embed-text
-lemonade-server pull bge-reranker-v2-m3
+lemonade-server pull nomic-embed-text        # embeddings (768-dim)
+lemonade-server pull bge-reranker-v2-m3      # reranking (Phase 4)
+
+# Start the server
+lemonade-server serve
+
+# Verify health
+curl http://localhost:8000/api/v1/health
+
+# Point u-forge.ai at it
+export LEMONADE_URL="http://localhost:8000/api/v1"
 ```
 
-The `EmbeddingManager::try_new_auto()` factory tries Lemonade first, falls back to local FastEmbed.
+`EmbeddingManager::try_new_auto(None, None)` resolves the URL in this order:
+1. The `lemonade_url` argument (if `Some`)
+2. `LEMONADE_URL` environment variable
+3. Hard error — no silent fallback
+
+## Database Location
+
+`KnowledgeGraph::new(db_path)` opens (or creates) a SQLite database at
+`<db_path>/knowledge.db`. The directory is created automatically if it does not
+exist.
+
+```bash
+# Default in CLI demo: a TempDir is used (ephemeral).
+# For a persistent database, pass an explicit path:
+cargo run --example cli_demo
+# or set UFORGE_DATA_FILE / UFORGE_SCHEMA_DIR to customise import sources.
+```
 
 ## Planned Configuration (Phase 3 — config.toml)
 
@@ -84,30 +107,37 @@ rerank_model = "bge-reranker-v2-m3"
 
 [database]
 path = "data/knowledge.db"
+
+[search]
+default_fts_limit = 10
+default_semantic_limit = 10
+rerank_enabled = true
 ```
 
 ## Build Commands
 
 ```bash
-source env.sh                           # Set environment
-cargo build                             # Build (~10 min first time, RocksDB)
-cargo test                              # Run all tests
-cargo run --example cli_demo            # Run CLI demo
-cargo test -- --nocapture               # Tests with stdout
+cargo build                           # Build (first time ~30s for bundled SQLite)
+cargo test                            # Run all tests (no server required)
+cargo run --example cli_demo          # Run demo with Foundation data
 RUST_LOG=debug cargo test -- --nocapture  # Tests with debug logging
 ```
 
 ## Cross-Platform
 
-| OS | RocksDB Compiler | Lemonade Install |
+| OS | C compiler needed | Lemonade install |
 |---|---|---|
-| Ubuntu/Debian | `apt install gcc-13 g++-13` | `snap install lemonade-server` |
-| macOS | `brew install gcc@13` | `.pkg` from releases |
-| Windows | WSL2 recommended | `.exe` installer from releases |
+| Ubuntu / Debian | `apt install gcc` (usually pre-installed) | `snap install lemonade-server` |
+| macOS | Xcode CLT (`xcode-select --install`) | `.pkg` from GitHub releases |
+| Windows | MSVC (Visual Studio Build Tools) or MinGW | `.exe` installer from releases |
 
 ## Troubleshooting
 
-1. **RocksDB compilation errors** → `source env.sh && cargo clean && cargo build`
-2. **Model download failures** → Check `$FASTEMBED_CACHE_PATH`, check disk space
-3. **Lemonade connection refused** → Ensure `lemonade-server serve` is running
-4. **Schema not found** → Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist
+| Problem | Fix |
+|---|---|
+| `openssl-sys` build error | Install `pkg-config libssl-dev` (Ubuntu) or `openssl` (macOS brew) |
+| `Lemonade Server not available` error | Run `lemonade-server serve` and set `LEMONADE_URL` |
+| `lemonade-server pull` fails | Check disk space; retry; verify network access |
+| Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
+| Database locked | Only one process should open the same `knowledge.db` at a time |
+| Dimension mismatch (future sqlite-vec) | Ensure embedding model matches vector column dimensions |

@@ -6,52 +6,83 @@ alwaysApply: true
 
 Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs. Built in Rust.
 
-**Status:** Early prototype. CLI demo only. Migrating to Lemonade Server + SQLite + web UI.
+**Status:** Early prototype. CLI demo only. Phases 1 + 2 complete. Next: sqlite-vec (Phase 2 remainder), axum server (Phase 3).
 
 ## Architecture Overview
 
-Read [ARCHITECTURE.md](mdc:ARCHITECTURE.md) for full details (module map, data model, known bugs, design decisions).
-Read [migration.md](mdc:migration.md) for the phased migration plan.
+Read [ARCHITECTURE.md](mdc:ARCHITECTURE.md) for full details (module map, SQLite schema, resolved bugs, design decisions).
+Read [migration.md](mdc:migration.md) for the phased migration plan and current completion status.
 
 ## Current Architecture
 
-- **Facade**: [src/lib.rs](mdc:src/lib.rs) — `KnowledgeGraph` struct (owns storage, embeddings, schemas) + `ObjectBuilder`
-- **Storage**: [src/storage.rs](mdc:src/storage.rs) — RocksDB with 5 column families (nodes, edges, chunks, names, schemas)
-- **Embeddings**: [src/embeddings.rs](mdc:src/embeddings.rs) — `EmbeddingProvider` trait + `FastEmbedProvider` (being replaced by `LemonadeProvider`)
-- **Vector Search**: [src/vector_search.rs](mdc:src/vector_search.rs) — HNSW + FST hybrid (being replaced by sqlite-vec + FTS5)
+- **Facade**: [src/lib.rs](mdc:src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas) + `ObjectBuilder`
+- **Storage**: [src/storage.rs](mdc:src/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts`. `KnowledgeGraphStorage` is the only storage struct.
+- **Embeddings**: [src/embeddings.rs](mdc:src/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP). FastEmbed/ORT/ONNX have been removed. `EmbeddingManager::try_new_auto` reads `LEMONADE_URL` env var.
+- **Full-Text Search**: Built into `KnowledgeGraphStorage::search_chunks_fts` via SQLite FTS5. Exposed on `KnowledgeGraph` as `search_chunks_fts(query, limit)`. No separate search module.
+- **Vector Search**: `src/vector_search.rs` **has been deleted**. `VectorSearchEngine`, `HnswVectorStore`, `VectorSearchConfig`, `HybridSearchResult`, `SemanticSearchResult`, `ExactSearchResult` **no longer exist**. sqlite-vec ANN search is deferred (planned Phase 2 remainder).
 - **Schemas**: [src/schema.rs](mdc:src/schema.rs) + [src/schema_manager.rs](mdc:src/schema_manager.rs) + [src/schema_ingestion.rs](mdc:src/schema_ingestion.rs)
-- **Data Import**: [src/data_ingestion.rs](mdc:src/data_ingestion.rs) — JSONL two-pass import
-- **Embedding Queue**: [src/embedding_queue.rs](mdc:src/embedding_queue.rs) — async background worker (not yet integrated)
+- **Data Import**: [src/data_ingestion.rs](mdc:src/data_ingestion.rs) — JSONL two-pass import. BUG-6 (dedup) and BUG-7 (cross-session edge resolution) are fixed.
+- **Embedding Queue**: [src/embedding_queue.rs](mdc:src/embedding_queue.rs) — async background worker (not yet integrated into KnowledgeGraph)
 
 ## Migration Direction
 
-Standardizing on **[Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
-- Embeddings: `POST /api/v1/embeddings` replaces FastEmbed
-- Reranking: `POST /api/v1/reranking` (new capability)
-- Chat: `POST /api/v1/chat/completions` (future)
+**Phases 1 and 2 are complete.**
 
-Storage migrating from RocksDB → **SQLite + FTS5 + sqlite-vec**.
-UI via **axum** HTTP/WebSocket server.
+- ✅ Phase 1: `LemonadeProvider` implemented. FastEmbed/ORT removed. BUG-2, BUG-6, BUG-7 fixed.
+- ✅ Phase 2: SQLite replaces RocksDB. FTS5 full-text search live. BUG-1, BUG-3, BUG-4, BUG-5, BUG-8, BUG-9 resolved. `src/vector_search.rs` deleted.
+- ⏳ Phase 2 (remainder): Add `sqlite-vec` extension for ANN vector search.
+- ⏳ Phase 3: `axum` HTTP/WebSocket server for web UI.
+- ⏳ Phase 4: Reranking via `POST /api/v1/reranking` on Lemonade Server.
+- ⏳ Phase 5: Cargo workspace split.
+
+**Standard on [Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
+- Embeddings: `POST /api/v1/embeddings` (implemented)
+- Reranking: `POST /api/v1/reranking` (Phase 4)
+- Chat: `POST /api/v1/chat/completions` (future)
 
 ## Key Integration Point
 
-The `EmbeddingProvider` trait in [src/embeddings.rs](mdc:src/embeddings.rs) is the primary abstraction for AI capabilities. New providers (Lemonade, etc.) implement this trait. Do NOT bypass it.
+The `EmbeddingProvider` trait in [src/embeddings.rs](mdc:src/embeddings.rs) is the primary abstraction for AI capabilities. Only `LemonadeProvider` currently implements it. Do NOT bypass the trait.
 
-## Known Bugs (see ARCHITECTURE.md for details)
+`KnowledgeGraph` does **not** hold an `EmbeddingManager`. Storage and schema operations are fully synchronous and require no running server. Embeddings are opt-in — construct an `EmbeddingManager` separately when needed.
 
-- BUG-1: HNSW persistence broken (always rebuilds on startup)
-- BUG-2: `similarity = 1.0 - distance` wrong for L2 (can go negative)
-- BUG-3: Node deletion is O(N) across entire edge column family
-- BUG-4: `get_stats()` is O(N) full table scan
-- BUG-5: `Mutex<TextEmbedding>` blocks Tokio thread
-- BUG-6: No import deduplication
-- BUG-7: In-memory-only edge resolution during import
+## Known Bugs — Current Status
+
+All originally listed bugs (BUG-1 through BUG-9) are **resolved**. See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) for resolution details.
+
+| Bug | Description | Resolution |
+|---|---|---|
+| BUG-1 | HNSW persistence broken | Resolved — HNSW eliminated (no more hnsw_rs) |
+| BUG-2 | `similarity = 1.0 - distance` wrong for L2 | Resolved — fixed formula, then HNSW removed |
+| BUG-3 | Node deletion O(N) across edge CF | Resolved — `ON DELETE CASCADE` with indexed FK |
+| BUG-4 | `get_stats()` O(N) full scan | Resolved — `SELECT COUNT(*)`/ `SUM()` in SQLite |
+| BUG-5 | `Mutex<TextEmbedding>` blocks Tokio thread | Resolved — FastEmbed removed; LemonadeProvider is fully async |
+| BUG-6 | No import deduplication | Resolved — `find_by_name` check before insert |
+| BUG-7 | In-memory-only edge resolution | Resolved — `find_by_name_only` storage fallback |
+| BUG-8 | `get_chunks_for_node` O(N) | Resolved — `idx_chunks_object` index |
+| BUG-9 | `'static` lifetime on Hnsw | Resolved — hnsw_rs removed |
 
 ## Important Files
 
-- [env.sh](mdc:env.sh) — MUST source before cargo commands (sets CC=gcc-13 for RocksDB)
-- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work
-- [migration.md](mdc:migration.md) — Phased migration plan with execution sequence
-- [examples/cli_demo.rs](mdc:examples/cli_demo.rs) — The only runnable entry point
-- [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files
-- [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data
+- [env.sh](mdc:env.sh) — Optional. Sets `UFORGE_*` path variables. **No longer required for compilation** (gcc-13 dependency eliminated with RocksDB).
+- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work. Contains current SQLite schema, module map, resolved bugs.
+- [migration.md](mdc:migration.md) — Phased migration plan with completion status.
+- [examples/cli_demo.rs](mdc:examples/cli_demo.rs) — The only runnable entry point. Uses FTS5 search. No embedding server required.
+- [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files (unchanged).
+- [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data (~220 nodes, ~312 edges).
+
+## Module Map
+
+| File | Role | Key Types |
+|---|---|---|
+| `src/lib.rs` | Facade + ObjectBuilder | `KnowledgeGraph`, `ObjectBuilder` |
+| `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
+| `src/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats` |
+| `src/embeddings.rs` | Embedding providers | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
+| `src/schema.rs` | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
+| `src/schema_manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
+| `src/schema_ingestion.rs` | JSON schema files → internal | `SchemaIngestion` |
+| `src/data_ingestion.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
+| `src/embedding_queue.rs` | Async background queue | `EmbeddingQueue`, `EmbeddingQueueBuilder` |
+
+**Deleted modules (do not reference):** `src/vector_search.rs` — removed in Phase 2.

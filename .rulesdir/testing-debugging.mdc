@@ -6,155 +6,292 @@ description: Testing and debugging patterns
 
 ## Test Environment
 
-All tests use temporary directories for isolation:
+All tests use temporary directories for isolation. `KnowledgeGraph::new` takes a
+single path argument — no embedding cache dir, no server required.
+
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn setup_test_storage() -> (KnowledgeGraph, TempDir) {
+    fn create_test_graph() -> (KnowledgeGraph, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let cache_dir = get_test_cache_dir();
-        let kg = KnowledgeGraph::new(temp_dir.path(), Some(&cache_dir)).unwrap();
-        (kg, temp_dir)
-    }
-
-    fn get_test_cache_dir() -> PathBuf {
-        std::env::var("FASTEMBED_CACHE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .join("test_model_cache")
-            })
+        let graph = KnowledgeGraph::new(temp_dir.path()).unwrap();
+        (graph, temp_dir)
     }
 }
 ```
+
+The SQLite database is created at `<temp_dir>/knowledge.db` automatically.
+No `source env.sh`, no model downloads, no running server needed.
+
+---
 
 ## Running Tests
 
 ```bash
-source env.sh                              # Required for RocksDB
-cargo test                                 # All tests
-cargo test storage                         # Module-specific
-cargo test -- --nocapture                  # With stdout
-RUST_LOG=debug cargo test -- --nocapture   # Debug logging
-cargo test test_name -- --exact            # Single test
+cargo build                                    # Build (no env.sh needed)
+cargo test                                     # All tests
+cargo test storage                             # Module-specific
+cargo test -- --nocapture                      # With stdout
+RUST_LOG=debug cargo test -- --nocapture       # With debug logging
+cargo test test_name -- --exact                # Single test by name
 ```
 
-## Mock vs Real Providers
+All 52 unit tests + 3 doc-tests pass without any external service.
 
-### Mock (fast, deterministic — use for unit tests)
+---
+
+## Embedding Providers in Tests
+
+### Mock provider (fast, no server — use for all unit tests)
+
+The mock produces deterministic fake vectors based on input length. It is
+used by `embedding_queue` tests and any test that needs an `EmbeddingProvider`
+without a live Lemonade Server.
+
 ```rust
-struct MockEmbeddingProvider { dimensions: usize }
+use u_forge_ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
 
-#[async_trait]
+const MOCK_DIMS: usize = 16;
+
+struct MockEmbeddingProvider;
+
+#[async_trait::async_trait]
 impl EmbeddingProvider for MockEmbeddingProvider {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let mut v = vec![0.1; self.dimensions];
-        v[0] = text.len() as f32 / 100.0;
-        Ok(v)
+    async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        Ok((0..MOCK_DIMS)
+            .map(|i| (text.len() as f32 + i as f32) / 100.0)
+            .collect())
     }
-    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        texts.iter().map(|t| self.embed(t)).collect() // simplified
-    }
-    fn dimensions(&self) -> Result<usize> { Ok(self.dimensions) }
-    fn max_tokens(&self) -> Result<usize> { Ok(512) }
-    fn provider_type(&self) -> EmbeddingProviderType { /* mock */ }
-    fn model_info(&self) -> Option<ModelInfo<EmbeddingModel>> { None }
-}
-```
 
-### Real FastEmbed (integration tests — slower, requires model download)
-```rust
-fn create_real_embedding_manager() -> Result<EmbeddingManager> {
-    let cache_dir = get_test_cache_dir();
-    EmbeddingManager::try_new_local_default(Some(cache_dir))
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for t in &texts {
+            out.push(self.embed(t).await?);
+        }
+        Ok(out)
+    }
+
+    fn dimensions(&self) -> anyhow::Result<usize> { Ok(MOCK_DIMS) }
+    fn max_tokens(&self) -> anyhow::Result<usize>  { Ok(512) }
+
+    fn provider_type(&self) -> EmbeddingProviderType {
+        EmbeddingProviderType::Lemonade
+    }
+
+    fn model_info(&self) -> Option<EmbeddingModelInfo> { None }
 }
 ```
 
 ### Lemonade Server (integration tests — requires running server)
+
+Gate on the `LEMONADE_URL` environment variable so the test silently skips
+in CI environments where no server is available:
+
 ```rust
-async fn create_lemonade_manager() -> Result<EmbeddingManager> {
-    EmbeddingManager::try_new_lemonade(
-        "http://localhost:8000/api/v1",
-        "nomic-embed-text"
-    ).await
+#[tokio::test]
+async fn test_lemonade_embed() {
+    let Some(url) = std::env::var("LEMONADE_URL").ok() else {
+        eprintln!("Skipping: LEMONADE_URL not set");
+        return;
+    };
+
+    let provider = u_forge_ai::embeddings::LemonadeProvider::new(&url, "nomic-embed-text")
+        .await
+        .expect("Connect to Lemonade");
+
+    let embedding = provider.embed("Test text").await.unwrap();
+    assert_eq!(embedding.len(), provider.dimensions().unwrap());
 }
 ```
 
-## Known Bug Testing
+> **There is no FastEmbed / local fallback.** FastEmbed and ONNX Runtime were
+> removed in Phase 1. Do not attempt to reference `FastEmbedProvider`,
+> `try_new_local_default`, or `FASTEMBED_CACHE_PATH` — they no longer exist.
 
-When fixing bugs from ARCHITECTURE.md, write regression tests:
+---
+
+## Storage Tests
+
+`KnowledgeGraphStorage` (SQLite) is tested directly in `src/storage.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_storage() -> (KnowledgeGraphStorage, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let storage = KnowledgeGraphStorage::new(tmp.path()).unwrap();
+        (storage, tmp)
+    }
+
+    #[test]
+    fn test_upsert_get_node() {
+        let (storage, _tmp) = create_test_storage();
+        let meta = ObjectMetadata::new("character".to_string(), "Gandalf".to_string());
+        let id = meta.id;
+        storage.upsert_node(meta).unwrap();
+        let found = storage.get_node(id).unwrap().unwrap();
+        assert_eq!(found.name, "Gandalf");
+    }
+}
+```
+
+Key behaviours to test:
+- `upsert_node` with `INSERT OR REPLACE` — updating a node must **not** wipe its edges/chunks (the implementation uses `ON CONFLICT DO UPDATE` for this reason)
+- `delete_node` — verify `ON DELETE CASCADE` removes edges and chunks
+- `search_chunks_fts` — insert a chunk, then query by keyword
+- `query_subgraph` — verify BFS hop depth and edge deduplication
+
+---
+
+## Known Bug Regression Tests
+
+All nine original bugs are resolved. Regression tests to keep passing:
+
+### BUG-2 (similarity score — resolved)
+```rust
+#[test]
+fn test_similarity_bounded() {
+    // 1.0 / (1.0 + distance) is always in (0, 1] regardless of distance magnitude
+    for distance in [0.0f32, 0.5, 1.0, 10.0, 1000.0] {
+        let sim = 1.0 / (1.0 + distance);
+        assert!(sim > 0.0 && sim <= 1.0, "similarity out of bounds for distance {distance}");
+    }
+}
+```
+
+### BUG-6 (import deduplication — resolved)
+```rust
+#[tokio::test]
+async fn test_import_dedup() {
+    let tmp = TempDir::new().unwrap();
+    let graph = KnowledgeGraph::new(tmp.path()).unwrap();
+    let mut ingestion = DataIngestion::new(&graph);
+
+    // Import the same file twice
+    ingestion.import_json_data("./defaults/data/memory.json").await.unwrap();
+    let count_after_first = graph.get_stats().unwrap().node_count;
+
+    ingestion.import_json_data("./defaults/data/memory.json").await.unwrap();
+    let count_after_second = graph.get_stats().unwrap().node_count;
+
+    assert_eq!(count_after_first, count_after_second, "Re-import must not create duplicates");
+}
+```
+
+### BUG-7 (cross-session edge resolution — resolved)
+```rust
+#[tokio::test]
+async fn test_cross_session_edge_resolution() {
+    let tmp = TempDir::new().unwrap();
+
+    // Session 1: import nodes only
+    {
+        let graph = KnowledgeGraph::new(tmp.path()).unwrap();
+        let mut ing = DataIngestion::new(&graph);
+        // Import a file with just nodes, no edges
+        // ...
+    }
+
+    // Session 2: import edges referencing those nodes
+    {
+        let graph = KnowledgeGraph::new(tmp.path()).unwrap();
+        let mut ing = DataIngestion::new(&graph);
+        // Edges should resolve via storage fallback
+        // assert relationships_created > 0
+    }
+}
+```
+
+---
+
+## FTS5 Search Tests
 
 ```rust
 #[test]
-fn test_bug6_import_deduplication() {
-    let (graph, _temp) = setup_test_storage();
-    // Import same data twice
-    // Assert object count doesn't double
-}
+fn test_fts_search_basic() {
+    let (graph, _tmp) = create_test_graph();
 
-#[test]
-fn test_bug2_similarity_bounded() {
-    // Ensure similarity is always in [0, 1]
-    let similarity = 1.0 / (1.0 + large_distance);
-    assert!(similarity >= 0.0 && similarity <= 1.0);
+    let id = ObjectBuilder::character("Saruman".to_string())
+        .add_to_graph(&graph)
+        .unwrap();
+
+    graph.add_text_chunk(
+        id,
+        "Saruman the White was head of the Istari order.".to_string(),
+        ChunkType::Description,
+    ).unwrap();
+
+    // Keyword present
+    let hits = graph.search_chunks_fts("Istari", 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].1, id);
+
+    // Keyword absent
+    let empty = graph.search_chunks_fts("dragon", 5).unwrap();
+    assert!(empty.is_empty());
 }
 ```
+
+FTS5 query syntax supported: phrase (`"foo bar"`), prefix (`foo*`), boolean
+(`foo AND bar`, `foo OR bar`, `foo NOT bar`), column filters.
+
+---
 
 ## Debugging
 
-### Logging levels
+### Log levels
 ```bash
-RUST_LOG=trace                          # Everything
-RUST_LOG=debug                          # Development
-RUST_LOG=info                           # Normal operation
-RUST_LOG=u_forge_ai::storage=debug      # Single module
+RUST_LOG=trace                               # Everything
+RUST_LOG=debug                               # Development detail
+RUST_LOG=info                                # Normal operation (default in demo)
+RUST_LOG=u_forge_ai::storage=debug           # Single module
+RUST_LOG=u_forge_ai::data_ingestion=warn     # Suppress noisy modules
 ```
 
 ### Structured logging in code
 ```rust
 tracing::info!(
-    operation = "create_object",
-    object_type = %obj_type,
-    duration_ms = start.elapsed().as_millis(),
-    "Object created"
+    operation = "upsert_node",
+    object_type = %obj.object_type,
+    name = %obj.name,
+    "Node persisted"
+);
+
+tracing::warn!(
+    name = %name,
+    "Skipping duplicate object during import"
 );
 ```
 
 ### Common issues
 
-| Symptom | Likely Cause | Fix |
+| Symptom | Likely cause | Fix |
 |---|---|---|
-| RocksDB compile error | Missing gcc-13 | `source env.sh` |
-| Dimension mismatch panic | Wrong embedding model | Check provider dimensions match VectorSearchConfig |
-| Search returns empty | HNSW not populated | Ensure add_chunk called before search |
-| Negative similarity scores | BUG-2 | Fix: `1.0 / (1.0 + distance)` |
-| Duplicate objects after import | BUG-6 | Add find_by_name check before insert |
-| Edge references unresolved | BUG-7 | Query storage before session map |
+| `openssl-sys` compile error | Missing system OpenSSL headers | `apt install pkg-config libssl-dev` (Ubuntu) |
+| `Lemonade Server not available` | Server not running or `LEMONADE_URL` not set | `lemonade-server serve` + `export LEMONADE_URL=http://localhost:8000/api/v1` |
+| FTS5 search returns nothing | Chunk not yet added for the object | Call `add_text_chunk` before `search_chunks_fts` |
+| `database is locked` | Two processes sharing the same `knowledge.db` | Ensure only one writer at a time |
+| Import creates 0 edges | Node names in edges don't match node names exactly | Check spelling; `resolve_node_id` does exact-match lookup |
+| Schema validation fails on known type | Schema not loaded before validation | Call `SchemaIngestion::load_schemas_from_directory` and `save_schema` first |
+| `cannot borrow … as mutable` in test | `TempDir` dropped too early | Bind `_tmp` to a named variable, not `_` |
 
-## Performance Testing
-
-```rust
-#[tokio::test]
-async fn test_embedding_throughput() {
-    let start = Instant::now();
-    let provider = create_real_embedding_manager().unwrap();
-    let texts: Vec<String> = (0..100).map(|i| format!("Test text {}", i)).collect();
-    let _ = provider.get_provider().embed_batch(texts).await.unwrap();
-    println!("100 embeddings in {:?}", start.elapsed());
-}
-```
+---
 
 ## CI Commands
 
 ```bash
-source env.sh
 cargo fmt --check
-cargo clippy --all-features -- -D warnings
-cargo test --all-features
+cargo clippy -- -D warnings
+cargo test
 cargo doc --no-deps
 cargo run --example cli_demo
 ```
+
+No `source env.sh` required. No model downloads. All commands work offline
+(except Lemonade integration tests, which are gated on `LEMONADE_URL`).

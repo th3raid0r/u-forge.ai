@@ -16,6 +16,7 @@
 pub mod data_ingestion;
 pub mod embedding_queue;
 pub mod embeddings;
+pub mod lemonade;
 pub mod schema;
 pub mod schema_ingestion;
 pub mod schema_manager;
@@ -30,6 +31,12 @@ pub use embedding_queue::{
 pub use embeddings::{
     EmbeddingManager, EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
     LemonadeProvider,
+};
+pub use lemonade::{
+    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
+    GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeModelEntry, LemonadeModelRegistry,
+    LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, ModelRole, SttGuard,
+    TranscriptionResult,
 };
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,

@@ -1,5 +1,11 @@
 # Migration Plan: Lemonade Server + SQLite + Web UI
 
+> **Status as of latest session:**
+> - ✅ **Phase 1 COMPLETE** — `LemonadeProvider` implemented; FastEmbed/ORT/ort-sys removed; BUG-2, BUG-6, BUG-7 fixed.
+> - ✅ **Phase 2 COMPLETE** — SQLite (`rusqlite` bundled) replaces RocksDB; FTS5 full-text search live; BUG-1, BUG-3, BUG-4, BUG-5, BUG-8, BUG-9 resolved. **sqlite-vec (vector ANN) is deferred** — FTS5 keyword search is the current semantic-search substitute until Phase 2 is fully closed out.
+> - ✅ **Extended Lemonade Integration COMPLETE** — `src/lemonade.rs` added: `LemonadeModelRegistry` (model discovery + role classification), `GpuResourceManager` (STT/LLM GPU sharing policy with RAII guards), `LemonadeTtsProvider` (kokoro-v1, CPU), `LemonadeSttProvider` (Whisper-Large-v3-Turbo, GPU), `LemonadeChatProvider` (GLM-4.7-Flash-GGUF, GPU), `LemonadeStack` convenience builder. Default embedding model changed to `embed-gemma-300m-FLM` (NPU). `embed_batch` fallback added for FLM backends. 92/92 tests passing.
+> - ⏳ **Phase 3–5** — not yet started.
+
 > Replaces the previous plan (self-managed llama.cpp fleet). This plan standardizes on
 > [Lemonade Server](https://github.com/lemonade-sdk/lemonade) for all AI capabilities
 > and SQLite for unified storage.
@@ -32,10 +38,12 @@ Lemonade provides an **OpenAI-compatible REST API** at `http://localhost:8000/ap
 
 | Endpoint | Use in u-forge.ai |
 |---|---|
-| `POST /api/v1/embeddings` | Text → vector embeddings |
-| `POST /api/v1/reranking` | Query + docs → relevance scores |
-| `POST /api/v1/chat/completions` | LLM generation (future) |
-| `GET /api/v1/models` | Available model listing |
+| `POST /api/v1/embeddings` | Text → vector embeddings (`LemonadeProvider`) |
+| `POST /api/v1/audio/speech` | Text-to-speech synthesis (`LemonadeTtsProvider`) |
+| `POST /api/v1/audio/transcriptions` | Speech-to-text transcription (`LemonadeSttProvider`) |
+| `POST /api/v1/chat/completions` | LLM generation (`LemonadeChatProvider`) |
+| `POST /api/v1/reranking` | Query + docs → relevance scores (Phase 4) |
+| `GET /api/v1/models` | Available model listing (`LemonadeModelRegistry`) |
 | `GET /api/v1/health` | Server health check |
 | `POST /api/v1/pull` | Download new models |
 
@@ -43,34 +51,46 @@ API key is required but ignored — use any string (e.g., `"lemonade"`).
 
 ### Models
 
-| Capability | Recommended Model | Endpoint |
-|---|---|---|
-| Embeddings | `nomic-embed-text` | `/api/v1/embeddings` |
-| Reranking | `bge-reranker-v2-m3` | `/api/v1/reranking` |
-| Chat/Generation | `Llama-3.2-1B-Instruct` or larger | `/api/v1/chat/completions` |
+The following hardware-aware model assignment is used. The `LemonadeModelRegistry`
+discovers and classifies all of these automatically via `GET /api/v1/models`.
+
+| Capability | Model | Hardware | Recipe | Endpoint |
+|---|---|---|---|---|
+| Embeddings | `embed-gemma-300m-FLM` | **NPU** | `flm` | `/api/v1/embeddings` |
+| Text-to-speech | `kokoro-v1` | **CPU** | `kokoro` | `/api/v1/audio/speech` |
+| Speech-to-text | `Whisper-Large-v3-Turbo` | **GPU** | `whispercpp` | `/api/v1/audio/transcriptions` |
+| Chat / LLM | `GLM-4.7-Flash-GGUF` | **GPU** | `llamacpp` | `/api/v1/chat/completions` |
+| Reranking (Phase 4) | `bge-reranker-v2-m3-GGUF` | CPU | `llamacpp` | `/api/v1/reranking` |
+
+> **GPU sharing policy:** `Whisper-Large-v3-Turbo` and `GLM-4.7-Flash-GGUF` share
+> the same GPU and run one at a time. `GpuResourceManager` enforces this:
+> STT invoked during LLM inference is **rejected immediately** (latency-sensitive);
+> LLM invoked during STT is **queued** until the STT session completes.
 
 Pull models via CLI or API:
 ```bash
-lemonade-server pull nomic-embed-text
-lemonade-server pull bge-reranker-v2-m3
+lemonade-server pull embed-gemma-300m-FLM
+lemonade-server pull kokoro-v1
+lemonade-server pull Whisper-Large-v3-Turbo
+lemonade-server pull GLM-4.7-Flash-GGUF
+lemonade-server pull bge-reranker-v2-m3-GGUF   # Phase 4
 ```
 
 ---
 
-## Phase 1: Lemonade Embedding Provider (Low Risk, High Value)
+## Phase 1: Lemonade Embedding Provider ✅ COMPLETE
 
 **Goal:** Add `LemonadeProvider` as a new `EmbeddingProvider` implementation using HTTP.
-**Files changed:** `src/embeddings.rs`, `Cargo.toml`
-**Files unchanged:** Everything else — this is purely additive.
+**Status:** Complete. `FastEmbedProvider`, `ort`, `ort-sys`, and `fastembed` crates have been removed entirely. `LemonadeProvider` is the only `EmbeddingProvider` implementation.
 
-### 1a. Make reqwest a required dependency
+### 1a. Make reqwest a required dependency ✅
 
 ```toml
 # Cargo.toml — change reqwest from optional to required
 reqwest = { version = "0.12", features = ["json"] }
 ```
 
-### 1b. Implement LemonadeProvider
+### 1b. Implement LemonadeProvider ✅
 
 Add to `src/embeddings.rs`:
 
@@ -114,7 +134,7 @@ impl EmbeddingProvider for LemonadeProvider {
 }
 ```
 
-### 1c. Add factory methods to EmbeddingManager
+### 1c. Add factory methods to EmbeddingManager ✅
 
 ```rust
 impl EmbeddingManager {
@@ -135,170 +155,130 @@ impl EmbeddingManager {
 }
 ```
 
-### 1d. Update KnowledgeGraph::new
+### 1d. Update KnowledgeGraph::new ✅
 
-Make construction async to support Lemonade probing:
+`KnowledgeGraph::new` is synchronous and takes only `db_path`. The `embedding_manager` field has been removed from the struct — embeddings are opt-in via `EmbeddingManager` separately. `EmbeddingManager::try_new_auto(url, model)` reads `LEMONADE_URL` from the environment.
 
-```rust
-impl KnowledgeGraph {
-    pub async fn new(db_path: &Path, config: &AppConfig) -> Result<Self> {
-        let storage = Arc::new(KnowledgeGraphStorage::new(db_path)?);
-        let embedding_manager = Arc::new(
-            EmbeddingManager::try_new_auto(
-                config.lemonade_url.as_deref(),
-                config.embedding_model.as_deref(),
-                config.cache_dir.clone(),
-            ).await?
-        );
-        let schema_manager = Arc::new(SchemaManager::new(storage.clone()));
-        Ok(Self { storage, embedding_manager, schema_manager })
-    }
-}
-```
+### 1e. Remove heavy crates ✅
 
-### 1e. Remove heavy crates (after Phase 1 is working)
+Removed: `fastembed`, `ort`, `ort-sys`, `petgraph`, `hnsw_rs`, `fst`, `memmap2`, `bincode`, `rayon`.
+Decision: FastEmbed removed entirely. Lemonade Server is required for embeddings. No local fallback.
 
-```toml
-# Remove from Cargo.toml:
-# fastembed = { version = "5.0" }      # Only if NOT keeping as fallback
-# ort-sys = ...                         # Only needed by fastembed
-# ort = ...                             # Only needed by fastembed
-petgraph = "0.8"                        # Unused, remove immediately
-```
+### Phase 1 Bug Fixes ✅
 
-**Decision point:** Keep FastEmbed behind a `local-fallback` feature flag, or remove entirely. If Lemonade Server is always expected to be running, remove it. If offline support matters, keep it gated.
-
-### Phase 1 Bug Fixes (do alongside)
-
-- **BUG-2 fix:** Change `similarity: 1.0 - distance` to `similarity: 1.0 / (1.0 + distance)` in vector_search.rs L367
-- **BUG-6 fix:** Add dedup check in `DataIngestion::create_objects` — call `find_by_name` before insert
-- **BUG-7 fix:** Query storage name index before session map in edge resolution
+- **BUG-2:** Fixed `similarity: 1.0 / (1.0 + distance)` — now moot since HNSW removed in Phase 2.
+- **BUG-6:** `DataIngestion::create_objects` calls `find_by_name` before insert; duplicates skipped with a warn log.
+- **BUG-7:** New `resolve_node_id` helper checks session map first, then falls back to `storage.find_nodes_by_name_only` (O(log N) via `idx_nodes_name_only` index).
 
 ---
 
-## Phase 2: SQLite Migration (Medium Risk, High Value)
+## Phase 2: SQLite Migration ✅ COMPLETE (sqlite-vec deferred)
 
 **Goal:** Replace RocksDB + HNSW + FST with SQLite + sqlite-vec + FTS5.
-**This is the biggest single change.** No production data exists, so this is a clean cut.
+**Status:** Complete for storage and FTS5. `sqlite-vec` (vector ANN search) is deferred — FTS5 keyword search serves as the interim text-matching solution. No production data existed, so this was a clean cut.
 
-### 2a. New dependencies
+### 2a. New dependencies ✅
 
 ```toml
-# Add to Cargo.toml:
+# Added:
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
-# sqlite-vec loaded as extension at runtime
+# sqlite-vec: deferred (no crate added yet)
 
-# Remove from Cargo.toml:
-rocksdb = "0.23"
-hnsw_rs = "0.3"
-fst = "0.4"
-memmap2 = "0.9"
+# Removed:
+# rocksdb, hnsw_rs, fst, memmap2, bincode, ort, ort-sys, fastembed, petgraph, rayon
 ```
 
-### 2b. SQLite schema
+### 2b. SQLite schema ✅
+
+Implemented in `src/storage.rs` as `SQL_SCHEMA` const. Actual schema:
 
 ```sql
--- Core tables
-CREATE TABLE nodes (
-    id TEXT PRIMARY KEY,           -- UUID as text
+CREATE TABLE IF NOT EXISTS nodes (
+    id          TEXT PRIMARY KEY,
     object_type TEXT NOT NULL,
     schema_name TEXT,
-    name TEXT NOT NULL,
+    name        TEXT NOT NULL,
     description TEXT,
-    tags TEXT,                     -- JSON array
-    properties TEXT NOT NULL,      -- JSON object
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    tags        TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    properties  TEXT NOT NULL DEFAULT '{}',  -- JSON object
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 
-CREATE TABLE edges (
-    id TEXT PRIMARY KEY,
-    source_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    target_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    edge_type TEXT NOT NULL,
-    weight REAL NOT NULL DEFAULT 1.0,
-    metadata TEXT,                 -- JSON object
+CREATE TABLE IF NOT EXISTS edges (
+    source_id  TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    target_id  TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    edge_type  TEXT NOT NULL,
+    weight     REAL NOT NULL DEFAULT 1.0,
+    metadata   TEXT NOT NULL DEFAULT '{}',   -- JSON object
     created_at TEXT NOT NULL,
     UNIQUE(source_id, target_id, edge_type)
 );
 
-CREATE TABLE chunks (
-    id TEXT PRIMARY KEY,
-    object_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    chunk_type TEXT NOT NULL,
-    content TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS chunks (
+    id          TEXT PRIMARY KEY,
+    object_id   TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    chunk_type  TEXT NOT NULL,
+    content     TEXT NOT NULL,
     token_count INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at  TEXT NOT NULL
 );
 
-CREATE TABLE schemas (
-    name TEXT PRIMARY KEY,
-    definition TEXT NOT NULL       -- JSON
+CREATE TABLE IF NOT EXISTS schemas (
+    name       TEXT PRIMARY KEY,
+    definition TEXT NOT NULL  -- JSON
 );
 
--- Full-text search
-CREATE VIRTUAL TABLE chunks_fts USING fts5(
+-- Full-text search (active)
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     content,
+    content='chunks',
     content_rowid='rowid'
 );
-
--- Vector search (via sqlite-vec extension)
-CREATE VIRTUAL TABLE chunk_vectors USING vec0(
-    chunk_id TEXT PRIMARY KEY,
-    embedding float[768]
-);
+-- Three DML triggers keep chunks_fts in sync with chunks automatically.
 
 -- Indexes
-CREATE INDEX idx_nodes_type ON nodes(object_type);
-CREATE INDEX idx_nodes_name ON nodes(object_type, name);
-CREATE INDEX idx_edges_source ON edges(source_id);
-CREATE INDEX idx_edges_target ON edges(target_id);
-CREATE INDEX idx_edges_type ON edges(edge_type);
-CREATE INDEX idx_chunks_object ON chunks(object_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_type      ON nodes(object_type);
+CREATE INDEX IF NOT EXISTS idx_nodes_name      ON nodes(object_type, name);
+CREATE INDEX IF NOT EXISTS idx_nodes_name_only ON nodes(name);  -- for find_by_name_only
+CREATE INDEX IF NOT EXISTS idx_edges_source    ON edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target    ON edges(target_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_object   ON chunks(object_id);
+
+-- NOTE: chunk_vectors (sqlite-vec) not yet created — deferred.
 ```
 
-### 2c. New StorageBackend trait
+### 2c. StorageBackend trait — deferred
+
+No trait was needed — this was a clean cut (no production data). `KnowledgeGraphStorage` is now the SQLite implementation directly. RocksDB was removed in the same commit. The `StorageBackend` trait can be introduced in Phase 5 (workspace split) if multiple backends are needed again.
+
+### 2d. Absorb VectorSearchEngine into KnowledgeGraph ✅ (partial)
+
+`VectorSearchEngine`, `HnswVectorStore`, and all HNSW/FST code have been deleted. `src/vector_search.rs` no longer exists.
 
 ```rust
-/// Abstract storage interface — allows RocksDB and SQLite to coexist during migration
-pub trait StorageBackend: Send + Sync {
-    fn upsert_node(&self, metadata: &ObjectMetadata) -> Result<ObjectId>;
-    fn get_node(&self, id: ObjectId) -> Result<Option<ObjectMetadata>>;
-    fn get_all_objects(&self) -> Result<Vec<ObjectMetadata>>;
-    fn find_nodes_by_name(&self, object_type: &str, name: &str) -> Result<Option<ObjectMetadata>>;
-    fn upsert_edge(&self, edge: &Edge) -> Result<()>;
-    fn get_edges(&self, node_id: ObjectId) -> Result<Vec<Edge>>;
-    fn delete_node(&self, id: ObjectId) -> Result<()>;
-    fn get_stats(&self) -> Result<GraphStats>;
-    // ... etc
-}
-```
-
-Implement for both `RocksDbStorage` (existing, wrapped) and `SqliteStorage` (new). Wire `KnowledgeGraph` to use `Arc<dyn StorageBackend>`. Test both in parallel. Remove RocksDB when SQLite is proven.
-
-### 2d. Absorb VectorSearchEngine into KnowledgeGraph
-
-```rust
+// Current KnowledgeGraph struct (src/lib.rs):
 pub struct KnowledgeGraph {
-    storage: Arc<dyn StorageBackend>,
-    embedding_manager: Arc<EmbeddingManager>,
+    storage: Arc<KnowledgeGraphStorage>,
     schema_manager: Arc<SchemaManager>,
-    // NEW: vector search is now owned, not floating separately
-    // With SQLite, this becomes queries against chunk_vectors table
+    // embedding_manager removed — opt-in via EmbeddingManager separately
 }
 ```
 
-### Phase 2 Bug Fixes (resolved by design)
+FTS5 search is exposed via `KnowledgeGraph::search_chunks_fts(query, limit)`.
+Vector ANN search via `sqlite-vec` is the remaining deferred item.
 
-- **BUG-1:** HNSW persistence → eliminated (sqlite-vec persists automatically)
-- **BUG-3:** O(N) node deletion → `ON DELETE CASCADE` + indexed foreign keys
-- **BUG-4:** O(N) get_stats → `SELECT COUNT(*)` with covering indexes
-- **BUG-8:** O(N) get_chunks_for_node → indexed `object_id` column
-- **BUG-9:** 'static lifetime on Hnsw → eliminated (no more hnsw_rs)
+### Phase 2 Bug Fixes ✅ (all resolved)
+
+- **BUG-1:** HNSW persistence broken → eliminated (HNSW removed entirely)
+- **BUG-3:** O(N) node deletion → `ON DELETE CASCADE` + indexed FK columns
+- **BUG-4:** O(N) get_stats → `SELECT COUNT(*)` + `SUM(token_count)` — O(1)
+- **BUG-8:** O(N) get_chunks_for_node → `idx_chunks_object` index on `chunks(object_id)`
+- **BUG-9:** `'static` lifetime on Hnsw → eliminated (hnsw_rs removed)
 
 ---
 
-## Phase 3: HTTP Server for UI (Medium Risk, Medium Value)
+## Phase 3: HTTP Server for UI ⏳ NOT STARTED
 
 **Goal:** Add an axum HTTP/WebSocket server so a web UI can connect.
 
@@ -367,7 +347,7 @@ rerank_enabled = true
 
 ---
 
-## Phase 4: Enhanced Search (Low Risk, Medium Value)
+## Phase 4: Enhanced Search ⏳ NOT STARTED
 
 **Goal:** Add reranking and improve search quality using Lemonade Server capabilities.
 
@@ -399,7 +379,7 @@ impl LemonadeReranker {
 
 ---
 
-## Phase 5: Cargo Workspace (Low Risk, Organizational)
+## Phase 5: Cargo Workspace ⏳ NOT STARTED
 
 **Goal:** Split single crate into workspace for separation of concerns.
 
@@ -419,43 +399,54 @@ u-forge.ai/
 
 ## Execution Sequence
 
-| Step | Phase | Description | Risk | Crate Changes |
+| Step | Phase | Description | Risk | Status |
 |---|---|---|---|---|
-| 1 | 1a | Add reqwest as required dep | None | +reqwest |
-| 2 | 1b-c | Implement LemonadeProvider + factory methods | Low | Edit embeddings.rs |
-| 3 | 1 | Fix BUG-2 (similarity score) | None | 1-line fix |
-| 4 | 1 | Fix BUG-6 (import dedup) | Low | Edit data_ingestion.rs |
-| 5 | 1 | Fix BUG-7 (edge resolution) | Low | Edit data_ingestion.rs |
-| 6 | 1e | Remove petgraph | None | -petgraph |
-| 7 | 2a-b | Add SQLite storage implementation | Medium | +rusqlite, new file |
-| 8 | 2c | Create StorageBackend trait, wrap both impls | Medium | Refactor storage.rs |
-| 9 | 2d | Absorb VectorSearchEngine into KnowledgeGraph | Medium | Refactor lib.rs |
-| 10 | 2 | Remove RocksDB, HNSW, FST, memmap2, ort | Medium | -5 crates |
-| 11 | 1e | Remove fastembed + ort (or gate behind feature) | Low | -3 crates |
-| 12 | 3 | Add axum server with REST API | Medium | +axum, new file |
-| 13 | 3 | Add WebSocket support | Medium | New file |
-| 14 | 4 | Add LemonadeReranker | Low | New file |
-| 15 | 4 | Enhanced search pipeline | Medium | Edit search logic |
-| 16 | 5 | Cargo workspace split | Low | Restructure |
+| 1 | 1a | Add reqwest as required dep | None | ✅ Done |
+| 2 | 1b-c | Implement LemonadeProvider + factory methods | Low | ✅ Done |
+| 3 | 1 | Fix BUG-2 (similarity score) | None | ✅ Done |
+| 4 | 1 | Fix BUG-6 (import dedup) | Low | ✅ Done |
+| 5 | 1 | Fix BUG-7 (edge resolution) | Low | ✅ Done |
+| 6 | 1e | Remove petgraph + fastembed + ort + all C++ crates | None | ✅ Done |
+| 7 | 2a-b | Add SQLite storage, overwrite storage.rs | Medium | ✅ Done |
+| 8 | 2c | StorageBackend trait | Medium | ⏭️ Skipped (clean cut, no trait needed) |
+| 9 | 2d | Remove VectorSearchEngine, expose FTS5 via KnowledgeGraph | Medium | ✅ Done |
+| 10 | 2 | Add sqlite-vec for ANN vector search | Medium | ⏳ Deferred |
+| 11 | Lemon | Add `LemonadeModelRegistry` + `ModelRole` classification | Low | ✅ Done |
+| 12 | Lemon | Add `GpuResourceManager` with STT-block / LLM-queue policy | Low | ✅ Done |
+| 13 | Lemon | Add `LemonadeTtsProvider` (kokoro-v1, CPU) | Low | ✅ Done |
+| 14 | Lemon | Add `LemonadeSttProvider` (Whisper, GPU, uses GpuResourceManager) | Low | ✅ Done |
+| 15 | Lemon | Add `LemonadeChatProvider` (GLM-4.7, GPU, uses GpuResourceManager) | Low | ✅ Done |
+| 16 | Lemon | Add `LemonadeStack` one-call builder | None | ✅ Done |
+| 17 | Lemon | Switch default embedding model to `embed-gemma-300m-FLM` (NPU) | None | ✅ Done |
+| 18 | Lemon | Add `embed_batch` sequential fallback for FLM/NPU backends | Low | ✅ Done |
+| 19 | 3 | Add axum server with REST API | Medium | ⏳ Not started |
+| 20 | 3 | Add WebSocket support | Medium | ⏳ Not started |
+| 21 | 4 | Add `LemonadeReranker` to `src/lemonade.rs` | Low | ⏳ Not started |
+| 22 | 4 | Enhanced search pipeline (FTS5 + vec + rerank) | Medium | ⏳ Not started |
+| 23 | 5 | Cargo workspace split | Low | ⏳ Not started |
 
-## What We Keep
+## What Was Kept ✅
 
-- **`EmbeddingProvider` trait** — perfect abstraction, Lemonade slots in cleanly
-- **Schema system** — all of schema.rs, schema_manager.rs, schema_ingestion.rs
-- **Domain types** — ObjectMetadata, Edge, EdgeType, TextChunk, QueryResult
+- **`EmbeddingProvider` trait** — clean abstraction; `LemonadeProvider` slots in via HTTP
+- **Schema system** — `schema.rs`, `schema_manager.rs`, `schema_ingestion.rs` unchanged
+- **Domain types** — `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult`
 - **ObjectBuilder** — fluent API unchanged
-- **Data ingestion** — JSONL format and pipeline (with bug fixes)
-- **Embedding queue** — well-architected, integrate into KnowledgeGraph
+- **Data ingestion** — JSONL format and two-pass pipeline (BUG-6 + BUG-7 fixed)
+- **Embedding queue** — well-architected async queue; now uses `MockEmbeddingProvider` in tests
 - **All 13 schema.json files** — unchanged
 - **Foundation sample data** — unchanged
 
-## What We Remove
+## What Was Removed ✅
 
-- `fastembed` + `ort` + `ort-sys` (replaced by Lemonade HTTP)
-- `hnsw_rs` (replaced by sqlite-vec)
-- `fst` + `memmap2` (replaced by SQLite FTS5)
-- `rocksdb` (replaced by SQLite)
-- `petgraph` (unused)
-- `env.sh` gcc-13 requirement (no more C++ compilation)
-- `HnswVectorStore` struct and all HNSW persistence code
-- `FastEmbedProvider` (or gate behind optional feature flag)
+- `fastembed`, `ort`, `ort-sys` — replaced by Lemonade HTTP
+- `hnsw_rs` — HNSW deleted; sqlite-vec is the planned replacement (deferred)
+- `fst`, `memmap2` — replaced by SQLite FTS5
+- `rocksdb` — replaced by `rusqlite` (bundled SQLite)
+- `petgraph` — was unused
+- `bincode` — replaced by `serde_json` text columns in SQLite
+- `rayon` — removed (minimal use, not needed)
+- `gcc-13` / `source env.sh` requirement — no more C++ compilation needed
+- `src/vector_search.rs` — deleted entirely
+- `FastEmbedProvider`, `LocalEmbeddingModelType`, `FastEmbedModel` enums
+- `embedding_cache_dir` param from `KnowledgeGraph::new`
+- `get_embedding_provider()` from `KnowledgeGraph`

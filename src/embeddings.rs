@@ -200,6 +200,24 @@ impl EmbeddingProvider for LemonadeProvider {
             .as_array()
             .ok_or_else(|| anyhow!("Lemonade Server returned no 'data' array in batch response"))?;
 
+        // Some backends (e.g. FLM/NPU recipe) do not support true multi-input
+        // batching and silently return only the first result.  Detect the mismatch
+        // and fall back to sequential single-item calls so callers always receive
+        // exactly one embedding per input regardless of backend capability.
+        if data.len() != texts.len() {
+            tracing::debug!(
+                expected = texts.len(),
+                got = data.len(),
+                model = %self.model,
+                "Batch size mismatch — falling back to sequential single-embed calls"
+            );
+            let mut results = Vec::with_capacity(texts.len());
+            for text in &texts {
+                results.push(self.embed(text).await?);
+            }
+            return Ok(results);
+        }
+
         data.iter()
             .map(|item| {
                 item["embedding"]
@@ -282,7 +300,7 @@ impl EmbeddingManager {
 
         match resolved_url {
             Some(url) => {
-                let lemonade_model = model.unwrap_or("nomic-embed-text");
+                let lemonade_model = model.unwrap_or("embed-gemma-300m-FLM");
                 match Self::try_new_lemonade(&url, lemonade_model).await {
                     Ok(mgr) => {
                         info!(url, "Auto-selected Lemonade Server");
@@ -343,11 +361,11 @@ mod tests {
     #[test]
     fn test_embedding_model_info_fields() {
         let info = EmbeddingModelInfo {
-            name: "nomic-embed-text".to_string(),
+            name: "embed-gemma-300m-FLM".to_string(),
             dimensions: 768,
             description: Some("Test model".to_string()),
         };
-        assert_eq!(info.name, "nomic-embed-text");
+        assert_eq!(info.name, "embed-gemma-300m-FLM");
         assert_eq!(info.dimensions, 768);
         assert!(info.description.is_some());
     }
@@ -373,9 +391,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_new_lemonade_unreachable() {
-        let result =
-            EmbeddingManager::try_new_lemonade("http://127.0.0.1:19999/api/v1", "nomic-embed-text")
-                .await;
+        let result = EmbeddingManager::try_new_lemonade(
+            "http://127.0.0.1:19999/api/v1",
+            "embed-gemma-300m-FLM",
+        )
+        .await;
         assert!(
             result.is_err(),
             "Expected connection error for unreachable server"
@@ -390,7 +410,7 @@ mod tests {
             eprintln!("Skipping: LEMONADE_URL not set");
             return;
         };
-        let provider = LemonadeProvider::new(&url, "nomic-embed-text").await;
+        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM").await;
         assert!(
             provider.is_ok(),
             "Failed to connect to Lemonade Server: {:?}",
@@ -401,7 +421,7 @@ mod tests {
         assert!(dims > 0, "Expected non-zero dimensions, got {dims}");
         assert_eq!(provider.provider_type(), EmbeddingProviderType::Lemonade);
         let info = provider.model_info().unwrap();
-        assert_eq!(info.name, "nomic-embed-text");
+        assert_eq!(info.name, "embed-gemma-300m-FLM");
         assert_eq!(info.dimensions, dims);
     }
 
@@ -411,7 +431,7 @@ mod tests {
             eprintln!("Skipping: LEMONADE_URL not set");
             return;
         };
-        let provider = LemonadeProvider::new(&url, "nomic-embed-text")
+        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
             .await
             .expect("Connect to Lemonade");
         let dims = provider.dimensions().unwrap();
@@ -432,7 +452,7 @@ mod tests {
             eprintln!("Skipping: LEMONADE_URL not set");
             return;
         };
-        let provider = LemonadeProvider::new(&url, "nomic-embed-text")
+        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
             .await
             .expect("Connect to Lemonade");
         let dims = provider.dimensions().unwrap();
