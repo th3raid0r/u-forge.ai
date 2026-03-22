@@ -54,12 +54,16 @@ navigational aids.
   hardware abstraction (`src/hardware/`), unified inference queue
   (`src/inference_queue.rs`), `LemonadeRerankProvider` + `InferenceQueue::rerank()`,
   `cli_demo` FTS5 + semantic search + rerank pipeline, all 9 tracked bugs resolved.
-- **New in this session:** sqlite-vec integration, multi-worker parallel embedding
-  (NPU + 2× llamacpp `nomic-embed-text-v2-moe-GGUF`), `InferenceQueueBuilder::with_embedding_provider`,
-  per-job retry logic, `MAX_CHUNK_TOKENS` splitting, `ENABLE_HIGH_QUALITY_EMBEDDING`
-  gate, `resolve_lemonade_url()` auto-discovery in `cli_demo`.
-- **Remaining:** axum HTTP server (Phase 3), hybrid search pipeline wiring (Phase 4),
-  Cargo workspace split (Phase 5).
+- **New in this session:** `src/search.rs` — `search_hybrid()` free async function,
+  `HybridSearchConfig`, `HybridSearchResult`, `SearchSources`; Reciprocal Rank
+  Fusion (RRF, k=60) merge of FTS5 + sqlite-vec ANN results; optional cross-encoder
+  rerank stage; `fts5_sanitize()` helper that strips FTS5-illegal punctuation from
+  natural-language queries before the SQLite MATCH call; graceful degradation at
+  every AI stage (no-embedding → FTS-only, no-reranker → RRF scores); 27 unit tests
+  (all passing, no server required); `cli_demo` 🔀 hybrid search demo with per-query
+  provenance labels (`[FTS]`, `[SEM]`, `[FTS+SEM+RR]`) and an alpha-sweep comparison.
+- **Remaining:** axum HTTP server (Phase 3), streaming LLM responses (Phase 4
+  remainder), Cargo workspace split (Phase 5).
 - **No active bugs.** Do not reference BUG-1 through BUG-9 as open issues.
 
 ---
@@ -136,9 +140,9 @@ previously tracked data bugs (BUG-6, BUG-7) are resolved — do not reopen them.
 → **`.rulesdir/project-structure.mdc`** (Migration Direction)
 → **`migration.md`** (remaining work items with implementation notes)
 
-Remaining phases in priority order: axum server (Phase 3) → hybrid search pipeline
-(Phase 4) → workspace split (Phase 5). sqlite-vec is complete. Do not skip ahead
-without explicit instruction.
+Remaining phases in priority order: axum server (Phase 3) → streaming LLM responses
+(Phase 4 remainder) → workspace split (Phase 5). Phase 4 search pipeline is
+complete. Do not skip ahead without explicit instruction.
 
 ---
 

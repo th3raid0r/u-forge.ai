@@ -22,6 +22,16 @@ details — they are thoroughly commented.
 - `ON DELETE CASCADE`, indexed FKs, `SELECT COUNT(*)` stats — all O(1) or DB-indexed
 - JSONL two-pass import with deduplication and cross-session edge resolution
 
+### Hybrid Search Pipeline (`src/search.rs`)
+- `search_hybrid(graph, queue, query, config)` — async free function combining FTS5 + ANN + rerank
+- `HybridSearchConfig` — `alpha` (0.0=FTS, 1.0=semantic, 0.5=blend), `fts_limit`, `semantic_limit`, `rerank`, `limit`; `Default` impl provides sensible values
+- `HybridSearchResult` — `chunk_id`, `object_id`, `content`, `score`, `sources: SearchSources`
+- `SearchSources` — provenance per result: `fts_rank`, `semantic_distance`, `rerank_score`; `label()` returns `[FTS]` / `[SEM]` / `[FTS+SEM]` / `[FTS+SEM+RR]`
+- Merge strategy: **Reciprocal Rank Fusion** (`score = weight / (60 + rank)`, summed across paths) — works with rank positions only so FTS5's lack of numeric scores is not a problem
+- **FTS5 query sanitisation**: `fts5_sanitize()` strips characters invalid in FTS5 syntax (e.g. `?`, `!`, `'`, `(`, `)`) before the SQLite call; original query is passed verbatim to embed + rerank
+- Graceful degradation at every stage: no embedding worker → FTS-only; embed fails → FTS-only with `warn!`; no reranker → RRF scores returned; reranker fails → RRF scores with `warn!`
+- All types re-exported from `src/lib.rs`; 27 unit tests, zero server required
+
 ### Embedding & Transcription
 - `LemonadeProvider` (HTTP) replaces FastEmbed/ORT/ONNX — fully async, no `Mutex` blocking
 - `EmbeddingManager::try_new_auto` probes `localhost:8000`, then `LEMONADE_URL`
@@ -57,6 +67,7 @@ details — they are thoroughly commented.
 - FTS5 search over Foundation universe dataset (~220 nodes, ~312 edges)
 - Rerank demo: FTS5 candidates → `LemonadeRerankProvider` → re-ordered results
 - Semantic search demo: all chunks embedded via 3-worker `InferenceQueue` (NPU + 2× llamacpp `nomic-embed-text-v2-moe-GGUF`); ~2264 chunks at ~240 chunks/s
+- **Hybrid search demo**: 4 natural-language queries showing `[FTS]`/`[SEM]`/`[FTS+SEM+RR]` provenance labels and scores; alpha sweep (0.0 / 0.5 / 1.0) on one query to visualise the blend effect
 - `resolve_lemonade_url()` auto-discovery — demo works with no env vars set; localhost probed first, `LEMONADE_URL` is an override only
 
 ### Removed (do not reference)
@@ -142,25 +153,21 @@ results, import progress.
 
 ---
 
-### Phase 4: Integrated Search Pipeline
+### Phase 4: Integrated Search Pipeline ✅ Complete (pipeline)
 
-**Goal:** Wire the existing `LemonadeRerankProvider` and `InferenceQueue::rerank()`
-into `KnowledgeGraph` search methods. The provider is already implemented and
-demonstrated in `cli_demo`.
+The `search_hybrid` free function in `src/search.rs` is the canonical hybrid search
+entry point. It deliberately lives outside `KnowledgeGraph` to preserve the graph's
+purely-synchronous, no-AI-dependency contract.
 
-**What remains:**
+**What was built:**
+- `search_hybrid(graph, queue, query, config)` — see `src/search.rs` and the
+  Hybrid Search Pipeline section under What Is Complete above.
+- `cli_demo` hybrid search demo section with alpha sweep.
 
-1. Add `search_hybrid(query, limit)` to `KnowledgeGraph` that:
-   - Embeds `query` via `InferenceQueue::embed()`
-   - Runs `search_chunks_semantic`
-   - Runs `search_chunks_fts` in parallel
-   - Merges results with configurable alpha weighting
-   - Reranks merged top-K via `InferenceQueue::rerank()`
-   - Returns final ranked `Vec<SearchResult>`
-2. `KnowledgeGraph` needs optional `Arc<InferenceQueue>` — pass via a builder or
-   separate `configure_inference(queue)` method (keeps `KnowledgeGraph::new` simple)
-3. Add streaming LLM responses: `InferenceQueue::generate_stream()` returning a
-   `tokio::sync::mpsc::Receiver<String>` of token chunks
+**Still remaining from Phase 4:**
+- Streaming LLM responses: `InferenceQueue::generate_stream()` returning a
+  `tokio::sync::mpsc::Receiver<String>` of token chunks (needed by the axum
+  WebSocket layer in Phase 3).
 
 ---
 

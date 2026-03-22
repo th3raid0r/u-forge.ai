@@ -23,17 +23,19 @@
 //! # use u_forge_ai::transcription::TranscriptionManager;
 //! # async fn example() -> anyhow::Result<()> {
 //! // Auto: reads LEMONADE_URL env var, defaults to whisper-v3-turbo-FLM
-//! let mgr = TranscriptionManager::try_new_auto(None, None)?;
+//! let mgr = TranscriptionManager::try_new_auto(None, None).await?;
 //! let wav  = std::fs::read("session.wav")?;
 //! let text = mgr.get_provider().transcribe(wav, "session.wav").await?;
 //! println!("{text}");
 //! # Ok(()) }
 //! ```
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+use crate::lemonade_client::LemonadeHttpClient;
 
 // ── TranscriptionProvider trait ───────────────────────────────────────────────
 
@@ -85,9 +87,7 @@ pub trait TranscriptionProvider: Send + Sync {
 /// * You are managing resource exclusion at a higher level (e.g. the
 ///   [`InferenceQueue`](crate::inference_queue::InferenceQueue)).
 pub struct LemonadeTranscriptionProvider {
-    client: reqwest::Client,
-    /// Base URL of the Lemonade Server API, e.g. `"http://localhost:8000/api/v1"`.
-    base_url: String,
+    client: LemonadeHttpClient,
     /// Whisper model identifier, e.g. `"whisper-v3-turbo-FLM"`.
     model: String,
 }
@@ -101,8 +101,7 @@ impl LemonadeTranscriptionProvider {
     /// [`transcribe`]: TranscriptionProvider::transcribe
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            client: LemonadeHttpClient::new(base_url),
             model: model.to_string(),
         }
     }
@@ -113,14 +112,7 @@ impl TranscriptionProvider for LemonadeTranscriptionProvider {
     async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> Result<String> {
         let start = std::time::Instant::now();
 
-        // Infer MIME type from the filename extension.
-        let mime = if filename.ends_with(".mp3") {
-            "audio/mpeg"
-        } else if filename.ends_with(".ogg") {
-            "audio/ogg"
-        } else {
-            "audio/wav"
-        };
+        let mime = mime_for_filename(filename);
 
         let part = reqwest::multipart::Part::bytes(audio_bytes)
             .file_name(filename.to_string())
@@ -133,14 +125,9 @@ impl TranscriptionProvider for LemonadeTranscriptionProvider {
 
         let resp: serde_json::Value = self
             .client
-            .post(format!("{}/audio/transcriptions", self.base_url))
-            .multipart(form)
-            .send()
+            .post_multipart("/audio/transcriptions", form)
             .await
-            .context("Lemonade transcription request failed")?
-            .json()
-            .await
-            .context("Failed to parse Lemonade transcription response")?;
+            .map_err(|e| anyhow!("Lemonade transcription request failed: {}", e))?;
 
         // Surface server-side errors as Rust errors.
         if let Some(err) = resp.get("error") {
@@ -182,7 +169,7 @@ impl TranscriptionProvider for LemonadeTranscriptionProvider {
 /// ```no_run
 /// # use u_forge_ai::transcription::TranscriptionManager;
 /// # async fn run() -> anyhow::Result<()> {
-/// let mgr = TranscriptionManager::try_new_auto(None, None)?;
+/// let mgr = TranscriptionManager::try_new_auto(None, None).await?;
 /// let provider = mgr.get_provider();       // Arc<dyn TranscriptionProvider>
 /// let wav = std::fs::read("session.wav")?;
 /// let text = provider.transcribe(wav, "session.wav").await?;
@@ -220,13 +207,12 @@ impl TranscriptionManager {
     /// **Resolution order:**
     /// 1. `lemonade_url` argument (if `Some`)
     /// 2. `LEMONADE_URL` environment variable
-    /// 3. Hard error — there is no silent local fallback
+    /// 3. Hard error — there is no silent local fallback for transcription
     ///
     /// `model` defaults to `"whisper-v3-turbo-FLM"` when `None`.
-    pub fn try_new_auto(lemonade_url: Option<&str>, model: Option<&str>) -> Result<Self> {
-        let url = lemonade_url
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("LEMONADE_URL").ok())
+    pub async fn try_new_auto(lemonade_url: Option<&str>, model: Option<&str>) -> Result<Self> {
+        let url = crate::lemonade::resolve_provider_url(lemonade_url, "LEMONADE_URL", false)
+            .await
             .ok_or_else(|| {
                 anyhow!(
                     "No Lemonade Server URL configured. Set the LEMONADE_URL environment \
@@ -332,13 +318,13 @@ mod tests {
 
     // ── Unit tests (no server required) ──────────────────────────────────────
 
-    #[test]
-    fn test_transcription_manager_fails_without_url() {
+    #[tokio::test]
+    async fn test_transcription_manager_fails_without_url() {
         if std::env::var("LEMONADE_URL").is_ok() {
             // Live server available — the "no URL" error path would not be hit.
             return;
         }
-        let result = TranscriptionManager::try_new_auto(None, None);
+        let result = TranscriptionManager::try_new_auto(None, None).await;
         assert!(
             result.is_err(),
             "Expected error when no URL is configured, got Ok"
@@ -384,9 +370,9 @@ mod tests {
         );
         // base_url should not end in '/'
         assert!(
-            !p.base_url.ends_with('/'),
+            !p.client.base_url.ends_with('/'),
             "base_url should not end with '/': {}",
-            p.base_url
+            p.client.base_url
         );
     }
 
@@ -463,7 +449,7 @@ mod tests {
             eprintln!("Skipping: LEMONADE_URL not set");
             return;
         };
-        let mgr = TranscriptionManager::try_new_auto(Some(&url), None);
+        let mgr = TranscriptionManager::try_new_auto(Some(&url), None).await;
         assert!(
             mgr.is_ok(),
             "try_new_auto failed unexpectedly: {:?}",
@@ -500,6 +486,7 @@ mod tests {
             return;
         };
         let mgr = TranscriptionManager::try_new_auto(Some(&url), None)
+            .await
             .expect("TranscriptionManager construction failed");
         let provider = mgr.get_provider();
 

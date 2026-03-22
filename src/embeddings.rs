@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::lemonade_client::LemonadeHttpClient;
+
 // ── Backward-compat re-exports ────────────────────────────────────────────────
 // Transcription types moved to `crate::transcription`.  Re-exported here so
 // existing code using `embeddings::TranscriptionProvider` continues to compile
@@ -103,9 +105,7 @@ pub trait EmbeddingProvider: Send + Sync {
 ///
 /// This provider is fully async — no Tokio threads are ever blocked (fixes BUG-5).
 pub struct LemonadeProvider {
-    client: reqwest::Client,
-    /// Base URL of the Lemonade Server API, e.g. `"http://localhost:8000/api/v1"`.
-    base_url: String,
+    client: LemonadeHttpClient,
     /// Model identifier, e.g. `"nomic-embed-text"`.
     model: String,
     /// Probed on construction.
@@ -118,16 +118,16 @@ impl LemonadeProvider {
     /// # Errors
     /// Returns an error if the server is unreachable or the model is not loaded.
     pub async fn new(base_url: &str, model: &str) -> Result<Self> {
-        let client = reqwest::Client::new();
+        let client = LemonadeHttpClient::new(base_url);
 
-        let resp = client
-            .post(format!("{}/embeddings", base_url))
-            .header("Authorization", "Bearer lemonade")
-            .json(&serde_json::json!({
-                "model": model,
-                "input": ["dimension probe"]
-            }))
-            .send()
+        let resp: serde_json::Value = client
+            .post_json(
+                "/embeddings",
+                &serde_json::json!({
+                    "model": model,
+                    "input": ["dimension probe"]
+                }),
+            )
             .await
             .map_err(|e| {
                 anyhow!(
@@ -135,10 +135,7 @@ impl LemonadeProvider {
                     base_url,
                     e
                 )
-            })?
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| anyhow!("Failed to parse Lemonade Server probe response: {}", e))?;
+            })?;
 
         let dimensions = resp["data"][0]["embedding"]
             .as_array()
@@ -156,7 +153,6 @@ impl LemonadeProvider {
 
         Ok(Self {
             client,
-            base_url: base_url.to_string(),
             model: model.to_string(),
             dimensions,
         })
@@ -166,20 +162,16 @@ impl LemonadeProvider {
 #[async_trait]
 impl EmbeddingProvider for LemonadeProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let resp = self
+        let resp: serde_json::Value = self
             .client
-            .post(format!("{}/embeddings", self.base_url))
-            .header("Authorization", "Bearer lemonade")
-            .json(&serde_json::json!({
-                "model": self.model,
-                "input": [text]
-            }))
-            .send()
-            .await
-            .map_err(|e| anyhow!("Lemonade Server request failed: {}", e))?
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| anyhow!("Failed to parse Lemonade embed response: {}", e))?;
+            .post_json(
+                "/embeddings",
+                &serde_json::json!({
+                    "model": self.model,
+                    "input": [text]
+                }),
+            )
+            .await?;
 
         let embedding: Vec<f32> = resp["data"][0]["embedding"]
             .as_array()
@@ -197,20 +189,16 @@ impl EmbeddingProvider for LemonadeProvider {
     }
 
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        let resp = self
+        let resp: serde_json::Value = self
             .client
-            .post(format!("{}/embeddings", self.base_url))
-            .header("Authorization", "Bearer lemonade")
-            .json(&serde_json::json!({
-                "model": self.model,
-                "input": texts
-            }))
-            .send()
-            .await
-            .map_err(|e| anyhow!("Lemonade Server batch request failed: {}", e))?
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| anyhow!("Failed to parse Lemonade batch response: {}", e))?;
+            .post_json(
+                "/embeddings",
+                &serde_json::json!({
+                    "model": self.model,
+                    "input": texts
+                }),
+            )
+            .await?;
 
         let data = resp["data"]
             .as_array()
@@ -265,7 +253,7 @@ impl EmbeddingProvider for LemonadeProvider {
         Some(EmbeddingModelInfo {
             name: self.model.clone(),
             dimensions: self.dimensions,
-            description: Some(format!("Lemonade Server model at {}", self.base_url)),
+            description: Some(format!("Lemonade Server model at {}", self.client.base_url)),
         })
     }
 }
@@ -313,13 +301,8 @@ impl EmbeddingManager {
     ///
     /// `model` defaults to `"embed-gemma-300m-FLM"` when `None`.
     pub async fn try_new_auto(lemonade_url: Option<&str>, model: Option<&str>) -> Result<Self> {
-        let resolved_url = match lemonade_url.map(|s| s.to_string()) {
-            Some(url) => Some(url),
-            None => match std::env::var("LEMONADE_URL").ok() {
-                Some(url) => Some(url),
-                None => crate::lemonade::resolve_lemonade_url().await,
-            },
-        };
+        let resolved_url =
+            crate::lemonade::resolve_provider_url(lemonade_url, "LEMONADE_URL", true).await;
 
         match resolved_url {
             Some(url) => {
