@@ -17,10 +17,17 @@
 
 use anyhow::Result;
 use std::env;
+use std::sync::Arc;
 use u_forge_ai::{
     data_ingestion::DataIngestion,
-    lemonade::{LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo},
-    ChunkType, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
+    embeddings::LemonadeProvider,
+    hardware::npu::NpuDevice,
+    inference_queue::{InferenceQueue, InferenceQueueBuilder},
+    lemonade::{
+        resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
+    },
+    ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
+    EMBEDDING_DIMENSIONS,
 };
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -48,15 +55,20 @@ async fn main() -> Result<()> {
         .or_else(|| env::var("UFORGE_SCHEMA_DIR").ok())
         .unwrap_or_else(|| "./defaults/schemas".to_string());
 
-    let lemonade_url = env::var("LEMONADE_URL").ok();
+    // Resolve the Lemonade Server URL: probe localhost first, then fall back to
+    // the LEMONADE_URL env var.  An unset env var is never a hard error here —
+    // the demo degrades gracefully when no server is reachable.
+    let lemonade_url = resolve_lemonade_url().await;
 
     println!("🌟 u-forge.ai — Universe Forge 🌟");
     println!("   Data      : {data_file}");
     println!("   Schemas   : {schema_dir}");
     println!("   Storage   : SQLite (bundled, no system libs required)");
     match &lemonade_url {
-        Some(url) => println!("   Lemonade  : {url}"),
-        None => println!("   Lemonade  : not configured (set LEMONADE_URL to enable AI features)"),
+        Some(url) => println!("   Lemonade  : {url} (auto-discovered)"),
+        None => {
+            println!("   Lemonade  : not reachable (start lemonade-server or set LEMONADE_URL)")
+        }
     }
     println!();
 
@@ -65,6 +77,8 @@ async fn main() -> Result<()> {
     // Capture reachable providers for later sections; these are all Option so
     // the demo degrades gracefully when no server is present.
     let mut reranker: Option<LemonadeRerankProvider> = None;
+    // Multi-worker embedding queue: NPU + all compatible llamacpp models.
+    let mut embed_queue: Option<InferenceQueue> = None;
 
     if let Some(ref url) = lemonade_url {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -226,6 +240,101 @@ async fn main() -> Result<()> {
                                 }
                                 Err(e) => println!("   ⚠️  No reranker available: {e}"),
                             }
+
+                            // Build a multi-worker embedding InferenceQueue.
+                            // Each compatible model (matching EMBEDDING_DIMENSIONS) becomes
+                            // its own Tokio worker competing on the shared embed_queue so
+                            // bulk embedding jobs are spread across all devices at once.
+                            println!("   Building embedding workers…");
+                            let mut eq_builder = InferenceQueueBuilder::new();
+                            let mut worker_count = 0usize;
+
+                            // NPU worker (FLM embed-gemma-300m-FLM)
+                            match NpuDevice::embedding_only(url, None).await {
+                                Ok(npu) => {
+                                    let dims = npu.embedding.dimensions().unwrap_or(0);
+                                    if dims == EMBEDDING_DIMENSIONS {
+                                        println!("     ✅ NPU worker: {} ({dims}-dim)", npu.name);
+                                        eq_builder = eq_builder.with_npu_device(npu);
+                                        worker_count += 1;
+                                    } else {
+                                        println!(
+                                            "     ⚠️  NPU skipped: returns {dims}-dim, \
+                                             need {EMBEDDING_DIMENSIONS}-dim"
+                                        );
+                                    }
+                                }
+                                Err(e) => println!("     ⚠️  NPU embedding unavailable: {e}"),
+                            }
+
+                            // llamacpp workers — two instances of the preferred model
+                            // (nomic-embed-text-v2-moe-GGUF), one served via ROCm and
+                            // one via CPU, so both iGPU and CPU cores stay busy during
+                            // bulk embedding.  The server allows up to 3 concurrent
+                            // instances of the same model class.
+                            if let Some(model) = registry.cpu_embedding_model() {
+                                let model_id = model.id.clone();
+                                match LemonadeProvider::new(url, &model_id).await {
+                                    Err(e) => {
+                                        println!("     ⚠️  llamacpp({model_id}) unavailable: {e}")
+                                    }
+                                    Ok(provider) => {
+                                        let dims = provider.dimensions().unwrap_or(0);
+                                        if dims != EMBEDDING_DIMENSIONS {
+                                            println!(
+                                                "     ⚠️  llamacpp({model_id}) skipped: \
+                                                 {dims}-dim ≠ {EMBEDDING_DIMENSIONS}-dim"
+                                            );
+                                        } else {
+                                            // Instance 1 — ROCm
+                                            println!(
+                                                "     ✅ llamacpp worker (ROCm): \
+                                                 {model_id} ({dims}-dim)"
+                                            );
+                                            eq_builder = eq_builder.with_embedding_provider(
+                                                Arc::new(provider),
+                                                format!("llamacpp({model_id})/ROCm"),
+                                            );
+                                            worker_count += 1;
+
+                                            // Instance 2 — CPU (second connection to same model)
+                                            match LemonadeProvider::new(url, &model_id).await {
+                                                Err(e) => println!(
+                                                    "     ⚠️  llamacpp({model_id})/CPU \
+                                                     unavailable: {e}"
+                                                ),
+                                                Ok(provider2) => {
+                                                    println!(
+                                                        "     ✅ llamacpp worker (CPU): \
+                                                         {model_id} ({dims}-dim)"
+                                                    );
+                                                    eq_builder = eq_builder
+                                                        .with_embedding_provider(
+                                                            Arc::new(provider2),
+                                                            format!("llamacpp({model_id})/CPU"),
+                                                        );
+                                                    worker_count += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                println!("     ⚠️  No llamacpp embedding model found in registry");
+                            }
+
+                            if worker_count > 0 {
+                                println!(
+                                    "   ✅ {worker_count} embedding worker(s) ready \
+                                     ({EMBEDDING_DIMENSIONS}-dim, cosine)"
+                                );
+                                embed_queue = Some(eq_builder.build());
+                            } else {
+                                println!(
+                                    "   ⚠️  No compatible {EMBEDDING_DIMENSIONS}-dim \
+                                     embedding models found — semantic search disabled."
+                                );
+                            }
                             println!();
                         }
                     }
@@ -327,13 +436,15 @@ async fn main() -> Result<()> {
     let mut indexed = 0usize;
 
     for obj in &all_objects {
-        graph.add_text_chunk(obj.id, obj.name.clone(), ChunkType::Description)?;
-        indexed += 1;
+        indexed += graph
+            .add_text_chunk(obj.id, obj.name.clone(), ChunkType::Description)?
+            .len();
 
         if let Some(desc) = &obj.description {
             if !desc.is_empty() {
-                graph.add_text_chunk(obj.id, desc.clone(), ChunkType::Description)?;
-                indexed += 1;
+                indexed += graph
+                    .add_text_chunk(obj.id, desc.clone(), ChunkType::Description)?
+                    .len();
             }
         }
 
@@ -341,8 +452,9 @@ async fn main() -> Result<()> {
             for (_key, val) in props {
                 if let Some(s) = val.as_str() {
                     if !s.is_empty() {
-                        graph.add_text_chunk(obj.id, s.to_string(), ChunkType::Imported)?;
-                        indexed += 1;
+                        indexed += graph
+                            .add_text_chunk(obj.id, s.to_string(), ChunkType::Imported)?
+                            .len();
                     }
                 }
             }
@@ -350,6 +462,69 @@ async fn main() -> Result<()> {
     }
 
     println!("    ✅ {indexed} text chunks indexed\n");
+
+    // ── Embed chunks for semantic (ANN) search ────────────────────────────────
+
+    if let Some(ref eq) = embed_queue {
+        println!("🧮 Embedding chunks for semantic search (sqlite-vec)…");
+        println!("   Workers  : {}", eq.embedding_worker_count());
+
+        // Collect all chunks that need embeddings.
+        let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
+            let mut all = Vec::new();
+            for obj in &objs {
+                for chunk in graph.get_text_chunks(obj.id)? {
+                    all.push(chunk);
+                }
+            }
+            Ok(all)
+        })?;
+
+        let total = chunks_to_embed.len();
+        println!("   Chunks   : {total}");
+
+        // Fire all texts at once — embed_many() dispatches one job per chunk
+        // and each worker races to claim jobs, so all workers run concurrently.
+        let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
+
+        let t0 = std::time::Instant::now();
+        match eq.embed_many(texts).await {
+            Err(e) => {
+                eprintln!("    ❌ embed_many failed: {e}");
+            }
+            Ok(vecs) => {
+                let elapsed = t0.elapsed();
+                let mut stored = 0usize;
+                let mut skipped = 0usize;
+                for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
+                    match graph.upsert_chunk_embedding(chunk.id, vec) {
+                        Ok(()) => stored += 1,
+                        Err(e) => {
+                            skipped += 1;
+                            eprintln!(
+                                "    ⚠️  Could not store embedding for chunk {}: {e}",
+                                chunk.id
+                            );
+                        }
+                    }
+                }
+                let rate = if elapsed.as_secs_f64() > 0.0 {
+                    stored as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                println!(
+                    "    ✅ {stored}/{total} embedded in {:.1}s ({rate:.0} chunks/s, \
+                     {skipped} skipped)\n",
+                    elapsed.as_secs_f64()
+                );
+            }
+        }
+    } else if lemonade_url.is_some() {
+        println!("ℹ️  Embedding skipped — no compatible embedding model available.\n");
+    } else {
+        println!("ℹ️  Embedding skipped — set LEMONADE_URL to enable semantic search.\n");
+    }
 
     // ── Graph statistics ──────────────────────────────────────────────────────
 
@@ -396,6 +571,59 @@ async fn main() -> Result<()> {
             println!("    {}. {} — \"{}\"", i + 1, label, preview);
         }
         println!();
+    }
+
+    // ── Semantic search demo ──────────────────────────────────────────────────
+
+    if let Some(ref eq) = embed_queue {
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("🔭 Semantic search demos (sqlite-vec ANN)");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        println!("   Strategy: embed the query with the same model used to index");
+        println!("   chunks, then find nearest neighbours by cosine distance.\n");
+
+        let semantic_queries = [
+            "mathematical prediction of human behaviour",
+            "the collapse of a great interstellar civilization",
+            "a planet on the periphery of known space",
+            "a brilliant scientist and planner",
+        ];
+
+        for query in &semantic_queries {
+            println!("  Query: \"{query}\"");
+            match eq.embed(*query).await {
+                Err(e) => println!("    ⚠️  Embed failed: {e}\n"),
+                Ok(query_vec) => match graph.search_chunks_semantic(&query_vec, 3) {
+                    Err(e) => println!("    ⚠️  Semantic search failed: {e}\n"),
+                    Ok(results) if results.is_empty() => {
+                        println!("    (no matches — are chunks embedded?)\n");
+                    }
+                    Ok(results) => {
+                        for (i, (_chunk_id, obj_id, snippet, distance)) in
+                            results.iter().enumerate()
+                        {
+                            let label = graph
+                                .get_object(*obj_id)?
+                                .map(|o| format!("{} [{}]", o.name, o.object_type))
+                                .unwrap_or_else(|| obj_id.to_string());
+                            let preview = truncate(snippet, 70);
+                            println!(
+                                "    {}. [dist {:.4}] {} — \"{}\"",
+                                i + 1,
+                                distance,
+                                label,
+                                preview
+                            );
+                        }
+                        println!();
+                    }
+                },
+            }
+        }
+    } else if lemonade_url.is_some() {
+        println!("ℹ️  Semantic search demo skipped — no compatible {EMBEDDING_DIMENSIONS}-dim embedding model available.\n");
+    } else {
+        println!("ℹ️  Semantic search demo skipped — set LEMONADE_URL to enable AI features.\n");
     }
 
     // ── Rerank demo ───────────────────────────────────────────────────────────

@@ -183,7 +183,12 @@ impl EmbeddingProvider for LemonadeProvider {
 
         let embedding: Vec<f32> = resp["data"][0]["embedding"]
             .as_array()
-            .ok_or_else(|| anyhow!("Lemonade Server returned no embedding in response"))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Lemonade Server returned no embedding in response (raw: {})",
+                    resp
+                )
+            })?
             .iter()
             .map(|v| v.as_f64().unwrap_or(0.0) as f32)
             .collect();

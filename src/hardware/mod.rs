@@ -134,7 +134,7 @@ impl std::fmt::Display for HardwareBackend {
 ///
 /// # Implementing `DeviceWorker`
 ///
-/// ```rust,ignore
+/// ```rust
 /// use u_forge_ai::hardware::{DeviceCapability, DeviceWorker, HardwareBackend};
 ///
 /// struct MyDevice { caps: Vec<DeviceCapability> }

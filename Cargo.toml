@@ -11,6 +11,7 @@ categories = ["games", "text-processing"]
 [dependencies]
 # Database and storage (SQLite — no C++ compiler required)
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+sqlite-vec = "0.1.7"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

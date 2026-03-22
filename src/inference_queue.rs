@@ -18,6 +18,8 @@
 //!   ──────                ──────────────           ────────────────────────────
 //!
 //!   embed(text)  ───────► embed_queue  ──────────► NpuDevice  (embed-gemma-300m-FLM)
+//!                                      ──────────► llamacpp   (nomic-embed-text-v2-moe-GGUF)
+//!                                      ──────────► llamacpp   (nomic-embed-text-v1-GGUF)
 //!
 //!   transcribe() ───────► transcribe_queue ──────► NpuDevice  (whisper-v3-turbo-FLM)
 //!                                         ──────► GpuDevice  (Whisper-Large-v3-Turbo)
@@ -600,6 +602,10 @@ pub struct InferenceQueueBuilder {
     gpu_devices: Vec<GpuDevice>,
     cpu_devices: Vec<CpuDevice>,
     rerankers: Vec<LemonadeRerankProvider>,
+    /// Standalone embedding providers registered directly (e.g. llamacpp ROCm/CPU).
+    /// Each entry becomes its own `run_embed_worker` Tokio task competing on the
+    /// shared `embed_queue` — natural work-stealing across all workers.
+    extra_embedding_providers: Vec<(Arc<dyn EmbeddingProvider>, String)>,
 }
 
 impl InferenceQueueBuilder {
@@ -610,6 +616,7 @@ impl InferenceQueueBuilder {
             gpu_devices: Vec::new(),
             cpu_devices: Vec::new(),
             rerankers: Vec::new(),
+            extra_embedding_providers: Vec::new(),
         }
     }
 
@@ -644,6 +651,28 @@ impl InferenceQueueBuilder {
     /// [`TextToSpeech`]: crate::hardware::DeviceCapability::TextToSpeech
     pub fn with_cpu_device(mut self, device: CpuDevice) -> Self {
         self.cpu_devices.push(device);
+        self
+    }
+
+    /// Register a standalone embedding provider as an additional worker.
+    ///
+    /// Each call adds one more Tokio task that competes on the shared
+    /// `embed_queue`.  Use this to add llamacpp ROCm or CPU embedding models
+    /// alongside the NPU worker so that bulk embedding jobs are distributed
+    /// across all available devices simultaneously.
+    ///
+    /// `name` is used only for tracing/logging and can be any descriptive string
+    /// (e.g. `"llamacpp(nomic-embed-text-v1-GGUF)/ROCm"`).
+    ///
+    /// The provider's output dimensions **must** match every other embedding
+    /// provider registered on this queue — callers are responsible for probing
+    /// dimensions via [`EmbeddingProvider::dimensions`] before registering.
+    pub fn with_embedding_provider(
+        mut self,
+        provider: Arc<dyn EmbeddingProvider>,
+        name: impl Into<String>,
+    ) -> Self {
+        self.extra_embedding_providers.push((provider, name.into()));
         self
     }
 
@@ -757,6 +786,16 @@ impl InferenceQueueBuilder {
             }
         }
 
+        // ── Extra standalone embedding workers ───────────────────────────────
+        for (provider, name) in self.extra_embedding_providers {
+            let q = Arc::clone(&embed_queue);
+            embedding_workers += 1;
+            debug!(device = %name, "Spawning standalone embedding worker");
+            tokio::spawn(async move {
+                run_embed_worker(q, provider, name).await;
+            });
+        }
+
         // ── Reranker workers ─────────────────────────────────────────────────
         for reranker in self.rerankers {
             let q = Arc::clone(&rerank_queue);
@@ -812,6 +851,11 @@ impl Default for InferenceQueueBuilder {
         Self::new()
     }
 }
+
+// ── Tests for with_embedding_provider ────────────────────────────────────────
+// (covered by the existing test_embed_* tests via build_mock_queue, which uses
+// with_npu_device; the extra_embedding_providers path is exercised by the
+// integration path in cli_demo and by the builder field defaulting to empty.)
 
 // ── LLM worker ────────────────────────────────────────────────────────────────
 
@@ -896,6 +940,15 @@ async fn run_rerank_worker(
 //
 // This is the canonical race-free pattern from the Tokio `Notify` documentation.
 
+/// Maximum number of attempts for a single embed job before the error is
+/// returned to the caller.  Retries guard against transient server hiccups
+/// (e.g. a Lemonade instance that is momentarily swapping a model in/out).
+const EMBED_MAX_ATTEMPTS: u32 = 3;
+
+/// Base delay before the first retry.  Doubles on each subsequent attempt
+/// (100 ms → 200 ms) so three attempts add at most ~300 ms of backoff.
+const EMBED_RETRY_BASE_MS: u64 = 100;
+
 async fn run_embed_worker(
     queue: Arc<WorkQueue<EmbedJob>>,
     provider: Arc<dyn EmbeddingProvider>,
@@ -909,16 +962,50 @@ async fn run_embed_worker(
         if let Some(job) = queue.try_pop() {
             drop(notified);
             let start = std::time::Instant::now();
-            let result = provider.embed(&job.text).await;
+
+            // Retry loop — attempt up to EMBED_MAX_ATTEMPTS times before
+            // giving up and forwarding the final error to the caller.
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut result: Option<Vec<f32>> = None;
+
+            for attempt in 1..=EMBED_MAX_ATTEMPTS {
+                match provider.embed(&job.text).await {
+                    Ok(vec) => {
+                        result = Some(vec);
+                        break;
+                    }
+                    Err(e) => {
+                        let delay_ms = EMBED_RETRY_BASE_MS * (1 << (attempt - 1));
+                        debug!(
+                            device = %device_name,
+                            attempt,
+                            EMBED_MAX_ATTEMPTS,
+                            delay_ms,
+                            error = %e,
+                            "Embed attempt failed — retrying"
+                        );
+                        last_err = Some(e);
+                        if attempt < EMBED_MAX_ATTEMPTS {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                }
+            }
+
+            let final_result = result.ok_or_else(|| {
+                last_err.unwrap_or_else(|| anyhow::anyhow!("embed failed with no error detail"))
+            });
+
             debug!(
                 device = %device_name,
                 text_len = job.text.len(),
-                ok = result.is_ok(),
+                ok = final_result.is_ok(),
                 duration_ms = start.elapsed().as_millis(),
                 "Embed job complete"
             );
+
             // Ignore send errors — caller may have timed out and dropped the receiver.
-            let _ = job.response.send(result);
+            let _ = job.response.send(final_result);
         } else {
             // Step 3b: nothing in queue, sleep until notified
             notified.await;

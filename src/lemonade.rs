@@ -277,13 +277,76 @@ impl LemonadeModelRegistry {
 
     /// The preferred CPU/GPU llamacpp embedding model, if available.
     ///
-    /// Prefers `nomic-embed-text-v1-GGUF`; falls back to any
-    /// [`ModelRole::CpuEmbedding`] model.
+    /// Prefers `nomic-embed-text-v2-moe-GGUF` (MoE, more recent) over
+    /// `nomic-embed-text-v1-GGUF`; falls back to any [`ModelRole::CpuEmbedding`]
+    /// model compatible with the standard 768-dim index.
+    ///
+    /// `Qwen3-Embedding-8B-GGUF` is excluded unless
+    /// [`ENABLE_HIGH_QUALITY_EMBEDDING`](crate::ENABLE_HIGH_QUALITY_EMBEDDING)
+    /// is `true` — it outputs 4096-dim vectors that require a separate index.
     pub fn cpu_embedding_model(&self) -> Option<&LemonadeModelEntry> {
         self.models
             .iter()
-            .find(|m| m.id == "nomic-embed-text-v1-GGUF")
-            .or_else(|| self.by_role(&ModelRole::CpuEmbedding).into_iter().next())
+            .find(|m| m.id == "nomic-embed-text-v2-moe-GGUF")
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .find(|m| m.id == "nomic-embed-text-v1-GGUF")
+            })
+            .or_else(|| {
+                self.by_role(&ModelRole::CpuEmbedding)
+                    .into_iter()
+                    .find(|m| {
+                        crate::storage::ENABLE_HIGH_QUALITY_EMBEDDING
+                            || m.id != "Qwen3-Embedding-8B-GGUF"
+                    })
+            })
+    }
+
+    /// All CPU/GPU llamacpp embedding models suitable for parallel workers.
+    ///
+    /// Returns every [`ModelRole::CpuEmbedding`] model in a stable preferred
+    /// order: `nomic-embed-text-v2-moe-GGUF` first (newer MoE architecture),
+    /// then `nomic-embed-text-v1-GGUF`, then any remaining models in
+    /// server-reported order.
+    ///
+    /// `Qwen3-Embedding-8B-GGUF` is **excluded** unless
+    /// [`ENABLE_HIGH_QUALITY_EMBEDDING`](crate::ENABLE_HIGH_QUALITY_EMBEDDING)
+    /// is `true`.  It outputs 4096-dim vectors that are incompatible with the
+    /// standard 768-dim index and require a separate search pipeline that is
+    /// not yet implemented.
+    ///
+    /// Callers should still probe each returned model's actual output dimensions
+    /// via [`LemonadeProvider::new`](crate::LemonadeProvider::new) and discard
+    /// any whose dimensions do not match [`crate::EMBEDDING_DIMENSIONS`].
+    pub fn all_cpu_embedding_models(&self) -> Vec<&LemonadeModelEntry> {
+        // Gate high-quality models behind the feature flag.
+        let high_quality = crate::storage::ENABLE_HIGH_QUALITY_EMBEDDING;
+
+        // Stable preferred order: v2-moe first (newer MoE architecture), v1
+        // second, everything else appended in server-reported order.
+        const PREFERRED: &[&str] = &["nomic-embed-text-v2-moe-GGUF", "nomic-embed-text-v1-GGUF"];
+
+        let candidates: Vec<&LemonadeModelEntry> = self
+            .by_role(&ModelRole::CpuEmbedding)
+            .into_iter()
+            .filter(|m| high_quality || m.id != "Qwen3-Embedding-8B-GGUF")
+            .collect();
+
+        // Pass 1: emit preferred models in declared order (skip absent ones).
+        let mut result: Vec<&LemonadeModelEntry> = PREFERRED
+            .iter()
+            .filter_map(|&id| candidates.iter().copied().find(|m| m.id == id))
+            .collect();
+
+        // Pass 2: append anything not already in the preferred list.
+        for m in &candidates {
+            if !PREFERRED.contains(&m.id.as_str()) {
+                result.push(m);
+            }
+        }
+
+        result
     }
 
     /// A human-readable summary of models grouped by role, for logging/diagnostics.

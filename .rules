@@ -49,12 +49,17 @@ navigational aids.
 
 ## Current Project State (snapshot)
 
-- **Complete:** SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware
-  abstraction (`src/hardware/`), unified inference queue (`src/inference_queue.rs`),
-  `LemonadeRerankProvider` + `InferenceQueue::rerank()`, `cli_demo` FTS5→rerank
-  pipeline, all 9 tracked bugs resolved.
-- **Remaining:** sqlite-vec ANN search (highest priority), axum HTTP server
-  (Phase 3), hybrid search pipeline wiring (Phase 4), Cargo workspace split (Phase 5).
+- **Complete:** SQLite + FTS5 storage, sqlite-vec ANN search (`chunks_vec` vec0
+  table, 768-dim cosine, `search_chunks_semantic`), `LemonadeProvider` embeddings,
+  hardware abstraction (`src/hardware/`), unified inference queue
+  (`src/inference_queue.rs`), `LemonadeRerankProvider` + `InferenceQueue::rerank()`,
+  `cli_demo` FTS5 + semantic search + rerank pipeline, all 9 tracked bugs resolved.
+- **New in this session:** sqlite-vec integration, multi-worker parallel embedding
+  (NPU + 2× llamacpp `nomic-embed-text-v2-moe-GGUF`), `InferenceQueueBuilder::with_embedding_provider`,
+  per-job retry logic, `MAX_CHUNK_TOKENS` splitting, `ENABLE_HIGH_QUALITY_EMBEDDING`
+  gate, `resolve_lemonade_url()` auto-discovery in `cli_demo`.
+- **Remaining:** axum HTTP server (Phase 3), hybrid search pipeline wiring (Phase 4),
+  Cargo workspace split (Phase 5).
 - **No active bugs.** Do not reference BUG-1 through BUG-9 as open issues.
 
 ---
@@ -131,8 +136,9 @@ previously tracked data bugs (BUG-6, BUG-7) are resolved — do not reopen them.
 → **`.rulesdir/project-structure.mdc`** (Migration Direction)
 → **`migration.md`** (remaining work items with implementation notes)
 
-Remaining phases in priority order: sqlite-vec → axum server → hybrid search
-pipeline → workspace split. Do not skip ahead without explicit instruction.
+Remaining phases in priority order: axum server (Phase 3) → hybrid search pipeline
+(Phase 4) → workspace split (Phase 5). sqlite-vec is complete. Do not skip ahead
+without explicit instruction.
 
 ---
 

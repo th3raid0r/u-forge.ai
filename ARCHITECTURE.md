@@ -130,6 +130,15 @@ Auto-populated and auto-updated via `AFTER INSERT`, `AFTER UPDATE`, and
 `AFTER DELETE` triggers on the `chunks` table. Queried via standard FTS5
 `MATCH` syntax.
 
+**`chunks_vec`** — sqlite-vec `vec0` virtual table for ANN similarity search.
+```
+rowid   INTEGER  (maps to chunks.rowid — same identity as chunks_fts)
+embedding float[768] distance_metric=cosine
+```
+Populated explicitly via `upsert_chunk_embedding()`; not every chunk has an entry
+immediately after creation. Kept clean by a `chunks_vec_ad` trigger that fires
+`AFTER DELETE ON chunks`.
+
 ### Indexes
 
 | Index | Table | Columns | Purpose |
@@ -140,6 +149,7 @@ Auto-populated and auto-updated via `AFTER INSERT`, `AFTER UPDATE`, and
 | `idx_edges_source` | edges | source_id | Outgoing edge lookup |
 | `idx_edges_target` | edges | target_id | Incoming edge lookup, cascade perf |
 | `idx_chunks_object` | chunks | object_id | get_chunks_for_node |
+| `chunks_vec_ad` trigger | chunks | rowid | Cascade-deletes vec entries when a chunk is deleted |
 
 ### Design Notes
 
@@ -156,6 +166,8 @@ Auto-populated and auto-updated via `AFTER INSERT`, `AFTER UPDATE`, and
 - The old `AdjacencyList` struct (with separate `outgoing`/`incoming` `Vec<Edge>`
   per node) is gone. Edge direction is now implicit in `source_id`/`target_id`.
 - `bincode` has been removed; all serialization is JSON via `serde_json`.
+- **Vector index live** — `chunks_vec` is a sqlite-vec `vec0` virtual table (768-dim cosine). `upsert_chunk_embedding()` maps chunk rowids into the index. `search_chunks_semantic()` returns results ordered by ascending cosine distance.
+- **Chunk size enforcement** — `add_text_chunk` splits content at word boundaries into ≤350-token pieces (`MAX_CHUNK_TOKENS`) before storage. Guards against the llamacpp 512-token batch limit. Uses the same `len/4` heuristic as `estimate_token_count`.
 
 ---
 
@@ -515,23 +527,23 @@ let answer = stack.chat.ask("Describe a dragon.").await?;
 
 ---
 
-## Full-Text Search
+## Search
 
-Semantic/vector search (HNSW, FST) has been removed. In its place:
+### Full-Text Search
 
-**`KnowledgeGraph::search_chunks_fts(query: &str, limit: usize)`**
+**`KnowledgeGraph::search_chunks_fts(query: &str, limit: usize) -> Vec<(ChunkId, ObjectId, String)>`**
 
-Runs an FTS5 `MATCH` query against the `chunks_fts` virtual table and returns
-`Vec<(ChunkId, ObjectId, String)>` — chunk ID, owning object ID, and matched
-content snippet.
+Runs an FTS5 `MATCH` query against the `chunks_fts` virtual table. Supports phrase queries, prefix queries, and boolean operators natively.
 
-FTS5 supports phrase queries, prefix queries, and boolean operators natively.
-This satisfies basic semantic search needs for the current phase.
+### Semantic (Vector) Search
 
-**sqlite-vec** integration (for true vector/ANN similarity search) is deferred to
-a follow-up task within Phase 2. When added, it will extend `storage.rs` with a
-`vec0` virtual table and a new `search_chunks_semantic` method; the FTS5 path
-will remain for keyword search.
+**`KnowledgeGraph::search_chunks_semantic(query_embedding: &[f32], limit: usize) -> Vec<(ChunkId, ObjectId, String, f32)>`**
+
+Queries the `chunks_vec` sqlite-vec `vec0` virtual table for the `limit` closest chunks by cosine distance. Returns `(chunk_id, object_id, content, distance)` tuples ordered by ascending distance (0.0 = identical, 2.0 = maximally dissimilar). Only chunks indexed via `upsert_chunk_embedding` are candidates.
+
+The embedding dimension is fixed at `EMBEDDING_DIMENSIONS = 768` (matching `embed-gemma-300m-FLM` and `nomic-embed-text-v2-moe-GGUF`). The constant and the `vec0` DDL must stay in sync; recreate the database if the model changes.
+
+Both search paths coexist. Phase 4 will combine them in a `search_hybrid()` method.
 
 ---
 
@@ -636,8 +648,6 @@ There are no active tracked bugs as of this writing.
   SQLite JSON1 columns. Filtering or querying inside these fields requires
   deserializing at the Rust layer. Acceptable for now; revisit if query patterns
   demand it.
-- **No vector columns yet** — `chunks` has no embedding column. sqlite-vec
-  integration will add one. Until then, semantic similarity search is unavailable.
 - **`inheritance` in `ObjectTypeSchema` is never acted on** — still present as a
   schema field, still ignored at runtime.
 
@@ -648,6 +658,7 @@ There are no active tracked bugs as of this writing.
 | Crate | Version | Role | Status |
 |---|---|---|---|
 | `rusqlite` | 0.32 | SQLite storage (bundled + vtab) | Active — primary storage |
+| `sqlite-vec` | 0.1.7 | ANN vector search via `vec0` virtual table (bundles C source) | Active |
 | `tokio` | 1.45 | Async runtime | Active |
 | `serde` / `serde_json` | 1.0 | Serialization (all layers) | Active |
 | `reqwest` | 0.12 | HTTP client — embeddings, TTS, STT, chat, registry (`json` + `multipart` features) | Active |
@@ -707,21 +718,20 @@ and the reranking provider are all complete. The following work remains:
 
 | Item | Description | Status |
 |---|---|---|
-| sqlite-vec | Vector/ANN semantic search via `vec0` virtual table | Deferred — FTS5 in place |
+| sqlite-vec | Vector/ANN semantic search via `vec0` virtual table | ✅ Complete |
 | Phase 3 | axum HTTP/WebSocket server for web UI | Not started |
 | Phase 4 (pipeline) | Wire reranking into KG search (hybrid FTS5 + vec + rerank) | Not started |
 | Phase 4 (streaming) | Streaming LLM responses via `InferenceQueue` | Not started |
 | Phase 5 | Cargo workspace split | Not started |
 
-**sqlite-vec** is the highest-priority remaining storage item. When added it
-introduces a `vec0` virtual table in `storage.rs`, an embedding column on
-`chunks`, and a `search_chunks_semantic` method on `KnowledgeGraph`. The
-`InferenceQueue::embed()` path provides the embedding side; FTS5 is retained
-alongside it for keyword search.
+**sqlite-vec** is complete. `chunks_vec` is live as a `vec0` virtual table in
+`storage.rs`; `upsert_chunk_embedding()` populates it and `search_chunks_semantic()`
+queries it. FTS5 is retained alongside it for keyword search.
 
-**Phase 3 (axum)** wraps `KnowledgeGraph` behind HTTP and WebSocket endpoints.
-`KnowledgeGraph` is already `Send + Sync` and `Arc`-wrapped; `LemonadeStack`
-and `InferenceQueue` slot naturally into an `AppState` alongside it.
+**Phase 3 (axum)** is the next priority. It wraps `KnowledgeGraph` behind HTTP
+and WebSocket endpoints. `KnowledgeGraph` is already `Send + Sync` and
+`Arc`-wrapped; `LemonadeStack` and `InferenceQueue` slot naturally into an
+`AppState` alongside it.
 
 **Phase 4 (search pipeline)** wires the existing `LemonadeRerankProvider` and
 `InferenceQueue::rerank()` into `KnowledgeGraph::search_*` methods. The provider

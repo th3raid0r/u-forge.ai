@@ -6,7 +6,7 @@ alwaysApply: true
 
 Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs. Built in Rust.
 
-**Status:** Early prototype. CLI demo only. Phases 1 + 2 complete. Hardware re-architecture complete (inter-phase). LLM queuing + reranking infrastructure added (Phase 4 partial). Next: sqlite-vec (Phase 2 remainder), axum server (Phase 3).
+**Status:** Early prototype. CLI demo only. Phases 1 + 2 complete. Hardware re-architecture complete (inter-phase). LLM queuing + reranking infrastructure added (Phase 4 partial). sqlite-vec complete. Next: axum server (Phase 3).
 
 ## Architecture Overview
 
@@ -16,7 +16,7 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
 ## Current Architecture
 
 - **Facade**: [src/lib.rs](mdc:src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas) + `ObjectBuilder`
-- **Storage**: [src/storage.rs](mdc:src/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts`. `KnowledgeGraphStorage` is the only storage struct.
+- **Storage**: [src/storage.rs](mdc:src/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts` + sqlite-vec virtual table `chunks_vec` (768-dim cosine ANN). Key constants: `EMBEDDING_DIMENSIONS = 768`, `MAX_CHUNK_TOKENS = 350`, `ENABLE_HIGH_QUALITY_EMBEDDING = false`. `KnowledgeGraphStorage` is the only storage struct.
 - **Embeddings**: [src/embeddings.rs](mdc:src/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP) + `EmbeddingManager`. FastEmbed/ORT/ONNX have been removed. Transcription types have been moved to `src/transcription.rs`; they are re-exported from `embeddings.rs` for backward compatibility.
 - **Transcription**: [src/transcription.rs](mdc:src/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`. Split out of `embeddings.rs` so embedding and transcription can evolve independently and be routed to different hardware.
 - **Hardware Abstraction**: [src/hardware/mod.rs](mdc:src/hardware/mod.rs) — `DeviceCapability` enum, `HardwareBackend` enum, `DeviceWorker` trait. Sub-modules:
@@ -29,10 +29,10 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
   - `synthesize_queue` → CPU Kokoro TTS workers
   - `generate_queue` → NPU FLM LLM + GPU llamacpp workers compete (first-free wins). **Now wired** — the previous `// NOTE:` bypass comment has been removed.
   - `rerank_queue` → `LemonadeRerankProvider` workers
-  - Public methods: `embed`, `embed_many`, `transcribe`, `synthesize`, `generate`, `ask` (convenience), `rerank`. Builder gains `with_reranker(LemonadeRerankProvider)`.
+  - Public methods: `embed`, `embed_many`, `transcribe`, `synthesize`, `generate`, `ask` (convenience), `rerank`. Builder gains `with_reranker(LemonadeRerankProvider)`. Builder also gains `with_embedding_provider(Arc<dyn EmbeddingProvider>, name)` for standalone llamacpp/CPU/ROCm workers. Per-job retry: up to 3 attempts with exponential backoff in `run_embed_worker`.
 - **Extended Lemonade Integration**: [src/lemonade.rs](mdc:src/lemonade.rs) — `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack`, **`LemonadeRerankProvider`**, **`SystemInfo`**, **`LemonadeCapabilities`**. GPU resource management for STT/LLM contention. `LemonadeChatProvider.gpu` is now `Option<Arc<GpuResourceManager>>` — `None` for NPU-backed providers (no locking needed), `Some(gpu)` for GPU-backed providers.
-- **Full-Text Search**: Built into `KnowledgeGraphStorage::search_chunks_fts` via SQLite FTS5. Exposed on `KnowledgeGraph` as `search_chunks_fts(query, limit)`. No separate search module.
-- **Vector Search**: `src/vector_search.rs` **has been deleted**. `VectorSearchEngine`, `HnswVectorStore`, `VectorSearchConfig`, `HybridSearchResult`, `SemanticSearchResult`, `ExactSearchResult` **no longer exist**. sqlite-vec ANN search is deferred (planned Phase 2 remainder).
+- **Full-Text Search**: `search_chunks_fts(query, limit)` — SQLite FTS5, keyword/phrase/prefix matching. **Semantic Search**: `search_chunks_semantic(query_embedding, limit)` — sqlite-vec vec0 cosine ANN, returns `(ChunkId, ObjectId, String, f32)` tuples. Both live in `storage.rs` / `lib.rs`; Phase 4 will combine them in `search_hybrid()`.
+- **Vector Search**: `src/vector_search.rs` **has been deleted**. ANN search is now provided by sqlite-vec: `chunks_vec` vec0 virtual table in `storage.rs`, `upsert_chunk_embedding()` and `search_chunks_semantic()` on both `KnowledgeGraphStorage` and `KnowledgeGraph`.
 - **Schemas**: [src/schema.rs](mdc:src/schema.rs) + [src/schema_manager.rs](mdc:src/schema_manager.rs) + [src/schema_ingestion.rs](mdc:src/schema_ingestion.rs)
 - **Data Import**: [src/data_ingestion.rs](mdc:src/data_ingestion.rs) — JSONL two-pass import. BUG-6 (dedup) and BUG-7 (cross-session edge resolution) are fixed.
 - **Embedding Queue**: [src/embedding_queue.rs](mdc:src/embedding_queue.rs) — embedding-only async background worker. Superseded for new work by `InferenceQueue`; retained for callers that need per-request status tracking.
@@ -41,7 +41,7 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
 
 **Current state:** SQLite + FTS5, Lemonade embeddings, hardware abstraction, unified inference queue, `LemonadeRerankProvider`, and `cli_demo` FTS5→rerank pipeline are all complete. All nine tracked bugs resolved.
 
-- ⏳ **sqlite-vec** — ANN vector search (highest priority; FTS5 is the interim substitute)
+- ✅ **sqlite-vec** — ANN vector search complete (`chunks_vec` vec0, 768-dim cosine, `search_chunks_semantic`)
 - ⏳ **Phase 3** — `axum` HTTP/WebSocket server for web UI
 - ⏳ **Phase 4 (pipeline)** — Wire reranking into `KnowledgeGraph` hybrid search (FTS5 + vec + rerank); streaming LLM responses
 - ⏳ **Phase 5** — Cargo workspace split
@@ -114,7 +114,7 @@ See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
 |---|---|---|
 | `src/lib.rs` | Facade + ObjectBuilder | `KnowledgeGraph`, `ObjectBuilder` |
 | `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
-| `src/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats` |
+| `src/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats`, `EMBEDDING_DIMENSIONS`, `MAX_CHUNK_TOKENS`, `ENABLE_HIGH_QUALITY_EMBEDDING` |
 | `src/embeddings.rs` | Embedding providers (transcription re-exported for compat) | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
 | `src/transcription.rs` | Audio-to-text providers | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager`, `mime_for_filename` |
 | `src/hardware/mod.rs` | Device abstraction layer | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait) |
@@ -129,7 +129,7 @@ See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
 | `src/data_ingestion.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
 | `src/embedding_queue.rs` | Embedding-only async background queue (legacy) | `EmbeddingQueue`, `EmbeddingQueueBuilder` |
 
-**Deleted modules (do not reference):** `src/vector_search.rs` — removed in Phase 2.
+**Deleted modules (do not reference):** `src/vector_search.rs` — removed in Phase 2. Its ANN responsibilities are now fulfilled by the sqlite-vec `chunks_vec` table in `storage.rs`.
 
 ## ModelRole Classification (lemonade.rs)
 
@@ -147,4 +147,4 @@ See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
 | `Reranker` | `llamacpp` | `reranking` | GPU/CPU |
 | `ImageGen` | `sd-cpp` | `image` | GPU |
 
-Registry selector methods: `npu_embedding_model()`, `npu_stt_model()`, `npu_llm_model()`, `tts_model()`, `stt_model()` (GpuStt only), `llm_model()` (GpuLlm only), `reranker_model()`, `cpu_embedding_model()`.
+Registry selector methods: `npu_embedding_model()`, `npu_stt_model()`, `npu_llm_model()`, `tts_model()`, `stt_model()` (GpuStt only), `llm_model()` (GpuLlm only), `reranker_model()`, `cpu_embedding_model()`, `all_cpu_embedding_models()`.
