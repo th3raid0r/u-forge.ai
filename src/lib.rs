@@ -17,7 +17,7 @@
 pub(crate) mod test_helpers;
 
 pub mod ai;
-pub mod data_ingestion;
+pub mod ingest;
 pub mod error;
 pub mod hardware;
 pub mod inference_queue;
