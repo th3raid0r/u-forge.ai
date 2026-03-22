@@ -33,6 +33,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tracing::{debug, info};
 
+use crate::lemonade_client::LemonadeHttpClient;
+
 // ── Model registry ────────────────────────────────────────────────────────────
 
 /// Raw model entry as returned by `GET /api/v1/models`.
@@ -162,21 +164,12 @@ pub struct LemonadeModelRegistry {
 impl LemonadeModelRegistry {
     /// Fetch the model list from `GET {base_url}/models` and build a registry.
     pub async fn fetch(base_url: &str) -> Result<Self> {
-        let client = reqwest::Client::new();
-        let base = base_url.trim_end_matches('/');
-        let url = format!("{base}/models");
+        let client = LemonadeHttpClient::new(base_url);
 
         let resp: ModelsListResponse = client
-            .get(&url)
-            .header("Authorization", "Bearer lemonade")
-            .send()
+            .get_json("/models")
             .await
-            .with_context(|| format!("Failed to reach Lemonade server at {url}"))?
-            .error_for_status()
-            .context("Lemonade /models returned an error status")?
-            .json()
-            .await
-            .context("Failed to parse /models JSON response")?;
+            .context("Failed to fetch Lemonade model registry")?;
 
         info!(
             model_count = resp.data.len(),
@@ -184,7 +177,7 @@ impl LemonadeModelRegistry {
         );
 
         Ok(Self {
-            base_url: base.to_string(),
+            base_url: client.base_url,
             models: resp.data,
         })
     }
@@ -608,8 +601,7 @@ impl std::fmt::Display for KokoroVoice {
 /// runs entirely on the CPU.
 #[derive(Debug, Clone)]
 pub struct LemonadeTtsProvider {
-    client: reqwest::Client,
-    base_url: String,
+    client: LemonadeHttpClient,
     /// The model id sent to the API (e.g. `"kokoro-v1"`).
     pub model: String,
     /// Voice used when none is specified at call time.
@@ -620,8 +612,7 @@ impl LemonadeTtsProvider {
     /// Construct with an explicit base URL and model id.
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            client: LemonadeHttpClient::new(base_url),
             model: model.to_string(),
             default_voice: KokoroVoice::default(),
         }
@@ -655,21 +646,11 @@ impl LemonadeTtsProvider {
             "voice":  voice_str,
         });
 
-        let response = self
+        let bytes = self
             .client
-            .post(format!("{}/audio/speech", self.base_url))
-            .header("Authorization", "Bearer lemonade")
-            .json(&body)
-            .send()
+            .post_bytes("/audio/speech", &body)
             .await
-            .context("TTS HTTP request failed")?
-            .error_for_status()
-            .context("Lemonade TTS returned an error status")?;
-
-        let bytes = response
-            .bytes()
-            .await
-            .context("Failed to read TTS audio bytes from response")?;
+            .context("TTS HTTP request failed")?;
 
         tracing::debug!(
             model    = %self.model,
@@ -680,7 +661,7 @@ impl LemonadeTtsProvider {
             "TTS synthesis complete"
         );
 
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Synthesize using `self.default_voice`.
@@ -706,8 +687,7 @@ pub struct TranscriptionResult {
 /// if LLM inference is currently active — STT must never queue behind slow inference.
 #[derive(Debug, Clone)]
 pub struct LemonadeSttProvider {
-    client: reqwest::Client,
-    base_url: String,
+    client: LemonadeHttpClient,
     /// The model id sent to the API (e.g. `"Whisper-Large-v3-Turbo"`).
     pub model: String,
     /// Shared GPU resource manager — also held by [`LemonadeChatProvider`].
@@ -718,8 +698,7 @@ impl LemonadeSttProvider {
     /// Construct with an explicit base URL, model id, and GPU manager.
     pub fn new(base_url: &str, model: &str, gpu: Arc<GpuResourceManager>) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            client: LemonadeHttpClient::new(base_url),
             model: model.to_string(),
             gpu,
         }
@@ -765,17 +744,9 @@ impl LemonadeSttProvider {
 
         let result: TranscriptionResult = self
             .client
-            .post(format!("{}/audio/transcriptions", self.base_url))
-            .header("Authorization", "Bearer lemonade")
-            .multipart(form)
-            .send()
+            .post_multipart("/audio/transcriptions", form)
             .await
-            .context("STT HTTP request failed")?
-            .error_for_status()
-            .context("Lemonade STT returned an error status")?
-            .json()
-            .await
-            .context("Failed to parse STT transcription response")?;
+            .context("STT HTTP request failed")?;
 
         tracing::debug!(
             model        = %self.model,
@@ -888,8 +859,7 @@ impl ChatRequest {
 /// See [`GpuResourceManager`] for the full policy description.
 #[derive(Debug, Clone)]
 pub struct LemonadeChatProvider {
-    client: reqwest::Client,
-    base_url: String,
+    client: LemonadeHttpClient,
     /// The model id sent to the API (e.g. `"GLM-4.7-Flash-GGUF"`).
     pub model: String,
     /// Shared GPU resource manager — also held by [`LemonadeSttProvider`].
@@ -914,8 +884,7 @@ impl LemonadeChatProvider {
     /// with no shared resource contention.
     pub fn new(base_url: &str, model: &str, gpu: Option<Arc<GpuResourceManager>>) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            client: LemonadeHttpClient::new(base_url),
             model: model.to_string(),
             gpu,
             default_max_tokens: 2048,
@@ -995,17 +964,9 @@ impl LemonadeChatProvider {
 
         let resp: ChatCompletionResponse = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", "Bearer lemonade")
-            .json(&body)
-            .send()
+            .post_json("/chat/completions", &body)
             .await
-            .context("Chat HTTP request failed")?
-            .error_for_status()
-            .context("Lemonade chat completions returned an error status")?
-            .json()
-            .await
-            .context("Failed to parse chat completion response")?;
+            .context("Chat HTTP request failed")?;
 
         tracing::debug!(
             model         = %self.model,
@@ -1063,6 +1024,38 @@ pub struct LemonadeStack {
     pub tts: LemonadeTtsProvider,
     pub stt: LemonadeSttProvider,
     pub chat: LemonadeChatProvider,
+}
+
+/// Resolve a Lemonade Server URL for a specific provider.
+///
+/// Shared helper for [`EmbeddingManager::try_new_auto`] and
+/// [`TranscriptionManager::try_new_auto`] to avoid duplicating the
+/// `arg → env var → [probe]` resolution pattern.
+///
+/// # Parameters
+/// - `explicit`         — Caller-supplied URL (highest priority).
+/// - `env_var`          — Name of the environment variable to check next.
+/// - `probe_localhost`  — When `true`, falls back to probing localhost if
+///   neither `explicit` nor the env var are set.  Pass `false` for providers
+///   that should hard-error instead of probing (e.g. transcription).
+///
+/// Returns `None` when no URL could be found, indicating a hard error is
+/// appropriate for the caller.
+pub async fn resolve_provider_url(
+    explicit: Option<&str>,
+    env_var: &str,
+    probe_localhost: bool,
+) -> Option<String> {
+    if let Some(url) = explicit {
+        return Some(url.to_string());
+    }
+    if let Ok(url) = std::env::var(env_var) {
+        return Some(url);
+    }
+    if probe_localhost {
+        return resolve_lemonade_url().await;
+    }
+    None
 }
 
 /// Resolve a reachable Lemonade Server base URL.
@@ -1159,8 +1152,7 @@ pub struct RerankDocument {
 /// them internally.
 #[derive(Debug, Clone)]
 pub struct LemonadeRerankProvider {
-    client: reqwest::Client,
-    base_url: String,
+    client: LemonadeHttpClient,
     /// The reranker model id (e.g. `"bge-reranker-v2-m3-GGUF"`).
     pub model: String,
 }
@@ -1169,8 +1161,7 @@ impl LemonadeRerankProvider {
     /// Construct with an explicit base URL and model id.
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            client: LemonadeHttpClient::new(base_url),
             model: model.to_string(),
         }
     }
@@ -1225,17 +1216,9 @@ impl LemonadeRerankProvider {
 
         let resp: RerankResponse = self
             .client
-            .post(format!("{}/reranking", self.base_url))
-            .header("Authorization", "Bearer lemonade")
-            .json(&body)
-            .send()
+            .post_json("/reranking", &body)
             .await
-            .context("Rerank HTTP request failed")?
-            .error_for_status()
-            .context("Lemonade /reranking returned an error status")?
-            .json()
-            .await
-            .context("Failed to parse reranking response")?;
+            .context("Rerank HTTP request failed")?;
 
         let mut results: Vec<RerankDocument> = resp
             .results

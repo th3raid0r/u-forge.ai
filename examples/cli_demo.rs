@@ -26,6 +26,7 @@ use u_forge_ai::{
     lemonade::{
         resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
     },
+    search::{search_hybrid, HybridSearchConfig},
     ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
     EMBEDDING_DIMENSIONS,
 };
@@ -704,6 +705,134 @@ async fn main() -> Result<()> {
         println!("ℹ️  Rerank demo skipped — no reranker model available on this server.\n");
     } else {
         println!("ℹ️  Rerank demo skipped — set LEMONADE_URL to enable AI features.\n");
+    }
+
+    // ── Hybrid search demo ────────────────────────────────────────────────────
+    //
+    // Combines FTS5 + semantic ANN via Reciprocal Rank Fusion, then
+    // optionally reranks the merged candidates with the cross-encoder.
+    // Degrades gracefully: FTS-only when no embedding worker is available;
+    // RRF-scored when no reranker is registered.
+
+    if let Some(ref eq) = embed_queue {
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("🔀 Hybrid search demo (FTS5 + semantic ANN + rerank)");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        println!("   Strategy: use FTS5 + semantic ANN chunk matches as signal to");
+        println!("   identify the most relevant knowledge graph NODES, then return");
+        println!("   each winning node with full content, edges, and connected nodes.\n");
+
+        let has_rr = reranker.is_some();
+
+        // Config: balanced blend, return top 3 nodes with full context.
+        let config = HybridSearchConfig {
+            alpha: 0.5,
+            fts_limit: 15,
+            semantic_limit: 15,
+            rerank: has_rr,
+            limit: 3,
+        };
+
+        println!(
+            "   Config: alpha={} | fts_limit={} | semantic_limit={} | rerank={} | limit={} nodes\n",
+            config.alpha, config.fts_limit, config.semantic_limit, config.rerank, config.limit,
+        );
+
+        let hybrid_queries = [
+            "Who founded the Foundation and why?",
+            "What happened to the Galactic Empire?",
+            "psychohistory and mathematical prediction",
+            "robotic civilizations and machine intelligence",
+        ];
+
+        for query in &hybrid_queries {
+            println!("  Query: \"{query}\"");
+
+            match search_hybrid(&graph, eq, query, &config).await {
+                Err(e) => {
+                    println!("    ⚠️  Hybrid search error: {e}\n");
+                }
+                Ok(results) if results.is_empty() => {
+                    println!("    (no results — are chunks embedded?)\n");
+                }
+                Ok(results) => {
+                    for (rank, result) in results.iter().enumerate() {
+                        let src = result.sources.label();
+                        let desc = result
+                            .node
+                            .description
+                            .as_deref()
+                            .unwrap_or("(no description)");
+                        let preview = truncate(desc, 65);
+                        println!(
+                            "    {}. [score {:.4}] {src} {} [{}] — {} chunks, {} edges",
+                            rank + 1,
+                            result.score,
+                            result.node.name,
+                            result.node.object_type,
+                            result.chunks.len(),
+                            result.edges.len(),
+                        );
+                        println!("       \"{preview}\"");
+                        if !result.connected_node_names.is_empty() {
+                            let connected: Vec<String> = result
+                                .connected_node_names
+                                .values()
+                                .map(|cn| format!("{} [{}]", cn.name, cn.object_type))
+                                .collect();
+                            println!("       → {}", connected.join(", "));
+                        }
+                    }
+                    println!();
+                }
+            }
+        }
+
+        // ── Per-alpha comparison ──────────────────────────────────────────────
+        // Show one query at three alpha values so the blend effect is visible.
+
+        println!("  — Alpha sweep (query: \"the collapse of an interstellar civilization\") —\n");
+
+        for &alpha in &[0.0f32, 0.5, 1.0] {
+            let label = match alpha {
+                a if a == 0.0 => "pure FTS5 ",
+                a if a == 1.0 => "pure SEM  ",
+                _ => "blend 50/50",
+            };
+            let sweep_config = HybridSearchConfig {
+                alpha,
+                fts_limit: 10,
+                semantic_limit: 10,
+                rerank: false, // keep comparable — no reranker variance
+                limit: 3,
+            };
+            print!("  alpha={alpha:.1} ({label}): ");
+            match search_hybrid(
+                &graph,
+                eq,
+                "the collapse of an interstellar civilization",
+                &sweep_config,
+            )
+            .await
+            {
+                Err(e) => println!("⚠️  {e}"),
+                Ok(rs) if rs.is_empty() => println!("(no results)"),
+                Ok(rs) => {
+                    let names: Vec<String> = rs
+                        .iter()
+                        .map(|r| format!("{} [{}]", r.node.name, r.node.object_type))
+                        .collect();
+                    println!("{}", names.join(" | "));
+                }
+            }
+        }
+        println!();
+    } else if lemonade_url.is_some() {
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("🔀 Hybrid search demo skipped — no compatible {EMBEDDING_DIMENSIONS}-dim embedding model available.\n");
+    } else {
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("🔀 Hybrid search demo skipped — set LEMONADE_URL to enable AI features.\n");
     }
 
     // ── Relationship exploration ───────────────────────────────────────────────

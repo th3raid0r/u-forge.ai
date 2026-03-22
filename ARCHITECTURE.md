@@ -3,12 +3,15 @@
 > This document describes the **current** state of the codebase after completing
 > Phase 1 (Lemonade Provider), Phase 2 (SQLite migration), the extended
 > Lemonade integration (`src/lemonade.rs` — model registry, GPU resource manager,
-> TTS/STT/Chat providers), and the hardware re-architecture session that:
+> TTS/STT/Chat providers), the hardware re-architecture session, and the
+> Phase 4 search pipeline session that:
 >
 > - Moved all transcription types out of `embeddings.rs` into `src/transcription.rs`
 > - Added `src/hardware/` (NPU, GPU, CPU device abstractions)
 > - Added `src/inference_queue.rs` — a unified MPMC work queue that routes
->   embedding, STT, and TTS jobs to any available capable device
+>   embedding, STT, TTS, LLM, and reranking jobs to any available capable device
+> - Added `src/search.rs` — `search_hybrid()` combining FTS5 + sqlite-vec ANN
+>   via Reciprocal Rank Fusion with optional cross-encoder reranking
 >
 > For planned future work see the Remaining Roadmap section at the bottom.
 
@@ -19,14 +22,15 @@
 | `src/lib.rs` | Facade + ObjectBuilder + tests | `KnowledgeGraph`, `ObjectBuilder` |
 | `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
 | `src/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats` |
+| `src/search.rs` | Hybrid search pipeline (FTS5 + ANN + rerank) | `search_hybrid`, `HybridSearchConfig`, `HybridSearchResult`, `SearchSources` |
 | `src/embeddings.rs` | Lemonade HTTP embedding providers only | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
 | `src/transcription.rs` | Audio-to-text providers (split from embeddings) | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager`, `mime_for_filename` |
 | `src/hardware/mod.rs` | Device abstraction layer | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait) |
-| `src/hardware/npu.rs` | AMD NPU device (embedding + STT) | `NpuDevice` |
+| `src/hardware/npu.rs` | AMD NPU device (embedding + STT + LLM) | `NpuDevice` |
 | `src/hardware/gpu.rs` | AMD GPU ROCm device (STT + LLM) | `GpuDevice` |
 | `src/hardware/cpu.rs` | CPU device (TTS) | `CpuDevice` |
 | `src/inference_queue.rs` | Unified MPMC capability-based dispatch queue | `InferenceQueue`, `InferenceQueueBuilder`, `QueueStats` |
-| `src/lemonade.rs` | Extended Lemonade integration (GPU-managed stack) | `LemonadeModelRegistry`, `GpuResourceManager`, `SttGuard`, `LlmGuard`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack` |
+| `src/lemonade.rs` | Extended Lemonade integration (GPU-managed stack) | `LemonadeModelRegistry`, `GpuResourceManager`, `SttGuard`, `LlmGuard`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `RerankDocument`, `SystemInfo`, `LemonadeCapabilities`, `LemonadeStack` |
 | `src/schema.rs` | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
 | `src/schema_manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
 | `src/schema_ingestion.rs` | JSON schema file → internal | `SchemaIngestion` |
@@ -35,8 +39,9 @@
 | `examples/cli_demo.rs` | Only runnable entry point | — |
 
 > **Removed:** `src/vector_search.rs` — `VectorSearchEngine`, `HnswVectorStore`,
-> `VectorSearchConfig`, `HybridSearchResult`, `SemanticSearchResult`, and
-> `ExactSearchResult` no longer exist. All vector/HNSW/FST code has been deleted.
+> `VectorSearchConfig`, `HybridSearchResult` (old HNSW type), `SemanticSearchResult`,
+> and `ExactSearchResult` no longer exist. All vector/HNSW/FST code has been deleted.
+> The current `HybridSearchResult` lives in `src/search.rs` and is unrelated.
 
 ---
 
@@ -543,7 +548,53 @@ Queries the `chunks_vec` sqlite-vec `vec0` virtual table for the `limit` closest
 
 The embedding dimension is fixed at `EMBEDDING_DIMENSIONS = 768` (matching `embed-gemma-300m-FLM` and `nomic-embed-text-v2-moe-GGUF`). The constant and the `vec0` DDL must stay in sync; recreate the database if the model changes.
 
-Both search paths coexist. Phase 4 will combine them in a `search_hybrid()` method.
+### Hybrid Search (`src/search.rs`)
+
+**`search_hybrid(graph, queue, query, config) -> Result<Vec<HybridSearchResult>>`**
+
+Free async function that combines the two search primitives above with optional
+cross-encoder reranking. Lives outside `KnowledgeGraph` to preserve the graph's
+purely-synchronous, no-AI-dependency contract.
+
+**Algorithm (5 stages):**
+
+1. **FTS5** — `graph.search_chunks_fts(fts5_sanitize(query), config.fts_limit)`.
+   Skipped when `alpha == 1.0`.
+2. **Embed** — `queue.embed(query)` for the query vector.
+   Skipped when `alpha == 0.0` or no embedding worker registered.
+3. **Semantic ANN** — `graph.search_chunks_semantic(&vec, config.semantic_limit)`.
+   Skipped when step 2 was skipped or failed.
+4. **RRF merge** — Reciprocal Rank Fusion (`score = weight / (k + rank)`, k=60).
+   Deduplicates by `chunk_id`, sums contributions from both paths, sorts descending,
+   caps at `config.limit`. Chunks found by both paths naturally outscore single-path
+   results.
+5. **Rerank** — `queue.rerank(query, docs, top_n)` if `config.rerank` and a
+   reranking worker is registered. Replaces RRF scores with cross-encoder scores.
+
+**`HybridSearchConfig`** fields: `alpha` (0.0–1.0), `fts_limit`, `semantic_limit`,
+`rerank: bool`, `limit`. `Default` provides `alpha=0.5`, pools of 20, rerank on,
+top 10 results.
+
+**`HybridSearchResult`** fields: `chunk_id`, `object_id`, `content`, `score`,
+`sources: SearchSources`.
+
+**`SearchSources`** tracks provenance: `fts_rank: Option<usize>`,
+`semantic_distance: Option<f32>`, `rerank_score: Option<f32>`. The `label()` method
+returns a human-readable string: `[FTS]`, `[SEM]`, `[FTS+SEM]`, `[FTS+SEM+RR]`.
+
+**`fts5_sanitize(query) -> Option<String>`** — strips characters that are illegal
+in FTS5 query syntax (e.g. `?`, `!`, `'`, `(`, `)`) before the SQLite `MATCH` call.
+The original query is passed verbatim to `embed()` and `rerank()` — those go over
+HTTP where punctuation is meaningful. Returns `None` for all-punctuation input,
+causing the FTS stage to be skipped cleanly.
+
+**Graceful degradation:** no embedding worker → FTS-only with `info!` log; embed
+fails at runtime → FTS-only with `warn!`; no reranking worker → RRF scores with
+`info!`; reranker fails → RRF scores with `warn!`. Never returns an error due to a
+missing AI capability.
+
+All public types are re-exported from `src/lib.rs`. 27 unit tests; all pass with
+no Lemonade Server required (`MockEmbeddingProvider` + `TempDir`).
 
 ---
 
@@ -714,13 +765,14 @@ startup; the `add_` prefix is stripped before storage.
 ## Remaining Roadmap
 
 Phases 1 and 2, the extended Lemonade integration, hardware re-architecture,
-and the reranking provider are all complete. The following work remains:
+the reranking provider, and the Phase 4 search pipeline are all complete. The
+following work remains:
 
 | Item | Description | Status |
 |---|---|---|
 | sqlite-vec | Vector/ANN semantic search via `vec0` virtual table | ✅ Complete |
+| Phase 4 (pipeline) | `search_hybrid` — FTS5 + ANN + RRF + rerank in `src/search.rs` | ✅ Complete |
 | Phase 3 | axum HTTP/WebSocket server for web UI | Not started |
-| Phase 4 (pipeline) | Wire reranking into KG search (hybrid FTS5 + vec + rerank) | Not started |
 | Phase 4 (streaming) | Streaming LLM responses via `InferenceQueue` | Not started |
 | Phase 5 | Cargo workspace split | Not started |
 
@@ -728,12 +780,15 @@ and the reranking provider are all complete. The following work remains:
 `storage.rs`; `upsert_chunk_embedding()` populates it and `search_chunks_semantic()`
 queries it. FTS5 is retained alongside it for keyword search.
 
-**Phase 3 (axum)** is the next priority. It wraps `KnowledgeGraph` behind HTTP
-and WebSocket endpoints. `KnowledgeGraph` is already `Send + Sync` and
-`Arc`-wrapped; `LemonadeStack` and `InferenceQueue` slot naturally into an
-`AppState` alongside it.
+**Phase 4 (search pipeline)** is complete. `search_hybrid` in `src/search.rs` is
+the canonical hybrid search entry point — see the Search section above for the full
+design. The `POST /api/search` axum route (Phase 3) will call it directly.
 
-**Phase 4 (search pipeline)** wires the existing `LemonadeRerankProvider` and
-`InferenceQueue::rerank()` into `KnowledgeGraph::search_*` methods. The provider
-is already implemented and demonstrated in `cli_demo`. What remains is the
-integrated FTS5 + sqlite-vec merge + rerank path on the `KnowledgeGraph` facade.
+**Phase 3 (axum)** is the next priority. It wraps `KnowledgeGraph` + `InferenceQueue`
+behind HTTP and WebSocket endpoints. `KnowledgeGraph` is already `Send + Sync` and
+`Arc`-wrapped; `LemonadeStack`, `InferenceQueue`, and `search_hybrid` slot naturally
+into an `AppState`.
+
+**Phase 4 (streaming)** adds `InferenceQueue::generate_stream()` returning a
+`tokio::sync::mpsc::Receiver<String>` of token chunks, needed by the axum WebSocket
+layer to stream LLM responses to the web UI.

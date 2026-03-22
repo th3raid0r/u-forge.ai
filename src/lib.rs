@@ -17,23 +17,22 @@
 pub(crate) mod test_helpers;
 
 pub mod data_ingestion;
-pub mod embedding_queue;
 pub mod embeddings;
+pub mod error;
 pub mod hardware;
 pub mod inference_queue;
 pub mod lemonade;
+pub(crate) mod lemonade_client;
 pub mod schema;
 pub mod schema_ingestion;
 pub mod schema_manager;
+pub mod search;
 pub mod storage;
 pub mod transcription;
 pub mod types;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
-pub use embedding_queue::{
-    EmbeddingProgress, EmbeddingQueue, EmbeddingQueueBuilder, RequestStatus,
-};
 pub use embeddings::{
     EmbeddingManager, EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
     LemonadeProvider,
@@ -49,6 +48,9 @@ pub use schema::{
 };
 pub use schema_ingestion::SchemaIngestion;
 pub use schema_manager::{SchemaManager, SchemaStats};
+pub use search::{
+    search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
+};
 pub use storage::{
     GraphStats, KnowledgeGraphStorage, EMBEDDING_DIMENSIONS, ENABLE_HIGH_QUALITY_EMBEDDING,
     MAX_CHUNK_TOKENS,
@@ -125,6 +127,10 @@ fn split_text(text: &str) -> Vec<String> {
 ///     .add_to_graph(&graph)
 ///     .unwrap();
 /// ```
+// KnowledgeGraph is Send + Sync:
+//   - KnowledgeGraphStorage wraps rusqlite::Connection in Arc<Mutex<Connection>> (see storage.rs)
+//   - SchemaManager holds Arc<KnowledgeGraphStorage> + DashMap (both Send + Sync)
+// This means Arc<KnowledgeGraph> is a valid axum State<T> type for Phase 3.
 pub struct KnowledgeGraph {
     storage: Arc<KnowledgeGraphStorage>,
     schema_manager: Arc<SchemaManager>,
