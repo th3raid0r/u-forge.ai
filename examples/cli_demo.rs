@@ -20,7 +20,7 @@ use std::env;
 use std::sync::Arc;
 use u_forge_ai::{
     data_ingestion::DataIngestion,
-    embeddings::LemonadeProvider,
+    ai::embeddings::LemonadeProvider,
     hardware::npu::NpuDevice,
     inference_queue::{InferenceQueue, InferenceQueueBuilder},
     lemonade::{

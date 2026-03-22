@@ -16,8 +16,8 @@
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
+pub mod ai;
 pub mod data_ingestion;
-pub mod embeddings;
 pub mod error;
 pub mod hardware;
 pub mod inference_queue;
@@ -25,12 +25,11 @@ pub mod lemonade;
 pub mod schema;
 pub mod search;
 pub mod graph;
-pub mod transcription;
 pub mod types;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
-pub use embeddings::{
+pub use ai::embeddings::{
     EmbeddingManager, EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
     LemonadeProvider,
 };

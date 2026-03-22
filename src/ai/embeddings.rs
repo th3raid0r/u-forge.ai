@@ -11,7 +11,7 @@
 //! # Quick start
 //!
 //! ```no_run
-//! # use u_forge_ai::embeddings::EmbeddingManager;
+//! # use u_forge_ai::ai::embeddings::EmbeddingManager;
 //! // Auto: reads LEMONADE_URL env var, connects to Lemonade Server
 //! # async fn example() {
 //! let mgr = EmbeddingManager::try_new_auto(None, None).await.unwrap();
@@ -32,7 +32,7 @@ use crate::lemonade::LemonadeHttpClient;
 // Transcription types moved to `crate::transcription`.  Re-exported here so
 // existing code using `embeddings::TranscriptionProvider` continues to compile
 // without changes.
-pub use crate::transcription::{
+pub use super::transcription::{
     LemonadeTranscriptionProvider, TranscriptionManager, TranscriptionProvider,
 };
 

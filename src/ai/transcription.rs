@@ -20,7 +20,7 @@
 //! # Quick start
 //!
 //! ```no_run
-//! # use u_forge_ai::transcription::TranscriptionManager;
+//! # use u_forge_ai::ai::transcription::TranscriptionManager;
 //! # async fn example() -> anyhow::Result<()> {
 //! // Auto: reads LEMONADE_URL env var, defaults to whisper-v3-turbo-FLM
 //! let mgr = TranscriptionManager::try_new_auto(None, None).await?;
@@ -167,7 +167,7 @@ impl TranscriptionProvider for LemonadeTranscriptionProvider {
 /// # Example
 ///
 /// ```no_run
-/// # use u_forge_ai::transcription::TranscriptionManager;
+/// # use u_forge_ai::ai::transcription::TranscriptionManager;
 /// # async fn run() -> anyhow::Result<()> {
 /// let mgr = TranscriptionManager::try_new_auto(None, None).await?;
 /// let provider = mgr.get_provider();       // Arc<dyn TranscriptionProvider>

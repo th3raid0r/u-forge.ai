@@ -49,9 +49,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::info;
 
-use crate::embeddings::{EmbeddingProvider, LemonadeProvider};
+use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
 use crate::lemonade::{LemonadeChatProvider, LemonadeModelRegistry};
-use crate::transcription::{LemonadeTranscriptionProvider, TranscriptionProvider};
+use crate::ai::transcription::{LemonadeTranscriptionProvider, TranscriptionProvider};
 
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
 
@@ -395,7 +395,7 @@ impl std::fmt::Debug for NpuDevice {
 struct DisabledEmbeddingProvider;
 
 #[async_trait::async_trait]
-impl crate::embeddings::EmbeddingProvider for DisabledEmbeddingProvider {
+impl crate::ai::embeddings::EmbeddingProvider for DisabledEmbeddingProvider {
     async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
         Err(anyhow::anyhow!(
             "DisabledEmbeddingProvider: this NpuDevice was built with transcription_only() \
@@ -418,11 +418,11 @@ impl crate::embeddings::EmbeddingProvider for DisabledEmbeddingProvider {
         Err(anyhow::anyhow!("DisabledEmbeddingProvider: no max_tokens"))
     }
 
-    fn provider_type(&self) -> crate::embeddings::EmbeddingProviderType {
-        crate::embeddings::EmbeddingProviderType::Lemonade
+    fn provider_type(&self) -> crate::ai::embeddings::EmbeddingProviderType {
+        crate::ai::embeddings::EmbeddingProviderType::Lemonade
     }
 
-    fn model_info(&self) -> Option<crate::embeddings::EmbeddingModelInfo> {
+    fn model_info(&self) -> Option<crate::ai::embeddings::EmbeddingModelInfo> {
         None
     }
 }

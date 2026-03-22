@@ -91,7 +91,7 @@ use parking_lot::Mutex;
 use tokio::sync::{oneshot, Notify};
 use tracing::{debug, instrument, warn};
 
-use crate::embeddings::EmbeddingProvider;
+use crate::ai::embeddings::EmbeddingProvider;
 use crate::hardware::cpu::CpuDevice;
 use crate::hardware::gpu::GpuDevice;
 use crate::hardware::npu::NpuDevice;
@@ -99,7 +99,7 @@ use crate::lemonade::{
     ChatCompletionResponse, ChatRequest, KokoroVoice, LemonadeChatProvider, LemonadeRerankProvider,
     LemonadeSttProvider, LemonadeTtsProvider, RerankDocument,
 };
-use crate::transcription::TranscriptionProvider;
+use crate::ai::transcription::TranscriptionProvider;
 
 // ── Internal job types ────────────────────────────────────────────────────────
 
@@ -1109,7 +1109,7 @@ async fn run_tts_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeddings::{EmbeddingModelInfo, EmbeddingProviderType};
+    use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProviderType};
     use crate::hardware::cpu::CpuDevice;
     use crate::hardware::npu::NpuDevice;
 

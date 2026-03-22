@@ -636,7 +636,7 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
 
-    use crate::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
+    use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
     use crate::inference_queue::InferenceQueueBuilder;
     use crate::types::ChunkType;
     use crate::{KnowledgeGraph, ObjectBuilder};
