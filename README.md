@@ -20,6 +20,8 @@ A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI
 |---|---|
 | SQLite knowledge graph (nodes, edges, chunks, schemas) | ✅ Working |
 | Full-text search via SQLite FTS5 | ✅ Working |
+| Semantic (vector) search via sqlite-vec ANN (`chunks_vec` vec0 table) | ✅ Working |
+| Hybrid search — FTS5 + ANN + RRF merge + optional rerank (`src/search/`) | ✅ Working |
 | Flexible JSON schema system with validation (13 TTRPG types) | ✅ Working |
 | JSONL data ingestion — two-pass node + edge import, deduplication | ✅ Working |
 | `ObjectBuilder` fluent API | ✅ Working |
@@ -28,10 +30,9 @@ A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI
 | Hardware device abstraction (NPU / GPU / CPU) | ✅ Working |
 | Unified inference queue (`InferenceQueue`) — embed, transcribe, TTS, LLM, rerank | ✅ Working |
 | Reranking via Lemonade Server (`LemonadeRerankProvider`) | ✅ Working |
-| `cli_demo` — FTS5 search + rerank pipeline demo with Foundation universe data | ✅ Working |
-| sqlite-vec ANN vector search | 🔜 Deferred |
+| `cli_demo` — hybrid search + rerank pipeline demo with Foundation universe data | ✅ Working |
 | axum HTTP / WebSocket server | 🔜 Planned |
-| Reranking wired into KG search pipeline (hybrid FTS5 + vec + rerank) | 🔜 Planned |
+| Streaming LLM responses | 🔜 Planned |
 | Web UI | 🔜 Planned |
 
 ---
@@ -43,7 +44,7 @@ A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI
 | Language | Rust (single crate, lib + CLI example) |
 | Storage | SQLite via `rusqlite` (bundled — zero system deps) |
 | Full-text search | SQLite FTS5 |
-| Vector search | *(deferred — sqlite-vec planned)* |
+| Vector search | sqlite-vec ANN (`vec0` virtual table, cosine distance) |
 | Embeddings / LLM / Reranking / TTS / STT | [Lemonade Server](https://github.com/lemonade-sdk/lemonade) HTTP API (optional) |
 | Async runtime | Tokio 1.x |
 | Serialization | serde\_json |
@@ -105,7 +106,9 @@ available — demonstrate the FTS5 → rerank pipeline.
 ```
 u-forge.ai/
 ├── src/
-│   ├── lib.rs              # KnowledgeGraph facade + ObjectBuilder
+│   ├── lib.rs              # KnowledgeGraph facade + re-exports
+│   ├── builder.rs          # ObjectBuilder fluent API
+│   ├── text.rs             # split_text() word-boundary chunking
 │   ├── types.rs            # Domain types
 │   ├── graph/              # SQLite persistence + FTS5 + ANN (6 files)
 │   ├── ai/                 # EmbeddingProvider + TranscriptionProvider traits + providers

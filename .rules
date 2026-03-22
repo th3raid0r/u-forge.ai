@@ -42,29 +42,21 @@ Every `.rs` file in `src/` and `examples/` is thoroughly commented. `.md` files
 and `.mdc` rules exist to tell you **where to look and why it matters**, not to
 repeat what the code already says. If you find yourself writing a code example or
 struct definition in a doc that already exists verbatim in source, replace it with
-a pointer (`see src/lemonade.rs — LemonadeRerankProvider`). Keep docs as
+a pointer (`see src/lemonade/rerank.rs — LemonadeRerankProvider`). Keep docs as
 navigational aids.
 
 ---
 
 ## Current Project State (snapshot)
 
-- **Complete:** SQLite + FTS5 storage, sqlite-vec ANN search (`chunks_vec` vec0
-  table, 768-dim cosine, `search_chunks_semantic`), `LemonadeProvider` embeddings,
-  hardware abstraction (`src/hardware/`), unified inference queue
-  (`src/inference_queue.rs`), `LemonadeRerankProvider` + `InferenceQueue::rerank()`,
-  `cli_demo` FTS5 + semantic search + rerank pipeline, all 9 tracked bugs resolved.
-- **New in this session:** `src/search.rs` — `search_hybrid()` free async function,
-  `HybridSearchConfig`, `HybridSearchResult`, `SearchSources`; Reciprocal Rank
-  Fusion (RRF, k=60) merge of FTS5 + sqlite-vec ANN results; optional cross-encoder
-  rerank stage; `fts5_sanitize()` helper that strips FTS5-illegal punctuation from
-  natural-language queries before the SQLite MATCH call; graceful degradation at
-  every AI stage (no-embedding → FTS-only, no-reranker → RRF scores); 27 unit tests
-  (all passing, no server required); `cli_demo` 🔀 hybrid search demo with per-query
-  provenance labels (`[FTS]`, `[SEM]`, `[FTS+SEM+RR]`) and an alpha-sweep comparison.
-- **Remaining:** axum HTTP server (Phase 3), streaming LLM responses (Phase 4
-  remainder), Cargo workspace split (Phase 5).
-- **No active bugs.** Do not reference BUG-1 through BUG-9 as open issues.
+- **Complete:** SQLite + FTS5 storage, sqlite-vec ANN search, `LemonadeProvider`
+  embeddings, hardware abstraction (`src/hardware/`), unified inference queue
+  (`src/queue/`), `LemonadeRerankProvider` + `InferenceQueue::rerank()`,
+  hybrid search pipeline (`src/search/` — `search_hybrid()`, RRF merge, optional
+  rerank, graceful degradation). `lib.rs` is facade-only; `ObjectBuilder` lives
+  in `builder.rs`. No active bugs.
+- **Remaining:** axum HTTP server, streaming LLM responses, Cargo workspace split.
+  See `ARCHITECTURE.md` — Remaining Roadmap for details.
 
 ---
 
@@ -89,7 +81,7 @@ the `LEMONADE_URL` auto-discovery order.
 
 ---
 
-### Writing or modifying Rust source (`src/*.rs`, `examples/*.rs`)
+### Writing or modifying Rust source (`src/**/*.rs`, `examples/*.rs`)
 → **`.rulesdir/rust-patterns.mdc`**
 
 Error handling (`anyhow`), `EmbeddingProvider` trait (do NOT bypass it),
@@ -131,18 +123,16 @@ built-in TTRPG types.
 ### Data files (`defaults/data/*.json`) or the import pipeline
 → **`.rulesdir/json-data-formats.mdc`**
 
-JSONL node/edge format, two-pass import, deduplication, edge resolution. All
-previously tracked data bugs (BUG-6, BUG-7) are resolved — do not reopen them.
+JSONL node/edge format, two-pass import, deduplication, edge resolution.
 
 ---
 
-### Migration / roadmap work
+### Roadmap / next work
 → **`.rulesdir/project-structure.mdc`** (Migration Direction)
-→ **`migration.md`** (remaining work items with implementation notes)
+→ **`ARCHITECTURE.md`** (Remaining Roadmap section)
 
-Remaining phases in priority order: axum server (Phase 3) → streaming LLM responses
-(Phase 4 remainder) → workspace split (Phase 5). Phase 4 search pipeline is
-complete. Do not skip ahead without explicit instruction.
+Remaining work in priority order: axum HTTP server → streaming LLM responses →
+Cargo workspace split. Do not skip ahead without explicit instruction.
 
 ---
 
@@ -157,5 +147,4 @@ complete. Do not skip ahead without explicit instruction.
 | `schema-system.mdc` | Schema format, validation, property types |
 | `json-data-formats.mdc` | JSONL import format, two-pass pipeline |
 | `testing-debugging.mdc` | TempDir setup, mock providers, skip guards, CI commands |
-| `ARCHITECTURE.md` | Full module map, SQLite schema, hardware design, design decisions |
-| `migration.md` | Remaining work items with concrete implementation steps |
+| `ARCHITECTURE.md` | Full module map, SQLite schema, hardware design, design decisions, remaining roadmap |

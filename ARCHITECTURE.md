@@ -1,26 +1,12 @@
 # u-forge.ai — Architecture Reference
 
-> This document describes the **current** state of the codebase after completing
-> Phase 1 (Lemonade Provider), Phase 2 (SQLite migration), the extended
-> Lemonade integration (`src/lemonade.rs` — model registry, GPU resource manager,
-> TTS/STT/Chat providers), the hardware re-architecture session, and the
-> Phase 4 search pipeline session that:
->
-> - Split `embeddings.rs` + `transcription.rs` → `src/ai/`
-> - Added `src/hardware/` (NPU, GPU, CPU device abstractions)
-> - Added `src/queue/` — unified MPMC work queue routing embedding, STT, TTS,
->   LLM, and reranking jobs to any available capable device
-> - Added `src/search/` — `search_hybrid()` combining FTS5 + sqlite-vec ANN
->   via Reciprocal Rank Fusion with optional cross-encoder reranking
-> - PR 3 complete: all flat `src/*.rs` files reorganized into module directories
->
-> For planned future work see the Remaining Roadmap section at the bottom.
-
 ## Module Map
 
 | File | Role | Key Types |
 |---|---|---|
-| `src/lib.rs` | Facade + ObjectBuilder + tests | `KnowledgeGraph`, `ObjectBuilder` |
+| `src/lib.rs` | KnowledgeGraph facade + re-exports | `KnowledgeGraph` |
+| `src/builder.rs` | Fluent object construction | `ObjectBuilder` |
+| `src/text.rs` | Word-boundary text splitting | `split_text` |
 | `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
 | `src/graph/` | SQLite persistence (6 files) | `KnowledgeGraphStorage`, `GraphStats` |
 | `src/search/mod.rs` | Hybrid search pipeline (FTS5 + ANN + rerank) | `search_hybrid`, `HybridSearchConfig`, `NodeSearchResult`, `SearchSources` |
@@ -41,9 +27,6 @@
 | `src/schema/ingestion.rs` | JSON schema file → internal | `SchemaIngestion` |
 | `src/ingest/data.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
 | `examples/cli_demo.rs` | Only runnable entry point | — |
-
-> **Removed:** `src/vector_search.rs` — all HNSW/FST code deleted in Phase 2.
-> ANN search is provided by sqlite-vec (`chunks_vec` virtual table in `graph/storage.rs`).
 
 ---
 
@@ -313,11 +296,7 @@ on `localhost:8000` via `GET /api/v1/health` — no `LEMONADE_URL` env var requi
 
 ---
 
-## Embeddings (embeddings.rs)
-
-`src/ai/embeddings.rs` now contains **only** the embedding pipeline. Transcription
-types were moved to `src/ai/transcription.rs`; they are re-exported from
-`embeddings.rs` for backward compatibility.
+## Embeddings (`src/ai/embeddings.rs`)
 
 ### EmbeddingProvider Trait
 
@@ -372,14 +351,7 @@ No `embedding_cache_dir` parameter.
 
 ---
 
----
-
-## Transcription (transcription.rs)
-
-`src/ai/transcription.rs` is the single home for all speech-to-text and voice-to-text
-concerns. It was split out of `embeddings.rs` so that embedding and transcription
-can evolve independently and be routed to different hardware by the
-`InferenceQueue`.
+## Transcription (`src/ai/transcription.rs`)
 
 ### TranscriptionProvider Trait
 
@@ -455,10 +427,7 @@ Used in transcription tests and copied inline into `inference_queue` tests.
 ---
 
 
-## Extended Lemonade Integration (lemonade.rs)
-
-`src/lemonade.rs` exposes the full hardware-aware model stack available on the
-Lemonade Server, covering three additional AI modalities beyond embeddings.
+## Extended Lemonade Integration (`src/lemonade/`)
 
 ### Hardware Assignment
 
@@ -600,9 +569,7 @@ no Lemonade Server required (`MockEmbeddingProvider` + `TempDir`).
 
 ---
 
-## Schema System (schema.rs / schema_manager.rs / schema_ingestion.rs)
-
-Unchanged from the previous architecture.
+## Schema System (`src/schema/`)
 
 - `SchemaDefinition` → named maps of `ObjectTypeSchema` and `EdgeTypeSchema`.
 - `SchemaManager` caches schemas in `DashMap`, validates properties (type, regex,
@@ -614,56 +581,20 @@ Unchanged from the previous architecture.
 
 ---
 
-## Data Ingestion (data_ingestion.rs)
+## Data Ingestion (`src/ingest/data.rs`)
 
 Two-pass JSONL import: collect all nodes → create objects with name→ID map →
 resolve edge names → create edges. Metadata strings `"key:value"` become
 properties; plain strings become tags.
 
-**BUG-6 fix:** `DataIngestion::create_objects` now calls `find_by_name` before
-inserting. If a node with the same type and name already exists, the existing ID
-is reused and no duplicate object is created.
-
-**BUG-7 fix:** `DataIngestion::resolve_node_id` now calls
-`KnowledgeGraph::find_by_name_only` as a storage fallback before failing. This
-allows edges to reference nodes that were created in a prior import session, not
-just the current in-memory name→ID map.
+`create_objects` calls `find_by_name` before inserting — if a node with the same
+type and name already exists, the existing ID is reused (no duplicates).
+`resolve_node_id` calls `KnowledgeGraph::find_by_name_only` as a storage fallback
+before failing, allowing edges to reference nodes from prior import sessions.
 
 ---
 
-## Embedding Queue (embedding_queue.rs)
-
-Embedding-only async background queue with `tokio::mpsc`, `DashMap` status
-tracking, and a broadcast progress channel. Builder pattern. Not integrated into
-`KnowledgeGraph` — exists as an isolated utility that callers wire up manually.
-
-**Superseded for new work by `InferenceQueue`**, which handles embedding,
-transcription, and TTS in a single unified queue with multi-device work-stealing.
-`EmbeddingQueue` is retained for callers that only need embedding with fine-grained
-per-request status tracking.
-
-In tests, a `MockEmbeddingProvider` (deterministic fake output) is used in place of
-`LemonadeProvider` so tests do not require a running Lemonade Server.
-
 ---
-
-## Known Bugs — All Resolved
-
-All nine bugs tracked in the previous architecture have been resolved:
-
-| ID | Summary | Resolution |
-|---|---|---|
-| BUG-1 | HNSW persistence non-functional | RESOLVED — HNSW eliminated; FTS5 replaces it |
-| BUG-2 | `similarity = 1.0 - distance` wrong | RESOLVED — fixed to `1.0 / (1.0 + distance)` before HNSW removal |
-| BUG-3 | Node deletion O(N) | RESOLVED — `ON DELETE CASCADE` with indexed FKs |
-| BUG-4 | `get_stats()` O(N) | RESOLVED — `SELECT COUNT(*)` + `SUM(token_count)` |
-| BUG-5 | `Mutex<TextEmbedding>` blocks Tokio | RESOLVED — FastEmbed removed; `LemonadeProvider` is fully async |
-| BUG-6 | No import deduplication | RESOLVED — `find_by_name` check before insert in `create_objects` |
-| BUG-7 | In-memory-only edge resolution | RESOLVED — `find_by_name_only` storage fallback in `resolve_node_id` |
-| BUG-8 | `get_chunks_for_node` O(N) | RESOLVED — `idx_chunks_object` index on `chunks(object_id)` |
-| BUG-9 | `'static` lifetime on `Hnsw` | RESOLVED — hnsw_rs removed entirely |
-
-There are no active tracked bugs as of this writing.
 
 ---
 
@@ -710,31 +641,18 @@ There are no active tracked bugs as of this writing.
 
 | Crate | Version | Role | Status |
 |---|---|---|---|
-| `rusqlite` | 0.32 | SQLite storage (bundled + vtab) | Active — primary storage |
+| `rusqlite` | 0.32 | SQLite storage (bundled + vtab) | Primary storage |
 | `sqlite-vec` | 0.1.7 | ANN vector search via `vec0` virtual table (bundles C source) | Active |
 | `tokio` | 1.45 | Async runtime | Active |
 | `serde` / `serde_json` | 1.0 | Serialization (all layers) | Active |
 | `reqwest` | 0.12 | HTTP client — embeddings, TTS, STT, chat, registry (`json` + `multipart` features) | Active |
-| `dashmap` | 6.1 | Concurrent maps (SchemaManager, EmbeddingQueue) | Active |
-| `parking_lot` | 0.12 | Fast non-async mutex used by GpuResourceManager | Active |
+| `dashmap` | 6.1 | Concurrent maps (SchemaManager) | Active |
+| `parking_lot` | 0.12 | Fast non-async mutex (GpuResourceManager, WorkQueue) | Active |
 | `uuid` | 1.x | ID generation | Active |
 | `anyhow` | 1.x | Error handling | Active |
 | `async-trait` | 0.1 | Trait-object async methods | Active |
 | `tracing` / `tracing-subscriber` | 0.1 | Structured logging | Active |
 | `tempfile` | 3.x | Test isolation | Dev/test |
-| `rocksdb` | 0.23 | Former storage backend | **Removed** |
-| `fastembed` | 5.0 | Former embedding backend | **Removed** |
-| `hnsw_rs` | 0.3 | Former vector ANN index | **Removed** |
-| `fst` | 0.4 | Former name prefix matching | **Removed** |
-| `ort` / `ort-sys` | =2.0.0-rc.10 | Former ONNX Runtime | **Removed** |
-| `petgraph` | 0.8 | Unused graph lib | **Removed** |
-| `bincode` | 1.3 | Former binary serialization | **Removed** |
-| `memmap2` | 0.9 | Former memory-mapped file I/O | **Removed** |
-| `rayon` | 1.8 | Former parallelism helper | **Removed** |
-
-> **Note on `reqwest` features:** the `multipart` feature was added alongside
-> `src/lemonade.rs` to support `LemonadeSttProvider`, which uploads audio files
-> via `POST /api/v1/audio/transcriptions` as a multipart form.
 
 ---
 
@@ -766,31 +684,8 @@ startup; the `add_` prefix is stripped before storage.
 
 ## Remaining Roadmap
 
-Phases 1 and 2, the extended Lemonade integration, hardware re-architecture,
-the reranking provider, and the Phase 4 search pipeline are all complete. The
-following work remains:
-
-| Item | Description | Status |
-|---|---|---|
-| sqlite-vec | Vector/ANN semantic search via `vec0` virtual table | ✅ Complete |
-| Phase 4 (pipeline) | `search_hybrid` — FTS5 + ANN + RRF + rerank in `src/search/` | ✅ Complete |
-| Phase 3 | axum HTTP/WebSocket server for web UI | Not started |
-| Phase 4 (streaming) | Streaming LLM responses via `InferenceQueue` | Not started |
-| Phase 5 | Cargo workspace split | Not started |
-
-**sqlite-vec** is complete. `chunks_vec` is live as a `vec0` virtual table in
-`storage.rs`; `upsert_chunk_embedding()` populates it and `search_chunks_semantic()`
-queries it. FTS5 is retained alongside it for keyword search.
-
-**Phase 4 (search pipeline)** is complete. `search_hybrid` in `src/search/` is
-the canonical hybrid search entry point — see the Search section above for the full
-design. The `POST /api/search` axum route (Phase 3) will call it directly.
-
-**Phase 3 (axum)** is the next priority. It wraps `KnowledgeGraph` + `InferenceQueue`
-behind HTTP and WebSocket endpoints. `KnowledgeGraph` is already `Send + Sync` and
-`Arc`-wrapped; `LemonadeStack`, `InferenceQueue`, and `search_hybrid` slot naturally
-into an `AppState`.
-
-**Phase 4 (streaming)** adds `InferenceQueue::generate_stream()` returning a
-`tokio::sync::mpsc::Receiver<String>` of token chunks, needed by the axum WebSocket
-layer to stream LLM responses to the web UI.
+| Item | Description |
+|---|---|
+| axum HTTP/WebSocket server | Wraps `KnowledgeGraph` + `InferenceQueue` behind HTTP and WebSocket endpoints. `KnowledgeGraph` is `Send + Sync` and `Arc`-wrapped; `LemonadeStack`, `InferenceQueue`, and `search_hybrid` slot into an `AppState`. `POST /api/search` will call `search_hybrid` directly. |
+| Streaming LLM responses | `InferenceQueue::generate_stream()` returning `tokio::sync::mpsc::Receiver<String>` of token chunks for axum WebSocket delivery. |
+| Cargo workspace split | Extract library and server into separate workspace members. |
