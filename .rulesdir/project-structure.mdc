@@ -17,8 +17,8 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
 
 - **Facade**: [src/lib.rs](mdc:src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas) + `ObjectBuilder`
 - **Storage**: [src/storage.rs](mdc:src/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts` + sqlite-vec virtual table `chunks_vec` (768-dim cosine ANN). Key constants: `EMBEDDING_DIMENSIONS = 768`, `MAX_CHUNK_TOKENS = 350`, `ENABLE_HIGH_QUALITY_EMBEDDING = false`. `KnowledgeGraphStorage` is the only storage struct.
-- **Embeddings**: [src/embeddings.rs](mdc:src/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP) + `EmbeddingManager`. FastEmbed/ORT/ONNX have been removed. Transcription types have been moved to `src/transcription.rs`; they are re-exported from `embeddings.rs` for backward compatibility.
-- **Transcription**: [src/transcription.rs](mdc:src/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`. Split out of `embeddings.rs` so embedding and transcription can evolve independently and be routed to different hardware.
+- **Embeddings**: [src/ai/embeddings.rs](mdc:src/ai/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP) + `EmbeddingManager`. FastEmbed/ORT/ONNX have been removed. Transcription types have been moved to `src/ai/transcription.rs`; they are re-exported from `embeddings.rs` for backward compatibility.
+- **Transcription**: [src/ai/transcription.rs](mdc:src/ai/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`. Split out of `embeddings.rs` so embedding and transcription can evolve independently and be routed to different hardware.
 - **Hardware Abstraction**: [src/hardware/mod.rs](mdc:src/hardware/mod.rs) — `DeviceCapability` enum, `HardwareBackend` enum, `DeviceWorker` trait. Sub-modules:
   - [src/hardware/npu.rs](mdc:src/hardware/npu.rs) — `NpuDevice` (embedding + STT + **LLM** on AMD NPU via FLM; no GPU contention). `NpuDevice::new()` takes a 4th `llm_model: Option<&str>` arg. `NpuDevice::from_registry()` auto-discovers all three capabilities. `NpuDevice::llm_only()` is synchronous. `pub chat: Option<LemonadeChatProvider>` field (no `GpuResourceManager` — NPU is independent).
   - [src/hardware/gpu.rs](mdc:src/hardware/gpu.rs) — `GpuDevice` (STT + LLM on AMD GPU via ROCm; shares `GpuResourceManager`)
@@ -34,7 +34,7 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
 - **Full-Text Search**: `search_chunks_fts(query, limit)` — SQLite FTS5, keyword/phrase/prefix matching. **Semantic Search**: `search_chunks_semantic(query_embedding, limit)` — sqlite-vec vec0 cosine ANN, returns `(ChunkId, ObjectId, String, f32)` tuples. Both live in `storage.rs` / `lib.rs`.
 - **Hybrid Search**: [src/search.rs](mdc:src/search.rs) — `search_hybrid(graph, queue, query, config)` free async function. Merges FTS5 + ANN results via Reciprocal Rank Fusion (RRF, k=60), then optionally reranks with the cross-encoder. `HybridSearchConfig` controls `alpha` (0.0=FTS, 1.0=semantic, 0.5=blend), candidate pool sizes, rerank flag, and result limit. `HybridSearchResult` carries `chunk_id`, `object_id`, `content`, `score`, and `sources: SearchSources`. `SearchSources` tracks which paths contributed each result (`fts_rank`, `semantic_distance`, `rerank_score`) and exposes a `label()` method (`[FTS]`, `[SEM]`, `[FTS+SEM]`, `[FTS+SEM+RR]`). `fts5_sanitize()` strips FTS5-illegal punctuation (e.g. `?`, `!`, `'`, `(`, `)`) from natural-language queries before the SQLite MATCH call; the original query is passed verbatim to embed + rerank. Degrades gracefully at every AI stage — no embedding worker → FTS-only; no reranker → RRF scores. All types re-exported from `lib.rs`.
 - **Vector Search**: `src/vector_search.rs` **has been deleted**. ANN search is now provided by sqlite-vec: `chunks_vec` vec0 virtual table in `storage.rs`, `upsert_chunk_embedding()` and `search_chunks_semantic()` on both `KnowledgeGraphStorage` and `KnowledgeGraph`.
-- **Schemas**: [src/schema.rs](mdc:src/schema.rs) + [src/schema_manager.rs](mdc:src/schema_manager.rs) + [src/schema_ingestion.rs](mdc:src/schema_ingestion.rs)
+- **Schemas**: [src/schema/definition.rs](mdc:src/schema/definition.rs) + [src/schema/manager.rs](mdc:src/schema/manager.rs) + [src/schema/ingestion.rs](mdc:src/schema/ingestion.rs)
 - **Data Import**: [src/data_ingestion.rs](mdc:src/data_ingestion.rs) — JSONL two-pass import. BUG-6 (dedup) and BUG-7 (cross-session edge resolution) are fixed.
 - **Embedding Queue**: [src/embedding_queue.rs](mdc:src/embedding_queue.rs) — embedding-only async background worker. Superseded for new work by `InferenceQueue`; retained for callers that need per-request status tracking.
 
@@ -49,8 +49,8 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
 - ⏳ **Phase 5** — Cargo workspace split
 
 **Standard on [Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
-- Embeddings: `POST /api/v1/embeddings` (implemented — `LemonadeProvider` in `embeddings.rs`)
-- Transcription: `POST /api/v1/audio/transcriptions` (implemented — `LemonadeTranscriptionProvider` in `transcription.rs` for NPU/simple use; `LemonadeSttProvider` in `lemonade.rs` for GPU-managed use)
+- Embeddings: `POST /api/v1/embeddings` (implemented — `LemonadeProvider` in `ai/embeddings.rs`)
+- Transcription: `POST /api/v1/audio/transcriptions` (implemented — `LemonadeTranscriptionProvider` in `ai/transcription.rs` for NPU/simple use; `LemonadeSttProvider` in `lemonade.rs` for GPU-managed use)
 - Reranking: `POST /api/v1/reranking` (**implemented** — `LemonadeRerankProvider` in `lemonade.rs`; wired into `InferenceQueue` via `rerank_queue`)
 - Chat/LLM: `POST /api/v1/chat/completions` (**fully queued** — `LemonadeChatProvider` in `lemonade.rs`; dispatched via `generate_queue` for both GPU llamacpp and NPU FLM models)
 - System info: `GET /system-info` (**implemented** — `SystemInfo::fetch()` in `lemonade.rs`; derives `LemonadeCapabilities` from installed recipe backends)
@@ -65,9 +65,9 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
 
 ## Key Integration Points
 
-The `EmbeddingProvider` trait in [src/embeddings.rs](mdc:src/embeddings.rs) is the primary abstraction for embedding work. Only `LemonadeProvider` currently implements it. Do NOT bypass the trait.
+The `EmbeddingProvider` trait in [src/ai/embeddings.rs](mdc:src/ai/embeddings.rs) is the primary abstraction for embedding work. Only `LemonadeProvider` currently implements it. Do NOT bypass the trait.
 
-The `TranscriptionProvider` trait in [src/transcription.rs](mdc:src/transcription.rs) is the primary abstraction for STT work. Do NOT bypass the trait.
+The `TranscriptionProvider` trait in [src/ai/transcription.rs](mdc:src/ai/transcription.rs) is the primary abstraction for STT work. Do NOT bypass the trait.
 
 The `DeviceWorker` trait in [src/hardware/mod.rs](mdc:src/hardware/mod.rs) is the abstraction for physical compute devices. New hardware backends must implement it.
 
@@ -117,8 +117,8 @@ See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
 | `src/lib.rs` | Facade + ObjectBuilder | `KnowledgeGraph`, `ObjectBuilder` |
 | `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
 | `src/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats`, `EMBEDDING_DIMENSIONS`, `MAX_CHUNK_TOKENS`, `ENABLE_HIGH_QUALITY_EMBEDDING` |
-| `src/embeddings.rs` | Embedding providers (transcription re-exported for compat) | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
-| `src/transcription.rs` | Audio-to-text providers | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager`, `mime_for_filename` |
+| `src/ai/embeddings.rs` | Embedding providers (transcription re-exported for compat) | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
+| `src/ai/transcription.rs` | Audio-to-text providers | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager`, `mime_for_filename` |
 | `src/hardware/mod.rs` | Device abstraction layer | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait) |
 | `src/hardware/npu.rs` | AMD NPU device | `NpuDevice` |
 | `src/hardware/gpu.rs` | AMD GPU ROCm device | `GpuDevice` |
@@ -126,9 +126,9 @@ See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
 | `src/inference_queue.rs` | Unified MPMC inference dispatch queue | `InferenceQueue`, `InferenceQueueBuilder`, `QueueStats` |
 | `src/lemonade.rs` | Extended Lemonade integration (GPU-managed stack) | `LemonadeModelRegistry`, `GpuResourceManager`, `SttGuard`, `LlmGuard`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `RerankDocument`, `SystemInfo`, `LemonadeCapabilities`, `RecipeBackendInfo`, `LemonadeStack` |
 | `src/search.rs` | Hybrid search pipeline (FTS5 + ANN + rerank) | `search_hybrid`, `HybridSearchConfig`, `HybridSearchResult`, `SearchSources` |
-| `src/schema.rs` | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
-| `src/schema_manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
-| `src/schema_ingestion.rs` | JSON schema files → internal | `SchemaIngestion` |
+| `src/schema/definition.rs` | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
+| `src/schema/manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
+| `src/schema/ingestion.rs` | JSON schema files → internal | `SchemaIngestion` |
 | `src/data_ingestion.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
 | `src/embedding_queue.rs` | Embedding-only async background queue (legacy) | `EmbeddingQueue`, `EmbeddingQueueBuilder` |
 

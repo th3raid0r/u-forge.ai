@@ -48,15 +48,21 @@ src/
     gpu.rs                # GpuDevice (ROCm)
     cpu.rs                # CpuDevice (Kokoro TTS)
 
+  schema/                 # ✅ REFACTORED — was schema.rs + schema_manager.rs + schema_ingestion.rs
+    mod.rs
+    definition.rs         # SchemaDefinition, ObjectTypeSchema, PropertySchema, ValidationResult, etc.
+    manager.rs            # SchemaManager, SchemaStats
+    ingestion.rs          # SchemaIngestion (JSON → SchemaDefinition)
+
+  ai/                     # ✅ REFACTORED — was embeddings.rs + transcription.rs
+    mod.rs
+    embeddings.rs         # EmbeddingProvider trait, LemonadeProvider, EmbeddingManager
+    transcription.rs      # TranscriptionProvider trait, LemonadeTranscriptionProvider, TranscriptionManager
+
   # ── Still to be reorganized (PR 3) ─────────────────────────────────────────
 
   inference_queue.rs      # ~1700 lines — target: queue/ directory
   search.rs               # ~1322 lines — target: search/ directory
-  schema.rs               # → schema/definition.rs
-  schema_manager.rs       # → schema/manager.rs
-  schema_ingestion.rs     # → schema/ingestion.rs
-  embeddings.rs           # → ai/embeddings.rs
-  transcription.rs        # → ai/transcription.rs
   data_ingestion.rs       # → ingest/data.rs
 ```
 
@@ -68,7 +74,7 @@ src/
 |----|--------|-------------|
 | PR 1 | ✅ Done | Split `lemonade.rs` (2134 lines) → `lemonade/` (10 files) |
 | PR 2 | ✅ Done | Split `storage.rs` (1630 lines) → `graph/` (6 files) |
-| PR 3 | ⏳ TODO | Reorganize: `inference_queue.rs` → `queue/`, `search.rs` → `search/`, `schema*.rs` → `schema/`, `embeddings.rs` + `transcription.rs` → `ai/`, `data_ingestion.rs` → `ingest/` |
+| PR 3 | 🔄 In progress | Reorganize: `inference_queue.rs` → `queue/`, `search.rs` → `search/`, ~~`schema*.rs` → `schema/`~~, ~~`embeddings.rs` + `transcription.rs` → `ai/`~~, `data_ingestion.rs` → `ingest/` |
 | PR 4 | ⏳ TODO | Docs cleanup: `env.sh` (remove RocksDB references), update `ARCHITECTURE.md` module map, update `.rulesdir/*.mdc` paths |
 | PR 5 | ⏳ TODO | Slim `lib.rs` to facade-only |
 
