@@ -262,7 +262,7 @@ impl LemonadeModelRegistry {
                 self.by_role(&ModelRole::CpuEmbedding)
                     .into_iter()
                     .find(|m| {
-                        crate::storage::ENABLE_HIGH_QUALITY_EMBEDDING
+                        crate::graph::ENABLE_HIGH_QUALITY_EMBEDDING
                             || m.id != "Qwen3-Embedding-8B-GGUF"
                     })
             })
@@ -286,7 +286,7 @@ impl LemonadeModelRegistry {
     /// any whose dimensions do not match [`crate::EMBEDDING_DIMENSIONS`].
     pub fn all_cpu_embedding_models(&self) -> Vec<&LemonadeModelEntry> {
         // Gate high-quality models behind the feature flag.
-        let high_quality = crate::storage::ENABLE_HIGH_QUALITY_EMBEDDING;
+        let high_quality = crate::graph::ENABLE_HIGH_QUALITY_EMBEDDING;
 
         // Stable preferred order: v2-moe first (newer MoE architecture), v1
         // second, everything else appended in server-reported order.

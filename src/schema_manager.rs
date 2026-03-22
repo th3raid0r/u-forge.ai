@@ -1,6 +1,6 @@
 use crate::schema::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, ValidationResult, ValidationError, ValidationErrorType, ValidationWarning, EdgeTypeSchema};
 use crate::types::{ObjectMetadata, Edge};
-use crate::storage::KnowledgeGraphStorage;
+use crate::graph::KnowledgeGraphStorage;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

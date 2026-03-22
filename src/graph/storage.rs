@@ -12,13 +12,10 @@
 //! is `Send + Sync` and can be placed behind an `Arc` in the facade layer.
 
 use crate::schema::SchemaDefinition;
-use crate::types::{
-    ChunkId, ChunkType, Edge, EdgeType, ObjectId, ObjectMetadata, QueryResult, TextChunk,
-};
-use anyhow::{anyhow, Context, Result};
+use crate::types::{ChunkType, ObjectMetadata};
+use anyhow::{Context, Result};
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, OptionalExtension};
 use sqlite_vec::sqlite3_vec_init;
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Once};
 use tracing::warn;
@@ -26,7 +23,7 @@ use uuid::Uuid;
 
 // ─── SQL schema ───────────────────────────────────────────────────────────────
 
-const SQL_SCHEMA: &str = r#"
+pub(super) const SQL_SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
@@ -148,7 +145,7 @@ pub const ENABLE_HIGH_QUALITY_EMBEDDING: bool = false;
 /// called before the first `Connection::open` and should fire exactly once.
 /// Using `Once` makes the intent explicit and prevents redundant FFI calls
 /// in tests that spin up many `KnowledgeGraphStorage` instances in sequence.
-static SQLITE_VEC_INIT: Once = Once::new();
+pub(super) static SQLITE_VEC_INIT: Once = Once::new();
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -157,7 +154,7 @@ static SQLITE_VEC_INIT: Once = Once::new();
 /// Wraps a single `rusqlite::Connection` in `Arc<Mutex<…>>` so the struct is
 /// cheaply cloneable and safe to share across threads.
 pub struct KnowledgeGraphStorage {
-    conn: Arc<Mutex<Connection>>,
+    pub(super) conn: Arc<Mutex<Connection>>,
 }
 
 /// Aggregate statistics about the knowledge graph.
@@ -169,10 +166,10 @@ pub struct GraphStats {
     pub total_tokens: usize,
 }
 
-// ─── Private helpers ──────────────────────────────────────────────────────────
+// ─── Helper functions (pub(super) for sibling modules) ────────────────────────
 
 /// Serialise a `ChunkType` to its snake_case storage string.
-fn chunk_type_to_str(ct: &ChunkType) -> &'static str {
+pub(super) fn chunk_type_to_str(ct: &ChunkType) -> &'static str {
     match ct {
         ChunkType::Description => "description",
         ChunkType::SessionNote => "session_note",
@@ -186,7 +183,7 @@ fn chunk_type_to_str(ct: &ChunkType) -> &'static str {
 ///
 /// Unknown values fall back to `ChunkType::Description` with a warning
 /// rather than panicking, matching the tolerant-reader principle.
-fn str_to_chunk_type(s: &str) -> ChunkType {
+pub(super) fn str_to_chunk_type(s: &str) -> ChunkType {
     match s {
         "session_note" => ChunkType::SessionNote,
         "ai_generated" => ChunkType::AiGenerated,
@@ -206,7 +203,7 @@ fn str_to_chunk_type(s: &str) -> ChunkType {
 /// Build an `ObjectMetadata` from the nine column values returned by every
 /// `SELECT … FROM nodes` query.  Centralising this avoids repeating
 /// fallible parsing logic across multiple methods.
-fn row_to_metadata(
+pub(super) fn row_to_metadata(
     id_str: String,
     object_type: String,
     schema_name: Option<String>,
@@ -273,614 +270,6 @@ impl KnowledgeGraphStorage {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
-    }
-
-    // ── Nodes ─────────────────────────────────────────────────────────────────
-
-    /// Insert or update a node.
-    ///
-    /// Uses `ON CONFLICT(id) DO UPDATE SET …` (the SQLite upsert syntax) rather
-    /// than `INSERT OR REPLACE` because `INSERT OR REPLACE` performs a DELETE
-    /// followed by an INSERT, which would fire the `ON DELETE CASCADE` on the
-    /// `edges` and `chunks` tables and wipe out every relationship and text
-    /// chunk every time a node property changes.
-    pub fn upsert_node(&self, metadata: ObjectMetadata) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO nodes
-                 (id, object_type, schema_name, name, description,
-                  tags, properties, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(id) DO UPDATE SET
-                 object_type  = excluded.object_type,
-                 schema_name  = excluded.schema_name,
-                 name         = excluded.name,
-                 description  = excluded.description,
-                 tags         = excluded.tags,
-                 properties   = excluded.properties,
-                 updated_at   = excluded.updated_at",
-            params![
-                metadata.id.hyphenated().to_string(),
-                metadata.object_type,
-                metadata.schema_name,
-                metadata.name,
-                metadata.description,
-                serde_json::to_string(&metadata.tags).context("Failed to serialise node tags")?,
-                metadata.properties.to_string(),
-                metadata.created_at.to_rfc3339(),
-                metadata.updated_at.to_rfc3339(),
-            ],
-        )
-        .context("Failed to upsert node")?;
-        Ok(())
-    }
-
-    /// Retrieve a node by its UUID.  Returns `Ok(None)` when the ID is unknown.
-    pub fn get_node(&self, id: ObjectId) -> Result<Option<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
-        let result = conn
-            .query_row(
-                "SELECT id, object_type, schema_name, name, description,
-                        tags, properties, created_at, updated_at
-                 FROM nodes
-                 WHERE id = ?1",
-                params![id.hyphenated().to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
-                    ))
-                },
-            )
-            .optional()
-            .context("Failed to query node by id")?;
-
-        match result {
-            None => Ok(None),
-            Some((id_s, ot, sn, nm, desc, tags, props, ca, ua)) => Ok(Some(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?)),
-        }
-    }
-
-    /// Return every node stored in the graph.
-    pub fn get_all_objects(&self) -> Result<Vec<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, object_type, schema_name, name, description,
-                    tags, properties, created_at, updated_at
-             FROM nodes",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (id_s, ot, sn, nm, desc, tags, props, ca, ua) = row?;
-            out.push(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?);
-        }
-        Ok(out)
-    }
-
-    /// Find nodes whose `object_type` **and** `name` both match exactly.
-    ///
-    /// Uses the composite index `idx_nodes_name (object_type, name)`.
-    pub fn find_nodes_by_name(&self, object_type: &str, name: &str) -> Result<Vec<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, object_type, schema_name, name, description,
-                    tags, properties, created_at, updated_at
-             FROM nodes
-             WHERE object_type = ?1 AND name = ?2",
-        )?;
-        let rows = stmt.query_map(params![object_type, name], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (id_s, ot, sn, nm, desc, tags, props, ca, ua) = row?;
-            out.push(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?);
-        }
-        Ok(out)
-    }
-
-    /// Find nodes whose `name` matches exactly, regardless of `object_type`.
-    ///
-    /// Backed by `idx_nodes_name_only`.  Intended as a cross-type lookup
-    /// fallback (e.g. BUG-7 cross-session edge resolution).
-    pub fn find_nodes_by_name_only(&self, name: &str) -> Result<Vec<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, object_type, schema_name, name, description,
-                    tags, properties, created_at, updated_at
-             FROM nodes
-             WHERE name = ?1",
-        )?;
-        let rows = stmt.query_map(params![name], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (id_s, ot, sn, nm, desc, tags, props, ca, ua) = row?;
-            out.push(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?);
-        }
-        Ok(out)
-    }
-
-    /// Delete a node by ID.
-    ///
-    /// `ON DELETE CASCADE` on `edges` and `chunks` handles all dependent rows
-    /// automatically — no manual cleanup is required.
-    pub fn delete_node(&self, id: ObjectId) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM nodes WHERE id = ?1",
-            params![id.hyphenated().to_string()],
-        )
-        .context("Failed to delete node")?;
-        Ok(())
-    }
-
-    // ── Edges ─────────────────────────────────────────────────────────────────
-
-    /// Insert or replace an edge.
-    ///
-    /// `INSERT OR REPLACE` is safe here because the `edges` table has no
-    /// cascading children.  The `UNIQUE(source_id, target_id, edge_type)`
-    /// constraint ensures a logical edge is stored at most once; re-inserting
-    /// the same (source, target, type) triplet updates `weight` and `metadata`.
-    ///
-    /// `EdgeType` is stored via `as_str()` and read back as
-    /// `EdgeType::Custom(s)`, which round-trips correctly for all variants.
-    pub fn upsert_edge(&self, edge: Edge) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let meta_json =
-            serde_json::to_string(&edge.metadata).context("Failed to serialise edge metadata")?;
-        conn.execute(
-            "INSERT OR REPLACE INTO edges
-                 (source_id, target_id, edge_type, weight, metadata, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                edge.from.hyphenated().to_string(),
-                edge.to.hyphenated().to_string(),
-                edge.edge_type.as_str(),
-                edge.weight as f64,
-                meta_json,
-                edge.created_at.to_rfc3339(),
-            ],
-        )
-        .context("Failed to upsert edge")?;
-        Ok(())
-    }
-
-    /// Return all edges incident on `node_id` (both outgoing **and** incoming).
-    ///
-    /// Each `Edge` is returned exactly once with its canonical `from`/`to`
-    /// direction as stored; the caller should check both fields when the
-    /// direction matters.
-    pub fn get_edges(&self, node_id: ObjectId) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
-        let id_str = node_id.hyphenated().to_string();
-        let mut stmt = conn.prepare(
-            "SELECT source_id, target_id, edge_type, weight, metadata, created_at
-             FROM edges
-             WHERE source_id = ?1 OR target_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![id_str], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
-
-        let mut edges = Vec::new();
-        for row in rows {
-            let (src_s, tgt_s, et_s, weight, meta_s, ca_s) = row?;
-            let metadata: HashMap<String, String> =
-                serde_json::from_str(&meta_s).unwrap_or_default();
-            edges.push(Edge {
-                from: Uuid::parse_str(&src_s)
-                    .with_context(|| format!("Invalid source UUID in edges table: '{src_s}'"))?,
-                to: Uuid::parse_str(&tgt_s)
-                    .with_context(|| format!("Invalid target UUID in edges table: '{tgt_s}'"))?,
-                edge_type: EdgeType::Custom(et_s),
-                weight: weight as f32,
-                metadata,
-                created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
-                    .with_context(|| format!("Invalid edge created_at: '{ca_s}'"))?
-                    .with_timezone(&chrono::Utc),
-            });
-        }
-        Ok(edges)
-    }
-
-    /// Return the IDs of all nodes reachable in exactly one hop from
-    /// `node_id`, following both outgoing and incoming edges.
-    ///
-    /// Results are deduplicated via `SELECT DISTINCT`.
-    pub fn get_neighbors(&self, node_id: ObjectId) -> Result<Vec<ObjectId>> {
-        let conn = self.conn.lock().unwrap();
-        let id_str = node_id.hyphenated().to_string();
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT
-                 CASE WHEN source_id = ?1 THEN target_id ELSE source_id END
-             FROM edges
-             WHERE source_id = ?1 OR target_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![id_str], |row| row.get::<_, String>(0))?;
-
-        let mut neighbors = Vec::new();
-        for row in rows {
-            let uuid_str = row?;
-            neighbors.push(
-                Uuid::parse_str(&uuid_str)
-                    .with_context(|| format!("Invalid neighbor UUID: '{uuid_str}'"))?,
-            );
-        }
-        Ok(neighbors)
-    }
-
-    // ── Chunks ────────────────────────────────────────────────────────────────
-
-    /// Insert or update a text chunk.
-    ///
-    /// Uses `ON CONFLICT(id) DO UPDATE SET …` rather than `INSERT OR REPLACE`
-    /// to **preserve the row's implicit SQLite `rowid`** across updates.  The
-    /// FTS5 content table (`chunks_fts`) maps FTS rowids to chunk content via
-    /// the `rowid` column; changing the rowid on every write would corrupt the
-    /// FTS index.
-    ///
-    /// The three triggers (`chunks_ai`, `chunks_ad`, `chunks_au`) keep
-    /// `chunks_fts` synchronised automatically.
-    pub fn upsert_chunk(&self, chunk: TextChunk) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO chunks
-                 (id, object_id, chunk_type, content, token_count, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-                 chunk_type  = excluded.chunk_type,
-                 content     = excluded.content,
-                 token_count = excluded.token_count",
-            params![
-                chunk.id.hyphenated().to_string(),
-                chunk.object_id.hyphenated().to_string(),
-                chunk_type_to_str(&chunk.chunk_type),
-                chunk.content,
-                chunk.token_count as i64,
-                chunk.created_at.to_rfc3339(),
-            ],
-        )
-        .context("Failed to upsert chunk")?;
-        Ok(())
-    }
-
-    /// Return all text chunks associated with `node_id`.
-    pub fn get_chunks_for_node(&self, node_id: ObjectId) -> Result<Vec<TextChunk>> {
-        let conn = self.conn.lock().unwrap();
-        let id_str = node_id.hyphenated().to_string();
-        let mut stmt = conn.prepare(
-            "SELECT id, object_id, chunk_type, content, token_count, created_at
-             FROM chunks
-             WHERE object_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![id_str], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
-
-        let mut chunks = Vec::new();
-        for row in rows {
-            let (id_s, obj_s, ct_s, content, token_count, ca_s) = row?;
-            chunks.push(TextChunk {
-                id: Uuid::parse_str(&id_s)
-                    .with_context(|| format!("Invalid chunk UUID: '{id_s}'"))?,
-                object_id: Uuid::parse_str(&obj_s)
-                    .with_context(|| format!("Invalid object UUID in chunk: '{obj_s}'"))?,
-                chunk_type: str_to_chunk_type(&ct_s),
-                content,
-                token_count: token_count as usize,
-                created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
-                    .with_context(|| format!("Invalid chunk created_at: '{ca_s}'"))?
-                    .with_timezone(&chrono::Utc),
-            });
-        }
-        Ok(chunks)
-    }
-
-    /// Full-text search over chunk content using the FTS5 index.
-    ///
-    /// `query` is an FTS5 query string — simple terms (`"wizard"`), phrases
-    /// (`"grey hat"`), and prefix queries (`"wiz*"`) are all supported.
-    ///
-    /// Returns at most `limit` results as `(ChunkId, ObjectId, content)` triples,
-    /// ordered by FTS5 relevance rank.
-    pub fn search_chunks_fts(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<(ChunkId, ObjectId, String)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT c.id, c.object_id, c.content
-             FROM chunks c
-             INNER JOIN (
-                 SELECT rowid
-                 FROM   chunks_fts
-                 WHERE  chunks_fts MATCH ?1
-                 LIMIT  ?2
-             ) fts ON c.rowid = fts.rowid",
-        )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let (chunk_id_s, obj_id_s, content) = row?;
-            results.push((
-                Uuid::parse_str(&chunk_id_s)
-                    .with_context(|| format!("Invalid chunk UUID in FTS result: '{chunk_id_s}'"))?,
-                Uuid::parse_str(&obj_id_s)
-                    .with_context(|| format!("Invalid object UUID in FTS result: '{obj_id_s}'"))?,
-                content,
-            ));
-        }
-        Ok(results)
-    }
-
-    // ── Semantic (vector) search ──────────────────────────────────────────────
-
-    /// Store or update the embedding vector for an existing chunk.
-    ///
-    /// Looks up the chunk's integer `rowid` from the `chunks` table then
-    /// inserts/replaces the corresponding row in `chunks_vec`.  The rowid
-    /// mapping mirrors the FTS5 content-table approach so both indexes stay
-    /// aligned with the same chunk identity.
-    ///
-    /// Embeddings are stored as raw little-endian `f32` bytes — the wire format
-    /// sqlite-vec expects for `float[N]` columns.
-    ///
-    /// # Errors
-    /// * `chunk_id` does not exist in the `chunks` table.
-    /// * `embedding.len() != EMBEDDING_DIMENSIONS`.
-    pub fn upsert_chunk_embedding(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
-        if embedding.len() != EMBEDDING_DIMENSIONS {
-            return Err(anyhow!(
-                "Embedding dimension mismatch: expected {EMBEDDING_DIMENSIONS}, got {}. \
-                 Ensure the embedding model matches the vec0 table configuration \
-                 (EMBEDDING_DIMENSIONS constant in storage.rs).",
-                embedding.len()
-            ));
-        }
-
-        let conn = self.conn.lock().unwrap();
-
-        // Resolve the chunk's integer rowid — vec0 uses rowid as its PK.
-        let rowid: i64 = conn
-            .query_row(
-                "SELECT rowid FROM chunks WHERE id = ?1",
-                params![chunk_id.hyphenated().to_string()],
-                |row| row.get(0),
-            )
-            .with_context(|| {
-                format!("upsert_chunk_embedding: chunk '{chunk_id}' not found in chunks table")
-            })?;
-
-        // Serialise &[f32] → little-endian bytes (no extra dependency required).
-        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-
-        // vec0 virtual tables do not support INSERT OR REPLACE / ON CONFLICT,
-        // so we emulate an upsert with an explicit DELETE (no-op if absent)
-        // followed by a fresh INSERT.  Both statements share the same connection
-        // lock so no other writer can interleave between them.
-        conn.execute("DELETE FROM chunks_vec WHERE rowid = ?1", params![rowid])
-            .context("Failed to delete old embedding from chunks_vec")?;
-
-        conn.execute(
-            "INSERT INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
-            params![rowid, bytes],
-        )
-        .context("Failed to insert embedding into chunks_vec")?;
-
-        Ok(())
-    }
-
-    /// Approximate nearest-neighbour search over stored chunk embeddings.
-    ///
-    /// Uses the `vec0` cosine-distance index to find at most `limit` chunks
-    /// whose stored embeddings are closest to `query_embedding`.  Only chunks
-    /// that have been indexed via [`upsert_chunk_embedding`] are candidates —
-    /// chunks without a stored embedding are invisible to this method.
-    ///
-    /// Returns `(chunk_id, object_id, content, distance)` tuples ordered by
-    /// ascending cosine distance (`0.0` = identical, `2.0` = maximally
-    /// dissimilar).
-    ///
-    /// Returns an empty `Vec` (not an error) when `chunks_vec` has no rows.
-    pub fn search_chunks_semantic(
-        &self,
-        query_embedding: &[f32],
-        limit: usize,
-    ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
-        let bytes: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT c.id, c.object_id, c.content, v.distance
-             FROM chunks c
-             INNER JOIN (
-                 SELECT rowid, distance
-                 FROM   chunks_vec
-                 WHERE  embedding MATCH ?1
-                 ORDER  BY distance
-                 LIMIT  ?2
-             ) v ON c.rowid = v.rowid
-             ORDER BY v.distance",
-        )?;
-
-        let rows = stmt.query_map(params![bytes, limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, f64>(3)? as f32,
-            ))
-        })?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let (chunk_id_s, obj_id_s, content, distance) = row?;
-            results.push((
-                Uuid::parse_str(&chunk_id_s).with_context(|| {
-                    format!("Invalid chunk UUID in semantic result: '{chunk_id_s}'")
-                })?,
-                Uuid::parse_str(&obj_id_s).with_context(|| {
-                    format!("Invalid object UUID in semantic result: '{obj_id_s}'")
-                })?,
-                content,
-                distance,
-            ));
-        }
-        Ok(results)
-    }
-
-    // ── Graph traversal ───────────────────────────────────────────────────────
-
-    /// BFS subgraph expansion starting from `start`, up to `max_hops` hops.
-    ///
-    /// Traversal details:
-    /// * A node is expanded at most once (tracked by a `visited` `HashSet`).
-    /// * Both outgoing **and** incoming edges are followed at each hop.
-    /// * Edges are deduplicated: each `(source, target, edge_type)` triple
-    ///   appears at most once in `QueryResult::edges` regardless of which
-    ///   endpoint triggered the visit.
-    /// * Text chunks for every visited node are collected into the result.
-    /// * If a neighbour UUID has no matching node row (should not happen with FK
-    ///   enforcement but guarded anyway), it is skipped with a `warn!`.
-    ///
-    /// The loop runs for `max_hops + 1` iterations: iteration 0 processes the
-    /// start node, iteration 1 its direct neighbours, and so on.
-    pub fn query_subgraph(&self, start: ObjectId, max_hops: usize) -> Result<QueryResult> {
-        let mut result = QueryResult::new();
-        let mut visited: HashSet<ObjectId> = HashSet::new();
-        let mut seen_edges: HashSet<(ObjectId, ObjectId, String)> = HashSet::new();
-        let mut frontier = vec![start];
-
-        for _hop in 0..=max_hops {
-            if frontier.is_empty() {
-                break;
-            }
-            let mut next_frontier: Vec<ObjectId> = Vec::new();
-
-            for node_id in frontier {
-                if visited.contains(&node_id) {
-                    continue;
-                }
-                visited.insert(node_id);
-
-                // ── node metadata ─────────────────────────────────────────────
-                match self.get_node(node_id)? {
-                    Some(meta) => result.add_object(meta),
-                    None => {
-                        warn!(
-                            id = %node_id,
-                            "BFS reached a node_id with no metadata row; skipping"
-                        );
-                        continue;
-                    }
-                }
-
-                // ── edges (deduplicated) ──────────────────────────────────────
-                for edge in self.get_edges(node_id)? {
-                    let key = (edge.from, edge.to, edge.edge_type.as_str().to_string());
-                    if seen_edges.insert(key) {
-                        result.add_edge(edge.clone());
-                    }
-                    // Enqueue the other endpoint for the next hop.
-                    let neighbour = if edge.from == node_id {
-                        edge.to
-                    } else {
-                        edge.from
-                    };
-                    if !visited.contains(&neighbour) {
-                        next_frontier.push(neighbour);
-                    }
-                }
-
-                // ── text chunks ───────────────────────────────────────────────
-                for chunk in self.get_chunks_for_node(node_id)? {
-                    result.add_chunk(chunk);
-                }
-            }
-
-            frontier = next_frontier;
-        }
-
-        Ok(result)
     }
 
     // ── Statistics ────────────────────────────────────────────────────────────
@@ -983,7 +372,8 @@ impl KnowledgeGraphStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChunkType, EdgeType, TextChunk};
+    use crate::types::{ChunkType, Edge, EdgeType, ObjectId, TextChunk};
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     // ── Test fixtures ─────────────────────────────────────────────────────────

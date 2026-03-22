@@ -26,7 +26,7 @@ pub mod schema;
 pub mod schema_ingestion;
 pub mod schema_manager;
 pub mod search;
-pub mod storage;
+pub mod graph;
 pub mod transcription;
 pub mod types;
 
@@ -50,7 +50,7 @@ pub use schema_manager::{SchemaManager, SchemaStats};
 pub use search::{
     search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
 };
-pub use storage::{
+pub use graph::{
     GraphStats, KnowledgeGraphStorage, EMBEDDING_DIMENSIONS, ENABLE_HIGH_QUALITY_EMBEDDING,
     MAX_CHUNK_TOKENS,
 };
