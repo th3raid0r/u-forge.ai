@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::lemonade_client::LemonadeHttpClient;
+use crate::lemonade::LemonadeHttpClient;
 
 // ── Backward-compat re-exports ────────────────────────────────────────────────
 // Transcription types moved to `crate::transcription`.  Re-exported here so

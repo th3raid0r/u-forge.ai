@@ -22,7 +22,6 @@ pub mod error;
 pub mod hardware;
 pub mod inference_queue;
 pub mod lemonade;
-pub(crate) mod lemonade_client;
 pub mod schema;
 pub mod schema_ingestion;
 pub mod schema_manager;

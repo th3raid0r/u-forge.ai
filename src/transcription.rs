@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-use crate::lemonade_client::LemonadeHttpClient;
+use crate::lemonade::LemonadeHttpClient;
 
 // ── TranscriptionProvider trait ───────────────────────────────────────────────
 

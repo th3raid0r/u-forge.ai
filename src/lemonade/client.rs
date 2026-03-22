@@ -6,7 +6,7 @@
 //!
 //! # Exception
 //!
-//! [`SystemInfo::fetch`](crate::lemonade::SystemInfo::fetch) does **not** use
+//! [`SystemInfo::fetch`](super::SystemInfo::fetch) does **not** use
 //! this client because the `/system-info` management endpoint is intentionally
 //! accessed without the Bearer token.
 
