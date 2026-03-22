@@ -1,5 +1,6 @@
 ---
 globs: defaults/data/*.json,defaults/schemas/*.json,*.json
+description: JSON data and schema file formats for u-forge.ai
 ---
 
 # JSON Data Formats
@@ -34,11 +35,37 @@ Fields:
 npc, player_character, location, faction, quest, artifact, currency, skills, temporal, setting_reference, system_reference, transportation, inventory
 
 ### Import Pipeline (data_ingestion.rs)
+
 Two-pass: collect all nodes → create objects with name→ID map → resolve edge names → create edges.
 
-**Known bugs:**
-- BUG-6: No deduplication — re-importing creates duplicates
-- BUG-7: Edge resolution only works within a single import session (in-memory name→ID map)
+**BUG-6 (resolved):** Before inserting a node, `DataIngestion::create_objects` calls
+`graph.find_by_name(object_type, name)`. If a matching object already exists, the
+insert is skipped and the existing ID is recorded in the session map. A `warn!` log
+is emitted for each skipped duplicate. Re-importing the same JSONL file is now safe.
+
+**BUG-7 (resolved):** Edge name resolution uses `DataIngestion::resolve_node_id`,
+which checks the in-session `name_to_id` map first (O(1)), then falls back to
+`graph.find_by_name_only(name)` — a storage scan against the `idx_nodes_name_only`
+index (O(log N)). Edges referencing nodes created in previous import sessions now
+resolve correctly. If a name matches multiple objects across types, the first match
+is used with a `warn!` log.
+
+### Import Deduplication — How It Works
+
+```
+For each node entry in the JSONL:
+  1. Call find_by_name(node_type, name) against SQLite
+  2. If found → skip insert, record existing id in session map, emit warn log
+  3. If not found → create ObjectMetadata, call add_object, record new id
+
+For each edge entry in the JSONL:
+  resolve_node_id(name, session_map):
+    1. Check session_map (current import session)   → O(1)
+    2. Else call storage.find_nodes_by_name_only()  → O(log N) via idx_nodes_name_only
+    3. Else log error "Missing node reference" and skip edge
+```
+
+---
 
 ## Schema Files (defaults/schemas/)
 
@@ -82,7 +109,7 @@ Named `*.schema.json`. Define object types and validation rules.
 ### Naming convention
 Files use `add_` prefix in `name` field (MCP tool convention). `SchemaIngestion` strips the prefix — `add_npc` becomes `npc` internally.
 
-## Validation Commands
+## Import Validation Commands
 
 ```bash
 # Check JSON syntax
@@ -97,4 +124,16 @@ jq -c 'select(.type == "edge")' defaults/data/memory.json | head
 
 ## Sample Data
 
-`defaults/data/memory.json`: ~220 nodes + ~312 edges from Isaac Asimov's Foundation universe. Used by CLI demo.
+`defaults/data/memory.json`: ~220 nodes + ~312 edges from Isaac Asimov's Foundation
+universe. Used by the CLI demo and integration tests.
+
+Re-importing this file is safe — deduplication (BUG-6 fix) prevents duplicate nodes.
+Cross-session edges resolve correctly via the storage name index (BUG-7 fix).
+
+```bash
+# Count nodes by type after import
+jq -r 'select(.type == "node") | .nodeType' defaults/data/memory.json | sort | uniq -c | sort -rn
+
+# Verify no parse errors
+cargo run --example cli_demo 2>&1 | grep "Parse errors"
+```

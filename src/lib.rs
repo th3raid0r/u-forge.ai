@@ -13,13 +13,20 @@
 //! are *not* coupled to the storage layer, making it straightforward to use the graph
 //! without a running Lemonade Server (e.g. in tests).
 
+#[cfg(test)]
+pub(crate) mod test_helpers;
+
 pub mod data_ingestion;
 pub mod embedding_queue;
 pub mod embeddings;
+pub mod hardware;
+pub mod inference_queue;
+pub mod lemonade;
 pub mod schema;
 pub mod schema_ingestion;
 pub mod schema_manager;
 pub mod storage;
+pub mod transcription;
 pub mod types;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
@@ -31,12 +38,21 @@ pub use embeddings::{
     EmbeddingManager, EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
     LemonadeProvider,
 };
+pub use lemonade::{
+    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
+    GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeModelEntry, LemonadeModelRegistry,
+    LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, ModelRole, SttGuard,
+    TranscriptionResult,
+};
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
 };
 pub use schema_ingestion::SchemaIngestion;
 pub use schema_manager::{SchemaManager, SchemaStats};
-pub use storage::{GraphStats, KnowledgeGraphStorage};
+pub use storage::{
+    GraphStats, KnowledgeGraphStorage, EMBEDDING_DIMENSIONS, ENABLE_HIGH_QUALITY_EMBEDDING,
+    MAX_CHUNK_TOKENS,
+};
 pub use types::*;
 
 // ── Facade ────────────────────────────────────────────────────────────────────
@@ -44,6 +60,54 @@ pub use types::*;
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
+
+// ── Text splitting ────────────────────────────────────────────────────────────
+
+/// Split `text` into pieces of at most [`MAX_CHUNK_TOKENS`] tokens, breaking
+/// only at whitespace boundaries.
+///
+/// Uses the same `len / 4` heuristic as [`estimate_token_count`] so that the
+/// token budget is always consistent with what is stored in [`TextChunk::token_count`].
+///
+/// [`estimate_token_count`]: crate::types
+fn split_text(text: &str) -> Vec<String> {
+    // 4 chars per token mirrors estimate_token_count in types.rs.
+    let max_chars = MAX_CHUNK_TOKENS * 4;
+
+    if text.len() <= max_chars {
+        let trimmed = text.trim().to_string();
+        return if trimmed.is_empty() {
+            vec![]
+        } else {
+            vec![trimmed]
+        };
+    }
+
+    let mut pieces: Vec<String> = Vec::new();
+    let mut remaining = text.trim();
+
+    while !remaining.is_empty() {
+        if remaining.len() <= max_chars {
+            pieces.push(remaining.to_string());
+            break;
+        }
+
+        // Find the last whitespace at or before the max_chars boundary so we
+        // never cut through a word.
+        let boundary = &remaining[..max_chars];
+        let split_at = boundary.rfind(char::is_whitespace).unwrap_or(max_chars); // no whitespace found → hard cut
+
+        let piece = remaining[..split_at].trim().to_string();
+        if !piece.is_empty() {
+            pieces.push(piece);
+        }
+
+        // Advance past the split point, skipping leading whitespace.
+        remaining = remaining[split_at..].trim_start();
+    }
+
+    pieces
+}
 
 /// Central knowledge graph interface.
 ///
@@ -159,17 +223,72 @@ impl KnowledgeGraph {
 
     // ── Chunk / text operations ───────────────────────────────────────────────
 
-    /// Attach a text chunk to an object.  Returns the new [`ChunkId`].
+    /// Attach text to an object, splitting into ≤[`MAX_CHUNK_TOKENS`] pieces at
+    /// word boundaries as needed.
+    ///
+    /// Each piece is stored as a separate [`TextChunk`] row, FTS5-indexed
+    /// automatically via the `chunks_ai` trigger.  Returns the [`ChunkId`] of
+    /// every piece created, in order.  The vast majority of calls produce a
+    /// single-element `Vec`; splitting only occurs when `content` exceeds
+    /// `MAX_CHUNK_TOKENS` (currently 500 tokens ≈ 2 000 characters).
     pub fn add_text_chunk(
         &self,
         object_id: ObjectId,
         content: String,
         chunk_type: ChunkType,
+    ) -> Result<Vec<ChunkId>> {
+        let pieces = split_text(&content);
+        let mut ids = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            let chunk = TextChunk::new(object_id, piece, chunk_type.clone());
+            ids.push(chunk.id);
+            self.storage.upsert_chunk(chunk)?;
+        }
+        Ok(ids)
+    }
+
+    /// Attach a pre-embedded text chunk to an object in one call.
+    ///
+    /// Because the caller supplies a single pre-computed embedding vector, the
+    /// content must fit within a single chunk (≤ [`MAX_CHUNK_TOKENS`] tokens).
+    /// Use [`add_text_chunk`](Self::add_text_chunk) followed by
+    /// [`upsert_chunk_embedding`](Self::upsert_chunk_embedding) for content that
+    /// may need splitting.
+    ///
+    /// Returns an error if `content` would be split into more than one chunk or
+    /// if `embedding.len() != EMBEDDING_DIMENSIONS`.
+    pub fn add_text_chunk_with_embedding(
+        &self,
+        object_id: ObjectId,
+        content: String,
+        chunk_type: ChunkType,
+        embedding: &[f32],
     ) -> Result<ChunkId> {
-        let chunk = TextChunk::new(object_id, content, chunk_type);
+        let pieces = split_text(&content);
+        if pieces.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "add_text_chunk_with_embedding: content splits into {} chunks \
+                 (max tokens per chunk: {}). Use add_text_chunk + upsert_chunk_embedding \
+                 for long content.",
+                pieces.len(),
+                MAX_CHUNK_TOKENS,
+            ));
+        }
+        let text = pieces.into_iter().next().unwrap_or_default();
+        let chunk = TextChunk::new(object_id, text, chunk_type);
         let chunk_id = chunk.id;
         self.storage.upsert_chunk(chunk)?;
+        self.storage.upsert_chunk_embedding(chunk_id, embedding)?;
         Ok(chunk_id)
+    }
+
+    /// Store or update the embedding vector for an existing chunk.
+    ///
+    /// The chunk must already exist (created via [`add_text_chunk`](Self::add_text_chunk)
+    /// or [`add_text_chunk_with_embedding`](Self::add_text_chunk_with_embedding)).
+    /// `embedding.len()` must equal [`EMBEDDING_DIMENSIONS`] (currently 256).
+    pub fn upsert_chunk_embedding(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
+        self.storage.upsert_chunk_embedding(chunk_id, embedding)
     }
 
     /// All text chunks belonging to `object_id`.
@@ -204,6 +323,28 @@ impl KnowledgeGraph {
         limit: usize,
     ) -> Result<Vec<(ChunkId, ObjectId, String)>> {
         self.storage.search_chunks_fts(query, limit)
+    }
+
+    /// Approximate nearest-neighbour search over stored chunk embeddings.
+    ///
+    /// Queries the `chunks_vec` sqlite-vec virtual table for the `limit` closest
+    /// chunks to `query_embedding` by cosine distance.  Only chunks that have
+    /// been indexed via [`upsert_chunk_embedding`](Self::upsert_chunk_embedding)
+    /// or [`add_text_chunk_with_embedding`](Self::add_text_chunk_with_embedding)
+    /// are candidates — unembedded chunks are invisible to this method.
+    ///
+    /// Returns `(chunk_id, object_id, content, distance)` tuples ordered by
+    /// ascending cosine distance (`0.0` = identical, `2.0` = maximally
+    /// dissimilar).  Returns an empty `Vec` (not an error) when no embeddings
+    /// are stored yet.
+    ///
+    /// `query_embedding.len()` must equal [`EMBEDDING_DIMENSIONS`] (currently 256).
+    pub fn search_chunks_semantic(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
+        self.storage.search_chunks_semantic(query_embedding, limit)
     }
 
     // ── Graph traversal ───────────────────────────────────────────────────────
@@ -431,13 +572,15 @@ mod tests {
         assert_eq!(neighbours[0], frodo_id);
 
         // Text chunk
-        let chunk_id = graph
+        let chunk_ids = graph
             .add_text_chunk(
                 gandalf_id,
                 "Gandalf appeared at Bilbo's birthday party.".to_string(),
                 ChunkType::UserNote,
             )
             .unwrap();
+        assert_eq!(chunk_ids.len(), 1);
+        let chunk_id = chunk_ids[0];
         let chunks = graph.get_text_chunks(gandalf_id).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].id, chunk_id);
@@ -550,6 +693,7 @@ mod tests {
                 ChunkType::Description,
             )
             .unwrap();
+        // add_text_chunk returns Vec<ChunkId>; short content → single chunk.
 
         // FTS5 exact-word search
         let results = graph.search_chunks_fts("Istari", 5).unwrap();
@@ -560,6 +704,131 @@ mod tests {
         // No match
         let empty = graph.search_chunks_fts("dragon", 5).unwrap();
         assert!(empty.is_empty());
+    }
+
+    // ── split_text ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_split_text_short_content_is_not_split() {
+        // Content well under MAX_CHUNK_TOKENS (500 tokens = 2000 chars).
+        let pieces = split_text("A short description.");
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], "A short description.");
+    }
+
+    #[test]
+    fn test_split_text_empty_and_whitespace_produce_no_pieces() {
+        assert!(split_text("").is_empty());
+        assert!(split_text("   \n\t  ").is_empty());
+    }
+
+    #[test]
+    fn test_split_text_exact_boundary_is_not_split() {
+        // A string of exactly MAX_CHUNK_TOKENS * 4 chars must NOT be split.
+        let max_chars = MAX_CHUNK_TOKENS * 4;
+        let content = "a".repeat(max_chars);
+        let pieces = split_text(&content);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].len(), max_chars);
+    }
+
+    #[test]
+    fn test_split_text_long_content_splits_on_word_boundary() {
+        // Build a string of 10 words each 399 chars + 1 space = 4000 chars total
+        // (≈ 1000 tokens).  With a 2000-char window the split should fall at the
+        // space between words 5 and 6, keeping pieces well under the limit.
+        let word = "x".repeat(399);
+        let content = (0..10).map(|_| word.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(
+            content.len() > 2000,
+            "pre-condition: content must exceed limit"
+        );
+
+        let pieces = split_text(&content);
+        assert!(pieces.len() >= 2, "long content must be split");
+        for piece in &pieces {
+            // Each piece must be within the 2000-char budget.
+            assert!(
+                piece.len() <= 2000,
+                "piece too long ({} chars): {:?}",
+                piece.len(),
+                &piece[..piece.len().min(40)]
+            );
+            // No piece should be empty.
+            assert!(!piece.is_empty());
+        }
+        // Reassembling (with a space) must cover all original words.
+        let rejoined = pieces.join(" ");
+        let original_words: Vec<_> = content.split_whitespace().collect();
+        let rejoined_words: Vec<_> = rejoined.split_whitespace().collect();
+        assert_eq!(original_words, rejoined_words);
+    }
+
+    #[test]
+    fn test_split_text_hard_cut_when_no_whitespace() {
+        // A single 4000-char token-free string (no spaces): must be hard-cut
+        // at max_chars since there is no whitespace boundary to use.
+        let content = "z".repeat(4000);
+        let pieces = split_text(&content);
+        assert!(
+            pieces.len() >= 2,
+            "must hard-cut oversized no-whitespace content"
+        );
+        for piece in &pieces {
+            assert!(piece.len() <= 2000);
+            assert!(!piece.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_split_text_leading_trailing_whitespace_is_trimmed() {
+        let pieces = split_text("  hello world  ");
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], "hello world");
+    }
+
+    #[test]
+    fn test_add_text_chunk_long_content_stored_as_multiple_chunks() {
+        let (graph, _tmp) = create_test_graph();
+        let obj_id = ObjectBuilder::character("Verbose".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+
+        // 5000-char content: ~1250 tokens → must split into at least 3 chunks
+        // (ceiling of 1250 / 500 = 3).
+        let long_content = "word ".repeat(1000); // 5000 chars
+        let chunk_ids = graph
+            .add_text_chunk(obj_id, long_content.clone(), ChunkType::Description)
+            .unwrap();
+
+        assert!(
+            chunk_ids.len() >= 3,
+            "expected ≥3 chunks for 5000-char content, got {}",
+            chunk_ids.len()
+        );
+
+        // All chunks must be retrievable and within the token budget.
+        let stored = graph.get_text_chunks(obj_id).unwrap();
+        assert_eq!(stored.len(), chunk_ids.len());
+        for chunk in &stored {
+            assert!(
+                chunk.token_count <= MAX_CHUNK_TOKENS,
+                "chunk exceeds MAX_CHUNK_TOKENS: {} tokens",
+                chunk.token_count
+            );
+        }
+
+        // The concatenated content must cover all original words (modulo
+        // trimming at boundaries).
+        let original_words: Vec<_> = long_content.split_whitespace().collect();
+        let stored_words: Vec<_> = stored
+            .iter()
+            .flat_map(|c| c.content.split_whitespace())
+            .collect();
+        assert_eq!(
+            original_words, stored_words,
+            "stored chunks must cover all original words in order"
+        );
     }
 
     // ── Schema integration ────────────────────────────────────────────────────

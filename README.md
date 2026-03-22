@@ -4,99 +4,101 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)
-![Status](https://img.shields.io/badge/status-Early%20Prototype-red.svg)
+![Status](https://img.shields.io/badge/status-Early%20Prototype-orange.svg)
 
 ## What is u-forge.ai?
 
-u-forge.ai (Universe Forge) is a **local-first TTRPG worldbuilding tool** that gives game masters a private, AI-assisted knowledge graph for managing worlds — characters, locations, factions, quests, and their relationships — with semantic and exact-name search.
+A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI-assisted knowledge graph for managing worlds — characters, locations, factions, quests, and their relationships — with full-text and semantic search.
 
 **⚠️ Status: Early prototype. No GUI yet; everything runs as a CLI demo.**
 
-### Vision
+---
 
-- Build rich, interconnected worlds with characters, locations, factions, and lore
-- AI-powered semantic search across your entire world
-- Session capture with automatic transcription *(planned)*
-- Interactive graph visualization *(planned)*
-- All data stays local — no cloud dependency
+## Current State
 
-## Current Prototype Features
-
-**What works today:**
-- RocksDB-backed knowledge graph with 5 column families (nodes, edges, chunks, names, schemas)
-- Local text embeddings via FastEmbed (NomicEmbedTextV15, 768-dim) — **being replaced by Lemonade Server**
-- HNSW approximate nearest-neighbor semantic search — **being replaced by sqlite-vec**
-- FST-based exact/prefix name matching
-- Flexible JSON schema system with validation (13 TTRPG schemas included)
-- JSONL data ingestion with two-pass node+edge import
-- Async embedding background queue (well-architected but not yet integrated)
-- `ObjectBuilder` fluent API for constructing graph objects
-- CLI demo with Foundation universe (Asimov) sample data
-
-**Known bugs — see [ARCHITECTURE.md](ARCHITECTURE.md) §Known Bugs for the full list.**
-
-## Architecture Direction
-
-We are migrating away from in-process AI dependencies toward **[Lemonade Server](https://github.com/lemonade-sdk/lemonade)** — an open-source, OpenAI-compatible local AI inference server by AMD that provides hardware-tuned LLM runtimes for Mac, Linux, and Windows.
-
-| Current | Target |
+| Area | Status |
 |---|---|
-| FastEmbed (in-process ONNX) | Lemonade Server `/api/v1/embeddings` |
-| HNSW (`hnsw_rs`) with broken persistence | SQLite + `sqlite-vec` |
-| FST prefix matching only | SQLite FTS5 (full-text search) |
-| RocksDB (requires gcc-13) | SQLite (bundled, zero system deps) |
-| No reranking | Lemonade Server `/api/v1/reranking` |
-| No LLM integration | Lemonade Server `/api/v1/chat/completions` |
-| CLI demo only | axum HTTP/WebSocket server → web UI |
+| SQLite knowledge graph (nodes, edges, chunks, schemas) | ✅ Working |
+| Full-text search via SQLite FTS5 | ✅ Working |
+| Flexible JSON schema system with validation (13 TTRPG types) | ✅ Working |
+| JSONL data ingestion — two-pass node + edge import, deduplication | ✅ Working |
+| `ObjectBuilder` fluent API | ✅ Working |
+| Lemonade Server embedding provider (`EmbeddingManager`) | ✅ Working |
+| Lemonade Server transcription provider (`TranscriptionManager`) | ✅ Working |
+| Hardware device abstraction (NPU / GPU / CPU) | ✅ Working |
+| Unified inference queue (`InferenceQueue`) — embed, transcribe, TTS, LLM, rerank | ✅ Working |
+| Reranking via Lemonade Server (`LemonadeRerankProvider`) | ✅ Working |
+| `cli_demo` — FTS5 search + rerank pipeline demo with Foundation universe data | ✅ Working |
+| sqlite-vec ANN vector search | 🔜 Deferred |
+| axum HTTP / WebSocket server | 🔜 Planned |
+| Reranking wired into KG search pipeline (hybrid FTS5 + vec + rerank) | 🔜 Planned |
+| Web UI | 🔜 Planned |
 
-**See [migration.md](migration.md) for the phased implementation plan.**
+---
 
 ## Technical Stack
 
-### Current
-- **Language:** Rust (single crate, lib + example)
-- **Storage:** RocksDB 0.23 with 5 column families
-- **Embeddings:** FastEmbed 5.0 (NomicEmbedTextV15, 768-dim)
-- **Vector Search:** hnsw_rs 0.3 (DistL2) + FST 0.4
-- **Async:** Tokio 1.45
-- **Serialization:** bincode 1.3 (nodes, edges, chunks) + serde_json (schemas)
+| Layer | Technology |
+|---|---|
+| Language | Rust (single crate, lib + CLI example) |
+| Storage | SQLite via `rusqlite` (bundled — zero system deps) |
+| Full-text search | SQLite FTS5 |
+| Vector search | *(deferred — sqlite-vec planned)* |
+| Embeddings / LLM / Reranking / TTS / STT | [Lemonade Server](https://github.com/lemonade-sdk/lemonade) HTTP API (optional) |
+| Async runtime | Tokio 1.x |
+| Serialization | serde\_json |
 
-### Target
-- **Language:** Rust (cargo workspace)
-- **Storage:** SQLite + FTS5 + sqlite-vec
-- **AI Backend:** Lemonade Server (OpenAI-compatible HTTP API)
-- **Server:** axum with REST + WebSocket
-- **UI:** Web-based (React or Svelte)
+---
 
-## Development Setup
+## Quick Start
 
-### Prerequisites
-- Rust toolchain (stable)
-- GCC 13+ (for RocksDB — **will be eliminated after SQLite migration**)
-- [Lemonade Server](https://github.com/lemonade-sdk/lemonade) running locally (optional — falls back to FastEmbed)
-
-### Quick Start
 ```bash
-# Set environment (required for RocksDB compilation)
-source env.sh
-
-# Build (~10 min first time due to RocksDB)
+# Build (~30 s first time — compiles bundled SQLite)
 cargo build
 
-# Run tests
-cargo test
+# Run all tests (no server required)
+cargo test -- --test-threads=1
 
-# Run CLI demo
+# Run the CLI demo with Foundation universe sample data
 cargo run --example cli_demo
 ```
 
-### Environment Variables
+No `source env.sh`. No gcc-13. No model downloads required to build and test.
+
+### With Lemonade Server (embeddings + reranking + LLM + transcription)
+
 ```bash
-source env.sh                              # Sets CC, CXX, cache paths
-export UFORGE_SCHEMA_DIR="./defaults/schemas"    # Schema directory
-export UFORGE_DATA_FILE="./defaults/data/memory.json"  # Data file
-export LEMONADE_URL="http://localhost:8000/api/v1"     # Lemonade Server (when available)
+# Install and start Lemonade Server
+sudo snap install lemonade-server        # Linux
+
+# Pull models you want to use
+lemonade-server pull embed-gemma-300m-FLM      # embeddings (NPU, 0.62 GB)
+lemonade-server pull bge-reranker-v2-m3-GGUF   # reranking (GPU/CPU)
+lemonade-server pull whisper-v3-turbo-FLM      # transcription (NPU, 1.55 GB)
+
+lemonade-server serve                    # leave running
+
+# u-forge.ai auto-discovers Lemonade on localhost:8000
+# Set LEMONADE_URL only to override (e.g. non-standard port):
+export LEMONADE_URL="http://localhost:8000/api/v1"
+
+cargo run --example cli_demo
 ```
+
+The CLI demo will detect hardware capabilities, list available models, run FTS5
+search over the Foundation universe dataset, and — when a reranker model is
+available — demonstrate the FTS5 → rerank pipeline.
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LEMONADE_URL` | *(auto-detected)* | Override Lemonade Server base URL |
+| `UFORGE_SCHEMA_DIR` | `./defaults/schemas` | Directory of `.schema.json` files |
+| `UFORGE_DATA_FILE` | `./defaults/data/memory.json` | JSONL data file for import |
+| `RUST_LOG` | `error` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`) |
+
+---
 
 ## Project Layout
 
@@ -104,37 +106,52 @@ export LEMONADE_URL="http://localhost:8000/api/v1"     # Lemonade Server (when a
 u-forge.ai/
 ├── src/
 │   ├── lib.rs              # KnowledgeGraph facade + ObjectBuilder
-│   ├── types.rs            # Domain types (ObjectMetadata, Edge, TextChunk, etc.)
-│   ├── storage.rs          # RocksDB persistence (5 column families)
-│   ├── embeddings.rs       # EmbeddingProvider trait + FastEmbed impl
-│   ├── vector_search.rs    # HNSW + FST hybrid search engine
+│   ├── types.rs            # Domain types
+│   ├── storage.rs          # SQLite persistence + FTS5
+│   ├── embeddings.rs       # EmbeddingProvider trait + LemonadeProvider
+│   ├── transcription.rs    # TranscriptionProvider trait + LemonadeTranscriptionProvider
+│   ├── hardware/           # DeviceCapability, NpuDevice, GpuDevice, CpuDevice
+│   ├── inference_queue.rs  # Unified MPMC inference dispatch (embed/transcribe/TTS/LLM/rerank)
+│   ├── lemonade.rs         # LemonadeModelRegistry, GpuResourceManager, LemonadeRerankProvider,
+│   │                       #   LemonadeChatProvider, LemonadeTtsProvider, LemonadeSttProvider,
+│   │                       #   LemonadeStack, SystemInfo, LemonadeCapabilities
+│   ├── embedding_queue.rs  # Legacy embedding-only background queue
 │   ├── schema.rs           # Schema definition types
-│   ├── schema_manager.rs   # Schema load/validate/cache
-│   ├── schema_ingestion.rs # JSON schema files → internal schema
-│   ├── data_ingestion.rs   # JSONL import pipeline
-│   └── embedding_queue.rs  # Async embedding background queue
-├── examples/cli_demo.rs    # CLI demo (the only runnable entry point)
+│   ├── schema_manager.rs   # Schema load / validate / cache
+│   ├── schema_ingestion.rs # JSON schema files → internal representation
+│   └── data_ingestion.rs   # JSONL two-pass import pipeline
+├── examples/
+│   └── cli_demo.rs         # Demo + integration test: hardware caps, FTS5, reranking
 ├── defaults/
-│   ├── data/memory.json    # Foundation universe JSONL dataset (~220 nodes, ~312 edges)
+│   ├── data/memory.json    # Foundation universe JSONL (~220 nodes, ~312 edges)
 │   └── schemas/            # 13 TTRPG JSON schema files
-├── ARCHITECTURE.md          # Detailed architecture, bugs, and design decisions
-├── migration.md            # Phased migration plan (Lemonade + SQLite + UI)
+├── .rulesdir/              # AI assistant context rules
+├── ARCHITECTURE.md         # Architecture reference and design decisions
 ├── Cargo.toml
-├── env.sh                  # CRITICAL: source before building
-└── dev.sh                  # Dev runner script
+└── env.sh                  # Optional: sets UFORGE_* path variables
 ```
+
+Source files are thoroughly commented — refer to them directly for implementation
+details rather than this document.
+
+---
 
 ## Key Documentation
 
 | Document | Purpose |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Current architecture, known bugs, design decisions |
-| [migration.md](migration.md) | Phased migration plan to Lemonade Server + SQLite + web UI |
-| [.cursor/rules/](/.cursor/rules/) | AI assistant context rules (7 files) |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Module map, SQLite schema, hardware architecture, inference queue, design decisions |
+| [.rulesdir/](.rulesdir/) | AI assistant context rules (7 `.mdc` files) |
+
+---
 
 ## Sample Data
 
-The included Foundation universe dataset (`defaults/data/memory.json`) contains ~220 nodes and ~312 edges modeling Isaac Asimov's Foundation series — characters, locations, factions, quests, and artifacts with rich metadata.
+`defaults/data/memory.json` models Isaac Asimov's **Foundation** universe (~220 nodes,
+~312 edges). Used by `cli_demo` for end-to-end testing of the full pipeline: schema
+load → data import → FTS5 indexing → search → rerank.
+
+---
 
 ## License
 

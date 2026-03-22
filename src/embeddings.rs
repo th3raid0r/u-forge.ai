@@ -4,6 +4,10 @@
 //! FastEmbed and ONNX Runtime have been removed — there are no in-process embedding
 //! models and no C++ compilation requirements.
 //!
+//! Transcription (speech-to-text / VTT) has been moved to
+//! [`crate::transcription`].  The types are re-exported here for backward
+//! compatibility.
+//!
 //! # Quick start
 //!
 //! ```no_run
@@ -21,6 +25,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
+
+// ── Backward-compat re-exports ────────────────────────────────────────────────
+// Transcription types moved to `crate::transcription`.  Re-exported here so
+// existing code using `embeddings::TranscriptionProvider` continues to compile
+// without changes.
+pub use crate::transcription::{
+    LemonadeTranscriptionProvider, TranscriptionManager, TranscriptionProvider,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider type identifiers
@@ -83,7 +95,6 @@ pub trait EmbeddingProvider: Send + Sync {
 // ─────────────────────────────────────────────────────────────────────────────
 // LemonadeProvider
 // ─────────────────────────────────────────────────────────────────────────────
-
 /// Embedding provider backed by [Lemonade Server](https://github.com/lemonade-sdk/lemonade).
 ///
 /// Uses the OpenAI-compatible `POST /api/v1/embeddings` endpoint.  The server
@@ -172,7 +183,12 @@ impl EmbeddingProvider for LemonadeProvider {
 
         let embedding: Vec<f32> = resp["data"][0]["embedding"]
             .as_array()
-            .ok_or_else(|| anyhow!("Lemonade Server returned no embedding in response"))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Lemonade Server returned no embedding in response (raw: {})",
+                    resp
+                )
+            })?
             .iter()
             .map(|v| v.as_f64().unwrap_or(0.0) as f32)
             .collect();
@@ -199,6 +215,24 @@ impl EmbeddingProvider for LemonadeProvider {
         let data = resp["data"]
             .as_array()
             .ok_or_else(|| anyhow!("Lemonade Server returned no 'data' array in batch response"))?;
+
+        // Some backends (e.g. FLM/NPU recipe) do not support true multi-input
+        // batching and silently return only the first result.  Detect the mismatch
+        // and fall back to sequential single-item calls so callers always receive
+        // exactly one embedding per input regardless of backend capability.
+        if data.len() != texts.len() {
+            tracing::debug!(
+                expected = texts.len(),
+                got = data.len(),
+                model = %self.model,
+                "Batch size mismatch — falling back to sequential single-embed calls"
+            );
+            let mut results = Vec::with_capacity(texts.len());
+            for text in &texts {
+                results.push(self.embed(text).await?);
+            }
+            return Ok(results);
+        }
 
         data.iter()
             .map(|item| {
@@ -237,6 +271,7 @@ impl EmbeddingProvider for LemonadeProvider {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // EmbeddingManager
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -272,17 +307,23 @@ impl EmbeddingManager {
     /// Resolution order:
     /// 1. `lemonade_url` argument (if provided)
     /// 2. `LEMONADE_URL` environment variable
-    /// 3. Hard error — there is no local fallback in this build
+    /// 3. Localhost probe — `http://localhost:8000` then `http://127.0.0.1:8000`
+    ///    via [`crate::lemonade::resolve_lemonade_url`]
+    /// 4. Hard error — no server could be found
     ///
-    /// `model` defaults to `"nomic-embed-text"` when `None`.
+    /// `model` defaults to `"embed-gemma-300m-FLM"` when `None`.
     pub async fn try_new_auto(lemonade_url: Option<&str>, model: Option<&str>) -> Result<Self> {
-        let resolved_url = lemonade_url
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("LEMONADE_URL").ok());
+        let resolved_url = match lemonade_url.map(|s| s.to_string()) {
+            Some(url) => Some(url),
+            None => match std::env::var("LEMONADE_URL").ok() {
+                Some(url) => Some(url),
+                None => crate::lemonade::resolve_lemonade_url().await,
+            },
+        };
 
         match resolved_url {
             Some(url) => {
-                let lemonade_model = model.unwrap_or("nomic-embed-text");
+                let lemonade_model = model.unwrap_or("embed-gemma-300m-FLM");
                 match Self::try_new_lemonade(&url, lemonade_model).await {
                     Ok(mgr) => {
                         info!(url, "Auto-selected Lemonade Server");
@@ -303,8 +344,9 @@ impl EmbeddingManager {
                 }
             }
             None => Err(anyhow!(
-                "No Lemonade Server URL configured. Set the LEMONADE_URL environment \
-                 variable or pass a URL explicitly:\n  \
+                "No Lemonade Server URL configured and none found on localhost. \
+                 Start lemonade-server or set the LEMONADE_URL environment variable:\n  \
+                 lemonade-server serve\n  \
                  export LEMONADE_URL=http://localhost:8000/api/v1"
             )),
         }
@@ -323,12 +365,7 @@ impl EmbeddingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Returns the Lemonade Server URL from the environment, or `None` if not set.
-    /// Tests that require a live server are skipped when this returns `None`.
-    fn lemonade_url() -> Option<String> {
-        std::env::var("LEMONADE_URL").ok()
-    }
+    use crate::test_helpers::lemonade_url;
 
     // ── Unit tests (no server required) ──────────────────────────────────────
 
@@ -343,21 +380,21 @@ mod tests {
     #[test]
     fn test_embedding_model_info_fields() {
         let info = EmbeddingModelInfo {
-            name: "nomic-embed-text".to_string(),
+            name: "embed-gemma-300m-FLM".to_string(),
             dimensions: 768,
             description: Some("Test model".to_string()),
         };
-        assert_eq!(info.name, "nomic-embed-text");
+        assert_eq!(info.name, "embed-gemma-300m-FLM");
         assert_eq!(info.dimensions, 768);
         assert!(info.description.is_some());
     }
 
     #[tokio::test]
     async fn test_try_new_auto_fails_without_url() {
-        // Make sure LEMONADE_URL is not set for this sub-test
-        // (if it IS set, the test is skipped rather than asserting failure)
-        if std::env::var("LEMONADE_URL").is_ok() {
-            return; // live server might be available — skip the "no URL" path
+        // Skip if any Lemonade Server is reachable (localhost probe or env var).
+        if lemonade_url().await.is_some() {
+            eprintln!("Skipping test_try_new_auto_fails_without_url — server is reachable");
+            return;
         }
         let result = EmbeddingManager::try_new_auto(None, None).await;
         assert!(
@@ -373,9 +410,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_new_lemonade_unreachable() {
-        let result =
-            EmbeddingManager::try_new_lemonade("http://127.0.0.1:19999/api/v1", "nomic-embed-text")
-                .await;
+        let result = EmbeddingManager::try_new_lemonade(
+            "http://127.0.0.1:19999/api/v1",
+            "embed-gemma-300m-FLM",
+        )
+        .await;
         assert!(
             result.is_err(),
             "Expected connection error for unreachable server"
@@ -386,11 +425,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_lemonade_provider_connect_and_dimensions() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("Skipping: LEMONADE_URL not set");
+        let Some(url) = lemonade_url().await else {
+            eprintln!("Skipping: no Lemonade Server reachable");
             return;
         };
-        let provider = LemonadeProvider::new(&url, "nomic-embed-text").await;
+        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM").await;
         assert!(
             provider.is_ok(),
             "Failed to connect to Lemonade Server: {:?}",
@@ -401,17 +440,17 @@ mod tests {
         assert!(dims > 0, "Expected non-zero dimensions, got {dims}");
         assert_eq!(provider.provider_type(), EmbeddingProviderType::Lemonade);
         let info = provider.model_info().unwrap();
-        assert_eq!(info.name, "nomic-embed-text");
+        assert_eq!(info.name, "embed-gemma-300m-FLM");
         assert_eq!(info.dimensions, dims);
     }
 
     #[tokio::test]
     async fn test_lemonade_embed_single() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("Skipping: LEMONADE_URL not set");
+        let Some(url) = lemonade_url().await else {
+            eprintln!("Skipping: no Lemonade Server reachable");
             return;
         };
-        let provider = LemonadeProvider::new(&url, "nomic-embed-text")
+        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
             .await
             .expect("Connect to Lemonade");
         let dims = provider.dimensions().unwrap();
@@ -428,11 +467,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_lemonade_embed_batch() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("Skipping: LEMONADE_URL not set");
+        let Some(url) = lemonade_url().await else {
+            eprintln!("Skipping: no Lemonade Server reachable");
             return;
         };
-        let provider = LemonadeProvider::new(&url, "nomic-embed-text")
+        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
             .await
             .expect("Connect to Lemonade");
         let dims = provider.dimensions().unwrap();
@@ -461,8 +500,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_embedding_manager_try_new_auto() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("Skipping: LEMONADE_URL not set");
+        let Some(url) = lemonade_url().await else {
+            eprintln!("Skipping: no Lemonade Server reachable");
             return;
         };
         let mgr = EmbeddingManager::try_new_auto(Some(&url), None).await;
