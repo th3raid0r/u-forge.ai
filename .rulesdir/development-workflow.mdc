@@ -49,7 +49,7 @@ Before making changes, read:
 - [migration.md](mdc:migration.md) — Phased plan and completion status
 
 ### Current state (all complete):
-- SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware abstraction (`src/hardware/`), unified inference queue (`src/inference_queue.rs`), `LemonadeRerankProvider` + `InferenceQueue::rerank()` wired, `cli_demo` demonstrates FTS5 → rerank pipeline.
+- SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware abstraction (`src/hardware/`), unified inference queue (`src/queue/`), `LemonadeRerankProvider` + `InferenceQueue::rerank()` wired, `cli_demo` demonstrates FTS5 → rerank pipeline.
 
 ### Remaining work:
 - **sqlite-vec** — ANN vector search (highest priority storage item)

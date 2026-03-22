@@ -16,7 +16,10 @@ Local-first TTRPG worldbuilding tool with an AI-powered knowledge graph. Written
 
 ```
 src/
-  lib.rs                  # KnowledgeGraph facade, ObjectBuilder, re-exports
+  lib.rs                  # KnowledgeGraph facade + re-exports (facade-only, ~270 lines)
+  builder.rs              # ObjectBuilder fluent API
+  text.rs                 # split_text() — word-boundary chunking utility (pub(crate))
+  lib_tests.rs            # Integration tests for KnowledgeGraph + ObjectBuilder
   error.rs                # AppError (future axum HTTP boundary)
   types.rs                # Domain types: ObjectMetadata, Edge, TextChunk, etc.
   test_helpers.rs         # lemonade_url() test helper
@@ -59,11 +62,20 @@ src/
     embeddings.rs         # EmbeddingProvider trait, LemonadeProvider, EmbeddingManager
     transcription.rs      # TranscriptionProvider trait, LemonadeTranscriptionProvider, TranscriptionManager
 
-  # ── Still to be reorganized (PR 3) ─────────────────────────────────────────
+  ingest/                 # ✅ REFACTORED — was data_ingestion.rs
+    mod.rs
+    data.rs               # DataIngestion, IngestionStats, JsonEntry
 
-  inference_queue.rs      # ~1700 lines — target: queue/ directory
-  search.rs               # ~1322 lines — target: search/ directory
-  data_ingestion.rs       # → ingest/data.rs
+  queue/                  # ✅ REFACTORED — was inference_queue.rs (1692 lines)
+    mod.rs                # Re-exports + module docs
+    jobs.rs               # EmbedJob, TranscribeJob, SynthesizeJob, GenerateJob, RerankJob, WorkQueue<T>
+    dispatch.rs           # InferenceQueue struct + public API + QueueStats + tests
+    builder.rs            # InferenceQueueBuilder struct + impl + Default
+    workers.rs            # run_*_worker functions + retry constants
+
+  search/                 # ✅ REFACTORED — was search.rs (1322 lines)
+    mod.rs                # HybridSearchConfig, NodeSearchResult, SearchSources, search_hybrid, tests
+    sanitize.rs           # fts5_sanitize() + unit tests
 ```
 
 ---
@@ -74,9 +86,9 @@ src/
 |----|--------|-------------|
 | PR 1 | ✅ Done | Split `lemonade.rs` (2134 lines) → `lemonade/` (10 files) |
 | PR 2 | ✅ Done | Split `storage.rs` (1630 lines) → `graph/` (6 files) |
-| PR 3 | 🔄 In progress | Reorganize: `inference_queue.rs` → `queue/`, `search.rs` → `search/`, ~~`schema*.rs` → `schema/`~~, ~~`embeddings.rs` + `transcription.rs` → `ai/`~~, `data_ingestion.rs` → `ingest/` |
-| PR 4 | ⏳ TODO | Docs cleanup: `env.sh` (remove RocksDB references), update `ARCHITECTURE.md` module map, update `.rulesdir/*.mdc` paths |
-| PR 5 | ⏳ TODO | Slim `lib.rs` to facade-only |
+| PR 3 | ✅ Done | Reorganize: `schema*.rs` → `schema/`, `embeddings.rs` + `transcription.rs` → `ai/`, `data_ingestion.rs` → `ingest/`, `inference_queue.rs` → `queue/`, `search.rs` → `search/` |
+| PR 4 | ✅ Done | Docs cleanup: `env.sh` (removed RocksDB references), updated `ARCHITECTURE.md` + `README.md` module maps, updated `.rulesdir/*.mdc` paths |
+| PR 5 | ✅ Done | Slim `lib.rs` to facade-only (~270 lines): extracted `ObjectBuilder` → `builder.rs`, `split_text` → `text.rs`, tests → `lib_tests.rs` |
 
 ---
 
@@ -96,7 +108,7 @@ src/
 | Phase 2: SQLite Migration | ✅ Complete |
 | Hardware re-arch (NPU/GPU/CPU) | ✅ Complete |
 | Phase 4: Hybrid Search | ✅ Complete |
-| **Code Refactor** | 🔄 In progress (PR 3 remaining) |
+| **Code Refactor** | ✅ Complete |
 | Phase 3: axum HTTP Server | ⏳ Next after refactor |
 | Phase 4b: LLM token streaming | ⏳ Planned |
 | Phase 5: Cargo workspace split | ⏳ Planned |

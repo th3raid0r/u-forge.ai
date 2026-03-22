@@ -17,14 +17,16 @@
 pub(crate) mod test_helpers;
 
 pub mod ai;
-pub mod ingest;
+pub mod builder;
 pub mod error;
+pub mod graph;
 pub mod hardware;
-pub mod inference_queue;
+pub mod ingest;
 pub mod lemonade;
+pub mod queue;
 pub mod schema;
 pub mod search;
-pub mod graph;
+pub(crate) mod text;
 pub mod types;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
@@ -32,6 +34,11 @@ pub mod types;
 pub use ai::embeddings::{
     EmbeddingManager, EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
     LemonadeProvider,
+};
+pub use builder::ObjectBuilder;
+pub use graph::{
+    GraphStats, KnowledgeGraphStorage, EMBEDDING_DIMENSIONS, ENABLE_HIGH_QUALITY_EMBEDDING,
+    MAX_CHUNK_TOKENS,
 };
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
@@ -46,10 +53,6 @@ pub use schema::{
 pub use search::{
     search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
 };
-pub use graph::{
-    GraphStats, KnowledgeGraphStorage, EMBEDDING_DIMENSIONS, ENABLE_HIGH_QUALITY_EMBEDDING,
-    MAX_CHUNK_TOKENS,
-};
 pub use types::*;
 
 // ── Facade ────────────────────────────────────────────────────────────────────
@@ -58,53 +61,7 @@ use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 
-// ── Text splitting ────────────────────────────────────────────────────────────
-
-/// Split `text` into pieces of at most [`MAX_CHUNK_TOKENS`] tokens, breaking
-/// only at whitespace boundaries.
-///
-/// Uses the same `len / 4` heuristic as [`estimate_token_count`] so that the
-/// token budget is always consistent with what is stored in [`TextChunk::token_count`].
-///
-/// [`estimate_token_count`]: crate::types
-fn split_text(text: &str) -> Vec<String> {
-    // 4 chars per token mirrors estimate_token_count in types.rs.
-    let max_chars = MAX_CHUNK_TOKENS * 4;
-
-    if text.len() <= max_chars {
-        let trimmed = text.trim().to_string();
-        return if trimmed.is_empty() {
-            vec![]
-        } else {
-            vec![trimmed]
-        };
-    }
-
-    let mut pieces: Vec<String> = Vec::new();
-    let mut remaining = text.trim();
-
-    while !remaining.is_empty() {
-        if remaining.len() <= max_chars {
-            pieces.push(remaining.to_string());
-            break;
-        }
-
-        // Find the last whitespace at or before the max_chars boundary so we
-        // never cut through a word.
-        let boundary = &remaining[..max_chars];
-        let split_at = boundary.rfind(char::is_whitespace).unwrap_or(max_chars); // no whitespace found → hard cut
-
-        let piece = remaining[..split_at].trim().to_string();
-        if !piece.is_empty() {
-            pieces.push(piece);
-        }
-
-        // Advance past the split point, skipping leading whitespace.
-        remaining = remaining[split_at..].trim_start();
-    }
-
-    pieces
-}
+use text::split_text;
 
 /// Central knowledge graph interface.
 ///
@@ -123,7 +80,7 @@ fn split_text(text: &str) -> Vec<String> {
 ///     .unwrap();
 /// ```
 // KnowledgeGraph is Send + Sync:
-//   - KnowledgeGraphStorage wraps rusqlite::Connection in Arc<Mutex<Connection>> (see storage.rs)
+//   - KnowledgeGraphStorage wraps rusqlite::Connection in Arc<Mutex<Connection>> (see graph/storage.rs)
 //   - SchemaManager holds Arc<KnowledgeGraphStorage> + DashMap (both Send + Sync)
 // This means Arc<KnowledgeGraph> is a valid axum State<T> type for Phase 3.
 pub struct KnowledgeGraph {
@@ -421,474 +378,8 @@ impl KnowledgeGraph {
     }
 }
 
-// ── ObjectBuilder ─────────────────────────────────────────────────────────────
-
-/// Fluent builder for constructing [`ObjectMetadata`] with TTRPG-friendly
-/// convenience constructors.
-///
-/// # Example
-/// ```no_run
-/// use u_forge_ai::ObjectBuilder;
-/// let obj = ObjectBuilder::character("Gandalf".to_string())
-///     .with_description("A wizard".to_string())
-///     .with_property("race".to_string(), "Maiar".to_string())
-///     .with_tag("wizard".to_string())
-///     .build();
-/// ```
-pub struct ObjectBuilder {
-    metadata: ObjectMetadata,
-}
-
-impl ObjectBuilder {
-    pub fn character(name: String) -> Self {
-        Self {
-            metadata: ObjectMetadata::new("character".to_string(), name),
-        }
-    }
-
-    pub fn location(name: String) -> Self {
-        Self {
-            metadata: ObjectMetadata::new("location".to_string(), name),
-        }
-    }
-
-    pub fn faction(name: String) -> Self {
-        Self {
-            metadata: ObjectMetadata::new("faction".to_string(), name),
-        }
-    }
-
-    pub fn item(name: String) -> Self {
-        Self {
-            metadata: ObjectMetadata::new("item".to_string(), name),
-        }
-    }
-
-    pub fn event(name: String) -> Self {
-        Self {
-            metadata: ObjectMetadata::new("event".to_string(), name),
-        }
-    }
-
-    pub fn session(name: String) -> Self {
-        Self {
-            metadata: ObjectMetadata::new("session".to_string(), name),
-        }
-    }
-
-    pub fn custom(object_type: String, name: String) -> Self {
-        Self {
-            metadata: ObjectMetadata::new(object_type, name),
-        }
-    }
-
-    pub fn with_description(mut self, description: String) -> Self {
-        self.metadata.description = Some(description);
-        self
-    }
-
-    pub fn with_property(mut self, key: String, value: String) -> Self {
-        self.metadata = self.metadata.with_property(key, value);
-        self
-    }
-
-    pub fn with_json_property(mut self, key: String, value: serde_json::Value) -> Self {
-        self.metadata = self.metadata.with_json_property(key, value);
-        self
-    }
-
-    pub fn with_tag(mut self, tag: String) -> Self {
-        self.metadata.add_tag(tag);
-        self
-    }
-
-    /// Consume the builder and return the finished [`ObjectMetadata`].
-    pub fn build(self) -> ObjectMetadata {
-        self.metadata
-    }
-
-    /// Build and immediately insert into `graph`.  Returns the new [`ObjectId`].
-    pub fn add_to_graph(self, graph: &KnowledgeGraph) -> Result<ObjectId> {
-        graph.add_object(self.build())
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn create_test_graph() -> (KnowledgeGraph, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let graph = KnowledgeGraph::new(temp_dir.path()).unwrap();
-        (graph, temp_dir)
-    }
-
-    async fn create_test_graph_async() -> (KnowledgeGraph, TempDir) {
-        create_test_graph()
-    }
-
-    // ── Basic CRUD ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_basic_graph_operations() {
-        let (graph, _tmp) = create_test_graph();
-
-        let gandalf_id = ObjectBuilder::character("Gandalf".to_string())
-            .with_description("A wise wizard of great power".to_string())
-            .with_property("race".to_string(), "Maiar".to_string())
-            .with_tag("wizard".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-
-        let frodo_id = ObjectBuilder::character("Frodo Baggins".to_string())
-            .with_description("A brave hobbit from the Shire".to_string())
-            .with_property("race".to_string(), "Hobbit".to_string())
-            .with_tag("ringbearer".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-
-        graph
-            .connect_objects_str(gandalf_id, frodo_id, "knows")
-            .unwrap();
-
-        let gandalf = graph.get_object(gandalf_id).unwrap().unwrap();
-        assert_eq!(gandalf.name, "Gandalf");
-        assert_eq!(gandalf.object_type, "character");
-
-        let frodo = graph.get_object(frodo_id).unwrap().unwrap();
-        assert_eq!(frodo.name, "Frodo Baggins");
-
-        // Relationship
-        let rels = graph.get_relationships(gandalf_id).unwrap();
-        assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].to, frodo_id);
-        assert_eq!(rels[0].edge_type, EdgeType::from_str("knows"));
-
-        // Neighbours
-        let neighbours = graph.get_neighbors(gandalf_id).unwrap();
-        assert_eq!(neighbours.len(), 1);
-        assert_eq!(neighbours[0], frodo_id);
-
-        // Text chunk
-        let chunk_ids = graph
-            .add_text_chunk(
-                gandalf_id,
-                "Gandalf appeared at Bilbo's birthday party.".to_string(),
-                ChunkType::UserNote,
-            )
-            .unwrap();
-        assert_eq!(chunk_ids.len(), 1);
-        let chunk_id = chunk_ids[0];
-        let chunks = graph.get_text_chunks(gandalf_id).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].id, chunk_id);
-
-        // Subgraph
-        let sg = graph.query_subgraph(gandalf_id, 1).unwrap();
-        assert_eq!(sg.objects.len(), 2);
-        assert_eq!(sg.edges.len(), 1);
-        assert_eq!(sg.chunks.len(), 1);
-
-        // Stats
-        let stats = graph.get_stats().unwrap();
-        assert_eq!(stats.node_count, 2);
-        assert_eq!(stats.edge_count, 1);
-        assert_eq!(stats.chunk_count, 1);
-        assert!(stats.total_tokens > 0);
-    }
-
-    #[test]
-    fn test_find_by_name() {
-        let (graph, _tmp) = create_test_graph();
-        ObjectBuilder::character("Gandalf".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-
-        let found = graph.find_by_name("character", "Gandalf").unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].name, "Gandalf");
-
-        // find_by_name_only (type-agnostic)
-        let found_any = graph.find_by_name_only("Gandalf").unwrap();
-        assert_eq!(found_any.len(), 1);
-    }
-
-    #[test]
-    fn test_weighted_relationships() {
-        let (graph, _tmp) = create_test_graph();
-
-        let sauron_id = ObjectBuilder::character("Sauron".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-        let frodo_id = ObjectBuilder::character("Frodo".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-
-        graph
-            .connect_objects_weighted_str(sauron_id, frodo_id, "enemy_of", 0.9)
-            .unwrap();
-
-        let rels = graph.get_relationships(sauron_id).unwrap();
-        assert_eq!(rels.len(), 1);
-        assert!((rels[0].weight - 0.9).abs() < 1e-6);
-        assert_eq!(rels[0].edge_type, EdgeType::from_str("enemy_of"));
-    }
-
-    #[test]
-    fn test_complex_world_scenario() {
-        let (graph, _tmp) = create_test_graph();
-
-        let shire_id = ObjectBuilder::location("The Shire".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-        let bag_end_id = ObjectBuilder::location("Bag End".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-        let frodo_id = ObjectBuilder::character("Frodo Baggins".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-        let ring_id = ObjectBuilder::item("The One Ring".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-        let fellowship_id = ObjectBuilder::faction("Fellowship of the Ring".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-
-        graph
-            .connect_objects_str(bag_end_id, shire_id, "located_in")
-            .unwrap();
-        graph
-            .connect_objects_str(frodo_id, bag_end_id, "located_in")
-            .unwrap();
-        graph
-            .connect_objects_str(frodo_id, ring_id, "owned_by")
-            .unwrap();
-        graph
-            .connect_objects_str(frodo_id, fellowship_id, "member_of")
-            .unwrap();
-
-        let frodo_world = graph.query_subgraph(frodo_id, 2).unwrap();
-        assert_eq!(frodo_world.objects.len(), 5);
-        assert!(frodo_world.edges.len() >= 4);
-
-        let stats = graph.get_stats().unwrap();
-        assert_eq!(stats.node_count, 5);
-        assert_eq!(stats.edge_count, 4);
-    }
-
-    #[test]
-    fn test_fts_search() {
-        let (graph, _tmp) = create_test_graph();
-
-        let obj_id = ObjectBuilder::character("Saruman".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-
-        graph
-            .add_text_chunk(
-                obj_id,
-                "Saruman the White was the head of the Istari order.".to_string(),
-                ChunkType::Description,
-            )
-            .unwrap();
-        // add_text_chunk returns Vec<ChunkId>; short content → single chunk.
-
-        // FTS5 exact-word search
-        let results = graph.search_chunks_fts("Istari", 5).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, obj_id);
-        assert!(results[0].2.contains("Istari"));
-
-        // No match
-        let empty = graph.search_chunks_fts("dragon", 5).unwrap();
-        assert!(empty.is_empty());
-    }
-
-    // ── split_text ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_split_text_short_content_is_not_split() {
-        // Content well under MAX_CHUNK_TOKENS (500 tokens = 2000 chars).
-        let pieces = split_text("A short description.");
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0], "A short description.");
-    }
-
-    #[test]
-    fn test_split_text_empty_and_whitespace_produce_no_pieces() {
-        assert!(split_text("").is_empty());
-        assert!(split_text("   \n\t  ").is_empty());
-    }
-
-    #[test]
-    fn test_split_text_exact_boundary_is_not_split() {
-        // A string of exactly MAX_CHUNK_TOKENS * 4 chars must NOT be split.
-        let max_chars = MAX_CHUNK_TOKENS * 4;
-        let content = "a".repeat(max_chars);
-        let pieces = split_text(&content);
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].len(), max_chars);
-    }
-
-    #[test]
-    fn test_split_text_long_content_splits_on_word_boundary() {
-        // Build a string of 10 words each 399 chars + 1 space = 4000 chars total
-        // (≈ 1000 tokens).  With a 2000-char window the split should fall at the
-        // space between words 5 and 6, keeping pieces well under the limit.
-        let word = "x".repeat(399);
-        let content = (0..10).map(|_| word.as_str()).collect::<Vec<_>>().join(" ");
-        assert!(
-            content.len() > 2000,
-            "pre-condition: content must exceed limit"
-        );
-
-        let pieces = split_text(&content);
-        assert!(pieces.len() >= 2, "long content must be split");
-        for piece in &pieces {
-            // Each piece must be within the 2000-char budget.
-            assert!(
-                piece.len() <= 2000,
-                "piece too long ({} chars): {:?}",
-                piece.len(),
-                &piece[..piece.len().min(40)]
-            );
-            // No piece should be empty.
-            assert!(!piece.is_empty());
-        }
-        // Reassembling (with a space) must cover all original words.
-        let rejoined = pieces.join(" ");
-        let original_words: Vec<_> = content.split_whitespace().collect();
-        let rejoined_words: Vec<_> = rejoined.split_whitespace().collect();
-        assert_eq!(original_words, rejoined_words);
-    }
-
-    #[test]
-    fn test_split_text_hard_cut_when_no_whitespace() {
-        // A single 4000-char token-free string (no spaces): must be hard-cut
-        // at max_chars since there is no whitespace boundary to use.
-        let content = "z".repeat(4000);
-        let pieces = split_text(&content);
-        assert!(
-            pieces.len() >= 2,
-            "must hard-cut oversized no-whitespace content"
-        );
-        for piece in &pieces {
-            assert!(piece.len() <= 2000);
-            assert!(!piece.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_split_text_leading_trailing_whitespace_is_trimmed() {
-        let pieces = split_text("  hello world  ");
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0], "hello world");
-    }
-
-    #[test]
-    fn test_add_text_chunk_long_content_stored_as_multiple_chunks() {
-        let (graph, _tmp) = create_test_graph();
-        let obj_id = ObjectBuilder::character("Verbose".to_string())
-            .add_to_graph(&graph)
-            .unwrap();
-
-        // 5000-char content: ~1250 tokens → must split into at least 3 chunks
-        // (ceiling of 1250 / 500 = 3).
-        let long_content = "word ".repeat(1000); // 5000 chars
-        let chunk_ids = graph
-            .add_text_chunk(obj_id, long_content.clone(), ChunkType::Description)
-            .unwrap();
-
-        assert!(
-            chunk_ids.len() >= 3,
-            "expected ≥3 chunks for 5000-char content, got {}",
-            chunk_ids.len()
-        );
-
-        // All chunks must be retrievable and within the token budget.
-        let stored = graph.get_text_chunks(obj_id).unwrap();
-        assert_eq!(stored.len(), chunk_ids.len());
-        for chunk in &stored {
-            assert!(
-                chunk.token_count <= MAX_CHUNK_TOKENS,
-                "chunk exceeds MAX_CHUNK_TOKENS: {} tokens",
-                chunk.token_count
-            );
-        }
-
-        // The concatenated content must cover all original words (modulo
-        // trimming at boundaries).
-        let original_words: Vec<_> = long_content.split_whitespace().collect();
-        let stored_words: Vec<_> = stored
-            .iter()
-            .flat_map(|c| c.content.split_whitespace())
-            .collect();
-        assert_eq!(
-            original_words, stored_words,
-            "stored chunks must cover all original words in order"
-        );
-    }
-
-    // ── Schema integration ────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_schema_integration() {
-        let (graph, _tmp) = create_test_graph_async().await;
-
-        let spell_schema =
-            ObjectTypeSchema::new("spell".to_string(), "A magical spell".to_string())
-                .with_property("level".to_string(), PropertySchema::number("Spell level"))
-                .with_property(
-                    "school".to_string(),
-                    PropertySchema::string("School of magic"),
-                )
-                .with_required_property("level".to_string());
-
-        graph
-            .register_object_type("spell", spell_schema)
-            .await
-            .unwrap();
-
-        let spell = ObjectBuilder::custom("spell".to_string(), "Fireball".to_string())
-            .with_json_property(
-                "level".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(3)),
-            )
-            .with_json_property(
-                "school".to_string(),
-                serde_json::Value::String("Evocation".to_string()),
-            )
-            .build();
-
-        let validation = graph.validate_object(&spell).await.unwrap();
-        assert!(
-            validation.valid,
-            "Expected valid spell: {:?}",
-            validation.errors
-        );
-
-        let spell_id = graph.add_object_validated(spell).await.unwrap();
-        let retrieved = graph.get_object(spell_id).unwrap().unwrap();
-        assert_eq!(retrieved.name, "Fireball");
-        assert_eq!(retrieved.object_type, "spell");
-
-        let stats = graph.get_schema_stats("default").await.unwrap();
-        assert!(stats.object_type_count >= 7); // 6 built-in + "spell"
-    }
-
-    #[tokio::test]
-    async fn test_validation_failure() {
-        let (graph, _tmp) = create_test_graph_async().await;
-
-        let bad = ObjectMetadata::new("unknown_type_xyz".to_string(), "Test".to_string());
-        let result = graph.validate_object(&bad).await.unwrap();
-        assert!(!result.valid);
-        assert!(!result.errors.is_empty());
-
-        let insert_result = graph.add_object_validated(bad).await;
-        assert!(insert_result.is_err());
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;
