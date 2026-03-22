@@ -19,10 +19,10 @@ use anyhow::Result;
 use std::env;
 use std::sync::Arc;
 use u_forge_ai::{
-    data_ingestion::DataIngestion,
-    embeddings::LemonadeProvider,
+    ingest::DataIngestion,
+    ai::embeddings::LemonadeProvider,
     hardware::npu::NpuDevice,
-    inference_queue::{InferenceQueue, InferenceQueueBuilder},
+    queue::{InferenceQueue, InferenceQueueBuilder},
     lemonade::{
         resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
     },

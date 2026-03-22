@@ -107,19 +107,16 @@ u-forge.ai/
 ├── src/
 │   ├── lib.rs              # KnowledgeGraph facade + ObjectBuilder
 │   ├── types.rs            # Domain types
-│   ├── storage.rs          # SQLite persistence + FTS5
-│   ├── embeddings.rs       # EmbeddingProvider trait + LemonadeProvider
-│   ├── transcription.rs    # TranscriptionProvider trait + LemonadeTranscriptionProvider
+│   ├── graph/              # SQLite persistence + FTS5 + ANN (6 files)
+│   ├── ai/                 # EmbeddingProvider + TranscriptionProvider traits + providers
 │   ├── hardware/           # DeviceCapability, NpuDevice, GpuDevice, CpuDevice
-│   ├── inference_queue.rs  # Unified MPMC inference dispatch (embed/transcribe/TTS/LLM/rerank)
-│   ├── lemonade.rs         # LemonadeModelRegistry, GpuResourceManager, LemonadeRerankProvider,
+│   ├── queue/              # Unified MPMC inference dispatch (embed/transcribe/TTS/LLM/rerank)
+│   ├── lemonade/           # LemonadeModelRegistry, GpuResourceManager, LemonadeRerankProvider,
 │   │                       #   LemonadeChatProvider, LemonadeTtsProvider, LemonadeSttProvider,
 │   │                       #   LemonadeStack, SystemInfo, LemonadeCapabilities
-│   ├── embedding_queue.rs  # Legacy embedding-only background queue
-│   ├── schema.rs           # Schema definition types
-│   ├── schema_manager.rs   # Schema load / validate / cache
-│   ├── schema_ingestion.rs # JSON schema files → internal representation
-│   └── data_ingestion.rs   # JSONL two-pass import pipeline
+│   ├── schema/             # Schema definition types, load/validate/cache, JSON ingestion
+│   ├── ingest/             # JSONL two-pass import pipeline
+│   └── search/             # Hybrid FTS5 + ANN + rerank search pipeline
 ├── examples/
 │   └── cli_demo.rs         # Demo + integration test: hardware caps, FTS5, reranking
 ├── defaults/

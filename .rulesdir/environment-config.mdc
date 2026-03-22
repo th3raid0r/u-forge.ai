@@ -99,7 +99,7 @@ model is `whisper-v3-turbo-FLM`. Errors surface only when `transcribe()` is call
 | `/api/v1/health` | GET | *(manual verification only)* | — |
 
 > **Note on the two transcription providers:** `LemonadeTranscriptionProvider` in
-> `embeddings.rs` is a simple standalone provider with no GPU resource management —
+> `ai/embeddings.rs` is a simple standalone provider with no GPU resource management —
 > suitable for one-off use and testing. `LemonadeSttProvider` in `lemonade.rs`
 > integrates with `GpuResourceManager` to prevent contention when LLM inference is
 > running concurrently on the same GPU. Use `LemonadeSttProvider` (via

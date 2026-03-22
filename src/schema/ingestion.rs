@@ -1,4 +1,4 @@
-use crate::schema::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, EdgeTypeSchema, ValidationRule, RelationshipDefinition, Cardinality};
+use super::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, EdgeTypeSchema, ValidationRule, RelationshipDefinition, Cardinality};
 use anyhow::{Context, Result};
 use serde_json::{Value, Map};
 use std::fs;
@@ -27,7 +27,7 @@ impl SchemaIngestion {
 
         if !std::path::Path::new(&schema_dir).exists() {
             return Err(anyhow::anyhow!(
-                "Schema directory not found: {}. Set UFORGE_SCHEMA_DIR environment variable or place schemas at ./defaults/schemas", 
+                "Schema directory not found: {}. Set UFORGE_SCHEMA_DIR environment variable or place schemas at ./defaults/schemas",
                 schema_dir
             ));
         }
@@ -132,7 +132,7 @@ impl SchemaIngestion {
                 .ok_or_else(|| anyhow::anyhow!("Property '{}' must be an object", prop_name))?;
 
             let property_schema = Self::convert_json_property_to_schema(prop_name.clone(), prop_obj)?;
-            
+
             // Check if this property is required
             if prop_obj.get("required").and_then(|v| v.as_bool()).unwrap_or(false) {
                 object_schema = object_schema.with_required_property(prop_name.clone());
@@ -204,7 +204,7 @@ impl SchemaIngestion {
                     .filter_map(|v| v.as_str())
                     .map(|s| s.to_string())
                     .collect();
-                
+
                 if !enum_strings.is_empty() {
                     // Update property type to enum
                     property_schema.property_type = PropertyType::Enum(enum_strings.clone());
@@ -231,7 +231,7 @@ impl SchemaIngestion {
                     .and_then(|v| v.as_str())
                     .unwrap_or("related_to")
                     .to_string();
-                
+
                 let rel_description = relationship_obj.get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Related entity")
@@ -378,7 +378,7 @@ mod tests {
 
         assert_eq!(schema.name, "test_schema");
         assert!(schema.object_types.contains_key("test_object"));
-        
+
         let object_type = &schema.object_types["test_object"];
         assert_eq!(object_type.name, "test_object");
         assert!(object_type.properties.contains_key("name"));
@@ -412,7 +412,7 @@ mod tests {
 
         let quest_type = &schema.object_types["quest"];
         let status_prop = &quest_type.properties["status"];
-        
+
         match &status_prop.property_type {
             PropertyType::Enum(values) => {
                 assert_eq!(values.len(), 3);
@@ -452,7 +452,7 @@ mod tests {
 
         let character_type = &schema.object_types["character"];
         let location_prop = &character_type.properties["location"];
-        
+
         assert!(location_prop.relationship.is_some());
         let relationship = location_prop.relationship.as_ref().unwrap();
         assert_eq!(relationship.edge_type, "located_in");
@@ -486,7 +486,7 @@ mod tests {
 
         let inventory_type = &schema.object_types["inventory"];
         let items_prop = &inventory_type.properties["items"];
-        
+
         match &items_prop.property_type {
             PropertyType::Array(element_type) => {
                 match element_type.as_ref() {
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn test_schema_validation() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         // Valid schema
         let valid_content = r#"{
             "name": "add_test",

@@ -1,6 +1,6 @@
-use crate::schema::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, ValidationResult, ValidationError, ValidationErrorType, ValidationWarning, EdgeTypeSchema};
+use super::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, ValidationResult, ValidationError, ValidationErrorType, ValidationWarning, EdgeTypeSchema, ValidationRule};
 use crate::types::{ObjectMetadata, Edge};
-use crate::storage::KnowledgeGraphStorage;
+use crate::graph::KnowledgeGraphStorage;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,7 +49,7 @@ impl SchemaManager {
                         format!("Auto-generated schema for {}", name),
                     )
                 };
-                
+
                 self.save_schema(&default_schema).await?;
                 let schema_arc = Arc::new(default_schema);
                 self.schema_cache.write().insert(name.to_string(), schema_arc.clone());
@@ -61,10 +61,10 @@ impl SchemaManager {
     /// Save a schema to storage and update cache
     pub async fn save_schema(&self, schema: &SchemaDefinition) -> Result<()> {
         self.storage.save_schema(schema)?;
-        
+
         // Update cache
         self.schema_cache.write().insert(schema.name.clone(), Arc::new(schema.clone()));
-        
+
         Ok(())
     }
 
@@ -98,7 +98,7 @@ impl SchemaManager {
                 // Name is always available in ObjectMetadata
                 continue;
             }
-            
+
             if !object.properties.as_object()
                 .unwrap_or(&serde_json::Map::new())
                 .contains_key(required_prop) {
@@ -141,7 +141,7 @@ impl SchemaManager {
         let mut result = ValidationResult::valid();
 
         let edge_type_str = edge.edge_type.as_str();
-        
+
         // Check if edge type exists in schema
         let edge_schema = match schema.edge_types.get(edge_type_str) {
             Some(schema) => schema,
@@ -155,7 +155,7 @@ impl SchemaManager {
         };
 
         // Validate source type constraints
-        if !edge_schema.allowed_source_types.is_empty() && 
+        if !edge_schema.allowed_source_types.is_empty() &&
            !edge_schema.allowed_source_types.contains(&source_object.object_type) {
             result.add_error(ValidationError {
                 property: "source_type".to_string(),
@@ -168,7 +168,7 @@ impl SchemaManager {
         }
 
         // Validate target type constraints
-        if !edge_schema.allowed_target_types.is_empty() && 
+        if !edge_schema.allowed_target_types.is_empty() &&
            !edge_schema.allowed_target_types.contains(&target_object.object_type) {
             result.add_error(ValidationError {
                 property: "target_type".to_string(),
@@ -199,10 +199,10 @@ impl SchemaManager {
         let mut schema = (*self.load_schema(schema_name).await?).clone();
         schema.add_object_type(type_name.to_string(), type_schema);
         self.save_schema(&schema).await?;
-        
+
         // Invalidate cache to force reload
         self.schema_cache.write().remove(schema_name);
-        
+
         Ok(())
     }
 
@@ -211,10 +211,10 @@ impl SchemaManager {
         let mut schema = (*self.load_schema(schema_name).await?).clone();
         schema.add_edge_type(edge_name.to_string(), edge_schema);
         self.save_schema(&schema).await?;
-        
+
         // Invalidate cache to force reload
         self.schema_cache.write().remove(schema_name);
-        
+
         Ok(())
     }
 
@@ -238,7 +238,7 @@ impl SchemaManager {
     /// Get schema statistics
     pub async fn get_schema_stats(&self, schema_name: &str) -> Result<SchemaStats> {
         let schema = self.load_schema(schema_name).await?;
-        
+
         Ok(SchemaStats {
             name: schema.name.clone(),
             version: schema.version.clone(),
@@ -311,7 +311,7 @@ impl SchemaManager {
     }
 
     /// Apply validation rules to a property value
-    fn apply_validation_rules(&self, property_name: &str, value: &Value, validation: &crate::schema::ValidationRule) -> Result<(), ValidationError> {
+    fn apply_validation_rules(&self, property_name: &str, value: &Value, validation: &ValidationRule) -> Result<(), ValidationError> {
         // String length validation
         if let Value::String(s) = value {
             if let Some(min_len) = validation.min_length {
@@ -527,7 +527,7 @@ mod tests {
 
         // Test string length validation
         let prop_schema = PropertySchema::string("Test property")
-            .with_validation(crate::schema::ValidationRule::new().with_length_range(Some(5), Some(10)));
+            .with_validation(ValidationRule::new().with_length_range(Some(5), Some(10)));
 
         let valid_value = serde_json::Value::String("hello".to_string());
         let result = manager.validate_property_value("test", &valid_value, &prop_schema);
@@ -543,7 +543,7 @@ mod tests {
         let (manager, _temp) = create_test_schema_manager();
 
         let enum_schema = PropertySchema::new(
-            crate::schema::PropertyType::Enum(vec!["red".to_string(), "green".to_string(), "blue".to_string()]),
+            PropertyType::Enum(vec!["red".to_string(), "green".to_string(), "blue".to_string()]),
             "Color choice".to_string()
         );
 

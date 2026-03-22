@@ -96,7 +96,7 @@ impl EmbeddingProvider for MyProvider {
 
 ## TranscriptionProvider
 
-A second provider trait lives alongside `EmbeddingProvider` in `src/embeddings.rs`.
+A second provider trait lives alongside `EmbeddingProvider` in `src/ai/embeddings.rs`.
 It follows the same trait + manager pattern but targets audio-to-text.
 
 ```rust

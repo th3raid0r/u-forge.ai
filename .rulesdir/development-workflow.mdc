@@ -49,7 +49,7 @@ Before making changes, read:
 - [migration.md](mdc:migration.md) — Phased plan and completion status
 
 ### Current state (all complete):
-- SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware abstraction (`src/hardware/`), unified inference queue (`src/inference_queue.rs`), `LemonadeRerankProvider` + `InferenceQueue::rerank()` wired, `cli_demo` demonstrates FTS5 → rerank pipeline.
+- SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware abstraction (`src/hardware/`), unified inference queue (`src/queue/`), `LemonadeRerankProvider` + `InferenceQueue::rerank()` wired, `cli_demo` demonstrates FTS5 → rerank pipeline.
 
 ### Remaining work:
 - **sqlite-vec** — ANN vector search (highest priority storage item)
@@ -63,7 +63,7 @@ Before making changes, read:
 
 ### Adding a new TranscriptionProvider
 
-1. Implement the `TranscriptionProvider` trait in `src/embeddings.rs`:
+1. Implement the `TranscriptionProvider` trait in `src/ai/transcription.rs`:
 
 ```rust
 pub struct MyTranscriptionProvider { /* base_url, model, client */ }
@@ -82,7 +82,7 @@ impl TranscriptionProvider for MyTranscriptionProvider {
 2. Add a factory method to `TranscriptionManager` (or expose construction directly).
 
 3. Gate live-server tests on `LEMONADE_URL` — see the existing
-   `test_lemonade_transcribe_*` tests in `embeddings.rs` for the pattern.
+   `test_lemonade_transcribe_*` tests in `ai/transcription.rs` for the pattern.
 
 4. **Do NOT add GPU resource management here** unless you are extending
    `src/lemonade.rs`. The `TranscriptionProvider` trait is intentionally simple
@@ -92,7 +92,7 @@ impl TranscriptionProvider for MyTranscriptionProvider {
 
 ### Adding a new EmbeddingProvider
 
-1. Implement the `EmbeddingProvider` trait in `src/embeddings.rs`:
+1. Implement the `EmbeddingProvider` trait in `src/ai/transcription.rs`:
 
 ```rust
 pub struct MyProvider { /* ... */ }
@@ -113,7 +113,7 @@ impl EmbeddingProvider for MyProvider {
 3. Update `try_new_auto` if this provider should be auto-selected.
 
 4. Add tests — gate live-server tests using `crate::test_helpers::lemonade_url`
-   (see `embeddings.rs` pattern: `let Some(url) = lemonade_url().await else { return; }`).
+   (see `ai/embeddings.rs` pattern: `let Some(url) = lemonade_url().await else { return; }`).
    The helper probes `localhost:8000` first, then falls back to `LEMONADE_URL`.
 
 5. **Do NOT add `Mutex<T>` around synchronous work in async embedding paths** (BUG-5

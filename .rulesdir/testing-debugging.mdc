@@ -145,13 +145,13 @@ pattern when you need real audio bytes in a test.
 > `resolve_lemonade_url()` is not called by `TranscriptionManager`.
 
 Transcription integration tests follow the same `lemonade_url().await` skip pattern
-as embedding tests. See `src/embeddings.rs` for working examples.
+as embedding tests. See `src/ai/embeddings.rs` for working examples.
 
 ---
 
 ## Storage Tests
 
-`KnowledgeGraphStorage` (SQLite) is tested directly in `src/storage.rs`. Key
+`KnowledgeGraphStorage` (SQLite) is tested directly in `src/graph/storage.rs`. Key
 behaviours to cover:
 
 - `upsert_node` — updating must not wipe edges/chunks (`ON CONFLICT DO UPDATE`)
@@ -164,8 +164,8 @@ behaviours to cover:
 ## Known Bug Regression Tests
 
 All nine original bugs (BUG-1 through BUG-9) are resolved. Regression tests live
-in their respective modules — see `src/data_ingestion.rs` for BUG-6/BUG-7 tests,
-`src/storage.rs` for BUG-3/BUG-4/BUG-8, and `src/embeddings.rs` for BUG-5. Do
+in their respective modules — see `src/ingest/data.rs` for BUG-6/BUG-7 tests,
+`src/graph/storage.rs` for BUG-3/BUG-4/BUG-8, and `src/ai/embeddings.rs` for BUG-5. Do
 not re-introduce any of these patterns.
 
 ---

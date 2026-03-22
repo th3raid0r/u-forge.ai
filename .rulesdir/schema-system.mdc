@@ -9,9 +9,9 @@ The schema system is one of u-forge.ai's strengths and is **retained through all
 ## Architecture
 
 Three files implement the schema system:
-- [src/schema.rs](mdc:src/schema.rs) — Type definitions (`SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema`, validation types)
-- [src/schema_manager.rs](mdc:src/schema_manager.rs) — Runtime load/validate/cache via `DashMap`, persists to storage
-- [src/schema_ingestion.rs](mdc:src/schema_ingestion.rs) — Reads `.schema.json` files from disk, strips `add_` prefix, adds 24 common TTRPG edge types
+- [src/schema/definition.rs](mdc:src/schema/definition.rs) — Type definitions (`SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema`, validation types)
+- [src/schema/manager.rs](mdc:src/schema/manager.rs) — Runtime load/validate/cache via `DashMap`, persists to storage
+- [src/schema/ingestion.rs](mdc:src/schema/ingestion.rs) — Reads `.schema.json` files from disk, strips `add_` prefix, adds 24 common TTRPG edge types
 
 ## Schema File Format
 

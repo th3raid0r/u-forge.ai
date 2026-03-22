@@ -1,178 +1,14 @@
-//! inference_queue.rs — Unified capability-based inference queue.
-//!
-//! The [`InferenceQueue`] accepts embedding, transcription, and TTS jobs from
-//! any number of callers and dispatches each job to whichever registered device
-//! worker is both **capable** of handling it and **free** to accept new work.
-//!
-//! # Design
-//!
-//! Each capability type (Embedding, Transcription, TextToSpeech) has its own
-//! shared work queue — a `Mutex<VecDeque<_>>` guarded by a `Notify` semaphore.
-//! When the queue is built, one Tokio background task is spawned per
-//! (device, capability) pair.  Multiple tasks listening on the same queue
-//! implement work-stealing: whichever worker finishes first picks up the next
-//! job.
-//!
-//! ```text
-//!   caller                InferenceQueue           device workers (Tokio tasks)
-//!   ──────                ──────────────           ────────────────────────────
-//!
-//!   embed(text)  ───────► embed_queue  ──────────► NpuDevice  (embed-gemma-300m-FLM)
-//!                                      ──────────► llamacpp   (nomic-embed-text-v2-moe-GGUF)
-//!                                      ──────────► llamacpp   (nomic-embed-text-v1-GGUF)
-//!
-//!   transcribe() ───────► transcribe_queue ──────► NpuDevice  (whisper-v3-turbo-FLM)
-//!                                         ──────► GpuDevice  (Whisper-Large-v3-Turbo)
-//!
-//!   synthesize() ───────► synthesize_queue ──────► CpuDevice  (kokoro-v1)
-//! ```
-//!
-//! The race is natural: both transcription workers receive a `notify_one()` when
-//! a job is pushed, but only one can pop the job from the `VecDeque`.  The other
-//! sees an empty queue and goes back to sleep.  If both workers are busy, the job
-//! waits in the deque until one finishes.
-//!
-//! # Race-free wakeup
-//!
-//! The worker loop registers a [`Notified`](tokio::sync::futures::Notified) future
-//! **before** checking the queue.  This prevents the classic lost-wakeup race:
-//!
-//! ```text
-//! loop {
-//!     let notified = queue.notify.notified();   // register first
-//!     if let Some(job) = queue.try_pop() {       // then check
-//!         drop(notified);
-//!         process(job).await;
-//!     } else {
-//!         notified.await;                        // sleep if nothing found
-//!     }
-//! }
-//! ```
-//!
-//! If a job is pushed between `notified()` and `try_pop()`, the deque will be
-//! non-empty and the worker processes it immediately.  If the push happens after
-//! `try_pop()` returns `None` but before `.await`, the stored `Notify` permit
-//! ensures the worker wakes on the next poll.
-//!
-//! # Usage
-//!
-//! ```no_run
-//! # use u_forge_ai::inference_queue::InferenceQueueBuilder;
-//! # use u_forge_ai::hardware::npu::NpuDevice;
-//! # use u_forge_ai::hardware::gpu::GpuDevice;
-//! # use u_forge_ai::hardware::cpu::CpuDevice;
-//! # async fn run() -> anyhow::Result<()> {
-//! # let npu_device: NpuDevice = todo!();
-//! # let gpu_device: GpuDevice = todo!();
-//! # let cpu_device: CpuDevice = todo!();
-//! # let wav_bytes: Vec<u8> = Vec::new();
-//! let queue = InferenceQueueBuilder::new()
-//!     .with_npu_device(npu_device)
-//!     .with_gpu_device(gpu_device)
-//!     .with_cpu_device(cpu_device)
-//!     .build();
-//!
-//! // Embeddings go to the NPU
-//! let vec = queue.embed("The kingdom fell at dawn.").await?;
-//!
-//! // Transcription goes to whichever of NPU / GPU is free first
-//! let text = queue.transcribe(wav_bytes, "session.wav").await?;
-//!
-//! // TTS goes to the CPU
-//! let audio = queue.synthesize("Welcome, adventurer!", None).await?;
-//! # Ok(()) }
-//! ```
+//! [`InferenceQueue`] struct, its public API, and its [`QueueStats`] snapshot type.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use parking_lot::Mutex;
-use tokio::sync::{oneshot, Notify};
-use tracing::{debug, instrument, warn};
+use tokio::sync::oneshot;
+use tracing::instrument;
 
-use crate::embeddings::EmbeddingProvider;
-use crate::hardware::cpu::CpuDevice;
-use crate::hardware::gpu::GpuDevice;
-use crate::hardware::npu::NpuDevice;
-use crate::lemonade::{
-    ChatCompletionResponse, ChatRequest, KokoroVoice, LemonadeChatProvider, LemonadeRerankProvider,
-    LemonadeSttProvider, LemonadeTtsProvider, RerankDocument,
-};
-use crate::transcription::TranscriptionProvider;
+use crate::lemonade::{ChatCompletionResponse, ChatRequest, KokoroVoice, RerankDocument};
 
-// ── Internal job types ────────────────────────────────────────────────────────
-
-/// A single text embedding job.
-struct EmbedJob {
-    text: String,
-    response: oneshot::Sender<Result<Vec<f32>>>,
-}
-
-/// A single audio transcription job.
-struct TranscribeJob {
-    audio_bytes: Vec<u8>,
-    filename: String,
-    response: oneshot::Sender<Result<String>>,
-}
-
-/// A single text-to-speech synthesis job.
-struct SynthesizeJob {
-    text: String,
-    /// Explicit voice override; `None` uses the provider's default voice.
-    voice: Option<KokoroVoice>,
-    response: oneshot::Sender<Result<Vec<u8>>>,
-}
-
-/// A single LLM chat-completion job.
-struct GenerateJob {
-    request: ChatRequest,
-    response: oneshot::Sender<Result<ChatCompletionResponse>>,
-}
-
-/// A single document reranking job.
-struct RerankJob {
-    query: String,
-    documents: Vec<String>,
-    top_n: Option<usize>,
-    response: oneshot::Sender<Result<Vec<RerankDocument>>>,
-}
-
-// ── MPMC work-queue primitive ─────────────────────────────────────────────────
-
-/// A thread-safe multi-producer / multi-consumer work queue.
-///
-/// Built from a `parking_lot::Mutex<VecDeque<T>>` plus a `tokio::sync::Notify`
-/// to wake sleeping workers when new jobs arrive.  No additional crates needed.
-struct WorkQueue<T> {
-    queue: Mutex<VecDeque<T>>,
-    notify: Notify,
-}
-
-impl<T> WorkQueue<T> {
-    fn new() -> Self {
-        Self {
-            queue: Mutex::new(VecDeque::new()),
-            notify: Notify::new(),
-        }
-    }
-
-    /// Push a job and wake **one** waiting worker.
-    fn push(&self, job: T) {
-        self.queue.lock().push_back(job);
-        self.notify.notify_one();
-    }
-
-    /// Try to pop the next job without blocking.
-    fn try_pop(&self) -> Option<T> {
-        self.queue.lock().pop_front()
-    }
-
-    /// Current number of pending jobs (for monitoring / metrics).
-    fn pending(&self) -> usize {
-        self.queue.lock().len()
-    }
-}
+use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
 
 // ── Public queue state exposed via QueueStats ─────────────────────────────────
 
@@ -196,33 +32,33 @@ pub struct QueueStats {
 /// Shared, capability-based work queue for all AI inference tasks.
 ///
 /// Construct via [`InferenceQueueBuilder`] — register your device workers there
-/// and call [`build`](InferenceQueueBuilder::build) to spawn the background
-/// Tokio tasks and obtain a queue handle.
+/// and call [`build`](super::builder::InferenceQueueBuilder::build) to spawn the
+/// background Tokio tasks and obtain a queue handle.
 ///
 /// The handle is `Clone` and cheap to clone (`Arc` internals) — hand copies to
 /// as many callers as needed.
 #[derive(Clone)]
 pub struct InferenceQueue {
-    embed_queue: Arc<WorkQueue<EmbedJob>>,
-    transcribe_queue: Arc<WorkQueue<TranscribeJob>>,
-    synthesize_queue: Arc<WorkQueue<SynthesizeJob>>,
-    generate_queue: Arc<WorkQueue<GenerateJob>>,
-    rerank_queue: Arc<WorkQueue<RerankJob>>,
+    pub(super) embed_queue: Arc<WorkQueue<EmbedJob>>,
+    pub(super) transcribe_queue: Arc<WorkQueue<TranscribeJob>>,
+    pub(super) synthesize_queue: Arc<WorkQueue<SynthesizeJob>>,
+    pub(super) generate_queue: Arc<WorkQueue<GenerateJob>>,
+    pub(super) rerank_queue: Arc<WorkQueue<RerankJob>>,
 
     // Capability presence flags — avoids dynamic trait-object dispatch for
     // the fast "no device registered" error path.
-    has_embedding: bool,
-    has_transcription: bool,
-    has_tts: bool,
-    has_text_generation: bool,
-    has_reranking: bool,
+    pub(super) has_embedding: bool,
+    pub(super) has_transcription: bool,
+    pub(super) has_tts: bool,
+    pub(super) has_text_generation: bool,
+    pub(super) has_reranking: bool,
 
     // Worker counts per capability (informational).
-    embedding_workers: usize,
-    transcription_workers: usize,
-    tts_workers: usize,
-    llm_workers: usize,
-    reranking_workers: usize,
+    pub(super) embedding_workers: usize,
+    pub(super) transcription_workers: usize,
+    pub(super) tts_workers: usize,
+    pub(super) llm_workers: usize,
+    pub(super) reranking_workers: usize,
 }
 
 impl InferenceQueue {
@@ -266,7 +102,7 @@ impl InferenceQueue {
     /// available embedding workers simultaneously.
     ///
     /// For small batches this is more efficient than a single
-    /// [`embed_batch`](crate::embeddings::EmbeddingProvider::embed_batch) call
+    /// [`embed_batch`](crate::ai::embeddings::EmbeddingProvider::embed_batch) call
     /// because it can parallelise across multiple NPU contexts.
     pub async fn embed_many(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if !self.has_embedding {
@@ -315,7 +151,7 @@ impl InferenceQueue {
     ///
     /// * `audio_bytes` — Contents of a valid audio file (WAV, MP3, OGG, …).
     /// * `filename`    — Filename hint used to infer the MIME type
-    ///   (e.g. `"session.wav"`).  See [`mime_for_filename`](crate::transcription::mime_for_filename).
+    ///   (e.g. `"session.wav"`).  See [`mime_for_filename`](crate::ai::transcription::mime_for_filename).
     ///
     /// # Errors
     ///
@@ -396,8 +232,6 @@ impl InferenceQueue {
         rx.await
             .map_err(|_| anyhow!("InferenceQueue: TTS worker dropped the response channel"))?
     }
-
-    // ── Monitoring ────────────────────────────────────────────────────────────
 
     /// Submit a chat-completion / LLM generation request and await the result.
     ///
@@ -573,550 +407,25 @@ impl std::fmt::Debug for InferenceQueue {
     }
 }
 
-// ── InferenceQueueBuilder ─────────────────────────────────────────────────────
-
-/// Builder for [`InferenceQueue`].
-///
-/// Register one or more device workers, then call [`build`] to spawn the
-/// background Tokio tasks and get a queue handle.
-///
-/// # Example
-///
-/// ```no_run
-/// # use u_forge_ai::inference_queue::InferenceQueueBuilder;
-/// # async fn run() -> anyhow::Result<()> {
-/// # let npu = todo!();
-/// # let gpu = todo!();
-/// # let cpu = todo!();
-/// let queue = InferenceQueueBuilder::new()
-///     .with_npu_device(npu)
-///     .with_gpu_device(gpu)
-///     .with_cpu_device(cpu)
-///     .build();
-/// # Ok(()) }
-/// ```
-///
-/// [`build`]: InferenceQueueBuilder::build
-pub struct InferenceQueueBuilder {
-    npu_devices: Vec<NpuDevice>,
-    gpu_devices: Vec<GpuDevice>,
-    cpu_devices: Vec<CpuDevice>,
-    rerankers: Vec<LemonadeRerankProvider>,
-    /// Standalone embedding providers registered directly (e.g. llamacpp ROCm/CPU).
-    /// Each entry becomes its own `run_embed_worker` Tokio task competing on the
-    /// shared `embed_queue` — natural work-stealing across all workers.
-    extra_embedding_providers: Vec<(Arc<dyn EmbeddingProvider>, String)>,
-}
-
-impl InferenceQueueBuilder {
-    /// Create an empty builder with no devices registered.
-    pub fn new() -> Self {
-        Self {
-            npu_devices: Vec::new(),
-            gpu_devices: Vec::new(),
-            cpu_devices: Vec::new(),
-            rerankers: Vec::new(),
-            extra_embedding_providers: Vec::new(),
-        }
-    }
-
-    /// Register an NPU device.
-    ///
-    /// The NPU can service both [`Embedding`] and [`Transcription`] jobs
-    /// depending on how the device was constructed.
-    ///
-    /// [`Embedding`]: crate::hardware::DeviceCapability::Embedding
-    /// [`Transcription`]: crate::hardware::DeviceCapability::Transcription
-    pub fn with_npu_device(mut self, device: NpuDevice) -> Self {
-        self.npu_devices.push(device);
-        self
-    }
-
-    /// Register a GPU device.
-    ///
-    /// The GPU can service [`Transcription`] and/or [`TextGeneration`] jobs
-    /// depending on which providers were loaded.
-    ///
-    /// [`Transcription`]: crate::hardware::DeviceCapability::Transcription
-    /// [`TextGeneration`]: crate::hardware::DeviceCapability::TextGeneration
-    pub fn with_gpu_device(mut self, device: GpuDevice) -> Self {
-        self.gpu_devices.push(device);
-        self
-    }
-
-    /// Register a CPU device.
-    ///
-    /// The CPU services [`TextToSpeech`] jobs via Kokoro TTS.
-    ///
-    /// [`TextToSpeech`]: crate::hardware::DeviceCapability::TextToSpeech
-    pub fn with_cpu_device(mut self, device: CpuDevice) -> Self {
-        self.cpu_devices.push(device);
-        self
-    }
-
-    /// Register a standalone embedding provider as an additional worker.
-    ///
-    /// Each call adds one more Tokio task that competes on the shared
-    /// `embed_queue`.  Use this to add llamacpp ROCm or CPU embedding models
-    /// alongside the NPU worker so that bulk embedding jobs are distributed
-    /// across all available devices simultaneously.
-    ///
-    /// `name` is used only for tracing/logging and can be any descriptive string
-    /// (e.g. `"llamacpp(nomic-embed-text-v1-GGUF)/ROCm"`).
-    ///
-    /// The provider's output dimensions **must** match every other embedding
-    /// provider registered on this queue — callers are responsible for probing
-    /// dimensions via [`EmbeddingProvider::dimensions`] before registering.
-    pub fn with_embedding_provider(
-        mut self,
-        provider: Arc<dyn EmbeddingProvider>,
-        name: impl Into<String>,
-    ) -> Self {
-        self.extra_embedding_providers.push((provider, name.into()));
-        self
-    }
-
-    /// Register a reranker provider.
-    ///
-    /// Rerankers service [`Reranking`] jobs via
-    /// `POST /api/v1/reranking` on Lemonade Server.
-    ///
-    /// [`Reranking`]: crate::hardware::DeviceCapability::Reranking
-    pub fn with_reranker(mut self, reranker: LemonadeRerankProvider) -> Self {
-        self.rerankers.push(reranker);
-        self
-    }
-
-    /// Spawn background worker Tokio tasks and return an [`InferenceQueue`]
-    /// handle.
-    ///
-    /// # Panics
-    ///
-    /// Must be called from within a Tokio runtime (required by
-    /// `tokio::spawn`).  Will panic if called outside an async context.
-    pub fn build(self) -> InferenceQueue {
-        let embed_queue = Arc::new(WorkQueue::<EmbedJob>::new());
-        let transcribe_queue = Arc::new(WorkQueue::<TranscribeJob>::new());
-        let synthesize_queue = Arc::new(WorkQueue::<SynthesizeJob>::new());
-        let generate_queue = Arc::new(WorkQueue::<GenerateJob>::new());
-        let rerank_queue = Arc::new(WorkQueue::<RerankJob>::new());
-
-        let mut embedding_workers: usize = 0;
-        let mut transcription_workers: usize = 0;
-        let mut tts_workers: usize = 0;
-        let mut llm_workers: usize = 0;
-        let mut reranking_workers: usize = 0;
-
-        // ── NPU workers ──────────────────────────────────────────────────────
-        for device in self.npu_devices {
-            let device = Arc::new(device) as Arc<NpuDevice>;
-
-            // Embedding worker
-            if device.has_embedding() {
-                let q = Arc::clone(&embed_queue);
-                let provider = Arc::clone(&device.embedding);
-                let name = device.name.clone();
-                embedding_workers += 1;
-                debug!(device = %name, "Spawning NPU embedding worker");
-                tokio::spawn(async move {
-                    run_embed_worker(q, provider, name).await;
-                });
-            }
-
-            // Transcription worker (NPU FLM whisper)
-            if let Some(provider) = device.transcription.clone() {
-                let q = Arc::clone(&transcribe_queue);
-                let name = device.name.clone();
-                transcription_workers += 1;
-                debug!(device = %name, "Spawning NPU transcription worker");
-                tokio::spawn(async move {
-                    run_transcribe_worker(q, provider, name).await;
-                });
-            }
-
-            // LLM worker (NPU FLM chat)
-            if let Some(chat) = device.chat.clone() {
-                let q = Arc::clone(&generate_queue);
-                let name = device.name.clone();
-                llm_workers += 1;
-                debug!(device = %name, model = %chat.model, "Spawning NPU LLM worker");
-                tokio::spawn(async move {
-                    run_llm_worker(q, chat, name).await;
-                });
-            }
-        }
-
-        // ── GPU workers ──────────────────────────────────────────────────────
-        for device in self.gpu_devices {
-            // GPU STT (whispercpp via Vulkan/ROCm) — shares the transcription
-            // queue with the NPU whisper worker; the first free device wins.
-            if let Some(stt) = device.stt {
-                let q = Arc::clone(&transcribe_queue);
-                let name = device.name.clone();
-                transcription_workers += 1;
-                debug!(device = %name, "Spawning GPU STT transcription worker");
-                tokio::spawn(async move {
-                    run_gpu_stt_worker(q, stt, name).await;
-                });
-            }
-
-            // GPU LLM (llamacpp via ROCm/Vulkan) — shares the generate queue
-            // with the NPU LLM worker; the first free device wins.
-            if let Some(chat) = device.chat {
-                let q = Arc::clone(&generate_queue);
-                let name = device.name.clone();
-                llm_workers += 1;
-                debug!(device = %name, model = %chat.model, "Spawning GPU LLM worker");
-                tokio::spawn(async move {
-                    run_llm_worker(q, chat, name).await;
-                });
-            }
-        }
-
-        // ── CPU workers ──────────────────────────────────────────────────────
-        for device in self.cpu_devices {
-            if let Some(tts) = device.tts {
-                let q = Arc::clone(&synthesize_queue);
-                let name = device.name.clone();
-                tts_workers += 1;
-                debug!(device = %name, "Spawning CPU TTS worker");
-                tokio::spawn(async move {
-                    run_tts_worker(q, tts, name).await;
-                });
-            }
-        }
-
-        // ── Extra standalone embedding workers ───────────────────────────────
-        for (provider, name) in self.extra_embedding_providers {
-            let q = Arc::clone(&embed_queue);
-            embedding_workers += 1;
-            debug!(device = %name, "Spawning standalone embedding worker");
-            tokio::spawn(async move {
-                run_embed_worker(q, provider, name).await;
-            });
-        }
-
-        // ── Reranker workers ─────────────────────────────────────────────────
-        for reranker in self.rerankers {
-            let q = Arc::clone(&rerank_queue);
-            let name = format!("Reranker({})", reranker.model);
-            reranking_workers += 1;
-            debug!(model = %reranker.model, "Spawning reranker worker");
-            tokio::spawn(async move {
-                run_rerank_worker(q, reranker, name).await;
-            });
-        }
-
-        let has_embedding = embedding_workers > 0;
-        let has_transcription = transcription_workers > 0;
-        let has_tts = tts_workers > 0;
-        let has_text_generation = llm_workers > 0;
-        let has_reranking = reranking_workers > 0;
-
-        if !has_embedding {
-            warn!("InferenceQueue built with no embedding-capable devices");
-        }
-        if !has_transcription {
-            warn!("InferenceQueue built with no transcription-capable devices");
-        }
-        if !has_tts {
-            warn!("InferenceQueue built with no TTS-capable devices");
-        }
-        if !has_text_generation {
-            warn!("InferenceQueue built with no LLM-capable devices");
-        }
-
-        InferenceQueue {
-            embed_queue,
-            transcribe_queue,
-            synthesize_queue,
-            generate_queue,
-            rerank_queue,
-            has_embedding,
-            has_transcription,
-            has_tts,
-            has_text_generation,
-            has_reranking,
-            embedding_workers,
-            transcription_workers,
-            tts_workers,
-            llm_workers,
-            reranking_workers,
-        }
-    }
-}
-
-impl Default for InferenceQueueBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── Tests for with_embedding_provider ────────────────────────────────────────
-// (covered by the existing test_embed_* tests via build_mock_queue, which uses
-// with_npu_device; the extra_embedding_providers path is exercised by the
-// integration path in cli_demo and by the builder field defaulting to empty.)
-
-// ── LLM worker ────────────────────────────────────────────────────────────────
-
-/// LLM generation worker — services both GPU llamacpp and NPU FLM chat providers.
-///
-/// When `provider.gpu` is `Some`, the [`GpuResourceManager`] inside the provider
-/// handles GPU locking automatically inside `complete()`.  When `None` (NPU), the
-/// call goes directly to the FLM model with no locking.
-async fn run_llm_worker(
-    queue: Arc<WorkQueue<GenerateJob>>,
-    provider: LemonadeChatProvider,
-    device_name: String,
-) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
-            let start = std::time::Instant::now();
-            let n_messages = job.request.messages.len();
-            let result = provider.complete(job.request).await;
-            debug!(
-                device = %device_name,
-                n_messages,
-                ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
-                "LLM generation job complete"
-            );
-            let _ = job.response.send(result);
-        } else {
-            notified.await;
-        }
-    }
-}
-
-// ── Reranker worker ───────────────────────────────────────────────────────────
-
-async fn run_rerank_worker(
-    queue: Arc<WorkQueue<RerankJob>>,
-    provider: LemonadeRerankProvider,
-    device_name: String,
-) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
-            let start = std::time::Instant::now();
-            let n_docs = job.documents.len();
-            let result = provider.rerank(&job.query, job.documents, job.top_n).await;
-            debug!(
-                device = %device_name,
-                n_docs,
-                top_n = ?job.top_n,
-                ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
-                "Rerank job complete"
-            );
-            let _ = job.response.send(result);
-        } else {
-            notified.await;
-        }
-    }
-}
-
-// ── Worker loop implementations ───────────────────────────────────────────────
-//
-// Each function is a long-running async loop.  Workers run until the queue Arc
-// is dropped (i.e. the InferenceQueue is dropped), at which point the channel
-// senders stored in each job will be dropped, causing the oneshot receivers to
-// return errors.
-//
-// Loop invariant (race-free wakeup):
-//
-//   1. Create `notified` future — this registers a permit listener BEFORE the
-//      deque is checked.
-//   2. Try to pop a job.
-//   3a. If a job is found: drop the `notified` future (permit stays registered
-//       for the next iteration if one was stored), process the job.
-//   3b. If no job: `.await` the `notified` future.  This will wake immediately
-//       if `notify_one()` was called between steps 1 and 3b.
-//
-// This is the canonical race-free pattern from the Tokio `Notify` documentation.
-
-/// Maximum number of attempts for a single embed job before the error is
-/// returned to the caller.  Retries guard against transient server hiccups
-/// (e.g. a Lemonade instance that is momentarily swapping a model in/out).
-const EMBED_MAX_ATTEMPTS: u32 = 3;
-
-/// Base delay before the first retry.  Doubles on each subsequent attempt
-/// (100 ms → 200 ms) so three attempts add at most ~300 ms of backoff.
-const EMBED_RETRY_BASE_MS: u64 = 100;
-
-async fn run_embed_worker(
-    queue: Arc<WorkQueue<EmbedJob>>,
-    provider: Arc<dyn EmbeddingProvider>,
-    device_name: String,
-) {
-    loop {
-        // Step 1: register before checking
-        let notified = queue.notify.notified();
-
-        // Step 2: try to pop
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
-            let start = std::time::Instant::now();
-
-            // Retry loop — attempt up to EMBED_MAX_ATTEMPTS times before
-            // giving up and forwarding the final error to the caller.
-            let mut last_err: Option<anyhow::Error> = None;
-            let mut result: Option<Vec<f32>> = None;
-
-            for attempt in 1..=EMBED_MAX_ATTEMPTS {
-                match provider.embed(&job.text).await {
-                    Ok(vec) => {
-                        result = Some(vec);
-                        break;
-                    }
-                    Err(e) => {
-                        let delay_ms = EMBED_RETRY_BASE_MS * (1 << (attempt - 1));
-                        debug!(
-                            device = %device_name,
-                            attempt,
-                            EMBED_MAX_ATTEMPTS,
-                            delay_ms,
-                            error = %e,
-                            "Embed attempt failed — retrying"
-                        );
-                        last_err = Some(e);
-                        if attempt < EMBED_MAX_ATTEMPTS {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        }
-                    }
-                }
-            }
-
-            let final_result = result.ok_or_else(|| {
-                last_err.unwrap_or_else(|| anyhow::anyhow!("embed failed with no error detail"))
-            });
-
-            debug!(
-                device = %device_name,
-                text_len = job.text.len(),
-                ok = final_result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
-                "Embed job complete"
-            );
-
-            // Ignore send errors — caller may have timed out and dropped the receiver.
-            let _ = job.response.send(final_result);
-        } else {
-            // Step 3b: nothing in queue, sleep until notified
-            notified.await;
-        }
-    }
-}
-
-async fn run_transcribe_worker(
-    queue: Arc<WorkQueue<TranscribeJob>>,
-    provider: Arc<dyn TranscriptionProvider>,
-    device_name: String,
-) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
-            let start = std::time::Instant::now();
-            let result = provider.transcribe(job.audio_bytes, &job.filename).await;
-            debug!(
-                device = %device_name,
-                filename = %job.filename,
-                ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
-                "Transcription job complete"
-            );
-            let _ = job.response.send(result);
-        } else {
-            notified.await;
-        }
-    }
-}
-
-/// Transcription worker backed by the GPU-managed [`LemonadeSttProvider`].
-///
-/// This is a separate function (rather than reusing `run_transcribe_worker`)
-/// because `LemonadeSttProvider` returns [`TranscriptionResult`](crate::lemonade::TranscriptionResult)
-/// (a struct) rather than `String`, so the result must be mapped before
-/// sending on the oneshot channel.
-async fn run_gpu_stt_worker(
-    queue: Arc<WorkQueue<TranscribeJob>>,
-    stt: LemonadeSttProvider,
-    device_name: String,
-) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
-            let start = std::time::Instant::now();
-            let result = stt
-                .transcribe(job.audio_bytes, &job.filename)
-                .await
-                .map(|r| r.text);
-            debug!(
-                device = %device_name,
-                filename = %job.filename,
-                ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
-                "GPU STT job complete"
-            );
-            let _ = job.response.send(result);
-        } else {
-            notified.await;
-        }
-    }
-}
-
-async fn run_tts_worker(
-    queue: Arc<WorkQueue<SynthesizeJob>>,
-    tts: LemonadeTtsProvider,
-    device_name: String,
-) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
-            let start = std::time::Instant::now();
-            let result = match &job.voice {
-                Some(voice) => tts.synthesize(&job.text, Some(&voice)).await,
-                None => tts.synthesize_default(&job.text).await,
-            };
-            debug!(
-                device = %device_name,
-                text_len = job.text.len(),
-                voice = job.voice.as_ref().map(|v| v.as_str()).unwrap_or("default"),
-                ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
-                "TTS job complete"
-            );
-            let _ = job.response.send(result);
-        } else {
-            notified.await;
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::embeddings::{EmbeddingModelInfo, EmbeddingProviderType};
-    use crate::hardware::cpu::CpuDevice;
-    use crate::hardware::npu::NpuDevice;
+    use std::sync::Arc;
 
+    use anyhow::Result;
+
+    use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
+    use crate::ai::transcription::TranscriptionProvider;
+    use crate::hardware::npu::NpuDevice;
     use crate::test_helpers::lemonade_url;
 
+    use super::super::builder::InferenceQueueBuilder;
+    use super::super::jobs::{EmbedJob, TranscribeJob, WorkQueue};
+    use super::super::workers::{run_embed_worker, run_transcribe_worker};
+    use super::*;
+
     /// Build a minimal valid mono 16-bit 16 kHz PCM WAV file of silence.
-    /// Inline copy so tests don't depend on the private `transcription::tests` module.
     fn make_test_silence_wav(duration_secs: f32) -> Vec<u8> {
         let sample_rate: u32 = 16_000;
         let num_channels: u16 = 1;
@@ -1207,7 +516,7 @@ mod tests {
         // internals directly so we can inject mock providers without a server.
         let embed_queue = Arc::new(WorkQueue::<EmbedJob>::new());
         let transcribe_queue = Arc::new(WorkQueue::<TranscribeJob>::new());
-        let synthesize_queue = Arc::new(WorkQueue::<SynthesizeJob>::new());
+        let synthesize_queue = Arc::new(WorkQueue::new());
 
         // Spawn a mock embedding worker
         {
@@ -1427,7 +736,7 @@ mod tests {
         struct SlowProvider;
         #[async_trait::async_trait]
         impl EmbeddingProvider for SlowProvider {
-            async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 Ok(vec![0.0; MOCK_DIMS])
             }
@@ -1633,8 +942,6 @@ mod tests {
 
         let queue = InferenceQueueBuilder::new().with_npu_device(npu).build();
 
-        // 1 second of silence
-        // 1 second of silence — valid WAV, no speech content.
         let wav = make_test_silence_wav(1.0);
         let result = queue.transcribe(wav, "silence.wav").await;
         assert!(
@@ -1651,8 +958,6 @@ mod tests {
             return;
         };
 
-        // Register the same NPU whisper provider twice to simulate two workers
-        // competing.  In a real setup these would be NPU + GPU.
         let npu1 = match NpuDevice::new(&url, None, None, None).await {
             Ok(d) => d,
             Err(e) => {
@@ -1681,7 +986,6 @@ mod tests {
 
         let wav = make_test_silence_wav(0.5);
 
-        // Fire two concurrent jobs — ideally each worker picks up one.
         let (r1, r2) = tokio::join!(
             queue.transcribe(wav.clone(), "a.wav"),
             queue.transcribe(wav.clone(), "b.wav"),
