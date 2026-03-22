@@ -23,8 +23,6 @@ pub mod hardware;
 pub mod inference_queue;
 pub mod lemonade;
 pub mod schema;
-pub mod schema_ingestion;
-pub mod schema_manager;
 pub mod search;
 pub mod graph;
 pub mod transcription;
@@ -44,9 +42,8 @@ pub use lemonade::{
 };
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
+    SchemaIngestion, SchemaManager, SchemaStats,
 };
-pub use schema_ingestion::SchemaIngestion;
-pub use schema_manager::{SchemaManager, SchemaStats};
 pub use search::{
     search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
 };
