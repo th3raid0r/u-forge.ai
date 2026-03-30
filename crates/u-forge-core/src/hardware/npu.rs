@@ -50,7 +50,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
-use crate::lemonade::{LemonadeChatProvider, LemonadeModelRegistry};
+use crate::lemonade::{LemonadeChatProvider, LemonadeModelRegistry, ModelLoadOptions};
 use crate::ai::transcription::{LemonadeTranscriptionProvider, TranscriptionProvider};
 
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
@@ -135,11 +135,28 @@ impl NpuDevice {
         stt_model: Option<&str>,
         llm_model: Option<&str>,
     ) -> Result<Self> {
+        Self::new_with_load(base_url, embedding_model, stt_model, llm_model, None).await
+    }
+
+    /// Like [`new`](Self::new) but explicitly loads the embedding model via
+    /// `POST /api/v1/load` before connecting.
+    ///
+    /// Pass `load_opts` to control `ctx_size` and other per-recipe parameters.
+    /// When `None`, behaves identically to [`new`](Self::new).
+    pub async fn new_with_load(
+        base_url: &str,
+        embedding_model: Option<&str>,
+        stt_model: Option<&str>,
+        llm_model: Option<&str>,
+        load_opts: Option<&ModelLoadOptions>,
+    ) -> Result<Self> {
         let emb_model = embedding_model.unwrap_or(DEFAULT_NPU_EMBEDDING_MODEL);
         let stt_model_id = stt_model.unwrap_or(DEFAULT_NPU_STT_MODEL);
 
-        let embedding = Arc::new(LemonadeProvider::new(base_url, emb_model).await?)
-            as Arc<dyn EmbeddingProvider>;
+        let embedding = Arc::new(match load_opts {
+            Some(opts) => LemonadeProvider::new_with_load(base_url, emb_model, opts).await?,
+            None => LemonadeProvider::new(base_url, emb_model).await?,
+        }) as Arc<dyn EmbeddingProvider>;
 
         let transcription: Option<Arc<dyn TranscriptionProvider>> = Some(Arc::new(
             LemonadeTranscriptionProvider::new(base_url, stt_model_id),
@@ -195,14 +212,27 @@ impl NpuDevice {
     /// cannot be probed for dimension information.  If the registry contains no
     /// embedding model at all, an error is returned immediately.
     pub async fn from_registry(registry: &LemonadeModelRegistry) -> Result<Self> {
+        Self::from_registry_with_load(registry, None).await
+    }
+
+    /// Like [`from_registry`](Self::from_registry) but explicitly loads the
+    /// embedding model via `POST /api/v1/load` before connecting.
+    pub async fn from_registry_with_load(
+        registry: &LemonadeModelRegistry,
+        load_opts: Option<&ModelLoadOptions>,
+    ) -> Result<Self> {
         use crate::lemonade::ModelRole;
 
         let emb_entry = registry.npu_embedding_model().ok_or_else(|| {
             anyhow::anyhow!("No NPU embedding model found in the Lemonade registry")
         })?;
 
-        let embedding = Arc::new(LemonadeProvider::new(&registry.base_url, &emb_entry.id).await?)
-            as Arc<dyn EmbeddingProvider>;
+        let embedding = Arc::new(match load_opts {
+            Some(opts) => {
+                LemonadeProvider::new_with_load(&registry.base_url, &emb_entry.id, opts).await?
+            }
+            None => LemonadeProvider::new(&registry.base_url, &emb_entry.id).await?,
+        }) as Arc<dyn EmbeddingProvider>;
 
         let mut capabilities = vec![DeviceCapability::Embedding];
 
@@ -252,14 +282,24 @@ impl NpuDevice {
     ///
     /// # Arguments
     ///
-    /// * `base_url` — Lemonade Server API root.
-    /// * `model` — FLM embedding model id.  Defaults to
+    /// * `base_url`   — Lemonade Server API root.
+    /// * `model`      — FLM embedding model id.  Defaults to
     ///   [`DEFAULT_NPU_EMBEDDING_MODEL`] when `None`.
-    pub async fn embedding_only(base_url: &str, model: Option<&str>) -> Result<Self> {
+    /// * `load_opts`  — Optional model load options (e.g. `ctx_size`).  When
+    ///   `Some`, the model is explicitly loaded via `POST /api/v1/load` with
+    ///   the given parameters before the dimension probe.  Pass `None` to rely
+    ///   on the server's default load behaviour.
+    pub async fn embedding_only(
+        base_url: &str,
+        model: Option<&str>,
+        load_opts: Option<&ModelLoadOptions>,
+    ) -> Result<Self> {
         let emb_model = model.unwrap_or(DEFAULT_NPU_EMBEDDING_MODEL);
 
-        let embedding = Arc::new(LemonadeProvider::new(base_url, emb_model).await?)
-            as Arc<dyn EmbeddingProvider>;
+        let embedding = Arc::new(match load_opts {
+            Some(opts) => LemonadeProvider::new_with_load(base_url, emb_model, opts).await?,
+            None => LemonadeProvider::new(base_url, emb_model).await?,
+        }) as Arc<dyn EmbeddingProvider>;
 
         info!(model = emb_model, "NpuDevice initialised (embedding only)");
 
@@ -559,7 +599,7 @@ mod tests {
             eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
             return;
         };
-        let device = NpuDevice::embedding_only(&url, None).await;
+        let device = NpuDevice::embedding_only(&url, None, None).await;
         assert!(
             device.is_ok(),
             "NpuDevice::embedding_only failed: {:?}",
@@ -580,7 +620,7 @@ mod tests {
             eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
             return;
         };
-        let device = NpuDevice::embedding_only(&url, None)
+        let device = NpuDevice::embedding_only(&url, None, None)
             .await
             .expect("NpuDevice construction failed");
         let embedding = device.embedding.embed("The quick brown fox").await;

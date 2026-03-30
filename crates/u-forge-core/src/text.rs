@@ -76,15 +76,21 @@ mod tests {
 
     #[test]
     fn test_split_text_long_content_splits_on_word_boundary() {
+        let max_chars = MAX_CHUNK_TOKENS * 4;
+        // Build content that is 3× the character limit so it must split into ≥2 pieces.
         let word = "x".repeat(399);
-        let content = (0..10).map(|_| word.as_str()).collect::<Vec<_>>().join(" ");
-        assert!(content.len() > 2000, "pre-condition: content must exceed limit");
+        let repeats = (max_chars * 3 / (word.len() + 1)) + 1;
+        let content = (0..repeats).map(|_| word.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(
+            content.len() > max_chars,
+            "pre-condition: content must exceed limit"
+        );
 
         let pieces = split_text(&content);
         assert!(pieces.len() >= 2, "long content must be split");
         for piece in &pieces {
             assert!(
-                piece.len() <= 2000,
+                piece.len() <= max_chars,
                 "piece too long ({} chars): {:?}",
                 piece.len(),
                 &piece[..piece.len().min(40)]
@@ -99,11 +105,12 @@ mod tests {
 
     #[test]
     fn test_split_text_hard_cut_when_no_whitespace() {
-        let content = "z".repeat(4000);
+        let max_chars = MAX_CHUNK_TOKENS * 4;
+        let content = "z".repeat(max_chars * 2 + 1);
         let pieces = split_text(&content);
         assert!(pieces.len() >= 2, "must hard-cut oversized no-whitespace content");
         for piece in &pieces {
-            assert!(piece.len() <= 2000);
+            assert!(piece.len() <= max_chars);
             assert!(!piece.is_empty());
         }
     }

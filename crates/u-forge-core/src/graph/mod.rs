@@ -6,4 +6,4 @@ mod chunks;
 mod fts;
 mod traversal;
 
-pub use storage::{KnowledgeGraphStorage, GraphStats, EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS, ENABLE_HIGH_QUALITY_EMBEDDING};
+pub use storage::{KnowledgeGraphStorage, GraphStats, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS, ENABLE_HIGH_QUALITY_EMBEDDING};

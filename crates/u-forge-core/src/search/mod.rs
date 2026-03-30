@@ -538,16 +538,12 @@ pub async fn search_hybrid(
     if do_rerank {
         debug!("Submitting {} nodes to reranker", results.len());
 
-        // Build one document per node by concatenating all chunk content.
+        // Build one document per node using the full flattened node representation.
+        // This gives the cross-encoder the complete node context (name, type,
+        // description, all properties, tags) rather than isolated chunk snippets.
         let documents: Vec<String> = results
             .iter()
-            .map(|r| {
-                r.chunks
-                    .iter()
-                    .map(|c| c.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
+            .map(|r| r.node.flatten_for_embedding())
             .collect();
 
         match queue.rerank(query, documents, Some(results.len())).await {

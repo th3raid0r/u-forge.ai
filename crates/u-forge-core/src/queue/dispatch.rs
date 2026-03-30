@@ -903,7 +903,7 @@ mod tests {
             return;
         };
 
-        let npu = match NpuDevice::embedding_only(&url, None).await {
+        let npu = match NpuDevice::embedding_only(&url, None, None).await {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("Skipping: NpuDevice construction failed: {e}");

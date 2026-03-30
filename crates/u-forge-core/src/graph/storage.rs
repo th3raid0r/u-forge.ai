@@ -112,18 +112,26 @@ END;
 /// database — `vec0` virtual tables cannot be `ALTER`ed after creation.
 pub const EMBEDDING_DIMENSIONS: usize = 768;
 
+/// Default context window size (in tokens) assumed for the active embedding model.
+///
+/// Used to derive [`MAX_CHUNK_TOKENS`].  Modern llamacpp embedding models
+/// (e.g. `nomic-embed-text-v2-moe-GGUF`) support up to 4 K or 8 K context.
+/// Setting this to 4096 is a conservative default that works across all
+/// currently-supported Lemonade embedding recipes.
+pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 4096;
+
 /// Maximum number of tokens per stored text chunk.
 ///
 /// Chunks larger than this are split at word boundaries by
 /// [`KnowledgeGraph::add_text_chunk`] before being written to storage.
 ///
-/// The llamacpp embedding backends enforce a 512-token physical batch limit.
-/// The `len/4` character heuristic used by `estimate_token_count` tends to
-/// *under*count real tokens for dense prose (typical variance: 30–50%).  At
-/// 350 tokens the heuristic would need to undercount by 46% before a chunk
-/// reaches the 512-token server limit, which gives a comfortable safety margin
-/// across a wide range of text styles.
-pub const MAX_CHUNK_TOKENS: usize = 350;
+/// Set to half of [`DEFAULT_EMBEDDING_CONTEXT_TOKENS`] to give a safe margin
+/// against the `len/4` character heuristic — which tends to *under*count real
+/// tokens for dense prose by 30–50%.  At 2048 heuristic tokens, a 50%
+/// undercount would yield ~3072 real tokens, still well within the 4096 context
+/// window.  Nodes are now embedded as a single flattened document, so this
+/// budget needs to accommodate an entire node's metadata in one chunk.
+pub const MAX_CHUNK_TOKENS: usize = DEFAULT_EMBEDDING_CONTEXT_TOKENS / 2;
 
 /// Enable high-quality embedding models (e.g. `Qwen3-Embedding-8B-GGUF`).
 ///

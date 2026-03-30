@@ -37,14 +37,14 @@ pub use ai::embeddings::{
 };
 pub use builder::ObjectBuilder;
 pub use graph::{
-    GraphStats, KnowledgeGraphStorage, EMBEDDING_DIMENSIONS, ENABLE_HIGH_QUALITY_EMBEDDING,
-    MAX_CHUNK_TOKENS,
+    GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
+    ENABLE_HIGH_QUALITY_EMBEDDING, MAX_CHUNK_TOKENS,
 };
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
     GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeModelEntry, LemonadeModelRegistry,
-    LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, ModelRole, SttGuard,
-    TranscriptionResult,
+    LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, ModelLoadOptions,
+    ModelRole, SttGuard, TranscriptionResult, load_model,
 };
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,

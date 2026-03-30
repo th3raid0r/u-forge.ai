@@ -40,13 +40,14 @@ use u_forge_core::{
     hardware::npu::NpuDevice,
     ingest::DataIngestion,
     lemonade::{
-        resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
+        resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelLoadOptions,
+        ModelRole, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
     types::ObjectMetadata,
     ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
-    EMBEDDING_DIMENSIONS,
+    DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
 };
 
 // ── Demo config ───────────────────────────────────────────────────────────────
@@ -393,6 +394,13 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("   ⚠️  No reranker available: {e}"),
                             }
 
+                            // Load options: set ctx_size so the model accepts full-node
+                            // documents rather than truncating at the server default.
+                            let embed_load_opts = ModelLoadOptions {
+                                ctx_size: Some(DEFAULT_EMBEDDING_CONTEXT_TOKENS),
+                                ..Default::default()
+                            };
+
                             // Build a multi-worker embedding InferenceQueue.
                             // Each compatible model (matching EMBEDDING_DIMENSIONS) becomes
                             // its own Tokio worker competing on the shared embed_queue so
@@ -402,7 +410,7 @@ async fn main() -> Result<()> {
                             let mut worker_count = 0usize;
 
                             // NPU worker (FLM embed-gemma-300m-FLM)
-                            match NpuDevice::embedding_only(url, None).await {
+                            match NpuDevice::embedding_only(url, None, Some(&embed_load_opts)).await {
                                 Ok(npu) => {
                                     let dims = npu.embedding.dimensions().unwrap_or(0);
                                     if dims == EMBEDDING_DIMENSIONS {
@@ -426,7 +434,14 @@ async fn main() -> Result<()> {
                             // instances of the same model class.
                             if let Some(model) = registry.cpu_embedding_model() {
                                 let model_id = model.id.clone();
-                                match LemonadeProvider::new(url, &model_id).await {
+                                // Load instance 1 with ctx_size, then connect.
+                                match LemonadeProvider::new_with_load(
+                                    url,
+                                    &model_id,
+                                    &embed_load_opts,
+                                )
+                                .await
+                                {
                                     Err(e) => {
                                         println!("     ⚠️  llamacpp({model_id}) unavailable: {e}")
                                     }
@@ -449,7 +464,8 @@ async fn main() -> Result<()> {
                                             );
                                             worker_count += 1;
 
-                                            // Instance 2 — CPU (second connection to same model)
+                                            // Instance 2 — CPU (second connection, model already
+                                            // loaded so no second load call needed)
                                             match LemonadeProvider::new(url, &model_id).await {
                                                 Err(e) => println!(
                                                     "     ⚠️  llamacpp({model_id})/CPU \
@@ -588,29 +604,12 @@ async fn main() -> Result<()> {
     let mut indexed = 0usize;
 
     for obj in &all_objects {
+        // Flatten the entire node (name, type, description, all properties, tags)
+        // into one chunk so FTS5 and semantic search both see the full context.
+        let text = obj.flatten_for_embedding();
         indexed += graph
-            .add_text_chunk(obj.id, obj.name.clone(), ChunkType::Description)?
+            .add_text_chunk(obj.id, text, ChunkType::Imported)?
             .len();
-
-        if let Some(desc) = &obj.description {
-            if !desc.is_empty() {
-                indexed += graph
-                    .add_text_chunk(obj.id, desc.clone(), ChunkType::Description)?
-                    .len();
-            }
-        }
-
-        if let Some(props) = obj.properties.as_object() {
-            for (_key, val) in props {
-                if let Some(s) = val.as_str() {
-                    if !s.is_empty() {
-                        indexed += graph
-                            .add_text_chunk(obj.id, s.to_string(), ChunkType::Imported)?
-                            .len();
-                    }
-                }
-            }
-        }
     }
 
     println!("    ✅ {indexed} text chunks indexed\n");
@@ -839,17 +838,20 @@ async fn main() -> Result<()> {
             }
 
             // Collect candidate documents with their obj_id so reranked results
-            // can load full node data.
+            // can load full node data.  Send the full flattened node (not just the
+            // matched chunk) so the reranker scores on complete node context.
             let candidates: Vec<(u_forge_core::types::ObjectId, String, String)> = sem_results
                 .iter()
-                .map(|(_chunk_id, obj_id, content, distance)| {
-                    let label = graph
-                        .get_object(*obj_id)
-                        .ok()
-                        .flatten()
+                .map(|(_chunk_id, obj_id, _content, distance)| {
+                    let node_opt = graph.get_object(*obj_id).ok().flatten();
+                    let label = node_opt
+                        .as_ref()
                         .map(|o| format!("{} [{}]", o.name, o.object_type))
                         .unwrap_or_else(|| obj_id.to_string());
-                    (*obj_id, label, format!("[dist:{distance:.4}] {content}"))
+                    let node_text = node_opt
+                        .map(|o| format!("[dist:{distance:.4}]\n{}", o.flatten_for_embedding()))
+                        .unwrap_or_else(|| format!("[dist:{distance:.4}] (node not found)"));
+                    (*obj_id, label, node_text)
                 })
                 .collect();
 
