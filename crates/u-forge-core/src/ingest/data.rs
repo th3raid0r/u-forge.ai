@@ -348,7 +348,11 @@ impl<'a> DataIngestion<'a> {
                 if parts.len() == 2 {
                     let key = parts[0].trim();
                     let value = parts[1].trim();
-                    builder = builder.with_property(key.to_string(), value.to_string());
+                    if key.eq_ignore_ascii_case("description") {
+                        builder = builder.with_description(value.to_string());
+                    } else {
+                        builder = builder.with_property(key.to_string(), value.to_string());
+                    }
                 }
             } else {
                 // Tag
