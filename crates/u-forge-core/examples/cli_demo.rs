@@ -19,14 +19,15 @@ use anyhow::Result;
 use std::env;
 use std::sync::Arc;
 use u_forge_core::{
-    ingest::DataIngestion,
     ai::embeddings::LemonadeProvider,
     hardware::npu::NpuDevice,
-    queue::{InferenceQueue, InferenceQueueBuilder},
+    ingest::DataIngestion,
     lemonade::{
         resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
     },
+    queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
+    types::ObjectMetadata,
     ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
     EMBEDDING_DIMENSIONS,
 };
@@ -49,16 +50,17 @@ async fn main() -> Result<()> {
         .cloned()
         .or_else(|| env::var("UFORGE_DATA_FILE").ok())
         .unwrap_or_else(|| {
-            format!("{}/../../defaults/data/memory.json", env!("CARGO_MANIFEST_DIR"))
+            format!(
+                "{}/../../defaults/data/memory.json",
+                env!("CARGO_MANIFEST_DIR")
+            )
         });
 
     let schema_dir = args
         .get(2)
         .cloned()
         .or_else(|| env::var("UFORGE_SCHEMA_DIR").ok())
-        .unwrap_or_else(|| {
-            format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR"))
-        });
+        .unwrap_or_else(|| format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR")));
 
     // Resolve the Lemonade Server URL: probe localhost first, then fall back to
     // the LEMONADE_URL env var.  An unset env var is never a hard error here —
@@ -564,16 +566,16 @@ async fn main() -> Result<()> {
             continue;
         }
         for (i, (_chunk_id, obj_id, snippet)) in results.iter().enumerate() {
-            let label = graph
-                .get_object(*obj_id)?
+            let node = graph.get_object(*obj_id)?;
+            let label = node
+                .as_ref()
                 .map(|o| format!("{} [{}]", o.name, o.object_type))
                 .unwrap_or_else(|| obj_id.to_string());
-            let preview = if snippet.len() > 80 {
-                format!("{}…", &snippet[..77])
-            } else {
-                snippet.clone()
-            };
-            println!("    {}. {} — \"{}\"", i + 1, label, preview);
+            println!("    {}. {}", i + 1, label);
+            println!("       Matched: \"{}\"", snippet);
+            if let Some(ref n) = node {
+                print_node_full(n, "       ");
+            }
         }
         println!();
     }
@@ -607,18 +609,16 @@ async fn main() -> Result<()> {
                         for (i, (_chunk_id, obj_id, snippet, distance)) in
                             results.iter().enumerate()
                         {
-                            let label = graph
-                                .get_object(*obj_id)?
+                            let node = graph.get_object(*obj_id)?;
+                            let label = node
+                                .as_ref()
                                 .map(|o| format!("{} [{}]", o.name, o.object_type))
                                 .unwrap_or_else(|| obj_id.to_string());
-                            let preview = truncate(snippet, 70);
-                            println!(
-                                "    {}. [dist {:.4}] {} — \"{}\"",
-                                i + 1,
-                                distance,
-                                label,
-                                preview
-                            );
+                            println!("    {}. [dist {:.4}] {}", i + 1, distance, label);
+                            println!("       Matched: \"{}\"", snippet);
+                            if let Some(ref n) = node {
+                                print_node_full(n, "       ");
+                            }
                         }
                         println!();
                     }
@@ -661,8 +661,9 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // Collect candidate documents (snippet text) with their FTS rank
-            let candidates: Vec<(String, String)> = fts_results
+            // Collect candidate documents (snippet text) with their FTS rank.
+            // Store obj_id alongside so reranked results can load full node data.
+            let candidates: Vec<(u_forge_core::types::ObjectId, String, String)> = fts_results
                 .iter()
                 .map(|(_chunk_id, obj_id, snippet)| {
                     let label = graph
@@ -671,35 +672,32 @@ async fn main() -> Result<()> {
                         .flatten()
                         .map(|o| format!("{} [{}]", o.name, o.object_type))
                         .unwrap_or_else(|| obj_id.to_string());
-                    (label, snippet.clone())
+                    (*obj_id, label, snippet.clone())
                 })
                 .collect();
 
             println!("   FTS candidates (keyword: \"{fts_keyword}\"):");
-            for (i, (label, snippet)) in candidates.iter().enumerate() {
-                let preview = truncate(snippet, 70);
-                println!("     {i}. {label} — \"{preview}\"");
+            for (i, (_id, label, snippet)) in candidates.iter().enumerate() {
+                println!("     {i}. {label} — \"{}\"", snippet);
             }
             println!();
 
             // Rerank
-            let documents: Vec<String> = candidates.iter().map(|(_, s)| s.clone()).collect();
+            let documents: Vec<String> = candidates.iter().map(|(_, _, s)| s.clone()).collect();
             match rr.rerank(query, documents, Some(candidates.len())).await {
                 Err(e) => println!("   ⚠️  Rerank request failed: {e}\n"),
                 Ok(ranked) => {
                     println!("   Reranked (most relevant first):");
                     for (rank, doc) in ranked.iter().enumerate() {
-                        let (label, original_text) = &candidates[doc.index];
+                        let (obj_id, label, original_text) = &candidates[doc.index];
                         // Fall back to the original candidate snippet when the
                         // server doesn't echo the document text back.
                         let text = doc.document.as_deref().unwrap_or(original_text.as_str());
-                        println!(
-                            "     {}. [score {:.4}] {} — \"{}\"",
-                            rank + 1,
-                            doc.score,
-                            label,
-                            truncate(text, 65),
-                        );
+                        println!("     {}. [score {:.4}] {}", rank + 1, doc.score, label,);
+                        println!("        Matched: \"{}\"", text);
+                        if let Ok(Some(node)) = graph.get_object(*obj_id) {
+                            print_node_full(&node, "        ");
+                        }
                     }
                     println!();
                 }
@@ -762,12 +760,6 @@ async fn main() -> Result<()> {
                 Ok(results) => {
                     for (rank, result) in results.iter().enumerate() {
                         let src = result.sources.label();
-                        let desc = result
-                            .node
-                            .description
-                            .as_deref()
-                            .unwrap_or("(no description)");
-                        let preview = truncate(desc, 65);
                         println!(
                             "    {}. [score {:.4}] {src} {} [{}] — {} chunks, {} edges",
                             rank + 1,
@@ -777,13 +769,14 @@ async fn main() -> Result<()> {
                             result.chunks.len(),
                             result.edges.len(),
                         );
-                        println!("       \"{preview}\"");
+                        print_node_full(&result.node, "       ");
                         if !result.connected_node_names.is_empty() {
-                            let connected: Vec<String> = result
+                            let mut connected: Vec<String> = result
                                 .connected_node_names
                                 .values()
                                 .map(|cn| format!("{} [{}]", cn.name, cn.object_type))
                                 .collect();
+                            connected.sort();
                             println!("       → {}", connected.join(", "));
                         }
                     }
@@ -919,7 +912,7 @@ async fn main() -> Result<()> {
     // ── Done ──────────────────────────────────────────────────────────────────
 
     println!("✨ Demo complete.");
-    println!("   Storage   : SQLite — no RocksDB, no FastEmbed, no gcc-13 required.");
+    println!("   Storage   : SQLite, sqlite-vec");
     if lemonade_url.is_some() {
         println!("   AI        : Lemonade Server connected. Capabilities reported above.");
     } else {
@@ -973,14 +966,29 @@ fn print_model_choice(label: &str, model: Option<&u_forge_core::lemonade::Lemona
     }
 }
 
-/// Truncate a string to at most `max_chars` chars, appending "…" if clipped.
-fn truncate(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let collected: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{collected}…")
-    } else {
-        collected
+/// Print the full metadata for a node: description, properties, and tags.
+/// `indent` is prepended to every output line.
+fn print_node_full(node: &ObjectMetadata, indent: &str) {
+    if let Some(desc) = &node.description {
+        if !desc.is_empty() {
+            println!("{indent}Description: {desc}");
+        }
+    }
+    if let Some(props) = node.properties.as_object() {
+        let mut pairs: Vec<(&String, &serde_json::Value)> = props.iter().collect();
+        pairs.sort_by_key(|(k, _)| k.as_str());
+        for (key, val) in pairs {
+            let display = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            if !display.is_empty() {
+                println!("{indent}{key}: {display}");
+            }
+        }
+    }
+    if !node.tags.is_empty() {
+        println!("{indent}Tags: {}", node.tags.join(", "));
     }
 }
 
