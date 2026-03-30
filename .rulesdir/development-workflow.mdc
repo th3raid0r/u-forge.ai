@@ -7,10 +7,10 @@ description: Development workflow and setup guide
 ## Quick Reference
 
 ```bash
-cargo build                                        # Build library + examples
-cargo test -- --test-threads=1                     # Run all tests (always single-threaded)
-cargo run --example cli_demo                       # Run CLI demo with Foundation data
-cargo run --example cli_demo ./data.json ./schemas/  # Custom data
+cargo build --workspace                                        # Build all crates
+cargo test --workspace -- --test-threads=1                     # Run all tests (always single-threaded)
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo   # Run CLI demo
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo ./data.json ./schemas/  # Custom data
 ```
 
 > **No `source env.sh` required.** The gcc-13 / RocksDB requirement was eliminated
@@ -27,17 +27,17 @@ cargo run --example cli_demo ./data.json ./schemas/  # Custom data
 
 2. **Build:**
    ```bash
-   cargo build       # ~30 seconds first time (bundled SQLite compilation, not RocksDB)
+   cargo build --workspace   # ~30 seconds first time (bundled SQLite compilation)
    ```
 
 3. **Run tests:**
    ```bash
-   cargo test -- --test-threads=1   # All 101+ tests pass with no server required
+   cargo test --workspace -- --test-threads=1   # All 220+ tests pass with no server required
    ```
 
 4. **Run the CLI demo:**
    ```bash
-   cargo run --example cli_demo
+   cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
    ```
 
 ---
@@ -52,10 +52,10 @@ Before making changes, read:
 - SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware abstraction (`src/hardware/`), unified inference queue (`src/queue/`), `LemonadeRerankProvider` + `InferenceQueue::rerank()` wired, `cli_demo` demonstrates FTS5 → rerank pipeline.
 
 ### Remaining work:
-- **sqlite-vec** — ANN vector search (highest priority storage item)
 - **Phase 3** — `axum` HTTP/WebSocket server for web UI
-- **Phase 4 (pipeline)** — Wire reranking into `KnowledgeGraph` hybrid search (FTS5 + vec + rerank)
-- **Phase 5** — Cargo workspace split
+- **Phase 4 (remainder)** — Streaming LLM responses via `InferenceQueue::generate_stream()`
+- **UI feature** — `u-forge-graph-view` + GPUI app (see `feature_UI.md`)
+- **TS sandbox feature** — `u-forge-ts-runtime` embedded V8 (see `feature_TS-Agent-Sandbox.md`)
 
 ---
 

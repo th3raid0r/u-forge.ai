@@ -49,13 +49,12 @@ navigational aids.
 
 ## Current Project State (snapshot)
 
-- **Complete:** SQLite + FTS5 storage, sqlite-vec ANN search, `LemonadeProvider`
-  embeddings, hardware abstraction (`src/hardware/`), unified inference queue
-  (`src/queue/`), `LemonadeRerankProvider` + `InferenceQueue::rerank()`,
-  hybrid search pipeline (`src/search/` — `search_hybrid()`, RRF merge, optional
-  rerank, graceful degradation). `lib.rs` is facade-only; `ObjectBuilder` lives
-  in `builder.rs`. No active bugs.
-- **Remaining:** axum HTTP server, streaming LLM responses, Cargo workspace split.
+- **Complete:** Cargo workspace split (`crates/` layout, `u-forge-core` + 5 skeleton crates).
+  SQLite + FTS5 storage, sqlite-vec ANN search, `LemonadeProvider` embeddings,
+  hardware abstraction, unified inference queue, `LemonadeRerankProvider`,
+  hybrid search pipeline, bulk graph access (`get_all_edges`, `get_nodes_paginated`).
+  No active bugs.
+- **Remaining:** axum HTTP server, streaming LLM responses, UI and TS sandbox features.
   See `ARCHITECTURE.md` — Remaining Roadmap for details.
 
 ---
@@ -132,7 +131,8 @@ JSONL node/edge format, two-pass import, deduplication, edge resolution.
 → **`ARCHITECTURE.md`** (Remaining Roadmap section)
 
 Remaining work in priority order: axum HTTP server → streaming LLM responses →
-Cargo workspace split. Do not skip ahead without explicit instruction.
+UI feature (`feature_UI.md`) → TS sandbox feature (`feature_TS-Agent-Sandbox.md`).
+Do not skip ahead without explicit instruction.
 
 ---
 

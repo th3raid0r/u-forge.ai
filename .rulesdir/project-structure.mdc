@@ -6,47 +6,55 @@ alwaysApply: true
 
 Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs. Built in Rust.
 
-**Status:** Early prototype. CLI demo only. Phases 1 + 2 complete. Hardware re-architecture complete. LLM queuing + reranking infrastructure added. sqlite-vec complete. Phase 4 search pipeline complete. Full code refactor complete (PRs 1–5). Next: axum server (Phase 3).
+**Status:** Early prototype. CLI demo only. Phases 1 + 2 complete. Hardware re-architecture complete. LLM queuing + reranking infrastructure added. sqlite-vec complete. Phase 4 search pipeline complete. Full code refactor complete (PRs 1–5). Cargo workspace split complete — project is now a multi-crate workspace under `crates/`. Next: axum server (Phase 3).
 
 ## Architecture Overview
 
 Read [ARCHITECTURE.md](mdc:ARCHITECTURE.md) for full details (module map, SQLite schema, resolved bugs, design decisions).
 Read [migration.md](mdc:migration.md) for the phased migration plan and current completion status.
 
-## Current Architecture
+## Workspace Layout
 
-- **Facade**: [src/lib.rs](mdc:src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas) + `ObjectBuilder`
-- **Storage**: [src/storage.rs](mdc:src/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts` + sqlite-vec virtual table `chunks_vec` (768-dim cosine ANN). Key constants: `EMBEDDING_DIMENSIONS = 768`, `MAX_CHUNK_TOKENS = 350`, `ENABLE_HIGH_QUALITY_EMBEDDING = false`. `KnowledgeGraphStorage` is the only storage struct.
-- **Embeddings**: [src/ai/embeddings.rs](mdc:src/ai/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP) + `EmbeddingManager`. FastEmbed/ORT/ONNX have been removed. Transcription types have been moved to `src/ai/transcription.rs`; they are re-exported from `embeddings.rs` for backward compatibility.
-- **Transcription**: [src/ai/transcription.rs](mdc:src/ai/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`. Split out of `embeddings.rs` so embedding and transcription can evolve independently and be routed to different hardware.
-- **Hardware Abstraction**: [src/hardware/mod.rs](mdc:src/hardware/mod.rs) — `DeviceCapability` enum, `HardwareBackend` enum, `DeviceWorker` trait. Sub-modules:
-  - [src/hardware/npu.rs](mdc:src/hardware/npu.rs) — `NpuDevice` (embedding + STT + **LLM** on AMD NPU via FLM; no GPU contention). `NpuDevice::new()` takes a 4th `llm_model: Option<&str>` arg. `NpuDevice::from_registry()` auto-discovers all three capabilities. `NpuDevice::llm_only()` is synchronous. `pub chat: Option<LemonadeChatProvider>` field (no `GpuResourceManager` — NPU is independent).
-  - [src/hardware/gpu.rs](mdc:src/hardware/gpu.rs) — `GpuDevice` (STT + LLM on AMD GPU via ROCm; shares `GpuResourceManager`)
-  - [src/hardware/cpu.rs](mdc:src/hardware/cpu.rs) — `CpuDevice` (TTS via Kokoro on host CPU)
-- **Inference Queue**: [src/queue/](mdc:src/queue) — `InferenceQueue` + `InferenceQueueBuilder` + `QueueStats`. Unified MPMC capability-based dispatch queue. Five capability channels:
-  - `embed_queue` → NPU embedding workers
-  - `transcribe_queue` → NPU FLM whisper + GPU whispercpp workers compete (first-free wins)
-  - `synthesize_queue` → CPU Kokoro TTS workers
-  - `generate_queue` → NPU FLM LLM + GPU llamacpp workers compete (first-free wins).
-  - `rerank_queue` → `LemonadeRerankProvider` workers
-  - Public methods: `embed`, `embed_many`, `transcribe`, `synthesize`, `generate`, `ask` (convenience), `rerank`. Builder gains `with_reranker(LemonadeRerankProvider)`. Builder also gains `with_embedding_provider(Arc<dyn EmbeddingProvider>, name)` for standalone llamacpp/CPU/ROCm workers. Per-job retry: up to 3 attempts with exponential backoff in `run_embed_worker`.
-- **Extended Lemonade Integration**: [src/lemonade.rs](mdc:src/lemonade.rs) — `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack`, **`LemonadeRerankProvider`**, **`SystemInfo`**, **`LemonadeCapabilities`**. GPU resource management for STT/LLM contention. `LemonadeChatProvider.gpu` is now `Option<Arc<GpuResourceManager>>` — `None` for NPU-backed providers (no locking needed), `Some(gpu)` for GPU-backed providers.
-- **Full-Text Search**: `search_chunks_fts(query, limit)` — SQLite FTS5, keyword/phrase/prefix matching. **Semantic Search**: `search_chunks_semantic(query_embedding, limit)` — sqlite-vec vec0 cosine ANN, returns `(ChunkId, ObjectId, String, f32)` tuples. Both live in `storage.rs` / `lib.rs`.
-- **Hybrid Search**: [src/search/](mdc:src/search) — `search_hybrid(graph, queue, query, config)` free async function. Merges FTS5 + ANN results via Reciprocal Rank Fusion (RRF, k=60), then optionally reranks with the cross-encoder. `HybridSearchConfig` controls `alpha` (0.0=FTS, 1.0=semantic, 0.5=blend), candidate pool sizes, rerank flag, and result limit. `SearchSources` tracks which paths contributed each result (`fts_rank`, `semantic_distance`, `rerank_score`) and exposes a `label()` method (`[FTS]`, `[SEM]`, `[FTS+SEM]`, `[FTS+SEM+RR]`). `fts5_sanitize()` in `src/search/sanitize.rs` strips FTS5-illegal punctuation; the original query is passed verbatim to embed + rerank. Degrades gracefully at every AI stage — no embedding worker → FTS-only; no reranker → RRF scores. All types re-exported from `lib.rs`.
-- **Vector Search**: `src/vector_search.rs` **has been deleted**. ANN search is now provided by sqlite-vec: `chunks_vec` vec0 virtual table in `storage.rs`, `upsert_chunk_embedding()` and `search_chunks_semantic()` on both `KnowledgeGraphStorage` and `KnowledgeGraph`.
-- **Schemas**: [src/schema/definition.rs](mdc:src/schema/definition.rs) + [src/schema/manager.rs](mdc:src/schema/manager.rs) + [src/schema/ingestion.rs](mdc:src/schema/ingestion.rs)
-- **Data Import**: [src/data_ingestion.rs](mdc:src/data_ingestion.rs) — JSONL two-pass import. BUG-6 (dedup) and BUG-7 (cross-session edge resolution) are fixed.
-- **Embedding Queue**: [src/embedding_queue.rs](mdc:src/embedding_queue.rs) — embedding-only async background worker. Superseded for new work by `InferenceQueue`; retained for callers that need per-request status tracking.
+The project is a Cargo workspace. All crates live under `crates/`:
+
+| Crate | Kind | Status | Purpose |
+|-------|------|--------|---------|
+| `u-forge-core` | lib | Complete | All current source (storage, AI, hardware, queue, search, schema, ingest) |
+| `u-forge-graph-view` | lib | Skeleton | Graph view model + layout (see `feature_UI.md`) |
+| `u-forge-ui-traits` | lib | Skeleton | Framework-agnostic rendering contracts (see `feature_UI.md`) |
+| `u-forge-ui-gpui` | bin | Skeleton | GPUI native app (see `feature_UI.md`) |
+| `u-forge-ui-egui` | bin | Skeleton | egui fallback app (see `feature_UI.md`) |
+| `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
+
+`defaults/` (schemas + sample data) lives at the **workspace root**, not inside any crate. `cli_demo.rs` resolves it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
+
+## Current Architecture (u-forge-core)
+
+- **Facade**: [crates/u-forge-core/src/lib.rs](mdc:crates/u-forge-core/src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas). New bulk methods: `get_all_edges()`, `get_nodes_paginated(offset, limit)`.
+- **Storage**: [crates/u-forge-core/src/graph/storage.rs](mdc:crates/u-forge-core/src/graph/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts` + sqlite-vec virtual table `chunks_vec` (768-dim cosine ANN). Key constants: `EMBEDDING_DIMENSIONS = 768`, `MAX_CHUNK_TOKENS = 350`, `ENABLE_HIGH_QUALITY_EMBEDDING = false`. `KnowledgeGraphStorage` is the only storage struct.
+- **Embeddings**: [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP) + `EmbeddingManager`.
+- **Transcription**: [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`.
+- **Hardware Abstraction**: [crates/u-forge-core/src/hardware/mod.rs](mdc:crates/u-forge-core/src/hardware/mod.rs) — `DeviceCapability` enum, `HardwareBackend` enum, `DeviceWorker` trait. Sub-modules:
+  - [crates/u-forge-core/src/hardware/npu.rs](mdc:crates/u-forge-core/src/hardware/npu.rs) — `NpuDevice` (embedding + STT + LLM on AMD NPU via FLM)
+  - [crates/u-forge-core/src/hardware/gpu.rs](mdc:crates/u-forge-core/src/hardware/gpu.rs) — `GpuDevice` (STT + LLM on AMD GPU via ROCm; shares `GpuResourceManager`)
+  - [crates/u-forge-core/src/hardware/cpu.rs](mdc:crates/u-forge-core/src/hardware/cpu.rs) — `CpuDevice` (TTS via Kokoro on host CPU)
+- **Inference Queue**: [crates/u-forge-core/src/queue/](mdc:crates/u-forge-core/src/queue) — `InferenceQueue` + `InferenceQueueBuilder` + `QueueStats`. Five capability channels: `embed_queue`, `transcribe_queue`, `synthesize_queue`, `generate_queue`, `rerank_queue`. Per-job retry: up to 3 attempts with exponential backoff in `run_embed_worker`.
+- **Extended Lemonade Integration**: [crates/u-forge-core/src/lemonade/](mdc:crates/u-forge-core/src/lemonade) — `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack`, `LemonadeRerankProvider`, `SystemInfo`.
+- **Hybrid Search**: [crates/u-forge-core/src/search/](mdc:crates/u-forge-core/src/search) — `search_hybrid(graph, queue, query, config)` free async function. RRF merge of FTS5 + ANN, optional rerank, graceful degradation.
+- **Schemas**: [crates/u-forge-core/src/schema/](mdc:crates/u-forge-core/src/schema)
+- **Data Import**: [crates/u-forge-core/src/ingest/data.rs](mdc:crates/u-forge-core/src/ingest/data.rs) — JSONL two-pass import.
 
 ## Migration Direction
 
-**Current state:** SQLite + FTS5, Lemonade embeddings, hardware abstraction, unified inference queue, `LemonadeRerankProvider`, `cli_demo` FTS5→rerank pipeline, and `search_hybrid` hybrid search pipeline are all complete. All nine tracked bugs resolved.
+**Current state:** SQLite + FTS5, Lemonade embeddings, hardware abstraction, unified inference queue, `LemonadeRerankProvider`, `cli_demo` FTS5→rerank pipeline, `search_hybrid` hybrid search pipeline, bulk graph access, and Cargo workspace split are all complete. All nine tracked bugs resolved.
 
 - ✅ **sqlite-vec** — ANN vector search complete (`chunks_vec` vec0, 768-dim cosine, `search_chunks_semantic`)
-- ✅ **Phase 4 (search pipeline)** — `search_hybrid` in `src/search/`: RRF merge of FTS5 + ANN, optional rerank, graceful degradation, unit tests
+- ✅ **Phase 4 (search pipeline)** — `search_hybrid` in `crates/u-forge-core/src/search/`: RRF merge of FTS5 + ANN, optional rerank, graceful degradation, unit tests
+- ✅ **Phase 5 (workspace split)** — Cargo workspace under `crates/`; `u-forge-core` + 5 skeleton crates
 - ⏳ **Phase 3** — `axum` HTTP/WebSocket server for web UI
 - ⏳ **Phase 4 (remainder)** — Streaming LLM responses: `InferenceQueue::generate_stream()` returning `tokio::sync::mpsc::Receiver<String>` of token chunks
-- ⏳ **Phase 5** — Cargo workspace split
+- ⏳ **UI feature** — `u-forge-graph-view` view model + GPUI prototype (see `feature_UI.md`)
+- ⏳ **TS sandbox feature** — `u-forge-ts-runtime` embedded V8 sandbox (see `feature_TS-Agent-Sandbox.md`)
 
 **Standard on [Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
 - Embeddings: `POST /api/v1/embeddings` (implemented — `LemonadeProvider` in `ai/embeddings.rs`)
@@ -65,11 +73,11 @@ Read [migration.md](mdc:migration.md) for the phased migration plan and current 
 
 ## Key Integration Points
 
-The `EmbeddingProvider` trait in [src/ai/embeddings.rs](mdc:src/ai/embeddings.rs) is the primary abstraction for embedding work. Only `LemonadeProvider` currently implements it. Do NOT bypass the trait.
+The `EmbeddingProvider` trait in [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) is the primary abstraction for embedding work. Only `LemonadeProvider` currently implements it. Do NOT bypass the trait.
 
-The `TranscriptionProvider` trait in [src/ai/transcription.rs](mdc:src/ai/transcription.rs) is the primary abstraction for STT work. Do NOT bypass the trait.
+The `TranscriptionProvider` trait in [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) is the primary abstraction for STT work. Do NOT bypass the trait.
 
-The `DeviceWorker` trait in [src/hardware/mod.rs](mdc:src/hardware/mod.rs) is the abstraction for physical compute devices. New hardware backends must implement it.
+The `DeviceWorker` trait in [crates/u-forge-core/src/hardware/mod.rs](mdc:crates/u-forge-core/src/hardware/mod.rs) is the abstraction for physical compute devices. New hardware backends must implement it.
 
 For new code that needs embedding, transcription, TTS, LLM generation, or reranking: use `InferenceQueueBuilder` to wire up devices and obtain an `InferenceQueue`. Do not call provider HTTP clients directly from business logic.
 
@@ -102,43 +110,42 @@ See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
 
 ## Important Files
 
-- [env.sh](mdc:env.sh) — Optional. Sets `UFORGE_*` path variables. **No longer required for compilation** (gcc-13 dependency eliminated with RocksDB).
+- [env.sh](mdc:env.sh) — Optional. Sets `UFORGE_*` path variables. **No longer required for compilation**.
 - [dev.sh](mdc:dev.sh) — Development runner. Automatically sets `--test-threads=1` when `LEMONADE_URL` is present.
 - [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work. Contains current module map, SQLite schema, hardware architecture, inference queue design, resolved bugs.
-- [migration.md](mdc:migration.md) — Phased migration plan with completion status including hardware re-architecture session notes.
-- [examples/cli_demo.rs](mdc:examples/cli_demo.rs) — The only runnable entry point. Demonstrates FTS5, semantic ANN, rerank, and hybrid search. No embedding server required for FTS-only sections.
-- [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files (unchanged).
+- [crates/u-forge-core/examples/cli_demo.rs](mdc:crates/u-forge-core/examples/cli_demo.rs) — The only runnable entry point. Resolves `defaults/` via `CARGO_MANIFEST_DIR`.
+- [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files (workspace root).
 - [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data (~220 nodes, ~312 edges).
 
-## Module Map
+## Module Map (u-forge-core)
+
+All paths below are relative to `crates/u-forge-core/`.
 
 | File | Role | Key Types |
 |---|---|---|
-| `src/lib.rs` | Facade + re-exports (~270 lines) | `KnowledgeGraph` |
+| `src/lib.rs` | Facade + re-exports | `KnowledgeGraph` |
 | `src/builder.rs` | ObjectBuilder fluent API | `ObjectBuilder` |
 | `src/text.rs` | Word-boundary text splitting (pub(crate)) | `split_text` |
 | `src/lib_tests.rs` | KnowledgeGraph + ObjectBuilder integration tests | *(test-only)* |
 | `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
-| `src/graph/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats`, `EMBEDDING_DIMENSIONS`, `MAX_CHUNK_TOKENS`, `ENABLE_HIGH_QUALITY_EMBEDDING` |
-| `src/ai/embeddings.rs` | Embedding providers (transcription re-exported for compat) | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
-| `src/ai/transcription.rs` | Audio-to-text providers | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager`, `mime_for_filename` |
+| `src/graph/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats`, `EMBEDDING_DIMENSIONS`, `MAX_CHUNK_TOKENS` |
+| `src/graph/edges.rs` | Edge CRUD + `get_all_edges()` bulk fetch | `KnowledgeGraphStorage` (impl) |
+| `src/graph/nodes.rs` | Node CRUD + `get_nodes_paginated()` | `KnowledgeGraphStorage` (impl) |
+| `src/ai/embeddings.rs` | Embedding providers | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager` |
+| `src/ai/transcription.rs` | Audio-to-text providers | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager` |
 | `src/hardware/mod.rs` | Device abstraction layer | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait) |
 | `src/hardware/npu.rs` | AMD NPU device | `NpuDevice` |
 | `src/hardware/gpu.rs` | AMD GPU ROCm device | `GpuDevice` |
 | `src/hardware/cpu.rs` | CPU device | `CpuDevice` |
 | `src/queue/dispatch.rs` | Unified MPMC inference dispatch queue | `InferenceQueue`, `QueueStats` |
 | `src/queue/builder.rs` | Queue builder + device wiring | `InferenceQueueBuilder` |
-| `src/queue/jobs.rs` | Internal job types + WorkQueue primitive | `EmbedJob`, `TranscribeJob`, etc., `WorkQueue<T>` |
+| `src/queue/jobs.rs` | Internal job types + WorkQueue primitive | `EmbedJob`, `TranscribeJob`, `WorkQueue<T>` |
 | `src/queue/workers.rs` | Background worker loops | `run_embed_worker`, `run_transcribe_worker`, etc. |
-| `src/lemonade/` | Extended Lemonade integration (GPU-managed stack) | `LemonadeModelRegistry`, `GpuResourceManager`, `SttGuard`, `LlmGuard`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `RerankDocument`, `SystemInfo`, `LemonadeCapabilities`, `LemonadeStack` |
+| `src/lemonade/` | Extended Lemonade integration | `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `SystemInfo`, `LemonadeStack` |
 | `src/search/mod.rs` | Hybrid search pipeline (FTS5 + ANN + rerank) | `search_hybrid`, `HybridSearchConfig`, `NodeSearchResult`, `SearchSources` |
 | `src/search/sanitize.rs` | FTS5 query sanitisation | `fts5_sanitize` |
-| `src/schema/definition.rs` | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
-| `src/schema/manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
-| `src/schema/ingestion.rs` | JSON schema files → internal | `SchemaIngestion` |
+| `src/schema/` | Schema definition, load/validate/cache, ingestion | `SchemaDefinition`, `SchemaManager`, `SchemaIngestion` |
 | `src/ingest/data.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
-
-**Deleted modules (do not reference):** `src/vector_search.rs` — removed in Phase 2. Its ANN responsibilities are now fulfilled by the sqlite-vec `chunks_vec` table in `storage.rs`.
 
 ## ModelRole Classification (lemonade.rs)
 

@@ -1,0 +1,13 @@
+[package]
+name = "u-forge-ui-gpui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "u-forge-ui-gpui"
+path = "src/main.rs"
+
+[dependencies]
+u-forge-core = { path = "../u-forge-core" }
+u-forge-graph-view = { path = "../u-forge-graph-view" }
+u-forge-ui-traits = { path = "../u-forge-ui-traits" }

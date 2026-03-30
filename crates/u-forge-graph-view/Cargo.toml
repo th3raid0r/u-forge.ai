@@ -1,0 +1,9 @@
+[package]
+name = "u-forge-graph-view"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+u-forge-core = { path = "../u-forge-core" }
+glam = "0.29"
+rstar = "0.12"

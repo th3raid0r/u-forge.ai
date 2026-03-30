@@ -36,7 +36,7 @@ used by `embedding_queue` tests and any test that needs an `EmbeddingProvider`
 without a live Lemonade Server.
 
 ```rust
-use u_forge_ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
+use u_forge_core::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
 
 const MOCK_DIMS: usize = 16;
 
@@ -83,7 +83,7 @@ async fn test_lemonade_embed() {
         return;
     };
 
-    let provider = u_forge_ai::embeddings::LemonadeProvider::new(&url, "nomic-embed-text")
+    let provider = u_forge_core::embeddings::LemonadeProvider::new(&url, "nomic-embed-text")
         .await
         .expect("Connect to Lemonade");
 
@@ -113,7 +113,7 @@ For tests that need a `TranscriptionProvider` without a live server, implement
 the trait inline:
 
 ```rust
-use u_forge_ai::embeddings::TranscriptionProvider;
+use u_forge_core::embeddings::TranscriptionProvider;
 
 struct MockTranscriptionProvider;
 
@@ -210,8 +210,8 @@ FTS5 query syntax supported: phrase (`"foo bar"`), prefix (`foo*`), boolean
 RUST_LOG=trace                               # Everything
 RUST_LOG=debug                               # Development detail
 RUST_LOG=info                                # Normal operation (default in demo)
-RUST_LOG=u_forge_ai::storage=debug           # Single module
-RUST_LOG=u_forge_ai::data_ingestion=warn     # Suppress noisy modules
+RUST_LOG=u_forge_core::storage=debug           # Single module
+RUST_LOG=u_forge_core::data_ingestion=warn     # Suppress noisy modules
 ```
 
 ### Structured logging in code

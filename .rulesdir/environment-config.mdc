@@ -36,7 +36,7 @@ export RUST_LOG=info                                # Log verbosity
 
 ### Module-specific logging
 ```bash
-export RUST_LOG=u_forge_ai::storage=debug,u_forge_ai::embeddings=info
+export RUST_LOG=u_forge_core::storage=debug,u_forge_core::embeddings=info
 ```
 
 ## Path Resolution
