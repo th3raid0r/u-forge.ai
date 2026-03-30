@@ -8,12 +8,29 @@
 //! Usage:
 //!   cargo run --example cli_demo
 //!   cargo run --example cli_demo [DATA_FILE] [SCHEMA_DIR]
+//!   cargo run --example cli_demo [DATA_FILE] [SCHEMA_DIR] --config <CONFIG_FILE>
 //!
 //! Environment:
-//!   LEMONADE_URL       Lemonade Server base URL (e.g. http://localhost:8000/api/v1)
-//!   UFORGE_DATA_FILE   override DATA_FILE
-//!   UFORGE_SCHEMA_DIR  override SCHEMA_DIR
-//!   RUST_LOG           log verbosity (error/warn/info/debug/trace)
+//!   LEMONADE_URL         Lemonade Server base URL (e.g. http://localhost:8000/api/v1)
+//!   UFORGE_DATA_FILE     override DATA_FILE
+//!   UFORGE_SCHEMA_DIR    override SCHEMA_DIR
+//!   UFORGE_DEMO_CONFIG   path to demo config JSON file
+//!   RUST_LOG             log verbosity (error/warn/info/debug/trace)
+//!
+//! Config file format (JSON):
+//! ```json
+//! {
+//!   "fts":      { "queries": [{"query": "empire", "limit": 3}] },
+//!   "semantic": { "queries": [{"query": "collapse of civilization", "limit": 3}] },
+//!   "rerank":   { "queries": [{"query": "Who founded the Foundation?", "fts_keyword": "foundation", "fts_limit": 6}] },
+//!   "hybrid": {
+//!     "config": {"alpha": 0.5, "fts_limit": 15, "semantic_limit": 15, "rerank": true, "limit": 3},
+//!     "queries": ["Who founded the Foundation and why?"],
+//!     "alpha_sweep_query": "the collapse of an interstellar civilization",
+//!     "alpha_sweep_values": [0.0, 0.5, 1.0]
+//!   }
+//! }
+//! ```
 
 use anyhow::Result;
 use std::env;
@@ -31,6 +48,101 @@ use u_forge_core::{
     ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
     EMBEDDING_DIMENSIONS,
 };
+
+// ── Demo config ───────────────────────────────────────────────────────────────
+
+/// Optional per-section configuration loaded from a JSON file.
+/// Every field is optional; missing sections fall back to built-in defaults.
+#[derive(serde::Deserialize, Default)]
+struct DemoConfig {
+    fts: Option<FtsDemoConfig>,
+    semantic: Option<SemanticDemoConfig>,
+    rerank: Option<RerankDemoConfig>,
+    hybrid: Option<HybridDemoConfig>,
+}
+
+#[derive(serde::Deserialize)]
+struct FtsQuery {
+    query: String,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct FtsDemoConfig {
+    queries: Vec<FtsQuery>,
+}
+
+#[derive(serde::Deserialize)]
+struct SemanticQuery {
+    query: String,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct SemanticDemoConfig {
+    queries: Vec<SemanticQuery>,
+}
+
+#[derive(serde::Deserialize)]
+struct RerankQuery {
+    query: String,
+    fts_keyword: String,
+    #[serde(default = "default_rerank_fts_limit")]
+    fts_limit: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct RerankDemoConfig {
+    queries: Vec<RerankQuery>,
+}
+
+#[derive(serde::Deserialize)]
+struct HybridSearchParams {
+    #[serde(default = "default_alpha")]
+    alpha: f32,
+    #[serde(default = "default_hybrid_fts_limit")]
+    fts_limit: usize,
+    #[serde(default = "default_hybrid_sem_limit")]
+    semantic_limit: usize,
+    #[serde(default)]
+    rerank: bool,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct HybridDemoConfig {
+    config: Option<HybridSearchParams>,
+    #[serde(default)]
+    queries: Vec<String>,
+    alpha_sweep_query: Option<String>,
+    alpha_sweep_values: Option<Vec<f32>>,
+}
+
+fn default_limit() -> usize {
+    3
+}
+fn default_rerank_fts_limit() -> usize {
+    6
+}
+fn default_alpha() -> f32 {
+    0.5
+}
+fn default_hybrid_fts_limit() -> usize {
+    15
+}
+fn default_hybrid_sem_limit() -> usize {
+    15
+}
+
+fn load_demo_config(path: &str) -> Result<DemoConfig> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("Could not read config file '{path}': {e}"))?;
+    serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("Could not parse config file '{path}': {e}"))
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -61,6 +173,40 @@ async fn main() -> Result<()> {
         .cloned()
         .or_else(|| env::var("UFORGE_SCHEMA_DIR").ok())
         .unwrap_or_else(|| format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR")));
+
+    // Optional demo config: --config <path>, UFORGE_DEMO_CONFIG env var, or
+    // defaults/demo_config.json next to the data file / schema dir.
+    let default_config_path = format!(
+        "{}/../../defaults/demo_config.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let config_path = args
+        .windows(2)
+        .find(|w| w[0] == "--config")
+        .map(|w| w[1].clone())
+        .or_else(|| env::var("UFORGE_DEMO_CONFIG").ok())
+        .or_else(|| {
+            if std::path::Path::new(&default_config_path).exists() {
+                Some(default_config_path.clone())
+            } else {
+                None
+            }
+        });
+
+    let demo_cfg: DemoConfig = match config_path {
+        None => DemoConfig::default(),
+        Some(ref path) => match load_demo_config(path) {
+            Ok(c) => {
+                println!("   Config    : {path} (loaded)");
+                c
+            }
+            Err(e) => {
+                eprintln!("   ⚠️  Config  : {e} — using built-in defaults");
+                DemoConfig::default()
+            }
+        },
+    };
 
     // Resolve the Lemonade Server URL: probe localhost first, then fall back to
     // the LEMONADE_URL env var.  An unset env var is never a hard error here —
@@ -549,18 +695,26 @@ async fn main() -> Result<()> {
     println!("🔎 Full-text search demos (SQLite FTS5)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let queries = [
-        "empire",
-        "foundation",
-        "terminus",
-        "psychohistory",
-        "robot",
-        "galaxy",
+    let default_fts_queries: &[(&str, usize)] = &[
+        ("empire", 3),
+        ("foundation", 3),
+        ("terminus", 3),
+        ("psychohistory", 3),
+        ("robot", 3),
+        ("galaxy", 3),
     ];
 
-    for query in &queries {
+    let fts_queries: Vec<(String, usize)> = match &demo_cfg.fts {
+        Some(cfg) => cfg.queries.iter().map(|q| (q.query.clone(), q.limit)).collect(),
+        None => default_fts_queries
+            .iter()
+            .map(|(q, l)| (q.to_string(), *l))
+            .collect(),
+    };
+
+    for (query, limit) in &fts_queries {
         println!("  Query: \"{query}\"");
-        let results = graph.search_chunks_fts(query, 3)?;
+        let results = graph.search_chunks_fts(query, *limit)?;
         if results.is_empty() {
             println!("    (no matches)\n");
             continue;
@@ -589,18 +743,26 @@ async fn main() -> Result<()> {
         println!("   Strategy: embed the query with the same model used to index");
         println!("   chunks, then find nearest neighbours by cosine distance.\n");
 
-        let semantic_queries = [
-            "mathematical prediction of human behaviour",
-            "the collapse of a great interstellar civilization",
-            "a planet on the periphery of known space",
-            "a brilliant scientist and planner",
+        let default_semantic: &[(&str, usize)] = &[
+            ("mathematical prediction of human behaviour", 3),
+            ("the collapse of a great interstellar civilization", 3),
+            ("a planet on the periphery of known space", 3),
+            ("a brilliant scientist and planner", 3),
         ];
 
-        for query in &semantic_queries {
+        let semantic_queries: Vec<(String, usize)> = match &demo_cfg.semantic {
+            Some(cfg) => cfg.queries.iter().map(|q| (q.query.clone(), q.limit)).collect(),
+            None => default_semantic
+                .iter()
+                .map(|(q, l)| (q.to_string(), *l))
+                .collect(),
+        };
+
+        for (query, limit) in &semantic_queries {
             println!("  Query: \"{query}\"");
-            match eq.embed(*query).await {
+            match eq.embed(query.as_str()).await {
                 Err(e) => println!("    ⚠️  Embed failed: {e}\n"),
-                Ok(query_vec) => match graph.search_chunks_semantic(&query_vec, 3) {
+                Ok(query_vec) => match graph.search_chunks_semantic(&query_vec, *limit) {
                     Err(e) => println!("    ⚠️  Semantic search failed: {e}\n"),
                     Ok(results) if results.is_empty() => {
                         println!("    (no matches — are chunks embedded?)\n");
@@ -641,7 +803,7 @@ async fn main() -> Result<()> {
         println!("   candidate documents, then ask the reranker to re-order them");
         println!("   by relevance to the original query.\n");
 
-        let rerank_queries: &[(&str, &str, usize)] = &[
+        let default_rerank: &[(&str, &str, usize)] = &[
             ("Who founded the Foundation?", "foundation", 6),
             (
                 "mathematics and prediction of civilisation",
@@ -651,7 +813,19 @@ async fn main() -> Result<()> {
             ("Galactic Empire collapse", "empire", 6),
         ];
 
-        for (query, fts_keyword, fts_limit) in rerank_queries {
+        let rerank_queries: Vec<(String, String, usize)> = match &demo_cfg.rerank {
+            Some(cfg) => cfg
+                .queries
+                .iter()
+                .map(|q| (q.query.clone(), q.fts_keyword.clone(), q.fts_limit))
+                .collect(),
+            None => default_rerank
+                .iter()
+                .map(|(q, k, l)| (q.to_string(), k.to_string(), *l))
+                .collect(),
+        };
+
+        for (query, fts_keyword, fts_limit) in &rerank_queries {
             println!("  Query: \"{query}\"");
 
             let fts_results = graph.search_chunks_fts(fts_keyword, *fts_limit)?;
@@ -726,13 +900,22 @@ async fn main() -> Result<()> {
 
         let has_rr = reranker.is_some();
 
-        // Config: balanced blend, return top 3 nodes with full context.
-        let config = HybridSearchConfig {
-            alpha: 0.5,
-            fts_limit: 15,
-            semantic_limit: 15,
-            rerank: has_rr,
-            limit: 3,
+        // Config: from file if provided, otherwise balanced blend with top 3 nodes.
+        let config = match demo_cfg.hybrid.as_ref().and_then(|h| h.config.as_ref()) {
+            Some(p) => HybridSearchConfig {
+                alpha: p.alpha,
+                fts_limit: p.fts_limit,
+                semantic_limit: p.semantic_limit,
+                rerank: p.rerank && has_rr,
+                limit: p.limit,
+            },
+            None => HybridSearchConfig {
+                alpha: 0.5,
+                fts_limit: 15,
+                semantic_limit: 15,
+                rerank: has_rr,
+                limit: 3,
+            },
         };
 
         println!(
@@ -740,17 +923,22 @@ async fn main() -> Result<()> {
             config.alpha, config.fts_limit, config.semantic_limit, config.rerank, config.limit,
         );
 
-        let hybrid_queries = [
+        let default_hybrid_queries: &[&str] = &[
             "Who founded the Foundation and why?",
             "What happened to the Galactic Empire?",
             "psychohistory and mathematical prediction",
             "robotic civilizations and machine intelligence",
         ];
 
+        let hybrid_queries: Vec<String> = match &demo_cfg.hybrid {
+            Some(h) if !h.queries.is_empty() => h.queries.clone(),
+            _ => default_hybrid_queries.iter().map(|q| q.to_string()).collect(),
+        };
+
         for query in &hybrid_queries {
             println!("  Query: \"{query}\"");
 
-            match search_hybrid(&graph, eq, query, &config).await {
+            match search_hybrid(&graph, eq, query.as_str(), &config).await {
                 Err(e) => {
                     println!("    ⚠️  Hybrid search error: {e}\n");
                 }
@@ -786,15 +974,28 @@ async fn main() -> Result<()> {
         }
 
         // ── Per-alpha comparison ──────────────────────────────────────────────
-        // Show one query at three alpha values so the blend effect is visible.
+        // Show one query at several alpha values so the blend effect is visible.
 
-        println!("  — Alpha sweep (query: \"the collapse of an interstellar civilization\") —\n");
+        let sweep_query = demo_cfg
+            .hybrid
+            .as_ref()
+            .and_then(|h| h.alpha_sweep_query.as_deref())
+            .unwrap_or("the collapse of an interstellar civilization");
 
-        for &alpha in &[0.0f32, 0.5, 1.0] {
+        let default_sweep_alphas = [0.0f32, 0.5, 1.0];
+        let sweep_alphas: &[f32] = demo_cfg
+            .hybrid
+            .as_ref()
+            .and_then(|h| h.alpha_sweep_values.as_deref())
+            .unwrap_or(&default_sweep_alphas);
+
+        println!("  — Alpha sweep (query: \"{sweep_query}\") —\n");
+
+        for &alpha in sweep_alphas {
             let label = match alpha {
                 a if a == 0.0 => "pure FTS5 ",
                 a if a == 1.0 => "pure SEM  ",
-                _ => "blend 50/50",
+                _ => "blend",
             };
             let sweep_config = HybridSearchConfig {
                 alpha,
@@ -804,13 +1005,7 @@ async fn main() -> Result<()> {
                 limit: 3,
             };
             print!("  alpha={alpha:.1} ({label}): ");
-            match search_hybrid(
-                &graph,
-                eq,
-                "the collapse of an interstellar civilization",
-                &sweep_config,
-            )
-            .await
+            match search_hybrid(&graph, eq, sweep_query, &sweep_config).await
             {
                 Err(e) => println!("⚠️  {e}"),
                 Ok(rs) if rs.is_empty() => println!("(no results)"),
@@ -998,18 +1193,29 @@ fn print_usage(prog: &str) {
     println!("u-forge.ai CLI Demo");
     println!();
     println!("Usage:");
-    println!("  {prog} [DATA_FILE] [SCHEMA_DIR]");
+    println!("  {prog} [DATA_FILE] [SCHEMA_DIR] [--config CONFIG_FILE]");
     println!();
     println!("Arguments:");
-    println!("  DATA_FILE   JSONL data file  (default: ./defaults/data/memory.json)");
-    println!("  SCHEMA_DIR  schema directory (default: ./defaults/schemas)");
+    println!("  DATA_FILE      JSONL data file       (default: ./defaults/data/memory.json)");
+    println!("  SCHEMA_DIR     schema directory      (default: ./defaults/schemas)");
+    println!("  --config PATH  demo config JSON file (optional)");
     println!();
     println!("Environment:");
-    println!("  UFORGE_DATA_FILE   override DATA_FILE");
-    println!("  UFORGE_SCHEMA_DIR  override SCHEMA_DIR");
-    println!("  LEMONADE_URL       Lemonade Server base URL for AI features");
-    println!("                     e.g. http://localhost:8000/api/v1");
-    println!("  RUST_LOG           log level (error/warn/info/debug/trace)");
+    println!("  UFORGE_DATA_FILE    override DATA_FILE");
+    println!("  UFORGE_SCHEMA_DIR   override SCHEMA_DIR");
+    println!("  UFORGE_DEMO_CONFIG  path to demo config JSON file");
+    println!("  LEMONADE_URL        Lemonade Server base URL for AI features");
+    println!("                      e.g. http://localhost:8000/api/v1");
+    println!("  RUST_LOG            log level (error/warn/info/debug/trace)");
+    println!();
+    println!("Config file format (JSON) — all sections are optional:");
+    println!(r#"  {{"fts": {{"queries": [{{"query": "empire", "limit": 3}}]}}}}"#);
+    println!(r#"  {{"semantic": {{"queries": [{{"query": "collapse of empire", "limit": 3}}]}}}}"#);
+    println!(r#"  {{"rerank": {{"queries": [{{"query": "Who founded it?", "fts_keyword": "foundation", "fts_limit": 6}}]}}}}"#);
+    println!(r#"  {{"hybrid": {{"config": {{"alpha": 0.5, "fts_limit": 15, "semantic_limit": 15, "rerank": true, "limit": 3}},"#);
+    println!(r#"              "queries": ["Who founded the Foundation?"],"#);
+    println!(r#"              "alpha_sweep_query": "collapse of civilization","#);
+    println!(r#"              "alpha_sweep_values": [0.0, 0.5, 1.0]}}}}"#);
     println!();
     println!("AI features (requires LEMONADE_URL):");
     println!("  • Hardware capability detection (NPU / iGPU / CPU)");
