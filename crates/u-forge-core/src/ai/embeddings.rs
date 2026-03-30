@@ -273,7 +273,7 @@ impl EmbeddingProvider for LemonadeProvider {
     }
 
     fn max_tokens(&self) -> Result<usize> {
-        Ok(crate::graph::DEFAULT_EMBEDDING_CONTEXT_TOKENS)
+        Ok(crate::lemonade::effective_ctx_size(&self.model))
     }
 
     fn provider_type(&self) -> EmbeddingProviderType {

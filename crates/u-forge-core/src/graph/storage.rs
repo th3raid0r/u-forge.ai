@@ -118,7 +118,7 @@ pub const EMBEDDING_DIMENSIONS: usize = 768;
 /// (e.g. `nomic-embed-text-v2-moe-GGUF`) support up to 4 K or 8 K context.
 /// Setting this to 4096 is a conservative default that works across all
 /// currently-supported Lemonade embedding recipes.
-pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 4096;
+pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 2048;
 
 /// Maximum number of tokens per stored text chunk.
 ///
@@ -1046,10 +1046,18 @@ mod tests {
             .upsert_edge(Edge::new(id_a, id_b, EdgeType::Custom("knows".to_string())))
             .unwrap();
         storage
-            .upsert_edge(Edge::new(id_b, id_c, EdgeType::Custom("trusts".to_string())))
+            .upsert_edge(Edge::new(
+                id_b,
+                id_c,
+                EdgeType::Custom("trusts".to_string()),
+            ))
             .unwrap();
         storage
-            .upsert_edge(Edge::new(id_a, id_c, EdgeType::Custom("opposes".to_string())))
+            .upsert_edge(Edge::new(
+                id_a,
+                id_c,
+                EdgeType::Custom("opposes".to_string()),
+            ))
             .unwrap();
 
         // Bulk fetch.

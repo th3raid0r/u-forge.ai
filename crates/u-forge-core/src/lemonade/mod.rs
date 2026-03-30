@@ -29,6 +29,7 @@ pub mod chat;
 pub(crate) mod client;
 pub mod gpu_manager;
 pub mod load;
+pub mod model_limits;
 pub mod registry;
 pub mod rerank;
 pub mod stt;
@@ -45,6 +46,7 @@ pub use chat::{
 pub use client::LemonadeHttpClient;
 pub use gpu_manager::{GpuResourceManager, GpuWorkload, LlmGuard, SttGuard};
 pub use load::{load_model, ModelLoadOptions};
+pub use model_limits::effective_ctx_size;
 pub use registry::{LemonadeModelEntry, LemonadeModelRegistry, ModelRole};
 pub use rerank::{LemonadeRerankProvider, RerankDocument};
 pub use stt::{LemonadeSttProvider, TranscriptionResult};

@@ -242,9 +242,10 @@ impl LemonadeModelRegistry {
 
     /// The preferred CPU/GPU llamacpp embedding model, if available.
     ///
-    /// Prefers `nomic-embed-text-v2-moe-GGUF` (MoE, more recent) over
-    /// `nomic-embed-text-v1-GGUF`; falls back to any [`ModelRole::CpuEmbedding`]
-    /// model compatible with the standard 768-dim index.
+    /// Prefers `nomic-embed-text-v1-GGUF` (8 192-token context) over
+    /// `nomic-embed-text-v2-moe-GGUF` (MoE, but capped at 512 tokens); falls
+    /// back to any [`ModelRole::CpuEmbedding`] model compatible with the
+    /// standard 768-dim index.
     ///
     /// `Qwen3-Embedding-8B-GGUF` is excluded unless
     /// [`ENABLE_HIGH_QUALITY_EMBEDDING`](crate::ENABLE_HIGH_QUALITY_EMBEDDING)
@@ -252,11 +253,11 @@ impl LemonadeModelRegistry {
     pub fn cpu_embedding_model(&self) -> Option<&LemonadeModelEntry> {
         self.models
             .iter()
-            .find(|m| m.id == "nomic-embed-text-v2-moe-GGUF")
+            .find(|m| m.id == "nomic-embed-text-v1-GGUF")
             .or_else(|| {
                 self.models
                     .iter()
-                    .find(|m| m.id == "nomic-embed-text-v1-GGUF")
+                    .find(|m| m.id == "nomic-embed-text-v2-moe-GGUF")
             })
             .or_else(|| {
                 self.by_role(&ModelRole::CpuEmbedding)
@@ -271,9 +272,9 @@ impl LemonadeModelRegistry {
     /// All CPU/GPU llamacpp embedding models suitable for parallel workers.
     ///
     /// Returns every [`ModelRole::CpuEmbedding`] model in a stable preferred
-    /// order: `nomic-embed-text-v2-moe-GGUF` first (newer MoE architecture),
-    /// then `nomic-embed-text-v1-GGUF`, then any remaining models in
-    /// server-reported order.
+    /// order: `nomic-embed-text-v1-GGUF` first (8 192-token context), then
+    /// `nomic-embed-text-v2-moe-GGUF` (MoE, capped at 512 tokens), then any
+    /// remaining models in server-reported order.
     ///
     /// `Qwen3-Embedding-8B-GGUF` is **excluded** unless
     /// [`ENABLE_HIGH_QUALITY_EMBEDDING`](crate::ENABLE_HIGH_QUALITY_EMBEDDING)
@@ -288,9 +289,10 @@ impl LemonadeModelRegistry {
         // Gate high-quality models behind the feature flag.
         let high_quality = crate::graph::ENABLE_HIGH_QUALITY_EMBEDDING;
 
-        // Stable preferred order: v2-moe first (newer MoE architecture), v1
-        // second, everything else appended in server-reported order.
-        const PREFERRED: &[&str] = &["nomic-embed-text-v2-moe-GGUF", "nomic-embed-text-v1-GGUF"];
+        // Stable preferred order: v1 first (8 192-token context window), v2-moe
+        // second (MoE but capped at 512 tokens), everything else appended in
+        // server-reported order.
+        const PREFERRED: &[&str] = &["nomic-embed-text-v1-GGUF", "nomic-embed-text-v2-moe-GGUF"];
 
         let candidates: Vec<&LemonadeModelEntry> = self
             .by_role(&ModelRole::CpuEmbedding)

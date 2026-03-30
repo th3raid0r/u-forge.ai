@@ -40,14 +40,14 @@ use u_forge_core::{
     hardware::npu::NpuDevice,
     ingest::DataIngestion,
     lemonade::{
-        resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelLoadOptions,
-        ModelRole, SystemInfo,
+        effective_ctx_size, resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider,
+        ModelLoadOptions, ModelRole, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
     types::ObjectMetadata,
     ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
-    DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
+    EMBEDDING_DIMENSIONS,
 };
 
 // ── Demo config ───────────────────────────────────────────────────────────────
@@ -394,13 +394,6 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("   ⚠️  No reranker available: {e}"),
                             }
 
-                            // Load options: set ctx_size so the model accepts full-node
-                            // documents rather than truncating at the server default.
-                            let embed_load_opts = ModelLoadOptions {
-                                ctx_size: Some(DEFAULT_EMBEDDING_CONTEXT_TOKENS),
-                                ..Default::default()
-                            };
-
                             // Build a multi-worker embedding InferenceQueue.
                             // Each compatible model (matching EMBEDDING_DIMENSIONS) becomes
                             // its own Tokio worker competing on the shared embed_queue so
@@ -410,7 +403,12 @@ async fn main() -> Result<()> {
                             let mut worker_count = 0usize;
 
                             // NPU worker (FLM embed-gemma-300m-FLM)
-                            match NpuDevice::embedding_only(url, None, Some(&embed_load_opts)).await {
+                            // ctx_size capped to the model's actual max sequence length.
+                            let npu_load_opts = ModelLoadOptions {
+                                ctx_size: Some(effective_ctx_size("embed-gemma-300m-FLM")),
+                                ..Default::default()
+                            };
+                            match NpuDevice::embedding_only(url, None, Some(&npu_load_opts)).await {
                                 Ok(npu) => {
                                     let dims = npu.embedding.dimensions().unwrap_or(0);
                                     if dims == EMBEDDING_DIMENSIONS {
@@ -434,11 +432,16 @@ async fn main() -> Result<()> {
                             // instances of the same model class.
                             if let Some(model) = registry.cpu_embedding_model() {
                                 let model_id = model.id.clone();
+                                // ctx_size capped to this model's actual max sequence length.
+                                let cpu_load_opts = ModelLoadOptions {
+                                    ctx_size: Some(effective_ctx_size(&model_id)),
+                                    ..Default::default()
+                                };
                                 // Load instance 1 with ctx_size, then connect.
                                 match LemonadeProvider::new_with_load(
                                     url,
                                     &model_id,
-                                    &embed_load_opts,
+                                    &cpu_load_opts,
                                 )
                                 .await
                                 {

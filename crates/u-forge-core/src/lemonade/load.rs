@@ -24,6 +24,39 @@ use serde::Serialize;
 
 use super::client::LemonadeHttpClient;
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Returns `true` when `model_name` uses the FLM (NPU) recipe.
+///
+/// FLM models do not use `llama-server` internally and will reject
+/// `llamacpp_backend` / `llamacpp_args` parameters.
+fn is_flm_model(model_name: &str) -> bool {
+    model_name.ends_with("-FLM")
+}
+
+/// Build the effective `llamacpp_args` string for a non-FLM model.
+///
+/// If `ctx_size` is set and `--ubatch-size` is not already present in
+/// `opts.llamacpp_args`, appends `--ubatch-size {ctx_size}` so the
+/// micro-batch is kept in sync with the context window.  This prevents
+/// llamacpp from rejecting prompts that fill the full context.
+fn build_llamacpp_args(opts: &ModelLoadOptions) -> Option<String> {
+    let base = opts.llamacpp_args.as_deref().unwrap_or("");
+
+    if let Some(ctx) = opts.ctx_size {
+        if !base.contains("--ubatch-size") {
+            let extra = format!("--ubatch-size {ctx}");
+            return Some(if base.is_empty() {
+                extra
+            } else {
+                format!("{base} {extra}")
+            });
+        }
+    }
+
+    opts.llamacpp_args.clone()
+}
+
 // ── ModelLoadOptions ──────────────────────────────────────────────────────────
 
 /// Options for the `POST /api/v1/load` Lemonade Server endpoint.
@@ -94,11 +127,19 @@ struct LoadRequest<'a> {
 pub async fn load_model(base_url: &str, model_name: &str, opts: &ModelLoadOptions) -> Result<()> {
     let client = LemonadeHttpClient::new(base_url);
 
+    // FLM (NPU) models do not use llama-server and will reject llamacpp params.
+    let flm = is_flm_model(model_name);
+    let effective_args: Option<String> = if flm {
+        None
+    } else {
+        build_llamacpp_args(opts)
+    };
+
     let body = LoadRequest {
         model_name,
         ctx_size: opts.ctx_size,
-        llamacpp_backend: opts.llamacpp_backend.as_deref(),
-        llamacpp_args: opts.llamacpp_args.as_deref(),
+        llamacpp_backend: if flm { None } else { opts.llamacpp_backend.as_deref() },
+        llamacpp_args: effective_args.as_deref(),
     };
 
     // The /load endpoint returns a JSON object; we don't need its contents —
@@ -111,8 +152,8 @@ pub async fn load_model(base_url: &str, model_name: &str, opts: &ModelLoadOption
     tracing::info!(
         model = model_name,
         ctx_size = ?opts.ctx_size,
-        llamacpp_backend = ?opts.llamacpp_backend,
-        llamacpp_args = ?opts.llamacpp_args,
+        flm,
+        effective_llamacpp_args = ?effective_args,
         "Model loaded via Lemonade Server"
     );
 
@@ -124,6 +165,69 @@ pub async fn load_model(base_url: &str, model_name: &str, opts: &ModelLoadOption
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Helper unit tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_flm_model() {
+        assert!(is_flm_model("embed-gemma-300m-FLM"));
+        assert!(is_flm_model("qwen3-8b-FLM"));
+        assert!(!is_flm_model("nomic-embed-text-v1-GGUF"));
+        assert!(!is_flm_model("bge-reranker-v2-m3-GGUF"));
+    }
+
+    #[test]
+    fn test_build_llamacpp_args_injects_ubatch_when_ctx_set() {
+        let opts = ModelLoadOptions {
+            ctx_size: Some(4096),
+            ..Default::default()
+        };
+        let args = build_llamacpp_args(&opts).unwrap();
+        assert_eq!(args, "--ubatch-size 4096");
+    }
+
+    #[test]
+    fn test_build_llamacpp_args_appends_to_existing() {
+        let opts = ModelLoadOptions {
+            ctx_size: Some(2048),
+            llamacpp_args: Some("--batch-size 512".to_string()),
+            ..Default::default()
+        };
+        let args = build_llamacpp_args(&opts).unwrap();
+        assert_eq!(args, "--batch-size 512 --ubatch-size 2048");
+    }
+
+    #[test]
+    fn test_build_llamacpp_args_no_duplicate_ubatch() {
+        let opts = ModelLoadOptions {
+            ctx_size: Some(4096),
+            llamacpp_args: Some("--ubatch-size 512".to_string()),
+            ..Default::default()
+        };
+        let args = build_llamacpp_args(&opts).unwrap();
+        // Already present — must not be added again
+        assert_eq!(args, "--ubatch-size 512");
+        assert_eq!(args.matches("--ubatch-size").count(), 1);
+    }
+
+    #[test]
+    fn test_build_llamacpp_args_no_ctx_returns_existing_args() {
+        let opts = ModelLoadOptions {
+            ctx_size: None,
+            llamacpp_args: Some("--batch-size 512".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_llamacpp_args(&opts).as_deref(),
+            Some("--batch-size 512")
+        );
+    }
+
+    #[test]
+    fn test_build_llamacpp_args_all_none_returns_none() {
+        let opts = ModelLoadOptions::default();
+        assert!(build_llamacpp_args(&opts).is_none());
+    }
 
     #[test]
     fn test_model_load_options_default_is_all_none() {
@@ -148,8 +252,14 @@ mod tests {
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["model_name"], "test-model");
         assert_eq!(json["ctx_size"], 4096);
-        assert!(json.get("llamacpp_backend").is_none(), "unset fields must be omitted");
-        assert!(json.get("llamacpp_args").is_none(), "unset fields must be omitted");
+        assert!(
+            json.get("llamacpp_backend").is_none(),
+            "unset fields must be omitted"
+        );
+        assert!(
+            json.get("llamacpp_args").is_none(),
+            "unset fields must be omitted"
+        );
     }
 
     #[test]
@@ -184,5 +294,31 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "Expected error for unreachable server");
+    }
+
+    /// Integration test: explicitly load `nomic-embed-text-v1-GGUF` with
+    /// `DEFAULT_EMBEDDING_CONTEXT_TOKENS` and verify the server accepts the request.
+    ///
+    /// Skips automatically when no Lemonade Server is reachable.
+    #[tokio::test]
+    async fn test_load_nomic_embed_v1_default_ctx() {
+        let Some(url) = crate::test_helpers::lemonade_url().await else {
+            eprintln!("Skipping: no Lemonade Server reachable");
+            return;
+        };
+
+        let opts = ModelLoadOptions {
+            ctx_size: Some(crate::lemonade::effective_ctx_size(
+                "nomic-embed-text-v1-GGUF",
+            )),
+            ..Default::default()
+        };
+
+        let result = load_model(&url, "nomic-embed-text-v1-GGUF", &opts).await;
+        assert!(
+            result.is_ok(),
+            "load_model failed: {:?}",
+            result.unwrap_err()
+        );
     }
 }
