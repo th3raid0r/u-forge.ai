@@ -3,7 +3,7 @@
 //! Loads the Foundation universe sample data and schemas, then demonstrates
 //! graph queries, FTS5 full-text search, and — when a Lemonade Server is
 //! reachable — prints detected hardware capabilities, available models, and
-//! runs a rerank check against FTS5 search results.
+//! runs a rerank check against semantic search results.
 //!
 //! Usage:
 //!   cargo run --example cli_demo
@@ -22,7 +22,7 @@
 //! {
 //!   "fts":      { "queries": [{"query": "empire", "limit": 3}] },
 //!   "semantic": { "queries": [{"query": "collapse of civilization", "limit": 3}] },
-//!   "rerank":   { "queries": [{"query": "Who founded the Foundation?", "fts_keyword": "foundation", "fts_limit": 6}] },
+//!   "rerank":   { "queries": [{"query": "Who founded the Foundation?", "semantic_limit": 6}] },
 //!   "hybrid": {
 //!     "config": {"alpha": 0.5, "fts_limit": 15, "semantic_limit": 15, "rerank": true, "limit": 3},
 //!     "queries": ["Who founded the Foundation and why?"],
@@ -88,9 +88,8 @@ struct SemanticDemoConfig {
 #[derive(serde::Deserialize)]
 struct RerankQuery {
     query: String,
-    fts_keyword: String,
-    #[serde(default = "default_rerank_fts_limit")]
-    fts_limit: usize,
+    #[serde(default = "default_rerank_semantic_limit")]
+    semantic_limit: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -124,7 +123,7 @@ struct HybridDemoConfig {
 fn default_limit() -> usize {
     3
 }
-fn default_rerank_fts_limit() -> usize {
+fn default_rerank_semantic_limit() -> usize {
     6
 }
 fn default_alpha() -> f32 {
@@ -795,62 +794,66 @@ async fn main() -> Result<()> {
 
     // ── Rerank demo ───────────────────────────────────────────────────────────
 
-    if let Some(ref rr) = reranker {
+    if let (Some(ref rr), Some(ref eq)) = (&reranker, &embed_queue) {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("🏆 Rerank demo (model: {})", rr.model);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        println!("   Strategy: run an FTS5 search, collect the top snippets as");
-        println!("   candidate documents, then ask the reranker to re-order them");
-        println!("   by relevance to the original query.\n");
+        println!("   Strategy: embed the query, run a semantic ANN search to gather");
+        println!("   candidate chunks, then ask the reranker to re-order them by");
+        println!("   relevance to the original query.\n");
 
-        let default_rerank: &[(&str, &str, usize)] = &[
-            ("Who founded the Foundation?", "foundation", 6),
-            (
-                "mathematics and prediction of civilisation",
-                "mathematics",
-                5,
-            ),
-            ("Galactic Empire collapse", "empire", 6),
+        let default_rerank: &[(&str, usize)] = &[
+            ("Who founded the Foundation?", 6),
+            ("mathematics and prediction of civilisation", 5),
+            ("Galactic Empire collapse", 6),
         ];
 
-        let rerank_queries: Vec<(String, String, usize)> = match &demo_cfg.rerank {
+        let rerank_queries: Vec<(String, usize)> = match &demo_cfg.rerank {
             Some(cfg) => cfg
                 .queries
                 .iter()
-                .map(|q| (q.query.clone(), q.fts_keyword.clone(), q.fts_limit))
+                .map(|q| (q.query.clone(), q.semantic_limit))
                 .collect(),
             None => default_rerank
                 .iter()
-                .map(|(q, k, l)| (q.to_string(), k.to_string(), *l))
+                .map(|(q, l)| (q.to_string(), *l))
                 .collect(),
         };
 
-        for (query, fts_keyword, fts_limit) in &rerank_queries {
+        for (query, semantic_limit) in &rerank_queries {
             println!("  Query: \"{query}\"");
 
-            let fts_results = graph.search_chunks_fts(fts_keyword, *fts_limit)?;
+            let query_vec = match eq.embed(query.as_str()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("    ⚠️  Embed failed: {e}\n");
+                    continue;
+                }
+            };
 
-            if fts_results.is_empty() {
-                println!("    ⚠️  FTS returned no candidates for keyword \"{fts_keyword}\"\n");
+            let sem_results = graph.search_chunks_semantic(&query_vec, *semantic_limit)?;
+
+            if sem_results.is_empty() {
+                println!("    ⚠️  Semantic search returned no candidates (are chunks embedded?)\n");
                 continue;
             }
 
-            // Collect candidate documents (snippet text) with their FTS rank.
-            // Store obj_id alongside so reranked results can load full node data.
-            let candidates: Vec<(u_forge_core::types::ObjectId, String, String)> = fts_results
+            // Collect candidate documents with their obj_id so reranked results
+            // can load full node data.
+            let candidates: Vec<(u_forge_core::types::ObjectId, String, String)> = sem_results
                 .iter()
-                .map(|(_chunk_id, obj_id, snippet)| {
+                .map(|(_chunk_id, obj_id, content, distance)| {
                     let label = graph
                         .get_object(*obj_id)
                         .ok()
                         .flatten()
                         .map(|o| format!("{} [{}]", o.name, o.object_type))
                         .unwrap_or_else(|| obj_id.to_string());
-                    (*obj_id, label, snippet.clone())
+                    (*obj_id, label, format!("[dist:{distance:.4}] {content}"))
                 })
                 .collect();
 
-            println!("   FTS candidates (keyword: \"{fts_keyword}\"):");
+            println!("   Semantic candidates:");
             for (i, (_id, label, snippet)) in candidates.iter().enumerate() {
                 println!("     {i}. {label} — \"{}\"", snippet);
             }
@@ -864,7 +867,7 @@ async fn main() -> Result<()> {
                     println!("   Reranked (most relevant first):");
                     for (rank, doc) in ranked.iter().enumerate() {
                         let (obj_id, label, original_text) = &candidates[doc.index];
-                        // Fall back to the original candidate snippet when the
+                        // Fall back to the original candidate text when the
                         // server doesn't echo the document text back.
                         let text = doc.document.as_deref().unwrap_or(original_text.as_str());
                         println!("     {}. [score {:.4}] {}", rank + 1, doc.score, label,);
@@ -878,7 +881,7 @@ async fn main() -> Result<()> {
             }
         }
     } else if lemonade_url.is_some() {
-        println!("ℹ️  Rerank demo skipped — no reranker model available on this server.\n");
+        println!("ℹ️  Rerank demo skipped — requires both an embedding model and a reranker model.\n");
     } else {
         println!("ℹ️  Rerank demo skipped — set LEMONADE_URL to enable AI features.\n");
     }

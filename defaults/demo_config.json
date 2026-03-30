@@ -9,8 +9,7 @@
     "queries": [
       {
         "query": "Who is the leader of the Foundation?",
-        "fts_keyword": "leader",
-        "fts_limit": 3
+        "semantic_limit": 6
       }
     ]
   },
