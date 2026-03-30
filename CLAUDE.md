@@ -40,10 +40,7 @@ See `.rules` for the full list. Summary:
 
 ---
 
-## Work in Progress
+## Active Features
 
-### Active features
-
-**Parallel tracks (now unblocked — workspace split is complete):**
 - **`feature_UI.md`** — Native GPUI graph visualization: `u-forge-graph-view` view model + GPUI prototype. Skeleton crate at `crates/u-forge-ui-gpui/`.
 - **`feature_TS-Agent-Sandbox.md`** — Embedded V8 TypeScript sandbox: `u-forge-ts-runtime` with `deno_core` ops and `.d.ts` contract. Skeleton crate at `crates/u-forge-ts-runtime/`.

@@ -703,13 +703,3 @@ Foundation universe. JSONL format. Used by the CLI demo for end-to-end testing.
 `add_system_reference`, `add_transportation`. Loaded by `SchemaIngestion` at
 startup; the `add_` prefix is stripped before storage.
 
----
-
-## Remaining Roadmap
-
-| Item | Description |
-|---|---|
-| axum HTTP/WebSocket server | Wraps `KnowledgeGraph` + `InferenceQueue` behind HTTP and WebSocket endpoints. `KnowledgeGraph` is `Send + Sync` and `Arc`-wrapped; `LemonadeStack`, `InferenceQueue`, and `search_hybrid` slot into an `AppState`. `POST /api/search` will call `search_hybrid` directly. |
-| Streaming LLM responses | `InferenceQueue::generate_stream()` returning `tokio::sync::mpsc::Receiver<String>` of token chunks for axum WebSocket delivery. |
-| UI feature | Native GPUI graph visualization (`u-forge-graph-view` view model + `u-forge-ui-gpui` app). Skeleton crates exist in `crates/`. See `feature_UI.md`. |
-| TS sandbox feature | Embedded V8 TypeScript sandbox (`u-forge-ts-runtime` with `deno_core` ops). Skeleton crate exists in `crates/`. See `feature_TS-Agent-Sandbox.md`. |

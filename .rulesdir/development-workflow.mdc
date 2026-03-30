@@ -13,8 +13,7 @@ cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo   # 
 cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo ./data.json ./schemas/  # Custom data
 ```
 
-> **No `source env.sh` required.** The gcc-13 / RocksDB requirement was eliminated
-> in Phase 2. Bundled SQLite compiles with any standard C compiler on PATH.
+> **No `source env.sh` required.** Bundled SQLite compiles with any standard C compiler on PATH.
 
 ---
 
@@ -45,17 +44,7 @@ cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo ./da
 ## Architecture Context
 
 Before making changes, read:
-- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — Current state (SQLite schema, module map, resolved bugs)
-- [migration.md](mdc:migration.md) — Phased plan and completion status
-
-### Current state (all complete):
-- SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware abstraction (`src/hardware/`), unified inference queue (`src/queue/`), `LemonadeRerankProvider` + `InferenceQueue::rerank()` wired, `cli_demo` demonstrates FTS5 → rerank pipeline.
-
-### Remaining work:
-- **Phase 3** — `axum` HTTP/WebSocket server for web UI
-- **Phase 4 (remainder)** — Streaming LLM responses via `InferenceQueue::generate_stream()`
-- **UI feature** — `u-forge-graph-view` + GPUI app (see `feature_UI.md`)
-- **TS sandbox feature** — `u-forge-ts-runtime` embedded V8 (see `feature_TS-Agent-Sandbox.md`)
+- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — Current state (SQLite schema, module map, resolved bugs, design decisions)
 
 ---
 

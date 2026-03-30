@@ -99,8 +99,8 @@ Resolution order:
 2. `http://127.0.0.1:8000/api/v1` — same probe, explicit IPv4 loopback
 3. `LEMONADE_URL` environment variable — accepted as-is, no liveness check
 
-> **There is no FastEmbed / local fallback.** FastEmbed and ONNX Runtime were
-> removed in Phase 1. Do not attempt to reference `FastEmbedProvider`,
+> **There is no FastEmbed / local fallback.** FastEmbed and ONNX Runtime have been
+> removed. Do not attempt to reference `FastEmbedProvider`,
 > `try_new_local_default`, or `FASTEMBED_CACHE_PATH` — they no longer exist.
 
 ---

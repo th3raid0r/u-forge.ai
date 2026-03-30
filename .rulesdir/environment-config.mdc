@@ -4,19 +4,15 @@ globs: env.sh,dev.sh,*.toml,*.yaml,*.yml,config.*
 
 # Environment and Configuration
 
-## Current Setup (Post-SQLite Migration)
+## Current Setup
 
-`env.sh` is **optional** after the Phase 2 migration. It no longer sets compiler
-variables — bundled SQLite compiles with any standard C compiler. Source it only if
-you want the convenience path exports.
+`env.sh` is **optional**. It no longer sets compiler variables — bundled SQLite
+compiles with any standard C compiler. Source it only if you want the convenience
+path exports.
 
 ```bash
 source env.sh   # optional — sets UFORGE_* path variables
 ```
-
-> **Before Phase 2** `env.sh` was required to set `CC=gcc-13` for RocksDB.
-> That requirement is gone. Plain `gcc` / `g++` (any version) is sufficient for
-> the `openssl-sys` transitive dependency brought in by `reqwest`.
 
 ## Environment Variables
 
@@ -51,7 +47,7 @@ export RUST_LOG=u_forge_core::storage=debug,u_forge_core::embeddings=info
 2. `./defaults/data/memory.json`
 3. `../defaults/data/memory.json`
 
-## Lemonade Server Configuration (Phase 1 — active)
+## Lemonade Server Configuration
 
 Lemonade Server provides embeddings (and future reranking / chat) via an
 OpenAI-compatible HTTP API.  u-forge.ai does **not** fall back to a local model if
@@ -64,7 +60,7 @@ sudo snap install lemonade-server
 # Pull required models
 lemonade-server pull embed-gemma-300m-FLM    # embeddings (NPU, 0.62 GB) — default embedding model
 lemonade-server pull whisper-v3-turbo-FLM    # transcription (NPU, 1.55 GB) — default transcription model
-lemonade-server pull bge-reranker-v2-m3      # reranking (Phase 4, not yet integrated)
+lemonade-server pull bge-reranker-v2-m3      # reranking (GPU/CPU)
 
 # Start the server
 lemonade-server serve
@@ -87,16 +83,16 @@ model is `whisper-v3-turbo-FLM`. Errors surface only when `transcribe()` is call
 
 ### Lemonade API Endpoints in Use
 
-| Endpoint | Method | Provider | Phase |
-|---|---|---|---|
-| `/api/v1/embeddings` | POST (JSON) | `LemonadeProvider` (`embeddings.rs`) | ✅ Phase 1 |
-| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeTranscriptionProvider` (`embeddings.rs`) | ✅ Phase 1 |
-| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeSttProvider` (`lemonade.rs`, GPU-managed) | ✅ Phase 1 |
-| `/api/v1/audio/speech` | POST (JSON) | `LemonadeTtsProvider` (`lemonade.rs`) | ✅ Phase 1 |
-| `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` (`lemonade.rs`) | ✅ Phase 1 |
-| `/api/v1/reranking` | POST (JSON) | *(not yet implemented)* | ⏳ Phase 4 |
-| `/api/v1/models` | GET | `LemonadeModelRegistry` (`lemonade.rs`) | ✅ Phase 1 |
-| `/api/v1/health` | GET | *(manual verification only)* | — |
+| Endpoint | Method | Provider |
+|---|---|---|
+| `/api/v1/embeddings` | POST (JSON) | `LemonadeProvider` (`embeddings.rs`) |
+| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeTranscriptionProvider` (`embeddings.rs`) |
+| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeSttProvider` (`lemonade.rs`, GPU-managed) |
+| `/api/v1/audio/speech` | POST (JSON) | `LemonadeTtsProvider` (`lemonade.rs`) |
+| `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` (`lemonade.rs`) |
+| `/api/v1/reranking` | POST (JSON) | `LemonadeRerankProvider` (`lemonade.rs`) |
+| `/api/v1/models` | GET | `LemonadeModelRegistry` (`lemonade.rs`) |
+| `/api/v1/health` | GET | *(manual verification only)* |
 
 > **Note on the two transcription providers:** `LemonadeTranscriptionProvider` in
 > `ai/embeddings.rs` is a simple standalone provider with no GPU resource management —
@@ -116,27 +112,6 @@ exist.
 # For a persistent database, pass an explicit path:
 cargo run --example cli_demo
 # or set UFORGE_DATA_FILE / UFORGE_SCHEMA_DIR to customise import sources.
-```
-
-## Planned Configuration (Phase 3 — config.toml)
-
-```toml
-[server]
-host = "127.0.0.1"
-port = 3000
-
-[lemonade]
-url = "http://localhost:8000/api/v1"
-embedding_model = "nomic-embed-text"
-rerank_model = "bge-reranker-v2-m3"
-
-[database]
-path = "data/knowledge.db"
-
-[search]
-default_fts_limit = 10
-default_semantic_limit = 10
-rerank_enabled = true
 ```
 
 ## Build Commands

@@ -49,13 +49,10 @@ navigational aids.
 
 ## Current Project State (snapshot)
 
-- **Complete:** Cargo workspace split (`crates/` layout, `u-forge-core` + 5 skeleton crates).
-  SQLite + FTS5 storage, sqlite-vec ANN search, `LemonadeProvider` embeddings,
-  hardware abstraction, unified inference queue, `LemonadeRerankProvider`,
-  hybrid search pipeline, bulk graph access (`get_all_edges`, `get_nodes_paginated`).
-  No active bugs.
-- **Remaining:** axum HTTP server, streaming LLM responses, UI and TS sandbox features.
-  See `ARCHITECTURE.md` — Remaining Roadmap for details.
+Working prototype. Multi-crate Cargo workspace under `crates/`. SQLite + FTS5 storage,
+sqlite-vec ANN search, `LemonadeProvider` embeddings, hardware abstraction, unified
+inference queue, `LemonadeRerankProvider`, hybrid search pipeline, bulk graph access
+(`get_all_edges`, `get_nodes_paginated`). No active bugs.
 
 ---
 
@@ -126,15 +123,6 @@ JSONL node/edge format, two-pass import, deduplication, edge resolution.
 
 ---
 
-### Roadmap / next work
-→ **`.rulesdir/project-structure.mdc`** (Migration Direction)
-→ **`ARCHITECTURE.md`** (Remaining Roadmap section)
-
-Remaining work in priority order: axum HTTP server → streaming LLM responses →
-UI feature (`feature_UI.md`) → TS sandbox feature (`feature_TS-Agent-Sandbox.md`).
-Do not skip ahead without explicit instruction.
-
----
 
 ## Quick Reference: File → Topic
 
@@ -147,4 +135,4 @@ Do not skip ahead without explicit instruction.
 | `schema-system.mdc` | Schema format, validation, property types |
 | `json-data-formats.mdc` | JSONL import format, two-pass pipeline |
 | `testing-debugging.mdc` | TempDir setup, mock providers, skip guards, CI commands |
-| `ARCHITECTURE.md` | Full module map, SQLite schema, hardware design, design decisions, remaining roadmap |
+| `ARCHITECTURE.md` | Full module map, SQLite schema, hardware design, design decisions |

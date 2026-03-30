@@ -41,7 +41,7 @@ A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI
 
 | Layer | Technology |
 |---|---|
-| Language | Rust (single crate, lib + CLI example) |
+| Language | Rust (multi-crate Cargo workspace) |
 | Storage | SQLite via `rusqlite` (bundled — zero system deps) |
 | Full-text search | SQLite FTS5 |
 | Vector search | sqlite-vec ANN (`vec0` virtual table, cosine distance) |
@@ -61,10 +61,10 @@ cargo build
 cargo test -- --test-threads=1
 
 # Run the CLI demo with Foundation universe sample data
-cargo run --example cli_demo
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 ```
 
-No `source env.sh`. No gcc-13. No model downloads required to build and test.
+No `source env.sh`. No model downloads required to build and test.
 
 ### With Lemonade Server (embeddings + reranking + LLM + transcription)
 
@@ -83,7 +83,7 @@ lemonade-server serve                    # leave running
 # Set LEMONADE_URL only to override (e.g. non-standard port):
 export LEMONADE_URL="http://localhost:8000/api/v1"
 
-cargo run --example cli_demo
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 ```
 
 The CLI demo will detect hardware capabilities, list available models, run FTS5
@@ -105,29 +105,34 @@ available — demonstrate the FTS5 → rerank pipeline.
 
 ```
 u-forge.ai/
-├── src/
-│   ├── lib.rs              # KnowledgeGraph facade + re-exports
-│   ├── builder.rs          # ObjectBuilder fluent API
-│   ├── text.rs             # split_text() word-boundary chunking
-│   ├── types.rs            # Domain types
-│   ├── graph/              # SQLite persistence + FTS5 + ANN (6 files)
-│   ├── ai/                 # EmbeddingProvider + TranscriptionProvider traits + providers
-│   ├── hardware/           # DeviceCapability, NpuDevice, GpuDevice, CpuDevice
-│   ├── queue/              # Unified MPMC inference dispatch (embed/transcribe/TTS/LLM/rerank)
-│   ├── lemonade/           # LemonadeModelRegistry, GpuResourceManager, LemonadeRerankProvider,
-│   │                       #   LemonadeChatProvider, LemonadeTtsProvider, LemonadeSttProvider,
-│   │                       #   LemonadeStack, SystemInfo, LemonadeCapabilities
-│   ├── schema/             # Schema definition types, load/validate/cache, JSON ingestion
-│   ├── ingest/             # JSONL two-pass import pipeline
-│   └── search/             # Hybrid FTS5 + ANN + rerank search pipeline
-├── examples/
-│   └── cli_demo.rs         # Demo + integration test: hardware caps, FTS5, reranking
+├── crates/
+│   ├── u-forge-core/       # All core logic (lib)
+│   │   ├── src/
+│   │   │   ├── lib.rs              # KnowledgeGraph facade + re-exports
+│   │   │   ├── builder.rs          # ObjectBuilder fluent API
+│   │   │   ├── text.rs             # split_text() word-boundary chunking
+│   │   │   ├── types.rs            # Domain types
+│   │   │   ├── graph/              # SQLite persistence + FTS5 + ANN
+│   │   │   ├── ai/                 # EmbeddingProvider + TranscriptionProvider traits + providers
+│   │   │   ├── hardware/           # DeviceCapability, NpuDevice, GpuDevice, CpuDevice
+│   │   │   ├── queue/              # Unified MPMC inference dispatch (embed/transcribe/TTS/LLM/rerank)
+│   │   │   ├── lemonade/           # LemonadeModelRegistry, GpuResourceManager, all Lemonade providers
+│   │   │   ├── schema/             # Schema definition types, load/validate/cache, JSON ingestion
+│   │   │   ├── ingest/             # JSONL two-pass import pipeline
+│   │   │   └── search/             # Hybrid FTS5 + ANN + rerank search pipeline
+│   │   └── examples/
+│   │       └── cli_demo.rs         # Demo: hardware caps, FTS5, reranking
+│   ├── u-forge-graph-view/ # Graph view model + layout (skeleton — see feature_UI.md)
+│   ├── u-forge-ui-traits/  # Framework-agnostic rendering contracts (skeleton — see feature_UI.md)
+│   ├── u-forge-ui-gpui/    # GPUI native app (skeleton — see feature_UI.md)
+│   ├── u-forge-ui-egui/    # egui fallback app (skeleton — see feature_UI.md)
+│   └── u-forge-ts-runtime/ # Embedded deno_core TypeScript sandbox (skeleton — see feature_TS-Agent-Sandbox.md)
 ├── defaults/
 │   ├── data/memory.json    # Foundation universe JSONL (~220 nodes, ~312 edges)
 │   └── schemas/            # 13 TTRPG JSON schema files
 ├── .rulesdir/              # AI assistant context rules
 ├── ARCHITECTURE.md         # Architecture reference and design decisions
-├── Cargo.toml
+├── Cargo.toml              # Workspace root
 └── env.sh                  # Optional: sets UFORGE_* path variables
 ```
 
