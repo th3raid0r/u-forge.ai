@@ -11,7 +11,7 @@
 //! # Quick start
 //!
 //! ```no_run
-//! # use u_forge_ai::ai::embeddings::EmbeddingManager;
+//! # use u_forge_core::ai::embeddings::EmbeddingManager;
 //! // Auto: reads LEMONADE_URL env var, connects to Lemonade Server
 //! # async fn example() {
 //! let mgr = EmbeddingManager::try_new_auto(None, None).await.unwrap();

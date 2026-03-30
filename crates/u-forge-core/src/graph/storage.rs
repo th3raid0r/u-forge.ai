@@ -1017,4 +1017,93 @@ mod tests {
             "empty vec table should return empty results"
         );
     }
+
+    // ── Bulk data access ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_all_edges_matches_per_node_union() {
+        let (storage, _dir) = create_test_storage();
+
+        // Create three nodes.
+        let a = ObjectMetadata::new("character".to_string(), "Alpha".to_string());
+        let b = ObjectMetadata::new("character".to_string(), "Beta".to_string());
+        let c = ObjectMetadata::new("character".to_string(), "Gamma".to_string());
+        let (id_a, id_b, id_c) = (a.id, b.id, c.id);
+        storage.upsert_node(a).unwrap();
+        storage.upsert_node(b).unwrap();
+        storage.upsert_node(c).unwrap();
+
+        // Insert edges across multiple nodes.
+        storage
+            .upsert_edge(Edge::new(id_a, id_b, EdgeType::Custom("knows".to_string())))
+            .unwrap();
+        storage
+            .upsert_edge(Edge::new(id_b, id_c, EdgeType::Custom("trusts".to_string())))
+            .unwrap();
+        storage
+            .upsert_edge(Edge::new(id_a, id_c, EdgeType::Custom("opposes".to_string())))
+            .unwrap();
+
+        // Bulk fetch.
+        let all_edges = storage.get_all_edges().unwrap();
+        assert_eq!(all_edges.len(), 3);
+
+        // Build expected set from per-node calls.
+        let mut expected: HashSet<(String, String)> = HashSet::new();
+        for id in [id_a, id_b, id_c] {
+            for e in storage.get_edges(id).unwrap() {
+                expected.insert((
+                    e.from.hyphenated().to_string(),
+                    e.to.hyphenated().to_string(),
+                ));
+            }
+        }
+
+        // Bulk result must match union of per-node results.
+        let bulk_set: HashSet<(String, String)> = all_edges
+            .iter()
+            .map(|e| {
+                (
+                    e.from.hyphenated().to_string(),
+                    e.to.hyphenated().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(bulk_set, expected);
+    }
+
+    #[test]
+    fn test_get_nodes_paginated_ordering_and_coverage() {
+        let (storage, _dir) = create_test_storage();
+
+        // Insert 10 nodes with distinct names.
+        let names: Vec<String> = (0..10).map(|i| format!("Node{:02}", i)).collect();
+        for name in &names {
+            storage
+                .upsert_node(ObjectMetadata::new("character".to_string(), name.clone()))
+                .unwrap();
+        }
+
+        // Fetch in pages of 3 and collect all results.
+        let mut seen: Vec<String> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = storage.get_nodes_paginated(offset, 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for node in &page {
+                seen.push(node.name.clone());
+            }
+            offset += page.len();
+        }
+
+        // All 10 nodes returned, no duplicates, ordered alphabetically.
+        assert_eq!(seen.len(), 10, "paginated fetch must return all nodes");
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted, "results must be name-ordered across pages");
+        let unique: HashSet<&String> = seen.iter().collect();
+        assert_eq!(unique.len(), 10, "no duplicates across pages");
+    }
 }

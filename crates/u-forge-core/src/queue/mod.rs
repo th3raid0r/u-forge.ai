@@ -57,10 +57,10 @@
 //! # Usage
 //!
 //! ```no_run
-//! # use u_forge_ai::queue::InferenceQueueBuilder;
-//! # use u_forge_ai::hardware::npu::NpuDevice;
-//! # use u_forge_ai::hardware::gpu::GpuDevice;
-//! # use u_forge_ai::hardware::cpu::CpuDevice;
+//! # use u_forge_core::queue::InferenceQueueBuilder;
+//! # use u_forge_core::hardware::npu::NpuDevice;
+//! # use u_forge_core::hardware::gpu::GpuDevice;
+//! # use u_forge_core::hardware::cpu::CpuDevice;
 //! # async fn run() -> anyhow::Result<()> {
 //! # let npu_device: NpuDevice = todo!();
 //! # let gpu_device: GpuDevice = todo!();

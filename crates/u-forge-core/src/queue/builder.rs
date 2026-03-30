@@ -27,7 +27,7 @@ use super::workers::{
 /// # Example
 ///
 /// ```no_run
-/// # use u_forge_ai::queue::InferenceQueueBuilder;
+/// # use u_forge_core::queue::InferenceQueueBuilder;
 /// # async fn run() -> anyhow::Result<()> {
 /// # let npu = todo!();
 /// # let gpu = todo!();

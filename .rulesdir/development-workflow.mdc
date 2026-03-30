@@ -7,14 +7,13 @@ description: Development workflow and setup guide
 ## Quick Reference
 
 ```bash
-cargo build                                        # Build library + examples
-cargo test -- --test-threads=1                     # Run all tests (always single-threaded)
-cargo run --example cli_demo                       # Run CLI demo with Foundation data
-cargo run --example cli_demo ./data.json ./schemas/  # Custom data
+cargo build --workspace                                        # Build all crates
+cargo test --workspace -- --test-threads=1                     # Run all tests (always single-threaded)
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo   # Run CLI demo
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo ./data.json ./schemas/  # Custom data
 ```
 
-> **No `source env.sh` required.** The gcc-13 / RocksDB requirement was eliminated
-> in Phase 2. Bundled SQLite compiles with any standard C compiler on PATH.
+> **No `source env.sh` required.** Bundled SQLite compiles with any standard C compiler on PATH.
 
 ---
 
@@ -27,17 +26,17 @@ cargo run --example cli_demo ./data.json ./schemas/  # Custom data
 
 2. **Build:**
    ```bash
-   cargo build       # ~30 seconds first time (bundled SQLite compilation, not RocksDB)
+   cargo build --workspace   # ~30 seconds first time (bundled SQLite compilation)
    ```
 
 3. **Run tests:**
    ```bash
-   cargo test -- --test-threads=1   # All 101+ tests pass with no server required
+   cargo test --workspace -- --test-threads=1   # All 220+ tests pass with no server required
    ```
 
 4. **Run the CLI demo:**
    ```bash
-   cargo run --example cli_demo
+   cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
    ```
 
 ---
@@ -45,17 +44,7 @@ cargo run --example cli_demo ./data.json ./schemas/  # Custom data
 ## Architecture Context
 
 Before making changes, read:
-- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — Current state (SQLite schema, module map, resolved bugs)
-- [migration.md](mdc:migration.md) — Phased plan and completion status
-
-### Current state (all complete):
-- SQLite + FTS5 storage, `LemonadeProvider` embeddings, hardware abstraction (`src/hardware/`), unified inference queue (`src/queue/`), `LemonadeRerankProvider` + `InferenceQueue::rerank()` wired, `cli_demo` demonstrates FTS5 → rerank pipeline.
-
-### Remaining work:
-- **sqlite-vec** — ANN vector search (highest priority storage item)
-- **Phase 3** — `axum` HTTP/WebSocket server for web UI
-- **Phase 4 (pipeline)** — Wire reranking into `KnowledgeGraph` hybrid search (FTS5 + vec + rerank)
-- **Phase 5** — Cargo workspace split
+- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — Current state (SQLite schema, module map, resolved bugs, design decisions)
 
 ---
 
@@ -63,7 +52,7 @@ Before making changes, read:
 
 ### Adding a new TranscriptionProvider
 
-1. Implement the `TranscriptionProvider` trait in `src/ai/transcription.rs`:
+1. Implement the `TranscriptionProvider` trait in `crates/u-forge-core/src/ai/transcription.rs`:
 
 ```rust
 pub struct MyTranscriptionProvider { /* base_url, model, client */ }
@@ -92,7 +81,7 @@ impl TranscriptionProvider for MyTranscriptionProvider {
 
 ### Adding a new EmbeddingProvider
 
-1. Implement the `EmbeddingProvider` trait in `src/ai/transcription.rs`:
+1. Implement the `EmbeddingProvider` trait in `crates/u-forge-core/src/ai/embeddings.rs`:
 
 ```rust
 pub struct MyProvider { /* ... */ }
@@ -123,7 +112,7 @@ impl EmbeddingProvider for MyProvider {
 ### Adding a new schema type
 
 1. Create `{type}.schema.json` in `defaults/schemas/`.
-2. Test with: `cargo run --example cli_demo`
+2. Test with: `cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo`
 3. Schema is auto-loaded by `SchemaIngestion::load_schemas_from_directory`.
 
 ### Working with SQLite storage
@@ -215,11 +204,11 @@ the full `LemonadeStack` from `src/lemonade.rs` instead of the standalone
 ## Testing
 
 ```bash
-cargo test -- --test-threads=1                      # All tests (always single-threaded)
-cargo test storage -- --test-threads=1              # Module-specific
-cargo test -- --test-threads=1 --nocapture          # With stdout
-RUST_LOG=debug cargo test -- --test-threads=1 --nocapture  # With debug logging
-cargo test test_name -- --exact --test-threads=1    # Single test by name
+cargo test --workspace -- --test-threads=1                      # All tests (always single-threaded)
+cargo test --workspace storage -- --test-threads=1              # Module-specific
+cargo test --workspace -- --test-threads=1 --nocapture          # With stdout
+RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture  # With debug logging
+cargo test --workspace test_name -- --exact --test-threads=1    # Single test by name
 ```
 
 ### Test conventions
@@ -239,10 +228,10 @@ cargo test test_name -- --exact --test-threads=1    # Single test by name
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
-cargo test -- --test-threads=1
-cargo doc --no-deps
-cargo run --example cli_demo
+cargo clippy --workspace -- -D warnings
+cargo test --workspace -- --test-threads=1
+cargo doc --no-deps --workspace
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 ```
 
 ---

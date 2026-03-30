@@ -15,7 +15,7 @@ use super::tts::LemonadeTtsProvider;
 ///
 /// ```no_run
 /// # async fn example() -> anyhow::Result<()> {
-/// use u_forge_ai::lemonade::{LemonadeStack, GpuResourceManager};
+/// use u_forge_core::lemonade::{LemonadeStack, GpuResourceManager};
 ///
 /// let stack = LemonadeStack::build("http://127.0.0.1:8000/api/v1").await?;
 /// let text  = stack.chat.ask("Describe a dragon in one sentence.").await?;

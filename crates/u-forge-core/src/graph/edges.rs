@@ -84,6 +84,49 @@ impl KnowledgeGraphStorage {
         Ok(edges)
     }
 
+    /// Return every edge stored in the graph in a single query.
+    ///
+    /// Prefer this over repeated `get_edges()` calls when building a full graph
+    /// snapshot — one `SELECT * FROM edges` is far cheaper than N per-node
+    /// round-trips.
+    pub fn get_all_edges(&self) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_id, target_id, edge_type, weight, metadata, created_at
+             FROM edges",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut edges = Vec::new();
+        for row in rows {
+            let (src_s, tgt_s, et_s, weight, meta_s, ca_s) = row?;
+            let metadata: HashMap<String, String> =
+                serde_json::from_str(&meta_s).unwrap_or_default();
+            edges.push(Edge {
+                from: Uuid::parse_str(&src_s)
+                    .with_context(|| format!("Invalid source UUID in edges table: '{src_s}'"))?,
+                to: Uuid::parse_str(&tgt_s)
+                    .with_context(|| format!("Invalid target UUID in edges table: '{tgt_s}'"))?,
+                edge_type: EdgeType::Custom(et_s),
+                weight: weight as f32,
+                metadata,
+                created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
+                    .with_context(|| format!("Invalid edge created_at: '{ca_s}'"))?
+                    .with_timezone(&chrono::Utc),
+            });
+        }
+        Ok(edges)
+    }
+
     /// Return the IDs of all nodes reachable in exactly one hop from
     /// `node_id`, following both outgoing and incoming edges.
     ///

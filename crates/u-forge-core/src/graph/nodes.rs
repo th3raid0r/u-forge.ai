@@ -183,6 +183,50 @@ impl KnowledgeGraphStorage {
         Ok(out)
     }
 
+    /// Return a page of nodes ordered by name.
+    ///
+    /// Suitable for building full-graph snapshots incrementally without loading
+    /// every node into memory at once.
+    pub fn get_nodes_paginated(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ObjectMetadata>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, object_type, schema_name, name, description,
+                    tags, properties, created_at, updated_at
+             FROM nodes
+             ORDER BY name
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![limit as i64, offset as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_s, ot, sn, nm, desc, tags, props, ca, ua) = row?;
+            out.push(row_to_metadata(
+                id_s, ot, sn, nm, desc, tags, props, ca, ua,
+            )?);
+        }
+        Ok(out)
+    }
+
     /// Delete a node by ID.
     ///
     /// `ON DELETE CASCADE` on `edges` and `chunks` handles all dependent rows

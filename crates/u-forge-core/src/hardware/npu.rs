@@ -16,7 +16,7 @@
 //! # Usage
 //!
 //! ```no_run
-//! # use u_forge_ai::hardware::npu::NpuDevice;
+//! # use u_forge_core::hardware::npu::NpuDevice;
 //! # async fn run() -> anyhow::Result<()> {
 //! // All three capabilities on the NPU
 //! let npu = NpuDevice::new(

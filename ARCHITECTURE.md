@@ -1,6 +1,23 @@
 # u-forge.ai — Architecture Reference
 
-## Module Map
+## Workspace Layout
+
+The project is a Cargo workspace. All source lives under `crates/`:
+
+| Crate | Kind | Status | Purpose |
+|-------|------|--------|---------|
+| `u-forge-core` | lib | Complete | All current source — storage, AI, hardware, queue, search, schema, ingest |
+| `u-forge-graph-view` | lib | Skeleton | Graph view model + layout (see `feature_UI.md`) |
+| `u-forge-ui-traits` | lib | Skeleton | Framework-agnostic rendering contracts (see `feature_UI.md`) |
+| `u-forge-ui-gpui` | bin | Skeleton | GPUI native app (see `feature_UI.md`) |
+| `u-forge-ui-egui` | bin | Skeleton | egui fallback app (see `feature_UI.md`) |
+| `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
+
+`defaults/` (schemas + sample data) stays at the workspace root. `cli_demo.rs` resolves it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
+
+## Module Map (u-forge-core)
+
+All paths below are relative to `crates/u-forge-core/`.
 
 | File | Role | Key Types |
 |---|---|---|
@@ -9,6 +26,8 @@
 | `src/text.rs` | Word-boundary text splitting | `split_text` |
 | `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
 | `src/graph/` | SQLite persistence (6 files) | `KnowledgeGraphStorage`, `GraphStats` |
+| `src/graph/edges.rs` | Edge CRUD + `get_all_edges()` | `KnowledgeGraphStorage` (impl) |
+| `src/graph/nodes.rs` | Node CRUD + `get_nodes_paginated()` | `KnowledgeGraphStorage` (impl) |
 | `src/search/mod.rs` | Hybrid search pipeline (FTS5 + ANN + rerank) | `search_hybrid`, `HybridSearchConfig`, `NodeSearchResult`, `SearchSources` |
 | `src/search/sanitize.rs` | FTS5 query sanitisation | `fts5_sanitize` |
 | `src/ai/embeddings.rs` | Lemonade HTTP embedding providers | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
@@ -26,7 +45,7 @@
 | `src/schema/manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
 | `src/schema/ingestion.rs` | JSON schema file → internal | `SchemaIngestion` |
 | `src/ingest/data.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
-| `examples/cli_demo.rs` | Only runnable entry point | — |
+| `examples/cli_demo.rs` | Only runnable entry point (resolves `defaults/` via `CARGO_MANIFEST_DIR`) | — |
 
 ---
 
@@ -58,7 +77,11 @@ API surface: CRUD for objects (`add_object`, `get_object`, `update_object`,
 `query_subgraph` (BFS), `search_chunks_fts`, schema validation (async methods),
 `get_stats`.
 
-**New methods:**
+**Bulk access methods:**
+- `get_all_edges() -> Result<Vec<Edge>>` — single `SELECT * FROM edges` query; prefer over repeated `get_relationships()` calls when building a full graph snapshot.
+- `get_nodes_paginated(offset: usize, limit: usize) -> Result<Vec<ObjectMetadata>>` — `ORDER BY name LIMIT ? OFFSET ?`; for incremental full-graph snapshots.
+
+**Other notable methods:**
 - `search_chunks_fts(query: &str, limit: usize) -> Result<Vec<(ChunkId, ObjectId, String)>>` — wraps SQLite FTS5 full-text search over the `chunks_fts` virtual table.
 - `find_by_name_only(name: &str) -> Result<Option<ObjectId>>` — name lookup independent of object type; used by `DataIngestion` to resolve cross-session edge references.
 
@@ -680,12 +703,3 @@ Foundation universe. JSONL format. Used by the CLI demo for end-to-end testing.
 `add_system_reference`, `add_transportation`. Loaded by `SchemaIngestion` at
 startup; the `add_` prefix is stripped before storage.
 
----
-
-## Remaining Roadmap
-
-| Item | Description |
-|---|---|
-| axum HTTP/WebSocket server | Wraps `KnowledgeGraph` + `InferenceQueue` behind HTTP and WebSocket endpoints. `KnowledgeGraph` is `Send + Sync` and `Arc`-wrapped; `LemonadeStack`, `InferenceQueue`, and `search_hybrid` slot into an `AppState`. `POST /api/search` will call `search_hybrid` directly. |
-| Streaming LLM responses | `InferenceQueue::generate_stream()` returning `tokio::sync::mpsc::Receiver<String>` of token chunks for axum WebSocket delivery. |
-| Cargo workspace split | Extract library and server into separate workspace members. |

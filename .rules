@@ -12,7 +12,7 @@ cycles and produces PRs that must be reverted.
 
 ### 1. Code defaults first — env vars are overrides, not requirements
 
-A user must be able to clone this repo and run `cargo run --example cli_demo` with
+A user must be able to clone this repo and run `cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo` with
 **no environment variables set** and have it work (degrading gracefully when no
 Lemonade Server is present). Env vars like `LEMONADE_URL` exist only to override
 a non-standard location or port.
@@ -36,7 +36,32 @@ for exactly this reason — use them. The `cli_demo` pattern (fetch → inspect 
 degrade gracefully) is the canonical example. Do not hardcode model IDs, device
 presence, or capability flags without a live registry check to back them up.
 
-### 3. Source code is the source of truth — docs are indexes, not mirrors
+### 3. Prescriptive plans belong in feature or bug files — not in shared docs
+
+Implementation plans, step-by-step task lists, phased roadmaps, PR checklists, and
+any other prescriptive or future-state content must live **only** in a `feature_*.md`
+or `bug_*.md` file at the workspace root. These files are purpose-built for driving
+active development and are expected to be prescriptive.
+
+`.rules`, `.rulesdir/*.mdc`, `ARCHITECTURE.md`, `CLAUDE.md`, and `README.md` must
+remain descriptive — they describe what **is**, not what **will be** or **should be
+done next**. If you find yourself writing a plan, a TODO list, a phase checklist, or
+a "remaining work" section in any of those files, stop and put it in the appropriate
+`feature_*.md` or `bug_*.md` instead.
+
+**What counts as prescriptive (belongs in feature/bug files):**
+- Ordered implementation steps or phases
+- "Next:" / "Remaining:" / "TODO:" sections
+- PR descriptions or checklists
+- Anything with ✅/⏳ progress tracking
+- Architectural decisions not yet reflected in the code
+
+**What belongs in shared docs:**
+- How the code currently works
+- Where to find things
+- Invariants and constraints the code already enforces
+
+### 4. Source code is the source of truth — docs are indexes, not mirrors
 
 Every `.rs` file in `src/` and `examples/` is thoroughly commented. `.md` files
 and `.mdc` rules exist to tell you **where to look and why it matters**, not to
@@ -49,14 +74,10 @@ navigational aids.
 
 ## Current Project State (snapshot)
 
-- **Complete:** SQLite + FTS5 storage, sqlite-vec ANN search, `LemonadeProvider`
-  embeddings, hardware abstraction (`src/hardware/`), unified inference queue
-  (`src/queue/`), `LemonadeRerankProvider` + `InferenceQueue::rerank()`,
-  hybrid search pipeline (`src/search/` — `search_hybrid()`, RRF merge, optional
-  rerank, graceful degradation). `lib.rs` is facade-only; `ObjectBuilder` lives
-  in `builder.rs`. No active bugs.
-- **Remaining:** axum HTTP server, streaming LLM responses, Cargo workspace split.
-  See `ARCHITECTURE.md` — Remaining Roadmap for details.
+Working prototype. Multi-crate Cargo workspace under `crates/`. SQLite + FTS5 storage,
+sqlite-vec ANN search, `LemonadeProvider` embeddings, hardware abstraction, unified
+inference queue, `LemonadeRerankProvider`, hybrid search pipeline, bulk graph access
+(`get_all_edges`, `get_nodes_paginated`). No active bugs.
 
 ---
 
@@ -127,14 +148,6 @@ JSONL node/edge format, two-pass import, deduplication, edge resolution.
 
 ---
 
-### Roadmap / next work
-→ **`.rulesdir/project-structure.mdc`** (Migration Direction)
-→ **`ARCHITECTURE.md`** (Remaining Roadmap section)
-
-Remaining work in priority order: axum HTTP server → streaming LLM responses →
-Cargo workspace split. Do not skip ahead without explicit instruction.
-
----
 
 ## Quick Reference: File → Topic
 
@@ -147,4 +160,4 @@ Cargo workspace split. Do not skip ahead without explicit instruction.
 | `schema-system.mdc` | Schema format, validation, property types |
 | `json-data-formats.mdc` | JSONL import format, two-pass pipeline |
 | `testing-debugging.mdc` | TempDir setup, mock providers, skip guards, CI commands |
-| `ARCHITECTURE.md` | Full module map, SQLite schema, hardware design, design decisions, remaining roadmap |
+| `ARCHITECTURE.md` | Full module map, SQLite schema, hardware design, design decisions |

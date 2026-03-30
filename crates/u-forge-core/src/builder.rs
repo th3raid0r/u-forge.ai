@@ -10,7 +10,7 @@ use crate::KnowledgeGraph;
 ///
 /// # Example
 /// ```no_run
-/// use u_forge_ai::ObjectBuilder;
+/// use u_forge_core::ObjectBuilder;
 /// let obj = ObjectBuilder::character("Gandalf".to_string())
 ///     .with_description("A wizard".to_string())
 ///     .with_property("race".to_string(), "Maiar".to_string())

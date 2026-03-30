@@ -28,8 +28,8 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use u_forge_ai::hardware::gpu::GpuDevice;
-//! # use u_forge_ai::lemonade::{GpuResourceManager, LemonadeModelRegistry};
+//! # use u_forge_core::hardware::gpu::GpuDevice;
+//! # use u_forge_core::lemonade::{GpuResourceManager, LemonadeModelRegistry};
 //! # async fn run() -> anyhow::Result<()> {
 //! let registry = LemonadeModelRegistry::fetch("http://localhost:8000/api/v1").await?;
 //! let gpu = GpuResourceManager::new();

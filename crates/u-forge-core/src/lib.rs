@@ -72,7 +72,7 @@ use text::split_text;
 ///
 /// # Example
 /// ```no_run
-/// use u_forge_ai::{KnowledgeGraph, ObjectBuilder};
+/// use u_forge_core::{KnowledgeGraph, ObjectBuilder};
 /// let graph = KnowledgeGraph::new("./data/kg").unwrap();
 /// let id = ObjectBuilder::character("Gandalf".to_string())
 ///     .with_description("A wizard of great power".to_string())
@@ -172,6 +172,25 @@ impl KnowledgeGraph {
     /// All edges incident to `id` (both outgoing and incoming).
     pub fn get_relationships(&self, id: ObjectId) -> Result<Vec<Edge>> {
         self.storage.get_edges(id)
+    }
+
+    /// Return every edge in the graph in a single query.
+    ///
+    /// Prefer this over repeated `get_relationships()` calls when building a
+    /// full graph snapshot.
+    pub fn get_all_edges(&self) -> Result<Vec<Edge>> {
+        self.storage.get_all_edges()
+    }
+
+    /// Return a page of nodes ordered by name.
+    ///
+    /// Use for incremental full-graph snapshots without loading all nodes at once.
+    pub fn get_nodes_paginated(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ObjectMetadata>> {
+        self.storage.get_nodes_paginated(offset, limit)
     }
 
     /// IDs of every object directly connected to `id` (1-hop neighbours).

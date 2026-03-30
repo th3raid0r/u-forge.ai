@@ -13,8 +13,8 @@
 //! # Usage
 //!
 //! ```no_run
-//! # use u_forge_ai::hardware::cpu::CpuDevice;
-//! # use u_forge_ai::lemonade::KokoroVoice;
+//! # use u_forge_core::hardware::cpu::CpuDevice;
+//! # use u_forge_core::lemonade::KokoroVoice;
 //! # async fn run() -> anyhow::Result<()> {
 //! let cpu = CpuDevice::new(
 //!     "http://localhost:8000/api/v1",
