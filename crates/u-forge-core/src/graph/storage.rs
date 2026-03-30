@@ -114,10 +114,9 @@ pub const EMBEDDING_DIMENSIONS: usize = 768;
 
 /// Default context window size (in tokens) assumed for the active embedding model.
 ///
-/// Used to derive [`MAX_CHUNK_TOKENS`].  Modern llamacpp embedding models
-/// (e.g. `nomic-embed-text-v2-moe-GGUF`) support up to 4 K or 8 K context.
-/// Setting this to 4096 is a conservative default that works across all
-/// currently-supported Lemonade embedding recipes.
+/// Used to derive [`MAX_CHUNK_TOKENS`].  The standard embedding model
+/// (`embed-gemma-300m-FLM` / `embeddinggemma-300M-GGUF`) supports a 2048-token
+/// context window.
 pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 2048;
 
 /// Maximum number of tokens per stored text chunk.

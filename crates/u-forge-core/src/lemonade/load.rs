@@ -15,7 +15,7 @@
 //!     ctx_size: Some(4096),
 //!     ..Default::default()
 //! };
-//! load_model("http://localhost:8000/api/v1", "nomic-embed-text-v2-moe-GGUF", &opts).await?;
+//! load_model("http://localhost:8000/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF", &opts).await?;
 //! # Ok(()) }
 //! ```
 

@@ -18,8 +18,7 @@
 //!   ──────                ──────────────           ────────────────────────────
 //!
 //!   embed(text)  ───────► embed_queue  ──────────► NpuDevice  (embed-gemma-300m-FLM)
-//!                                      ──────────► llamacpp   (nomic-embed-text-v2-moe-GGUF)
-//!                                      ──────────► llamacpp   (nomic-embed-text-v1-GGUF)
+//!                                      ──────────► llamacpp   (embeddinggemma-300M-GGUF)
 //!
 //!   transcribe() ───────► transcribe_queue ──────► NpuDevice  (whisper-v3-turbo-FLM)
 //!                                         ──────► GpuDevice  (Whisper-Large-v3-Turbo)

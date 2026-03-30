@@ -78,7 +78,27 @@ lemonade-server pull bge-reranker-v2-m3-GGUF   # reranking (GPU/CPU)
 lemonade-server pull whisper-v3-turbo-FLM      # transcription (NPU, 1.55 GB)
 
 lemonade-server serve                    # leave running
+```
 
+#### Adding the CPU/GPU embedding model (required for hybrid search)
+
+The NPU embedding model (`embed-gemma-300m-FLM`) only runs on systems with an
+AMD NPU.  For CPU/GPU embedding — needed for hybrid search on all other
+hardware — you must manually add `embeddinggemma-300M-GGUF` via the
+**Lemonade UI**:
+
+1. Open the Lemonade Server UI (default: `http://localhost:8000`)
+2. Navigate to **Models** and click **Add Custom Model**
+3. Enter the HuggingFace checkpoint: `ggml-org/embeddinggemma-300M-GGUF:Q8_0`
+4. Select the **llamacpp** recipe and add the **embeddings** label
+5. Save — the model will appear as `user.ggml-org/embeddinggemma-300M-GGUF`
+
+This is the same model family as the NPU variant, so NPU and CPU/GPU workers
+produce vectors in the same embedding space.  Using a different embedding model
+(e.g. nomic) alongside the NPU gemma model will produce incorrect search
+results.
+
+```bash
 # u-forge.ai auto-discovers Lemonade on localhost:8000
 # Set LEMONADE_URL only to override (e.g. non-standard port):
 export LEMONADE_URL="http://localhost:8000/api/v1"

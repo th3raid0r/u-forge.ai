@@ -106,7 +106,7 @@ impl InferenceQueueBuilder {
     /// across all available devices simultaneously.
     ///
     /// `name` is used only for tracing/logging and can be any descriptive string
-    /// (e.g. `"llamacpp(nomic-embed-text-v1-GGUF)/ROCm"`).
+    /// (e.g. `"llamacpp(user.ggml-org/embeddinggemma-300M-GGUF)"`).
     ///
     /// The provider's output dimensions **must** match every other embedding
     /// provider registered on this queue — callers are responsible for probing

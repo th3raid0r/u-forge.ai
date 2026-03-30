@@ -425,19 +425,17 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("     ⚠️  NPU embedding unavailable: {e}"),
                             }
 
-                            // llamacpp workers — two instances of the preferred model
-                            // (nomic-embed-text-v2-moe-GGUF), one served via ROCm and
-                            // one via CPU, so both iGPU and CPU cores stay busy during
-                            // bulk embedding.  The server allows up to 3 concurrent
-                            // instances of the same model class.
+                            // llamacpp worker — embedding-gemma GGUF variant.
+                            // Must be the same model family as the NPU embed-gemma-300m-FLM
+                            // so that all workers produce vectors in the same embedding
+                            // space.  Mixing model families (e.g. nomic + gemma) causes
+                            // meaningless distance scores.
                             if let Some(model) = registry.cpu_embedding_model() {
                                 let model_id = model.id.clone();
-                                // ctx_size capped to this model's actual max sequence length.
                                 let cpu_load_opts = ModelLoadOptions {
                                     ctx_size: Some(effective_ctx_size(&model_id)),
                                     ..Default::default()
                                 };
-                                // Load instance 1 with ctx_size, then connect.
                                 match LemonadeProvider::new_with_load(
                                     url,
                                     &model_id,
@@ -456,42 +454,22 @@ async fn main() -> Result<()> {
                                                  {dims}-dim ≠ {EMBEDDING_DIMENSIONS}-dim"
                                             );
                                         } else {
-                                            // Instance 1 — ROCm
                                             println!(
-                                                "     ✅ llamacpp worker (ROCm): \
+                                                "     ✅ llamacpp worker: \
                                                  {model_id} ({dims}-dim)"
                                             );
                                             eq_builder = eq_builder.with_embedding_provider(
                                                 Arc::new(provider),
-                                                format!("llamacpp({model_id})/ROCm"),
+                                                format!("llamacpp({model_id})"),
                                             );
                                             worker_count += 1;
-
-                                            // Instance 2 — CPU (second connection, model already
-                                            // loaded so no second load call needed)
-                                            match LemonadeProvider::new(url, &model_id).await {
-                                                Err(e) => println!(
-                                                    "     ⚠️  llamacpp({model_id})/CPU \
-                                                     unavailable: {e}"
-                                                ),
-                                                Ok(provider2) => {
-                                                    println!(
-                                                        "     ✅ llamacpp worker (CPU): \
-                                                         {model_id} ({dims}-dim)"
-                                                    );
-                                                    eq_builder = eq_builder
-                                                        .with_embedding_provider(
-                                                            Arc::new(provider2),
-                                                            format!("llamacpp({model_id})/CPU"),
-                                                        );
-                                                    worker_count += 1;
-                                                }
-                                            }
                                         }
                                     }
                                 }
                             } else {
                                 println!("     ⚠️  No llamacpp embedding model found in registry");
+                                println!("        Add embedding-gemma GGUF via Lemonade UI —");
+                                println!("        see README.md for instructions.");
                             }
 
                             if worker_count > 0 {

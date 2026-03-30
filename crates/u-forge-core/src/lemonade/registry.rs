@@ -242,10 +242,13 @@ impl LemonadeModelRegistry {
 
     /// The preferred CPU/GPU llamacpp embedding model, if available.
     ///
-    /// Prefers `nomic-embed-text-v1-GGUF` (8 192-token context) over
-    /// `nomic-embed-text-v2-moe-GGUF` (MoE, but capped at 512 tokens); falls
-    /// back to any [`ModelRole::CpuEmbedding`] model compatible with the
-    /// standard 768-dim index.
+    /// Prefers `user.ggml-org/embeddinggemma-300M-GGUF` — the GGUF variant of
+    /// embedding-gemma that produces 768-dim vectors compatible with the NPU
+    /// `embed-gemma-300m-FLM` model.  This ensures all embedding workers share
+    /// the same vector space regardless of which device produces the embedding.
+    ///
+    /// Falls back to any [`ModelRole::CpuEmbedding`] model whose dimensions
+    /// match the standard 768-dim index.
     ///
     /// `Qwen3-Embedding-8B-GGUF` is excluded unless
     /// [`ENABLE_HIGH_QUALITY_EMBEDDING`](crate::ENABLE_HIGH_QUALITY_EMBEDDING)
@@ -253,51 +256,59 @@ impl LemonadeModelRegistry {
     pub fn cpu_embedding_model(&self) -> Option<&LemonadeModelEntry> {
         self.models
             .iter()
-            .find(|m| m.id == "nomic-embed-text-v1-GGUF")
+            .find(|m| m.id == "user.ggml-org/embeddinggemma-300M-GGUF")
             .or_else(|| {
-                self.models
-                    .iter()
-                    .find(|m| m.id == "nomic-embed-text-v2-moe-GGUF")
-            })
-            .or_else(|| {
+                // Fall back to any CpuEmbedding that isn't Qwen3 (wrong dims)
+                // and isn't a nomic model (different embedding space than gemma).
                 self.by_role(&ModelRole::CpuEmbedding)
                     .into_iter()
                     .find(|m| {
-                        crate::graph::ENABLE_HIGH_QUALITY_EMBEDDING
-                            || m.id != "Qwen3-Embedding-8B-GGUF"
+                        let dominated = m.id == "Qwen3-Embedding-8B-GGUF"
+                            && !crate::graph::ENABLE_HIGH_QUALITY_EMBEDDING;
+                        let wrong_space = m.id.starts_with("nomic-");
+                        !dominated && !wrong_space
                     })
             })
     }
 
     /// All CPU/GPU llamacpp embedding models suitable for parallel workers.
     ///
-    /// Returns every [`ModelRole::CpuEmbedding`] model in a stable preferred
-    /// order: `nomic-embed-text-v1-GGUF` first (8 192-token context), then
-    /// `nomic-embed-text-v2-moe-GGUF` (MoE, capped at 512 tokens), then any
-    /// remaining models in server-reported order.
+    /// Returns every [`ModelRole::CpuEmbedding`] model that lives in the same
+    /// vector space as the NPU `embed-gemma-300m-FLM` model (768-dim gemma
+    /// embeddings).  The preferred model is
+    /// `user.ggml-org/embeddinggemma-300M-GGUF`; other gemma-compatible models
+    /// are appended in server-reported order.
     ///
-    /// `Qwen3-Embedding-8B-GGUF` is **excluded** unless
+    /// Models from a **different embedding family** (e.g. nomic) are excluded
+    /// because mixing embedding spaces produces meaningless distance scores.
+    ///
+    /// `Qwen3-Embedding-8B-GGUF` is also **excluded** unless
     /// [`ENABLE_HIGH_QUALITY_EMBEDDING`](crate::ENABLE_HIGH_QUALITY_EMBEDDING)
-    /// is `true`.  It outputs 4096-dim vectors that are incompatible with the
-    /// standard 768-dim index and require a separate search pipeline that is
-    /// not yet implemented.
+    /// is `true` — it outputs 4096-dim vectors incompatible with the 768-dim
+    /// index.
     ///
     /// Callers should still probe each returned model's actual output dimensions
     /// via [`LemonadeProvider::new`](crate::LemonadeProvider::new) and discard
     /// any whose dimensions do not match [`crate::EMBEDDING_DIMENSIONS`].
     pub fn all_cpu_embedding_models(&self) -> Vec<&LemonadeModelEntry> {
-        // Gate high-quality models behind the feature flag.
         let high_quality = crate::graph::ENABLE_HIGH_QUALITY_EMBEDDING;
 
-        // Stable preferred order: v1 first (8 192-token context window), v2-moe
-        // second (MoE but capped at 512 tokens), everything else appended in
-        // server-reported order.
-        const PREFERRED: &[&str] = &["nomic-embed-text-v1-GGUF", "nomic-embed-text-v2-moe-GGUF"];
+        const PREFERRED: &[&str] = &["user.ggml-org/embeddinggemma-300M-GGUF"];
 
         let candidates: Vec<&LemonadeModelEntry> = self
             .by_role(&ModelRole::CpuEmbedding)
             .into_iter()
-            .filter(|m| high_quality || m.id != "Qwen3-Embedding-8B-GGUF")
+            .filter(|m| {
+                // Exclude Qwen3 unless high-quality flag is set.
+                if m.id == "Qwen3-Embedding-8B-GGUF" && !high_quality {
+                    return false;
+                }
+                // Exclude nomic models — different embedding space than gemma.
+                if m.id.starts_with("nomic-") {
+                    return false;
+                }
+                true
+            })
             .collect();
 
         // Pass 1: emit preferred models in declared order (skip absent ones).
@@ -381,6 +392,17 @@ mod tests {
     fn test_role_cpu_embedding_llamacpp() {
         // llamacpp recipe + embeddings label → CpuEmbedding
         let m = make_entry("nomic-embed-text-v1-GGUF", &["embeddings"], "llamacpp");
+        assert_eq!(m.role(), ModelRole::CpuEmbedding);
+    }
+
+    #[test]
+    fn test_role_cpu_embedding_gemma_gguf() {
+        // User-added gemma GGUF: llamacpp recipe + custom + embeddings labels → CpuEmbedding
+        let m = make_entry(
+            "user.ggml-org/embeddinggemma-300M-GGUF",
+            &["custom", "embeddings"],
+            "llamacpp",
+        );
         assert_eq!(m.role(), ModelRole::CpuEmbedding);
     }
 

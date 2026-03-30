@@ -14,9 +14,9 @@
 //!
 //! ```json
 //! {
-//!   "nomic-embed-text-v1-GGUF": 8192,
-//!   "nomic-embed-text-v2-moe-GGUF": 512,
-//!   "embed-gemma-300m-FLM": 2048
+//!   "embed-gemma-300m-FLM": 2048,
+//!   "embed-gemma-300M-GGUF": 2048,
+//!   "user.ggml-org/embeddinggemma-300M-GGUF": 2048
 //! }
 //! ```
 
@@ -46,11 +46,9 @@ fn limits() -> &'static HashMap<String, usize> {
 /// ```
 /// use u_forge_core::lemonade::effective_ctx_size;
 ///
-/// // nomic-v2-moe only supports 512 tokens despite the system default being 4096
-/// assert_eq!(effective_ctx_size("nomic-embed-text-v2-moe-GGUF"), 512);
-///
-/// // nomic-v1 supports 8192, but is capped at DEFAULT_EMBEDDING_CONTEXT_TOKENS (4096)
-/// assert_eq!(effective_ctx_size("nomic-embed-text-v1-GGUF"), 4096);
+/// // embedding-gemma (both NPU and GGUF variants) supports 2048 tokens
+/// assert_eq!(effective_ctx_size("embed-gemma-300m-FLM"), 2048);
+/// assert_eq!(effective_ctx_size("user.ggml-org/embeddinggemma-300M-GGUF"), 2048);
 /// ```
 pub fn effective_ctx_size(model_id: &str) -> usize {
     let cap = crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS;
@@ -81,6 +79,14 @@ mod tests {
     #[test]
     fn test_embed_gemma_300m_flm() {
         assert_eq!(effective_ctx_size("embed-gemma-300m-FLM"), 2048);
+    }
+
+    #[test]
+    fn test_embed_gemma_gguf_user_model() {
+        assert_eq!(
+            effective_ctx_size("user.ggml-org/embeddinggemma-300M-GGUF"),
+            2048
+        );
     }
 
     #[test]
