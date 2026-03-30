@@ -30,7 +30,7 @@ The project is a Cargo workspace. All crates live under `crates/`:
 ## Current Architecture (u-forge-core)
 
 - **Facade**: [crates/u-forge-core/src/lib.rs](mdc:crates/u-forge-core/src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas). New bulk methods: `get_all_edges()`, `get_nodes_paginated(offset, limit)`.
-- **Storage**: [crates/u-forge-core/src/graph/storage.rs](mdc:crates/u-forge-core/src/graph/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts` + sqlite-vec virtual table `chunks_vec` (768-dim cosine ANN). Key constants: `EMBEDDING_DIMENSIONS = 768`, `MAX_CHUNK_TOKENS = 350`, `ENABLE_HIGH_QUALITY_EMBEDDING = false`. `KnowledgeGraphStorage` is the only storage struct.
+- **Storage**: [crates/u-forge-core/src/graph/storage.rs](mdc:crates/u-forge-core/src/graph/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts` + sqlite-vec virtual table `chunks_vec` (768-dim cosine ANN). Key constants: `EMBEDDING_DIMENSIONS = 768`, `MAX_CHUNK_TOKENS = 350`, `DEFAULT_EMBEDDING_CONTEXT_TOKENS = 2048`. `KnowledgeGraphStorage` is the only storage struct.
 - **Embeddings**: [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP) + `EmbeddingManager`.
 - **Transcription**: [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`.
 - **Hardware Abstraction**: [crates/u-forge-core/src/hardware/mod.rs](mdc:crates/u-forge-core/src/hardware/mod.rs) — `DeviceCapability` enum, `HardwareBackend` enum, `DeviceWorker` trait. Sub-modules:
@@ -131,6 +131,8 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/queue/jobs.rs` | Internal job types + WorkQueue primitive | `EmbedJob`, `TranscribeJob`, `WorkQueue<T>` |
 | `src/queue/workers.rs` | Background worker loops | `run_embed_worker`, `run_transcribe_worker`, etc. |
 | `src/lemonade/` | Extended Lemonade integration | `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `SystemInfo`, `LemonadeStack` |
+| `src/lemonade/load.rs` | Model load/unload (`POST /api/v1/load`); FLM vs llamacpp parameter handling | `load_model()`, `ModelLoadOptions` |
+| `src/lemonade/model_limits.rs` | Per-model context window lookup from compile-time JSON registry | `effective_ctx_size()`, `is_flm_model()` |
 | `src/search/mod.rs` | Hybrid search pipeline (FTS5 + ANN + rerank) | `search_hybrid`, `HybridSearchConfig`, `NodeSearchResult`, `SearchSources` |
 | `src/search/sanitize.rs` | FTS5 query sanitisation | `fts5_sanitize` |
 | `src/schema/` | Schema definition, load/validate/cache, ingestion | `SchemaDefinition`, `SchemaManager`, `SchemaIngestion` |

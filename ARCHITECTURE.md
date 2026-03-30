@@ -40,7 +40,10 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/queue/builder.rs` | Queue builder + device wiring | `InferenceQueueBuilder` |
 | `src/queue/jobs.rs` | Internal job types + WorkQueue primitive | `EmbedJob`, `WorkQueue<T>` |
 | `src/queue/workers.rs` | Background worker loops | `run_embed_worker`, `run_transcribe_worker`, etc. |
-| `src/lemonade/` | Extended Lemonade integration (10 files) | `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `SystemInfo`, `LemonadeStack` |
+| `src/lemonade/` | Extended Lemonade integration (12 files) | `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `SystemInfo`, `LemonadeStack` |
+| `src/lemonade/load.rs` | Model load/unload via Lemonade `POST /api/v1/load` | `load_model()`, `ModelLoadOptions` |
+| `src/lemonade/model_limits.rs` | Per-model context window registry (backed by `assets/model_context_limits.json`) | `effective_ctx_size()`, `is_flm_model()` |
+| `assets/model_context_limits.json` | Compile-time registry of known model context windows (maintained alongside code) | — |
 | `src/schema/definition.rs` | Schema definition types | `SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema` |
 | `src/schema/manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
 | `src/schema/ingestion.rs` | JSON schema file → internal | `SchemaIngestion` |
@@ -190,6 +193,7 @@ Unchanged from the previous architecture. Key types:
 
 - `ObjectMetadata`: `object_type: String` + `serde_json::Value` properties blob.
   Dynamic schema, no compile-time type enforcement.
+  `flatten_for_embedding(edge_lines: &[String]) -> String` accepts incident edge strings (formatted as `"{from_name} {edge_type} {to_name}"`) so relationship context is included in the embedding input. Pass `&[]` when no edges are needed.
 - `EdgeType`: primarily `Custom(String)`. The four legacy variants (`Contains`,
   `OwnedBy`, `LocatedIn`, `MemberOf`) remain `#[deprecated]` for backward compat.
 - `TextChunk`: content + estimated token count (`text.len() / 4`). Types:
@@ -212,6 +216,7 @@ caller                InferenceQueue             device workers (Tokio tasks)
 ──────                ──────────────             ────────────────────────────
 
 embed(text)  ───────► embed_queue   ───────────► NpuDevice  (embed-gemma-300m-FLM)
+                                   ───────────► CpuDevice  (embeddinggemma-300M-GGUF, same vector space)
 
 transcribe() ───────► transcribe_queue ─────────► NpuDevice  (whisper-v3-turbo-FLM)
                                        ─────────► GpuDevice  (Whisper-Large-v3-Turbo)
@@ -460,6 +465,9 @@ Used in transcription tests and copied inline into `inference_queue` tests.
 | `LemonadeSttProvider` | GPU | `Whisper-Large-v3-Turbo` (whispercpp recipe) |
 | `LemonadeChatProvider` | GPU | `GLM-4.7-Flash-GGUF` (llamacpp recipe) |
 | NPU embedding (via `LemonadeProvider`) | NPU | `embed-gemma-300m-FLM` (flm recipe) |
+| CPU/GPU embedding (via `LemonadeProvider`) | CPU/GPU | `embeddinggemma-300M-GGUF` (llamacpp recipe, user-added — see README) |
+
+**Embedding space invariant:** all embedding workers must produce 768-dim vectors in the same gemma embedding space. Nomic models are explicitly excluded from registry selection because they use a different vector space. See `registry.rs → cpu_embedding_model()` and `all_cpu_embedding_models()`. The `embeddinggemma-300M-GGUF` model must be added manually by the user via Lemonade UI (see README setup instructions).
 
 ### LemonadeModelRegistry
 
@@ -473,7 +481,10 @@ Classification is rule-based (recipe + labels):
 - llamacpp/flm recipe + `reasoning`/`tool-calling`/`vision` label → `GpuLlm`
 
 Convenience accessors: `npu_embedding_model()`, `tts_model()`, `stt_model()`,
-`llm_model()`, `by_role(role)`, `summary()`.
+`llm_model()`, `by_role(role)`, `summary()`, `cpu_embedding_model()`,
+`all_cpu_embedding_models()`.
+
+**`cpu_embedding_model()` returns only gemma-compatible models** — nomic models are explicitly excluded even if present in the registry, because they occupy a different vector space from `embed-gemma-300m-FLM`. `all_cpu_embedding_models()` returns all gemma-compatible CPU embedding models in a stable order.
 
 ### GpuResourceManager
 
@@ -513,6 +524,34 @@ and shared via `Arc<GpuResourceManager>` between `LemonadeSttProvider` and
   `chat(messages)`, `complete(ChatRequest)` (with per-call `max_tokens` and
   `temperature` overrides).
 
+### Model Loading (`src/lemonade/load.rs`)
+
+`load_model(url, model_id, options)` calls `POST /api/v1/load` to ensure a model is loaded before inference. Used by embedding workers to load models with the correct context window size.
+
+**`ModelLoadOptions`** controls context window at load time:
+
+```rust
+let opts = ModelLoadOptions {
+    ctx_size: Some(effective_ctx_size("embed-gemma-300m-FLM")),  // from model_limits.rs
+};
+load_model(&url, "embed-gemma-300m-FLM", opts).await?;
+```
+
+**FLM vs llamacpp parameter handling:** FLM recipe models reject `llamacpp_backend` and `llamacpp_args` — `load_model()` detects FLM models via `is_flm_model()` and omits those fields. Non-FLM models get `--ubatch-size {ctx_size}` injected into `llamacpp_args` to sync batch size with context window.
+
+### Model Context Limits (`src/lemonade/model_limits.rs` + `assets/model_context_limits.json`)
+
+`effective_ctx_size(model_id: &str) -> usize` looks up the model in the compile-time JSON registry (`include_str!("../../../assets/model_context_limits.json")`) and returns its context window, capped at `DEFAULT_EMBEDDING_CONTEXT_TOKENS` (2048).
+
+**Known models in the registry:**
+| Model ID | Context Tokens |
+|---|---|
+| `embed-gemma-300m-FLM` | 2048 |
+| `embed-gemma-300M-GGUF` | 2048 |
+| `user.ggml-org/embeddinggemma-300M-GGUF` | 2048 |
+
+When adding new embedding models, add an entry to `assets/model_context_limits.json`. Unknown models fall back to `DEFAULT_EMBEDDING_CONTEXT_TOKENS`.
+
 ### LemonadeStack
 
 One-call builder that fetches the registry and wires all three providers to a
@@ -540,7 +579,7 @@ Runs an FTS5 `MATCH` query against the `chunks_fts` virtual table. Supports phra
 
 Queries the `chunks_vec` sqlite-vec `vec0` virtual table for the `limit` closest chunks by cosine distance. Returns `(chunk_id, object_id, content, distance)` tuples ordered by ascending distance (0.0 = identical, 2.0 = maximally dissimilar). Only chunks indexed via `upsert_chunk_embedding` are candidates.
 
-The embedding dimension is fixed at `EMBEDDING_DIMENSIONS = 768` (matching `embed-gemma-300m-FLM` and `nomic-embed-text-v2-moe-GGUF`). The constant and the `vec0` DDL must stay in sync; recreate the database if the model changes.
+The embedding dimension is fixed at `EMBEDDING_DIMENSIONS = 768` (matching the gemma embedding family: `embed-gemma-300m-FLM` on NPU and `embeddinggemma-300M-GGUF` on CPU/GPU). **Only gemma-family models are supported** — mixing models from different embedding families (e.g. nomic) produces vectors in incompatible spaces, making cosine distances meaningless. The constant and the `vec0` DDL must stay in sync; recreate the database if the model changes.
 
 ### Hybrid Search (`src/search/`)
 
