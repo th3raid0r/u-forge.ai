@@ -52,7 +52,7 @@ Before making changes, read:
 
 ### Adding a new TranscriptionProvider
 
-1. Implement the `TranscriptionProvider` trait in `src/ai/transcription.rs`:
+1. Implement the `TranscriptionProvider` trait in `crates/u-forge-core/src/ai/transcription.rs`:
 
 ```rust
 pub struct MyTranscriptionProvider { /* base_url, model, client */ }
@@ -81,7 +81,7 @@ impl TranscriptionProvider for MyTranscriptionProvider {
 
 ### Adding a new EmbeddingProvider
 
-1. Implement the `EmbeddingProvider` trait in `src/ai/transcription.rs`:
+1. Implement the `EmbeddingProvider` trait in `crates/u-forge-core/src/ai/embeddings.rs`:
 
 ```rust
 pub struct MyProvider { /* ... */ }
@@ -112,7 +112,7 @@ impl EmbeddingProvider for MyProvider {
 ### Adding a new schema type
 
 1. Create `{type}.schema.json` in `defaults/schemas/`.
-2. Test with: `cargo run --example cli_demo`
+2. Test with: `cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo`
 3. Schema is auto-loaded by `SchemaIngestion::load_schemas_from_directory`.
 
 ### Working with SQLite storage
@@ -204,11 +204,11 @@ the full `LemonadeStack` from `src/lemonade.rs` instead of the standalone
 ## Testing
 
 ```bash
-cargo test -- --test-threads=1                      # All tests (always single-threaded)
-cargo test storage -- --test-threads=1              # Module-specific
-cargo test -- --test-threads=1 --nocapture          # With stdout
-RUST_LOG=debug cargo test -- --test-threads=1 --nocapture  # With debug logging
-cargo test test_name -- --exact --test-threads=1    # Single test by name
+cargo test --workspace -- --test-threads=1                      # All tests (always single-threaded)
+cargo test --workspace storage -- --test-threads=1              # Module-specific
+cargo test --workspace -- --test-threads=1 --nocapture          # With stdout
+RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture  # With debug logging
+cargo test --workspace test_name -- --exact --test-threads=1    # Single test by name
 ```
 
 ### Test conventions
@@ -228,10 +228,10 @@ cargo test test_name -- --exact --test-threads=1    # Single test by name
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
-cargo test -- --test-threads=1
-cargo doc --no-deps
-cargo run --example cli_demo
+cargo clippy --workspace -- -D warnings
+cargo test --workspace -- --test-threads=1
+cargo doc --no-deps --workspace
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 ```
 
 ---

@@ -19,6 +19,7 @@ See `.rules` for the full list. Summary:
 1. **Env vars are overrides, not requirements.** `cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo` must work with zero env vars set. Always try `http://localhost:8000/api/v1` first.
 2. **Fetch live state before assuming capabilities.** Use `SystemInfo::fetch()` and `LemonadeModelRegistry::fetch()`.
 3. **Docs are indexes, not mirrors.** Don't duplicate what source comments already say.
+4. **Prescriptive plans belong in `feature_*.md` or `bug_*.md` files.** Implementation steps, roadmaps, phase lists, and TODO sections must not appear in `.rules`, `.rulesdir/`, `ARCHITECTURE.md`, `CLAUDE.md`, or `README.md`. Put them in the appropriate feature or bug file instead.
 
 ---
 

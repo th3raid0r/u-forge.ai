@@ -32,7 +32,7 @@ export RUST_LOG=info                                # Log verbosity
 
 ### Module-specific logging
 ```bash
-export RUST_LOG=u_forge_core::storage=debug,u_forge_core::embeddings=info
+export RUST_LOG=u_forge_core::graph::storage=debug,u_forge_core::ai::embeddings=info
 ```
 
 ## Path Resolution
@@ -117,10 +117,10 @@ cargo run --example cli_demo
 ## Build Commands
 
 ```bash
-cargo build                           # Build (first time ~30s for bundled SQLite)
-cargo test                            # Run all tests (no server required)
-cargo run --example cli_demo          # Run demo with Foundation data
-RUST_LOG=debug cargo test -- --nocapture  # Tests with debug logging
+cargo build --workspace                                                              # Build (first time ~30s for bundled SQLite)
+cargo test --workspace -- --test-threads=1                                           # Run all tests (no server required)
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo         # Run demo with Foundation data
+RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture               # Tests with debug logging
 ```
 
 ## Cross-Platform

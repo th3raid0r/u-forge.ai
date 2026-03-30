@@ -1,5 +1,5 @@
 ---
-globs: src/*.rs,examples/*.rs
+globs: crates/**/*.rs,crates/**/examples/*.rs
 ---
 
 # Rust Code Patterns for u-forge.ai
@@ -96,7 +96,7 @@ impl EmbeddingProvider for MyProvider {
 
 ## TranscriptionProvider
 
-A second provider trait lives alongside `EmbeddingProvider` in `src/ai/embeddings.rs`.
+A second provider trait lives in `crates/u-forge-core/src/ai/transcription.rs`, alongside the embedding module.
 It follows the same trait + manager pattern but targets audio-to-text.
 
 ```rust
@@ -250,7 +250,7 @@ graph.connect_objects_weighted_str(sauron_id, frodo_id, "enemy_of", 0.9)?;
 
 ## Storage Patterns (SQLite — current)
 
-Storage is `KnowledgeGraphStorage` in `src/storage.rs`, backed by SQLite via
+Storage is `KnowledgeGraphStorage` in `crates/u-forge-core/src/graph/storage.rs`, backed by SQLite via
 `rusqlite` with bundled SQLite. Thread safety: `Arc<Mutex<Connection>>`.
 
 ```rust
