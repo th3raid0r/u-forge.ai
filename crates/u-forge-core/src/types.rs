@@ -218,10 +218,12 @@ impl ObjectMetadata {
     /// Flatten all node metadata into a single string for embedding and reranking.
     ///
     /// Produces a structured key-value representation that includes the name,
-    /// type, description, all properties, and tags.  This ensures the full node
-    /// context is captured in one embedding rather than scattered across
-    /// separate per-field chunks.
-    pub fn flatten_for_embedding(&self) -> String {
+    /// type, description, all properties, tags, and any pre-formatted edge lines.
+    /// Pass `edge_lines` as `&[]` when edges are not available.
+    ///
+    /// Properties whose keys duplicate the explicit fields (`name`, `type`,
+    /// `description`) are skipped to avoid redundant text.
+    pub fn flatten_for_embedding(&self, edge_lines: &[String]) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         parts.push(format!("Name: {}", self.name));
@@ -254,6 +256,10 @@ impl ObjectMetadata {
 
         if !self.tags.is_empty() {
             parts.push(format!("Tags: {}", self.tags.join(", ")));
+        }
+
+        if !edge_lines.is_empty() {
+            parts.push(format!("Relationships:\n{}", edge_lines.join("\n")));
         }
 
         parts.join("\n")

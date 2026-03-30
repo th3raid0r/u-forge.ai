@@ -604,12 +604,25 @@ async fn main() -> Result<()> {
 
     println!("🔍 Indexing text for full-text search…");
     let all_objects = graph.get_all_objects()?;
+    // Build a fast id→name lookup for edge label resolution.
+    let id_to_name: std::collections::HashMap<u_forge_core::types::ObjectId, String> =
+        all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
     let mut indexed = 0usize;
 
     for obj in &all_objects {
-        // Flatten the entire node (name, type, description, all properties, tags)
-        // into one chunk so FTS5 and semantic search both see the full context.
-        let text = obj.flatten_for_embedding();
+        // Flatten the entire node (name, type, description, all properties, tags,
+        // and incident edges) into one chunk so FTS5 and semantic search both
+        // see the full node context including its relationships.
+        let edges = graph.get_relationships(obj.id).unwrap_or_default();
+        let edge_lines: Vec<String> = edges
+            .iter()
+            .filter_map(|e| {
+                let from_name = id_to_name.get(&e.from)?;
+                let to_name = id_to_name.get(&e.to)?;
+                Some(format!("{} {} {}", from_name, e.edge_type.as_str(), to_name))
+            })
+            .collect();
+        let text = obj.flatten_for_embedding(&edge_lines);
         indexed += graph
             .add_text_chunk(obj.id, text, ChunkType::Imported)?
             .len();
@@ -727,9 +740,8 @@ async fn main() -> Result<()> {
                 .map(|o| format!("{} [{}]", o.name, o.object_type))
                 .unwrap_or_else(|| obj_id.to_string());
             println!("    {}. {}", i + 1, label);
-            println!("       Matched: \"{}\"", snippet);
             if let Some(ref n) = node {
-                print_node_full(n, "       ");
+                print_node_full(n, &graph, "       ");
             }
         }
         println!();
@@ -778,9 +790,8 @@ async fn main() -> Result<()> {
                                 .map(|o| format!("{} [{}]", o.name, o.object_type))
                                 .unwrap_or_else(|| obj_id.to_string());
                             println!("    {}. [dist {:.4}] {}", i + 1, distance, label);
-                            println!("       Matched: \"{}\"", snippet);
                             if let Some(ref n) = node {
-                                print_node_full(n, "       ");
+                                print_node_full(n, &graph, "       ");
                             }
                         }
                         println!();
@@ -852,7 +863,31 @@ async fn main() -> Result<()> {
                         .map(|o| format!("{} [{}]", o.name, o.object_type))
                         .unwrap_or_else(|| obj_id.to_string());
                     let node_text = node_opt
-                        .map(|o| format!("[dist:{distance:.4}]\n{}", o.flatten_for_embedding()))
+                        .map(|o| {
+                            let edges = graph.get_relationships(o.id).unwrap_or_default();
+                            let edge_lines: Vec<String> = edges
+                                .iter()
+                                .filter_map(|e| {
+                                    let from = if e.from == o.id {
+                                        Some(o.name.clone())
+                                    } else {
+                                        graph.get_object(e.from).ok().flatten().map(|n| n.name)
+                                    };
+                                    let to = if e.to == o.id {
+                                        Some(o.name.clone())
+                                    } else {
+                                        graph.get_object(e.to).ok().flatten().map(|n| n.name)
+                                    };
+                                    Some(format!(
+                                        "{} {} {}",
+                                        from?,
+                                        e.edge_type.as_str(),
+                                        to?
+                                    ))
+                                })
+                                .collect();
+                            format!("[dist:{distance:.4}]\n{}", o.flatten_for_embedding(&edge_lines))
+                        })
                         .unwrap_or_else(|| format!("[dist:{distance:.4}] (node not found)"));
                     (*obj_id, label, node_text)
                 })
@@ -876,9 +911,8 @@ async fn main() -> Result<()> {
                         // server doesn't echo the document text back.
                         let text = doc.document.as_deref().unwrap_or(original_text.as_str());
                         println!("     {}. [score {:.4}] {}", rank + 1, doc.score, label,);
-                        println!("        Matched: \"{}\"", text);
                         if let Ok(Some(node)) = graph.get_object(*obj_id) {
-                            print_node_full(&node, "        ");
+                            print_node_full(&node, &graph, "        ");
                         }
                     }
                     println!();
@@ -965,16 +999,7 @@ async fn main() -> Result<()> {
                             result.chunks.len(),
                             result.edges.len(),
                         );
-                        print_node_full(&result.node, "       ");
-                        if !result.connected_node_names.is_empty() {
-                            let mut connected: Vec<String> = result
-                                .connected_node_names
-                                .values()
-                                .map(|cn| format!("{} [{}]", cn.name, cn.object_type))
-                                .collect();
-                            connected.sort();
-                            println!("       → {}", connected.join(", "));
-                        }
+                        print_node_full(&result.node, &graph, "       ");
                     }
                     println!();
                 }
@@ -1169,9 +1194,9 @@ fn print_model_choice(label: &str, model: Option<&u_forge_core::lemonade::Lemona
     }
 }
 
-/// Print the full metadata for a node: description, properties, and tags.
+/// Print the full metadata for a node: description, properties, tags, and edges.
 /// `indent` is prepended to every output line.
-fn print_node_full(node: &ObjectMetadata, indent: &str) {
+fn print_node_full(node: &ObjectMetadata, graph: &KnowledgeGraph, indent: &str) {
     if let Some(desc) = &node.description {
         if !desc.is_empty() {
             println!("{indent}Description: {desc}");
@@ -1192,6 +1217,9 @@ fn print_node_full(node: &ObjectMetadata, indent: &str) {
     }
     if !node.tags.is_empty() {
         println!("{indent}Tags: {}", node.tags.join(", "));
+    }
+    for line in graph.edge_display_lines(node) {
+        println!("{indent}{line}");
     }
 }
 

@@ -174,6 +174,30 @@ impl KnowledgeGraph {
         self.storage.get_edges(id)
     }
 
+    /// Format all edges incident on `node` as human-readable `"From edgeType To"` strings.
+    ///
+    /// Endpoint names are resolved by looking up the connected node; edges
+    /// whose endpoints cannot be resolved are silently dropped.
+    pub fn edge_display_lines(&self, node: &ObjectMetadata) -> Vec<String> {
+        self.get_relationships(node.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let from = if e.from == node.id {
+                    node.name.clone()
+                } else {
+                    self.get_object(e.from).ok().flatten()?.name
+                };
+                let to = if e.to == node.id {
+                    node.name.clone()
+                } else {
+                    self.get_object(e.to).ok().flatten()?.name
+                };
+                Some(format!("{} {} {}", from, e.edge_type.as_str(), to))
+            })
+            .collect()
+    }
+
     /// Return every edge in the graph in a single query.
     ///
     /// Prefer this over repeated `get_relationships()` calls when building a

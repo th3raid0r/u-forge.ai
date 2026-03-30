@@ -540,10 +540,29 @@ pub async fn search_hybrid(
 
         // Build one document per node using the full flattened node representation.
         // This gives the cross-encoder the complete node context (name, type,
-        // description, all properties, tags) rather than isolated chunk snippets.
+        // description, all properties, tags, and edges) rather than isolated chunk snippets.
         let documents: Vec<String> = results
             .iter()
-            .map(|r| r.node.flatten_for_embedding())
+            .map(|r| {
+                let edge_lines: Vec<String> = r
+                    .edges
+                    .iter()
+                    .filter_map(|e| {
+                        let from_name = if e.from == r.node.id {
+                            r.node.name.clone()
+                        } else {
+                            r.connected_node_names.get(&e.from)?.name.clone()
+                        };
+                        let to_name = if e.to == r.node.id {
+                            r.node.name.clone()
+                        } else {
+                            r.connected_node_names.get(&e.to)?.name.clone()
+                        };
+                        Some(format!("{} {} {}", from_name, e.edge_type.as_str(), to_name))
+                    })
+                    .collect();
+                r.node.flatten_for_embedding(&edge_lines)
+            })
             .collect();
 
         match queue.rerank(query, documents, Some(results.len())).await {
