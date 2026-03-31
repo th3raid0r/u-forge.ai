@@ -4,9 +4,8 @@
 use tempfile::TempDir;
 
 use crate::graph::MAX_CHUNK_TOKENS;
-use crate::text::split_text;
 use crate::types::{ChunkType, EdgeType};
-use crate::{KnowledgeGraph, ObjectBuilder, ObjectTypeSchema, PropertySchema, SchemaStats, ValidationResult};
+use crate::{KnowledgeGraph, ObjectBuilder, ObjectTypeSchema, PropertySchema};
 
 fn create_test_graph() -> (KnowledgeGraph, TempDir) {
     let temp_dir = TempDir::new().unwrap();
@@ -247,14 +246,13 @@ fn test_add_text_chunk_long_content_stored_as_multiple_chunks() {
 async fn test_schema_integration() {
     let (graph, _tmp) = create_test_graph_async().await;
 
-    let spell_schema =
-        ObjectTypeSchema::new("spell".to_string(), "A magical spell".to_string())
-            .with_property("level".to_string(), PropertySchema::number("Spell level"))
-            .with_property(
-                "school".to_string(),
-                PropertySchema::string("School of magic"),
-            )
-            .with_required_property("level".to_string());
+    let spell_schema = ObjectTypeSchema::new("spell".to_string(), "A magical spell".to_string())
+        .with_property("level".to_string(), PropertySchema::number("Spell level"))
+        .with_property(
+            "school".to_string(),
+            PropertySchema::string("School of magic"),
+        )
+        .with_required_property("level".to_string());
 
     graph
         .register_object_type("spell", spell_schema)

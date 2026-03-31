@@ -14,8 +14,7 @@
 use crate::schema::SchemaDefinition;
 use crate::types::{ChunkType, ObjectMetadata};
 use anyhow::{Context, Result};
-use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, OptionalExtension};
-use sqlite_vec::sqlite3_vec_init;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Once};
 use tracing::warn;
@@ -261,6 +260,8 @@ impl KnowledgeGraphStorage {
         // fires exactly once per process — safe even in multi-threaded tests
         // that each create their own KnowledgeGraphStorage on a TempDir.
         SQLITE_VEC_INIT.call_once(|| unsafe {
+            use rusqlite::ffi::sqlite3_auto_extension;
+            use sqlite_vec::sqlite3_vec_init;
             sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
         });
 

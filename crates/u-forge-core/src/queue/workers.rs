@@ -6,8 +6,8 @@
 //!      deque is checked.
 //!   2. Try to pop a job.
 //!   3a. If a job is found: drop the `notified` future, process the job.
-//!   3b. If no job: `.await` the `notified` future.  Wakes immediately if
-//!       `notify_one()` was called between steps 1 and 3b.
+//!   3b. If no job: `.await` the `notified` future. Wakes immediately if
+//!      `notify_one()` was called between steps 1 and 3b.
 //!
 //! This is the canonical race-free pattern from the Tokio `Notify` docs.
 
@@ -20,7 +20,9 @@ use tracing::debug;
 
 use crate::ai::embeddings::EmbeddingProvider;
 use crate::ai::transcription::TranscriptionProvider;
-use crate::lemonade::{LemonadeChatProvider, LemonadeRerankProvider, LemonadeSttProvider, LemonadeTtsProvider};
+use crate::lemonade::{
+    LemonadeChatProvider, LemonadeRerankProvider, LemonadeSttProvider, LemonadeTtsProvider,
+};
 
 use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
 use super::weighted::WeightedEmbedDispatcher;
@@ -154,7 +156,11 @@ async fn execute_embed_job(
     // Update EWMA (α = 0.5): first sample is used directly; subsequent samples
     // converge quickly to the actual device latency.
     let old = ewma_us.load(Ordering::Relaxed);
-    let new_ewma = if old == 0 { elapsed_us } else { old / 2 + elapsed_us / 2 };
+    let new_ewma = if old == 0 {
+        elapsed_us
+    } else {
+        old / 2 + elapsed_us / 2
+    };
     ewma_us.store(new_ewma, Ordering::Relaxed);
 
     let _ = job.response.send(final_result);
@@ -284,7 +290,7 @@ pub(super) async fn run_tts_worker(
             drop(notified);
             let start = std::time::Instant::now();
             let result = match &job.voice {
-                Some(voice) => tts.synthesize(&job.text, Some(&voice)).await,
+                Some(voice) => tts.synthesize(&job.text, Some(voice)).await,
                 None => tts.synthesize_default(&job.text).await,
             };
             debug!(

@@ -767,7 +767,7 @@ async fn main() -> Result<()> {
             println!("    (no matches)\n");
             continue;
         }
-        for (i, (_chunk_id, obj_id, snippet)) in results.iter().enumerate() {
+        for (i, (_chunk_id, obj_id, _snippet)) in results.iter().enumerate() {
             let node = graph.get_object(*obj_id)?;
             let label = node
                 .as_ref()
@@ -819,7 +819,7 @@ async fn main() -> Result<()> {
                         println!("    (no matches — are chunks embedded?)\n");
                     }
                     Ok(results) => {
-                        for (i, (_chunk_id, obj_id, snippet, distance)) in
+                        for (i, (_chunk_id, obj_id, _snippet, distance)) in
                             results.iter().enumerate()
                         {
                             let node = graph.get_object(*obj_id)?;
@@ -945,7 +945,7 @@ async fn main() -> Result<()> {
                         let (obj_id, label, original_text) = &candidates[doc.index];
                         // Fall back to the original candidate text when the
                         // server doesn't echo the document text back.
-                        let text = doc.document.as_deref().unwrap_or(original_text.as_str());
+                        let _text = doc.document.as_deref().unwrap_or(original_text.as_str());
                         println!("     {}. [score {:.4}] {}", rank + 1, doc.score, label,);
                         if let Ok(Some(node)) = graph.get_object(*obj_id) {
                             print_node_full(&node, &graph, "        ");
