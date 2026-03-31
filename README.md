@@ -119,6 +119,26 @@ available — demonstrate the FTS5 → rerank pipeline.
 | `UFORGE_DATA_FILE` | `./defaults/data/memory.json` | JSONL data file for import |
 | `RUST_LOG` | `error` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`) |
 
+### Device Configuration
+
+Device weights and enable/disable state are controlled by an optional TOML file at:
+- `$XDG_CONFIG_HOME/u-forge-devices.toml` (or `~/.config/u-forge-devices.toml`)
+- `./u-forge-devices.toml` (current directory)
+
+If no file exists, defaults are used (all devices enabled: NPU=100, GPU=50, CPU=10).
+
+Example `u-forge-devices.toml`:
+```toml
+[embedding]
+npu_enabled = true
+npu_weight = 100
+gpu_enabled = true
+gpu_weight = 40      # prefer NPU over GPU
+cpu_enabled = false  # disable CPU embedding
+```
+
+When multiple embedding workers are available, the highest-weight idle worker is selected. This configuration only affects the inference queue's device selection strategy — it does not require code changes.
+
 ---
 
 ## Project Layout

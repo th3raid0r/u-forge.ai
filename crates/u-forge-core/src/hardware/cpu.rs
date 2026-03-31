@@ -1,14 +1,14 @@
 //! CPU device implementation for host-CPU inference via Lemonade Server.
 //!
 //! CPU-resident models run entirely on the host processor without occupying
-//! the GPU or NPU.  Currently the only CPU-resident capability is
-//! text-to-speech via the **Kokoro** TTS engine.
+//! the GPU or NPU.
 //!
 //! # Supported capabilities
 //!
 //! | Capability     | Provider               | Default model |
 //! |----------------|------------------------|---------------|
 //! | [`TextToSpeech`] | [`LemonadeTtsProvider`] | `kokoro-v1`  |
+//! | [`Embedding`]    | [`LemonadeProvider`]    | `embeddinggemma-300M-GGUF` |
 //!
 //! # Usage
 //!
@@ -31,10 +31,15 @@
 //!
 //! [`TextToSpeech`]: crate::hardware::DeviceCapability::TextToSpeech
 //! [`LemonadeTtsProvider`]: crate::lemonade::LemonadeTtsProvider
+//! [`Embedding`]: crate::hardware::DeviceCapability::Embedding
+//! [`LemonadeProvider`]: crate::ai::embeddings::LemonadeProvider
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use tracing::info;
 
+use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
 use crate::lemonade::{KokoroVoice, LemonadeModelRegistry, LemonadeTtsProvider};
 
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
@@ -66,36 +71,77 @@ pub struct CpuDevice {
     /// `None` when the device was constructed with [`CpuDevice::empty`] or
     /// when no TTS model was found in the Lemonade registry.
     pub tts: Option<LemonadeTtsProvider>,
+
+    /// CPU llamacpp embedding provider.
+    ///
+    /// Uses a llamacpp GGUF model (e.g. `embeddinggemma-300M-GGUF`) running on
+    /// the host CPU.  This path is typically lower priority than the NPU or GPU
+    /// workers; use [`DeviceConfig`](crate::config::DeviceConfig) to disable it
+    /// when the same model is already loaded on the GPU.
+    ///
+    /// `None` when no llamacpp embedding model was found in the registry or
+    /// explicitly provided.
+    pub embedding: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl CpuDevice {
     /// Construct a `CpuDevice` from an already-fetched [`LemonadeModelRegistry`].
     ///
     /// The TTS provider is initialised when the registry contains a Kokoro
-    /// model entry; otherwise `tts` is `None` and no capabilities are
-    /// advertised.
-    pub fn from_registry(registry: &LemonadeModelRegistry) -> Self {
+    /// model entry; otherwise `tts` is `None`.  Similarly, if a llamacpp
+    /// embedding model is found in the registry the embedding provider is
+    /// initialised; otherwise `embedding` is `None`.
+    pub async fn from_registry(registry: &LemonadeModelRegistry) -> Self {
         let tts = LemonadeTtsProvider::from_registry(registry).ok();
 
-        let capabilities = if tts.is_some() {
+        let mut capabilities = Vec::new();
+
+        if tts.is_some() {
             info!("CpuDevice: TTS provider ready (Kokoro)");
-            vec![DeviceCapability::TextToSpeech]
-        } else {
+            capabilities.push(DeviceCapability::TextToSpeech);
+        }
+
+        let embedding =
+            if let Some(model_entry) = registry.llamacpp_embedding_model() {
+                let model_id = model_entry.id.clone();
+                match LemonadeProvider::new(&registry.base_url, &model_id).await {
+                    Ok(p) => {
+                        capabilities.push(DeviceCapability::Embedding);
+                        info!(model = %model_id, "CpuDevice: embedding provider ready");
+                        Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %model_id,
+                            error = %e,
+                            "CpuDevice: embedding model not reachable"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        if capabilities.is_empty() {
             tracing::warn!(
-                "CpuDevice::from_registry: no TTS model found — \
+                "CpuDevice::from_registry: no TTS or embedding models found — \
                  device will advertise no capabilities"
             );
-            vec![]
-        };
+        }
 
         Self {
             name: "CPU (Kokoro TTS)".to_string(),
             capabilities,
             tts,
+            embedding,
         }
     }
 
     /// Construct a `CpuDevice` with an explicit TTS model and default voice.
+    ///
+    /// Embedding is not set by `new()`; use the async
+    /// [`with_embedding`](Self::with_embedding) builder method to add it.
     ///
     /// # Arguments
     ///
@@ -115,6 +161,7 @@ impl CpuDevice {
             name: "CPU (Kokoro TTS)".to_string(),
             capabilities: vec![DeviceCapability::TextToSpeech],
             tts: Some(LemonadeTtsProvider::new(base_url, model).with_voice(default_voice)),
+            embedding: None,
         }
     }
 
@@ -136,12 +183,40 @@ impl CpuDevice {
             name: "CPU (no providers)".to_string(),
             capabilities: vec![],
             tts: None,
+            embedding: None,
         }
+    }
+
+    /// Add a llamacpp embedding provider to this device (async builder).
+    ///
+    /// Probes the model dimensions once; if the model is not reachable the
+    /// device is returned unchanged (no capability added, no error propagated).
+    pub async fn with_embedding(mut self, base_url: &str, model_id: &str) -> Self {
+        match LemonadeProvider::new(base_url, model_id).await {
+            Ok(p) => {
+                self.capabilities.push(DeviceCapability::Embedding);
+                info!(model = %model_id, "CpuDevice: embedding provider added");
+                self.embedding = Some(Arc::new(p) as Arc<dyn EmbeddingProvider>);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %model_id,
+                    error = %e,
+                    "CpuDevice::with_embedding: model not reachable — skipping"
+                );
+            }
+        }
+        self
     }
 
     /// Returns `true` if this device has an active TTS provider.
     pub fn has_tts(&self) -> bool {
         self.tts.is_some()
+    }
+
+    /// Returns `true` if this device has an active llamacpp embedding provider.
+    pub fn has_embedding(&self) -> bool {
+        self.embedding.is_some()
     }
 
     /// Synthesise speech using the configured default voice.
@@ -189,6 +264,7 @@ impl std::fmt::Debug for CpuDevice {
             .field("backend", &HardwareBackend::Cpu)
             .field("capabilities", &self.capabilities)
             .field("tts_model", &self.tts.as_ref().map(|p| p.model.as_str()))
+            .field("has_embedding", &self.embedding.is_some())
             .finish()
     }
 }
@@ -359,7 +435,7 @@ mod tests {
             }
         };
 
-        let device = CpuDevice::from_registry(&registry);
+        let device = CpuDevice::from_registry(&registry).await;
         println!("CpuDevice from registry: {}", device.summary());
         // We do not assert specific capabilities here since the server's
         // model set is environment-dependent, but we log the result for

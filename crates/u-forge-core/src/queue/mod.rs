@@ -85,6 +85,7 @@
 mod builder;
 mod dispatch;
 mod jobs;
+mod weighted;
 mod workers;
 
 pub use builder::InferenceQueueBuilder;

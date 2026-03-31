@@ -169,7 +169,7 @@ export LEMONADE_URL="http://localhost:8000/api/v1"
 ```
 
 **CPU/GPU embedding setup (required on non-NPU machines):**
-The `embeddinggemma-300M-GGUF` model must be added manually via the Lemonade UI — it is not available via `lemonade-server pull`. See README for the exact steps (Models → Add Custom Model → llamacpp recipe + embeddings label, using `ggml-org/embeddinggemma-300M-GGUF:Q8_0`). This model must be in the registry as `user.ggml-org/embeddinggemma-300M-GGUF` for `cpu_embedding_model()` to detect it.
+The `embeddinggemma-300M-GGUF` model must be added manually via the Lemonade UI — it is not available via `lemonade-server pull`. See README for the exact steps (Models → Add Custom Model → llamacpp recipe + embeddings label, using `ggml-org/embeddinggemma-300M-GGUF:Q8_0`). This model must be in the registry as `user.ggml-org/embeddinggemma-300M-GGUF` for `llamacpp_embedding_model()` to detect it.
 
 **Embedding space requirement:** All embedding models used in the same database must be from the gemma family (768-dim, same vector space as `embed-gemma-300m-FLM`). Do not use nomic models — they produce incompatible vectors.
 

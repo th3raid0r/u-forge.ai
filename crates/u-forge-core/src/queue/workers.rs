@@ -11,7 +11,10 @@
 //!
 //! This is the canonical race-free pattern from the Tokio `Notify` docs.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use tracing::debug;
 
@@ -90,10 +93,20 @@ pub(super) async fn run_rerank_worker(
     }
 }
 
+/// Embedding worker loop.
+///
+/// `idle` is an `AtomicBool` shared with the [`WeightedEmbedDispatcher`](super::weighted::WeightedEmbedDispatcher).
+/// The worker sets it `true` before sleeping (so the dispatcher can see that it
+/// is free) and `false` immediately after popping a job.  The window between
+/// the `false` store and the actual pop is negligible; the window between job
+/// completion and the `true` store is also small (just before `notified.await`).
+/// Both races are acceptable — they cause a job to go to a slightly non-optimal
+/// worker, never to be lost.
 pub(super) async fn run_embed_worker(
     queue: Arc<WorkQueue<EmbedJob>>,
     provider: Arc<dyn EmbeddingProvider>,
     device_name: String,
+    idle: Arc<AtomicBool>,
 ) {
     loop {
         // Step 1: register before checking
@@ -101,6 +114,7 @@ pub(super) async fn run_embed_worker(
 
         // Step 2: try to pop
         if let Some(job) = queue.try_pop() {
+            idle.store(false, Ordering::Relaxed);
             drop(notified);
             let start = std::time::Instant::now();
 
@@ -148,7 +162,8 @@ pub(super) async fn run_embed_worker(
             // Ignore send errors — caller may have timed out and dropped the receiver.
             let _ = job.response.send(final_result);
         } else {
-            // Step 3b: nothing in queue, sleep until notified
+            // Step 3b: nothing in queue — mark idle then sleep until notified.
+            idle.store(true, Ordering::Relaxed);
             notified.await;
         }
     }

@@ -35,9 +35,10 @@ The project is a Cargo workspace. All crates live under `crates/`:
 - **Transcription**: [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`.
 - **Hardware Abstraction**: [crates/u-forge-core/src/hardware/mod.rs](mdc:crates/u-forge-core/src/hardware/mod.rs) — `DeviceCapability` enum, `HardwareBackend` enum, `DeviceWorker` trait. Sub-modules:
   - [crates/u-forge-core/src/hardware/npu.rs](mdc:crates/u-forge-core/src/hardware/npu.rs) — `NpuDevice` (embedding + STT + LLM on AMD NPU via FLM)
-  - [crates/u-forge-core/src/hardware/gpu.rs](mdc:crates/u-forge-core/src/hardware/gpu.rs) — `GpuDevice` (STT + LLM on AMD GPU via ROCm; shares `GpuResourceManager`)
-  - [crates/u-forge-core/src/hardware/cpu.rs](mdc:crates/u-forge-core/src/hardware/cpu.rs) — `CpuDevice` (TTS via Kokoro on host CPU)
-- **Inference Queue**: [crates/u-forge-core/src/queue/](mdc:crates/u-forge-core/src/queue) — `InferenceQueue` + `InferenceQueueBuilder` + `QueueStats`. Five capability channels: `embed_queue`, `transcribe_queue`, `synthesize_queue`, `generate_queue`, `rerank_queue`. Per-job retry: up to 3 attempts with exponential backoff in `run_embed_worker`.
+  - [crates/u-forge-core/src/hardware/gpu.rs](mdc:crates/u-forge-core/src/hardware/gpu.rs) — `GpuDevice` (STT + LLM on AMD GPU via ROCm; optional embedding via llamacpp; shares `GpuResourceManager` only for STT/LLM, not embeddings)
+  - [crates/u-forge-core/src/hardware/cpu.rs](mdc:crates/u-forge-core/src/hardware/cpu.rs) — `CpuDevice` (TTS via Kokoro; optional embedding via llamacpp)
+- **Device Configuration**: [crates/u-forge-core/src/config.rs](mdc:crates/u-forge-core/src/config.rs) — `DeviceConfig` + `EmbeddingDeviceConfig`. TOML file loading from standard paths; controls device enable/disable state and dispatch weights. Defaults: NPU=100, GPU=50, CPU=10.
+- **Inference Queue**: [crates/u-forge-core/src/queue/](mdc:crates/u-forge-core/src/queue) — `InferenceQueue` + `InferenceQueueBuilder` + `QueueStats`. Five capability channels: `WeightedEmbedDispatcher` (for embeddings), `transcribe_queue`, `synthesize_queue`, `generate_queue`, `rerank_queue`. Per-job retry: up to 3 attempts with exponential backoff in `run_embed_worker`. Weighted dispatch selects highest-weight idle embedding worker, falls back to highest-weight when all busy.
 - **Extended Lemonade Integration**: [crates/u-forge-core/src/lemonade/](mdc:crates/u-forge-core/src/lemonade) — `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack`, `LemonadeRerankProvider`, `SystemInfo`.
 - **Hybrid Search**: [crates/u-forge-core/src/search/](mdc:crates/u-forge-core/src/search) — `search_hybrid(graph, queue, query, config)` free async function. RRF merge of FTS5 + ANN, optional rerank, graceful degradation.
 - **Schemas**: [crates/u-forge-core/src/schema/](mdc:crates/u-forge-core/src/schema)
@@ -126,9 +127,11 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/hardware/npu.rs` | AMD NPU device | `NpuDevice` |
 | `src/hardware/gpu.rs` | AMD GPU ROCm device | `GpuDevice` |
 | `src/hardware/cpu.rs` | CPU device | `CpuDevice` |
+| `src/config.rs` | Device configuration (TOML loading, weights) | `DeviceConfig`, `EmbeddingDeviceConfig` |
 | `src/queue/dispatch.rs` | Unified MPMC inference dispatch queue | `InferenceQueue`, `QueueStats` |
 | `src/queue/builder.rs` | Queue builder + device wiring | `InferenceQueueBuilder` |
 | `src/queue/jobs.rs` | Internal job types + WorkQueue primitive | `EmbedJob`, `TranscribeJob`, `WorkQueue<T>` |
+| `src/queue/weighted.rs` | Weighted embedding job dispatcher (best-effort idle selection) | `WeightedEmbedDispatcher`, `WeightedWorkerSlot` |
 | `src/queue/workers.rs` | Background worker loops | `run_embed_worker`, `run_transcribe_worker`, etc. |
 | `src/lemonade/` | Extended Lemonade integration | `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `SystemInfo`, `LemonadeStack` |
 | `src/lemonade/load.rs` | Model load/unload (`POST /api/v1/load`); FLM vs llamacpp parameter handling | `load_model()`, `ModelLoadOptions` |
@@ -150,8 +153,8 @@ All paths below are relative to `crates/u-forge-core/`.
 | `CpuTts` | `kokoro` | `tts` / `speech` | CPU |
 | `GpuStt` | `whispercpp` | `transcription` (non-FLM) | GPU/Vulkan |
 | `GpuLlm` | `llamacpp` | `reasoning` / `tool-calling` / `vision` / `coding` | GPU ROCm/Vulkan |
-| `CpuEmbedding` | `llamacpp` | `embeddings` | CPU/GPU |
+| `LlamacppEmbedding` | `llamacpp` | `embeddings` | CPU/GPU |
 | `Reranker` | `llamacpp` | `reranking` | GPU/CPU |
 | `ImageGen` | `sd-cpp` | `image` | GPU |
 
-Registry selector methods: `npu_embedding_model()`, `npu_stt_model()`, `npu_llm_model()`, `tts_model()`, `stt_model()` (GpuStt only), `llm_model()` (GpuLlm only), `reranker_model()`, `cpu_embedding_model()`, `all_cpu_embedding_models()`.
+Registry selector methods: `npu_embedding_model()`, `npu_stt_model()`, `npu_llm_model()`, `tts_model()`, `stt_model()` (GpuStt only), `llm_model()` (GpuLlm only), `reranker_model()`, `llamacpp_embedding_model()`, `all_llamacpp_embedding_models()`.

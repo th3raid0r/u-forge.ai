@@ -37,6 +37,7 @@ use std::env;
 use std::sync::Arc;
 use u_forge_core::{
     ai::embeddings::LemonadeProvider,
+    config::DeviceConfig,
     hardware::npu::NpuDevice,
     ingest::DataIngestion,
     lemonade::{
@@ -343,7 +344,7 @@ async fn main() -> Result<()> {
                             // Group by role for a tidy display
                             let all_roles = [
                                 ModelRole::NpuEmbedding,
-                                ModelRole::CpuEmbedding,
+                                ModelRole::LlamacppEmbedding,
                                 ModelRole::NpuLlm,
                                 ModelRole::GpuLlm,
                                 ModelRole::Reranker,
@@ -379,7 +380,7 @@ async fn main() -> Result<()> {
                             // Summarise which canonical models will be used
                             println!("   Active model selection:");
                             print_model_choice("   Embed (NPU)  ", registry.npu_embedding_model());
-                            print_model_choice("   Embed (CPU)  ", registry.cpu_embedding_model());
+                            print_model_choice("   Embed (llamacpp)", registry.llamacpp_embedding_model());
                             print_model_choice("   LLM (NPU)   ", registry.npu_llm_model());
                             print_model_choice("   LLM (GPU)   ", registry.llm_model());
                             print_model_choice("   Reranker     ", registry.reranker_model());
@@ -394,12 +395,30 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("   ⚠️  No reranker available: {e}"),
                             }
 
-                            // Build a multi-worker embedding InferenceQueue.
-                            // Each compatible model (matching EMBEDDING_DIMENSIONS) becomes
-                            // its own Tokio worker competing on the shared embed_queue so
-                            // bulk embedding jobs are spread across all devices at once.
+                            // Build a multi-worker embedding InferenceQueue with weighted dispatch.
+                            // Load device config (u-forge-devices.toml) to determine which
+                            // backends to use and their priority weights.
+                            let device_cfg = DeviceConfig::load_default();
+                            println!("   Device config:");
+                            println!(
+                                "     NPU embed: {} (weight={})",
+                                if device_cfg.embedding.npu_enabled { "enabled" } else { "disabled" },
+                                device_cfg.embedding.npu_weight
+                            );
+                            println!(
+                                "     GPU embed: {} (weight={})",
+                                if device_cfg.embedding.gpu_enabled { "enabled" } else { "disabled" },
+                                device_cfg.embedding.gpu_weight
+                            );
+                            println!(
+                                "     CPU embed: {} (weight={})",
+                                if device_cfg.embedding.cpu_enabled { "enabled" } else { "disabled" },
+                                device_cfg.embedding.cpu_weight
+                            );
+
                             println!("   Building embedding workers…");
-                            let mut eq_builder = InferenceQueueBuilder::new();
+                            let mut eq_builder = InferenceQueueBuilder::new()
+                                .with_device_config(device_cfg.clone());
                             let mut worker_count = 0usize;
 
                             // NPU worker (FLM embed-gemma-300m-FLM)
@@ -425,12 +444,12 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("     ⚠️  NPU embedding unavailable: {e}"),
                             }
 
-                            // llamacpp worker — embedding-gemma GGUF variant.
+                            // llamacpp worker — embedding-gemma GGUF variant (GPU or CPU).
                             // Must be the same model family as the NPU embed-gemma-300m-FLM
                             // so that all workers produce vectors in the same embedding
                             // space.  Mixing model families (e.g. nomic + gemma) causes
                             // meaningless distance scores.
-                            if let Some(model) = registry.cpu_embedding_model() {
+                            if let Some(model) = registry.llamacpp_embedding_model() {
                                 let model_id = model.id.clone();
                                 let cpu_load_opts = ModelLoadOptions {
                                     ctx_size: Some(effective_ctx_size(&model_id)),
@@ -1152,7 +1171,7 @@ fn capability_icon(available: bool) -> &'static str {
 fn role_label(role: &ModelRole) -> &'static str {
     match role {
         ModelRole::NpuEmbedding => "Embedding (NPU / FLM)",
-        ModelRole::CpuEmbedding => "Embedding (CPU / llamacpp)",
+        ModelRole::LlamacppEmbedding => "Embedding (GPU/CPU llamacpp)",
         ModelRole::NpuStt => "Speech-to-Text (NPU / FLM)",
         ModelRole::GpuStt => "Speech-to-Text (GPU / whispercpp)",
         ModelRole::NpuLlm => "LLM (NPU / FLM)",

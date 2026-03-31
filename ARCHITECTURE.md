@@ -36,9 +36,11 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/hardware/npu.rs` | AMD NPU device (embedding + STT + LLM) | `NpuDevice` |
 | `src/hardware/gpu.rs` | AMD GPU ROCm device (STT + LLM) | `GpuDevice` |
 | `src/hardware/cpu.rs` | CPU device (TTS) | `CpuDevice` |
+| `src/config.rs` | Device configuration (TOML file loading, device weights) | `DeviceConfig`, `EmbeddingDeviceConfig` |
 | `src/queue/dispatch.rs` | Unified MPMC capability-based dispatch queue | `InferenceQueue`, `QueueStats` |
 | `src/queue/builder.rs` | Queue builder + device wiring | `InferenceQueueBuilder` |
 | `src/queue/jobs.rs` | Internal job types + WorkQueue primitive | `EmbedJob`, `WorkQueue<T>` |
+| `src/queue/weighted.rs` | Weighted embedding job dispatcher (high-weight idle first) | `WeightedEmbedDispatcher`, `WeightedWorkerSlot` |
 | `src/queue/workers.rs` | Background worker loops | `run_embed_worker`, `run_transcribe_worker`, etc. |
 | `src/lemonade/` | Extended Lemonade integration (12 files) | `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `SystemInfo`, `LemonadeStack` |
 | `src/lemonade/load.rs` | Model load/unload via Lemonade `POST /api/v1/load` | `load_model()`, `ModelLoadOptions` |
@@ -215,8 +217,12 @@ routes jobs to whichever device is both capable and free.
 caller                InferenceQueue             device workers (Tokio tasks)
 ──────                ──────────────             ────────────────────────────
 
-embed(text)  ───────► embed_queue   ───────────► NpuDevice  (embed-gemma-300m-FLM)
-                                   ───────────► CpuDevice  (embeddinggemma-300M-GGUF, same vector space)
+                    ┌─ WeightedEmbedDispatcher
+embed(text) ────────┤  (weight: NPU 100, GPU 50, CPU 10)
+                    └─ selects highest-weight idle worker
+                       ┌─► NpuDevice  (embed-gemma-300m-FLM, weight=100)
+                       ├─► GpuDevice  (embeddinggemma-300M-GGUF, weight=50)
+                       └─► CpuDevice  (embeddinggemma-300M-GGUF, weight=10)
 
 transcribe() ───────► transcribe_queue ─────────► NpuDevice  (whisper-v3-turbo-FLM)
                                        ─────────► GpuDevice  (Whisper-Large-v3-Turbo)
@@ -224,8 +230,11 @@ transcribe() ───────► transcribe_queue ────────�
 synthesize() ───────► synthesize_queue ─────────► CpuDevice  (kokoro-v1)
 ```
 
-Both whisper workers (NPU and GPU) listen on the **same** `transcribe_queue`.
-Whichever is free first picks up the job — natural work-stealing with no
+**Embedding dispatch:** `WeightedEmbedDispatcher` selects the highest-weight idle worker.
+When all are busy, the job is queued and claimed by the highest-weight worker when free.
+
+**Transcription dispatch:** Both whisper workers (NPU and GPU) listen on the **same**
+`transcribe_queue`. Whichever is free first picks up the job — natural work-stealing with no
 coordination overhead.
 
 ### DeviceCapability / HardwareBackend / DeviceWorker
@@ -261,42 +270,105 @@ Constructors: `NpuDevice::new()` (both), `NpuDevice::embedding_only()`,
 
 Wraps `LemonadeSttProvider` and/or `LemonadeChatProvider`, both sharing a single
 `Arc<GpuResourceManager>` that enforces the GPU scheduling policy (see
-[GpuResourceManager](#gpuresourcemanager) below).
+[GpuResourceManager](#gpuresourcemanager) below). Optionally holds an embedding
+provider (llamacpp-based, independent of GPU resource manager).
 
 | Default model | Capability |
 |---|---|
 | `Whisper-Large-v3-Turbo` | `Transcription` |
 | `GLM-4.7-Flash-GGUF` | `TextGeneration` |
+| `embeddinggemma-300M-GGUF` (optional) | `Embedding` |
 
 Constructors: `GpuDevice::from_registry()`, `GpuDevice::new()`,
 `GpuDevice::stt_only()`, `GpuDevice::llm_only()`.
 
+Builder: `with_embedding(base_url, model_id)` — adds an embedding provider asynchronously.
+
+Convenience methods: `has_embedding()` → bool.
+
 ### CpuDevice (`src/hardware/cpu.rs`)
 
-Wraps `LemonadeTtsProvider` (Kokoro). No GPU or NPU resource contention.
+Wraps `LemonadeTtsProvider` (Kokoro) and optionally an embedding provider
+(llamacpp-based). No GPU or NPU resource contention.
 
 | Default model | Capability |
 |---|---|
 | `kokoro-v1` | `TextToSpeech` |
+| `embeddinggemma-300M-GGUF` (optional) | `Embedding` |
 
 Constructors: `CpuDevice::from_registry()`, `CpuDevice::new()`,
 `CpuDevice::new_with_voice()`, `CpuDevice::empty()`.
 
-Convenience methods: `speak(text)`, `speak_with_voice(text, voice)`.
+Builder: `with_embedding(base_url, model_id)` — adds an embedding provider asynchronously.
+
+Convenience methods: `speak(text)`, `speak_with_voice(text, voice)`, `has_embedding()` → bool.
 
 ### InferenceQueue (`src/queue/`)
 
 MPMC work queue built from `parking_lot::Mutex<VecDeque<T>> + tokio::sync::Notify`
 per capability type — no additional crate dependencies.
 
+#### Weighted Embedding Dispatch
+
+Embedding jobs are routed via `WeightedEmbedDispatcher` (`src/queue/weighted.rs`):
+
+- Each embedding worker registers with a **weight** (e.g., NPU=100, GPU=50, CPU=10)
+- When a job arrives, the dispatcher **selects the highest-weight idle worker**
+- If all workers are busy, the job is queued and the **highest-weight worker** claims it when free
+- Each worker maintains an atomic `idle` flag set before sleeping and cleared after popping a job
+- This allows best-effort selection without coordination — slightly non-optimal assignments are acceptable
+
+**Device weights** (configurable via `DeviceConfig`):
+- NPU embedding: 100 (fastest, preferred)
+- GPU embedding: 50 (medium speed, lower power than CPU)
+- CPU embedding: 10 (slowest, always available)
+
+#### Configuration
+
+Device capabilities and dispatch weights are controlled by `DeviceConfig` (`src/config.rs`):
+
+```rust
+pub struct DeviceConfig {
+    pub embedding: EmbeddingDeviceConfig,
+}
+
+pub struct EmbeddingDeviceConfig {
+    pub npu_enabled: bool,   // default: true
+    pub npu_weight: u32,     // default: 100
+    pub gpu_enabled: bool,   // default: true
+    pub gpu_weight: u32,     // default: 50
+    pub cpu_enabled: bool,   // default: true
+    pub cpu_weight: u32,     // default: 10
+}
+```
+
+`DeviceConfig::load_default()` loads from:
+1. `$XDG_CONFIG_HOME/u-forge-devices.toml` (or `~/.config/u-forge-devices.toml`)
+2. `./u-forge-devices.toml` (current directory)
+3. Built-in defaults (all enabled, standard weights)
+
+Example `u-forge-devices.toml`:
+```toml
+[embedding]
+npu_enabled = true
+npu_weight = 100
+gpu_enabled = true
+gpu_weight = 40    # prefer NPU over GPU
+cpu_enabled = false  # disable CPU embedding
+```
+
 **Public API:**
 
 ```rust
-// Build the queue
+// Load config (uses defaults if no file found)
+let config = DeviceConfig::load_default();
+
+// Build the queue with config
 let queue = InferenceQueueBuilder::new()
     .with_npu_device(npu)   // Embedding + Transcription
-    .with_gpu_device(gpu)   // Transcription (GPU STT competes with NPU whisper)
-    .with_cpu_device(cpu)   // TextToSpeech
+    .with_gpu_device(gpu)   // Transcription + optional Embedding
+    .with_cpu_device(cpu)   // TextToSpeech + optional Embedding
+    .with_device_config(config)  // apply weights and enable/disable rules
     .build();               // spawns background Tokio tasks
 
 // Submit jobs (all async, block until a worker picks them up)
@@ -314,7 +386,8 @@ needed.
 
 **Race-free worker wakeup:** each worker loop registers a `Notify::notified()`
 future *before* checking the deque, preventing lost-wakeup races when a push
-arrives between the check and the sleep.
+arrives between the check and the sleep. Embedding workers also manage an atomic
+`idle` flag for dispatcher visibility.
 
 **Integration test parallelism:** integration tests from multiple modules hit the
 same Lemonade Server concurrently, causing intermittent GPU/NPU resource contention
@@ -464,27 +537,39 @@ Used in transcription tests and copied inline into `inference_queue` tests.
 | `LemonadeTtsProvider` | CPU | `kokoro-v1` (kokoro recipe) |
 | `LemonadeSttProvider` | GPU | `Whisper-Large-v3-Turbo` (whispercpp recipe) |
 | `LemonadeChatProvider` | GPU | `GLM-4.7-Flash-GGUF` (llamacpp recipe) |
-| NPU embedding (via `LemonadeProvider`) | NPU | `embed-gemma-300m-FLM` (flm recipe) |
-| CPU/GPU embedding (via `LemonadeProvider`) | CPU/GPU | `embeddinggemma-300M-GGUF` (llamacpp recipe, user-added — see README) |
+| NPU embedding | NPU | `embed-gemma-300m-FLM` (flm recipe) |
+| GPU embedding | GPU | `embeddinggemma-300M-GGUF` (llamacpp recipe, user-added) |
+| CPU embedding | CPU | `embeddinggemma-300M-GGUF` (llamacpp recipe, user-added) |
 
-**Embedding space invariant:** all embedding workers must produce 768-dim vectors in the same gemma embedding space. Nomic models are explicitly excluded from registry selection because they use a different vector space. See `registry.rs → cpu_embedding_model()` and `all_cpu_embedding_models()`. The `embeddinggemma-300M-GGUF` model must be added manually by the user via Lemonade UI (see README setup instructions).
+**Embedding space invariant:** all embedding workers must produce 768-dim vectors in the same
+gemma embedding space. Nomic models are explicitly excluded from registry selection because
+they use a different vector space. See `registry.rs → llamacpp_embedding_model()` and
+`all_llamacpp_embedding_models()`. The `embeddinggemma-300M-GGUF` model must be added
+manually by the user via Lemonade UI (see README setup instructions).
+
+**GPU and CPU embedding:** These are optional and must be registered via `with_embedding()`
+on `GpuDevice` and `CpuDevice` after construction. By default, devices do not include embedding
+providers. The `InferenceQueueBuilder` automatically probes for GPU/CPU embedding capabilities
+when `from_registry()` is used. When embedding providers are registered on multiple devices,
+the `WeightedEmbedDispatcher` selects workers based on configured weights (NPU > GPU > CPU).
 
 ### LemonadeModelRegistry
 
 Fetches `GET /api/v1/models` and classifies each entry into a `ModelRole`:
-`NpuEmbedding`, `CpuTts`, `GpuStt`, `GpuLlm`, `Reranker`, `ImageGen`, `Other`.
+`NpuEmbedding`, `LlamacppEmbedding`, `CpuTts`, `GpuStt`, `GpuLlm`, `Reranker`, `ImageGen`, `Other`.
 
 Classification is rule-based (recipe + labels):
 - FLM recipe + `embeddings` label → `NpuEmbedding`
+- llamacpp recipe + `embeddings` label → `LlamacppEmbedding` (runs on GPU or CPU depending on server config)
 - kokoro recipe, or `tts`/`speech` label → `CpuTts`
 - whispercpp recipe, or `transcription` label → `GpuStt`
 - llamacpp/flm recipe + `reasoning`/`tool-calling`/`vision` label → `GpuLlm`
 
 Convenience accessors: `npu_embedding_model()`, `tts_model()`, `stt_model()`,
-`llm_model()`, `by_role(role)`, `summary()`, `cpu_embedding_model()`,
-`all_cpu_embedding_models()`.
+`llm_model()`, `by_role(role)`, `summary()`, `llamacpp_embedding_model()`,
+`all_llamacpp_embedding_models()`.
 
-**`cpu_embedding_model()` returns only gemma-compatible models** — nomic models are explicitly excluded even if present in the registry, because they occupy a different vector space from `embed-gemma-300m-FLM`. `all_cpu_embedding_models()` returns all gemma-compatible CPU embedding models in a stable order.
+**`llamacpp_embedding_model()` returns only gemma-compatible models** — nomic models are explicitly excluded even if present in the registry, because they occupy a different vector space from `embed-gemma-300m-FLM`. `all_llamacpp_embedding_models()` returns all gemma-compatible llamacpp embedding models in a stable order.
 
 ### GpuResourceManager
 

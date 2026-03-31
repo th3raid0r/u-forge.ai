@@ -18,6 +18,7 @@ pub(crate) mod test_helpers;
 
 pub mod ai;
 pub mod builder;
+pub mod config;
 pub mod error;
 pub mod graph;
 pub mod hardware;
@@ -36,6 +37,7 @@ pub use ai::embeddings::{
     LemonadeProvider,
 };
 pub use builder::ObjectBuilder;
+pub use config::{DeviceConfig, EmbeddingDeviceConfig};
 pub use graph::{
     GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
     ENABLE_HIGH_QUALITY_EMBEDDING, MAX_CHUNK_TOKENS,
