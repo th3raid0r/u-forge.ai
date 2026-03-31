@@ -98,6 +98,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
 CREATE TRIGGER IF NOT EXISTS chunks_vec_ad AFTER DELETE ON chunks BEGIN
     DELETE FROM chunks_vec WHERE rowid = old.rowid;
 END;
+
+-- ── High-quality ANN vector search (sqlite-vec) ─────────────────────────────
+-- 4096-dim index for high-quality embedding models (e.g. Qwen3-Embedding-8B-GGUF).
+-- Populated only when high_quality_embedding is enabled in config.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec_hq USING vec0(
+    embedding float[4096] distance_metric=cosine
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_vec_hq_ad AFTER DELETE ON chunks BEGIN
+    DELETE FROM chunks_vec_hq WHERE rowid = old.rowid;
+END;
 "#;
 
 // ─── Constants & process-level init ───────────────────────────────────────────
@@ -131,19 +142,13 @@ pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 2048;
 /// budget needs to accommodate an entire node's metadata in one chunk.
 pub const MAX_CHUNK_TOKENS: usize = DEFAULT_EMBEDDING_CONTEXT_TOKENS / 2;
 
-/// Enable high-quality embedding models (e.g. `Qwen3-Embedding-8B-GGUF`).
+/// Number of dimensions produced by high-quality embedding models
+/// (e.g. `Qwen3-Embedding-8B-GGUF`).
 ///
-/// High-quality models produce vectors with a **different dimensionality**
-/// (e.g. 4096-dim for Qwen3) that is incompatible with the standard
-/// [`EMBEDDING_DIMENSIONS`] index.  Enabling this flag requires a separate
-/// `vec0` virtual table and a distinct search path — neither of which is
-/// implemented yet.
-///
-/// **Keep this `false` until the high-quality search pipeline is built.**
-/// Flipping it to `true` without the supporting infrastructure will cause
-/// model registration to include Qwen3-Embedding-8B-GGUF in the standard
-/// 768-dim worker pool, producing dimension-mismatch errors at embedding time.
-pub const ENABLE_HIGH_QUALITY_EMBEDDING: bool = false;
+/// Must match the `float[N]` declaration in the `chunks_vec_hq` `vec0`
+/// virtual table.  Stored alongside — not replacing — the standard
+/// [`EMBEDDING_DIMENSIONS`] index.
+pub const HIGH_QUALITY_EMBEDDING_DIMENSIONS: usize = 4096;
 
 /// Guards the one-time sqlite-vec auto-extension registration.
 ///
@@ -170,6 +175,10 @@ pub struct GraphStats {
     pub edge_count: usize,
     pub chunk_count: usize,
     pub total_tokens: usize,
+    /// Number of chunks with a stored 768-dim embedding in `chunks_vec`.
+    pub embedded_count: usize,
+    /// Number of chunks with a stored high-quality embedding in `chunks_vec_hq`.
+    pub embedded_hq_count: usize,
 }
 
 // ─── Helper functions (pub(super) for sibling modules) ────────────────────────
@@ -280,6 +289,24 @@ impl KnowledgeGraphStorage {
         })
     }
 
+    // ── Bulk operations ───────────────────────────────────────────────────────
+
+    /// Delete all data from the knowledge graph, leaving an empty database.
+    ///
+    /// Deletes all nodes (which cascades to edges and chunks via `ON DELETE
+    /// CASCADE`), all schemas, and explicitly clears the vector index tables
+    /// (`chunks_vec` and `chunks_vec_hq`).
+    pub fn clear_all(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "DELETE FROM nodes;
+             DELETE FROM schemas;
+             DELETE FROM chunks_vec;
+             DELETE FROM chunks_vec_hq;",
+        )
+        .context("Failed to clear knowledge graph")
+    }
+
     // ── Statistics ────────────────────────────────────────────────────────────
 
     /// Return aggregate graph statistics.
@@ -305,12 +332,20 @@ impl KnowledgeGraphStorage {
                 |r| r.get(0),
             )
             .context("Failed to sum token_count")?;
+        let embedded_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .context("Failed to count chunks_vec")?;
+        let embedded_hq_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec_hq", [], |r| r.get(0))
+            .context("Failed to count chunks_vec_hq")?;
 
         Ok(GraphStats {
             node_count: node_count as usize,
             edge_count: edge_count as usize,
             chunk_count: chunk_count as usize,
             total_tokens: total_tokens as usize,
+            embedded_count: embedded_count as usize,
+            embedded_hq_count: embedded_hq_count as usize,
         })
     }
 

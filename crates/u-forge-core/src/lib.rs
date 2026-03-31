@@ -40,7 +40,7 @@ pub use builder::ObjectBuilder;
 pub use config::{AppConfig, EmbeddingDeviceConfig};
 pub use graph::{
     GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
-    ENABLE_HIGH_QUALITY_EMBEDDING, MAX_CHUNK_TOKENS,
+    HIGH_QUALITY_EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS,
 };
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
@@ -132,6 +132,11 @@ impl KnowledgeGraph {
     /// Delete an object and, via `ON DELETE CASCADE`, all its edges and chunks.
     pub fn delete_object(&self, id: ObjectId) -> Result<()> {
         self.storage.delete_node(id)
+    }
+
+    /// Delete all data from the graph (nodes, edges, chunks, schemas, vectors).
+    pub fn clear_all(&self) -> Result<()> {
+        self.storage.clear_all()
     }
 
     // ── Edge / relationship operations ────────────────────────────────────────
@@ -341,13 +346,34 @@ impl KnowledgeGraph {
     /// dissimilar).  Returns an empty `Vec` (not an error) when no embeddings
     /// are stored yet.
     ///
-    /// `query_embedding.len()` must equal [`EMBEDDING_DIMENSIONS`] (currently 256).
+    /// `query_embedding.len()` must equal [`EMBEDDING_DIMENSIONS`] (currently 768).
     pub fn search_chunks_semantic(
         &self,
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
         self.storage.search_chunks_semantic(query_embedding, limit)
+    }
+
+    // ── High-quality (4096-dim) embedding methods ────────────────────────────
+
+    /// Store or update the high-quality embedding vector for an existing chunk.
+    ///
+    /// Writes to the `chunks_vec_hq` (4096-dim) index.
+    /// `embedding.len()` must equal [`HIGH_QUALITY_EMBEDDING_DIMENSIONS`].
+    pub fn upsert_chunk_embedding_hq(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
+        self.storage.upsert_chunk_embedding_hq(chunk_id, embedding)
+    }
+
+    /// Approximate nearest-neighbour search over the high-quality embedding index.
+    ///
+    /// Queries `chunks_vec_hq` (4096-dim) instead of `chunks_vec` (768-dim).
+    pub fn search_chunks_semantic_hq(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
+        self.storage.search_chunks_semantic_hq(query_embedding, limit)
     }
 
     // ── Graph traversal ───────────────────────────────────────────────────────

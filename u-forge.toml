@@ -1,10 +1,10 @@
 [embedding]
 npu_enabled = true
-npu_weight = 100
+high_quality_embedding = true
 gpu_enabled = true
 gpu_weight = 40
 cpu_enabled = false
-cpu_enabled = 10
+cpu_weight = 10
 
 [models.context_limits]
 "embed-gemma-300m-FLM"     = 2048

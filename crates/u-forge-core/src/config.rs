@@ -61,6 +61,15 @@ pub struct EmbeddingDeviceConfig {
     #[serde(default = "default_true")]
     pub cpu_enabled: bool,
 
+    /// Enable high-quality 4096-dim embedding via `Qwen3-Embedding-8B-GGUF`.
+    ///
+    /// When `true`, the registry includes the Qwen3 model and embeddings are
+    /// stored in the `chunks_vec_hq` 4096-dim index alongside the standard
+    /// 768-dim `chunks_vec` index.  NPU embedding should typically be disabled
+    /// when this is active (the NPU model only produces 768-dim vectors).
+    #[serde(default)]
+    pub high_quality_embedding: bool,
+
     /// Dispatch weight for the NPU worker.  Higher weight → preferred when idle.
     #[serde(default = "default_npu_weight")]
     pub npu_weight: u32,
@@ -80,6 +89,7 @@ impl Default for EmbeddingDeviceConfig {
             npu_enabled: true,
             gpu_enabled: true,
             cpu_enabled: true,
+            high_quality_embedding: false,
             npu_weight: default_npu_weight(),
             gpu_weight: default_gpu_weight(),
             cpu_weight: default_cpu_weight(),
@@ -224,6 +234,7 @@ fn default_model_context_limits() -> HashMap<String, usize> {
     m.insert("user.ggml-org/embeddinggemma-300M-GGUF".to_string(), 2048);
     m.insert("nomic-embed-text-v2-moe-GGUF".to_string(), 512);
     m.insert("nomic-embed-text-v1-GGUF".to_string(), 2048);
+    m.insert("Qwen3-Embedding-8B-GGUF".to_string(), 32768);
     m
 }
 

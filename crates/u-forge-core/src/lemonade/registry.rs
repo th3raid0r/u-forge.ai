@@ -243,84 +243,63 @@ impl LemonadeModelRegistry {
             .or_else(|| self.by_role(&ModelRole::Reranker).into_iter().next())
     }
 
-    /// The preferred llamacpp embedding model (GPU or CPU), if available.
+    /// The preferred llamacpp embedding model (GPU or CPU) for the standard
+    /// 768-dim index, if available.
     ///
     /// Prefers `user.ggml-org/embeddinggemma-300M-GGUF` — the GGUF variant of
     /// embedding-gemma that produces 768-dim vectors compatible with the NPU
-    /// `embed-gemma-300m-FLM` model.  This ensures all embedding workers share
-    /// the same vector space regardless of which device produces the embedding.
+    /// `embed-gemma-300m-FLM` model.
     ///
-    /// Falls back to any [`ModelRole::LlamacppEmbedding`] model whose dimensions
-    /// match the standard 768-dim index.
-    ///
-    /// `Qwen3-Embedding-8B-GGUF` is excluded unless
-    /// [`ENABLE_HIGH_QUALITY_EMBEDDING`](crate::ENABLE_HIGH_QUALITY_EMBEDDING)
-    /// is `true` — it outputs 4096-dim vectors that require a separate index.
+    /// `Qwen3-Embedding-8B-GGUF` is always excluded here — it outputs 4096-dim
+    /// vectors for the separate HQ index.  Use [`hq_embedding_model`] instead.
     pub fn llamacpp_embedding_model(&self) -> Option<&LemonadeModelEntry> {
         self.models
             .iter()
             .find(|m| m.id == "user.ggml-org/embeddinggemma-300M-GGUF")
             .or_else(|| {
-                // Fall back to any LlamacppEmbedding that isn't Qwen3 (wrong dims)
-                // and isn't a nomic model (different embedding space than gemma).
                 self.by_role(&ModelRole::LlamacppEmbedding)
                     .into_iter()
                     .find(|m| {
-                        let dominated = m.id == "Qwen3-Embedding-8B-GGUF"
-                            && !crate::graph::ENABLE_HIGH_QUALITY_EMBEDDING;
-                        let wrong_space = m.id.starts_with("nomic-");
-                        !dominated && !wrong_space
+                        m.id != "Qwen3-Embedding-8B-GGUF" && !m.id.starts_with("nomic-")
                     })
             })
     }
 
-    /// All llamacpp embedding models (GPU or CPU) suitable for parallel workers.
+    /// The high-quality embedding model (`Qwen3-Embedding-8B-GGUF`), if available.
     ///
-    /// Returns every [`ModelRole::LlamacppEmbedding`] model that lives in the same
-    /// vector space as the NPU `embed-gemma-300m-FLM` model (768-dim gemma
-    /// embeddings).  The preferred model is
-    /// `user.ggml-org/embeddinggemma-300M-GGUF`; other gemma-compatible models
-    /// are appended in server-reported order.
-    ///
-    /// Models from a **different embedding family** (e.g. nomic) are excluded
-    /// because mixing embedding spaces produces meaningless distance scores.
-    ///
-    /// `Qwen3-Embedding-8B-GGUF` is also **excluded** unless
-    /// [`ENABLE_HIGH_QUALITY_EMBEDDING`](crate::ENABLE_HIGH_QUALITY_EMBEDDING)
-    /// is `true` — it outputs 4096-dim vectors incompatible with the 768-dim
-    /// index.
-    ///
-    /// Callers should still probe each returned model's actual output dimensions
-    /// via [`LemonadeProvider::new`](crate::LemonadeProvider::new) and discard
-    /// any whose dimensions do not match [`crate::EMBEDDING_DIMENSIONS`].
-    pub fn all_llamacpp_embedding_models(&self) -> Vec<&LemonadeModelEntry> {
-        let high_quality = crate::graph::ENABLE_HIGH_QUALITY_EMBEDDING;
+    /// Returns `None` when `high_quality_enabled` is `false` or the model is
+    /// not present in the registry.
+    pub fn hq_embedding_model(&self, high_quality_enabled: bool) -> Option<&LemonadeModelEntry> {
+        if !high_quality_enabled {
+            return None;
+        }
+        self.models
+            .iter()
+            .find(|m| m.id == "Qwen3-Embedding-8B-GGUF")
+    }
 
+    /// All llamacpp embedding models (GPU or CPU) suitable for the standard
+    /// 768-dim parallel workers.
+    ///
+    /// `Qwen3-Embedding-8B-GGUF` is always excluded — it produces 4096-dim
+    /// vectors for the separate HQ index.  Nomic models are excluded because
+    /// they occupy a different embedding space.
+    pub fn all_llamacpp_embedding_models(&self) -> Vec<&LemonadeModelEntry> {
         const PREFERRED: &[&str] = &["user.ggml-org/embeddinggemma-300M-GGUF"];
 
         let candidates: Vec<&LemonadeModelEntry> = self
             .by_role(&ModelRole::LlamacppEmbedding)
             .into_iter()
             .filter(|m| {
-                // Exclude Qwen3 unless high-quality flag is set.
-                if m.id == "Qwen3-Embedding-8B-GGUF" && !high_quality {
-                    return false;
-                }
-                // Exclude nomic models — different embedding space than gemma.
-                if m.id.starts_with("nomic-") {
-                    return false;
-                }
-                true
+                m.id != "Qwen3-Embedding-8B-GGUF" && !m.id.starts_with("nomic-")
             })
             .collect();
 
-        // Pass 1: emit preferred models in declared order (skip absent ones).
         let mut result: Vec<&LemonadeModelEntry> = PREFERRED
             .iter()
             .filter_map(|&id| candidates.iter().copied().find(|m| m.id == id))
             .collect();
 
-        // Pass 2: append anything not already in the preferred list.
         for m in &candidates {
             if !PREFERRED.contains(&m.id.as_str()) {
                 result.push(m);
