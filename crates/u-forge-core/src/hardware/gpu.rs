@@ -13,9 +13,10 @@
 //! | STT while idle | Proceeds immediately |
 //! | LLM while idle | Proceeds immediately |
 //!
-//! RAII guards ([`SttGuard`](crate::lemonade::SttGuard),
-//! [`LlmGuard`](crate::lemonade::LlmGuard)) are managed internally by the
-//! providers — callers cannot accidentally forget to release the GPU.
+//! Embedding via llamacpp **does not** need the `GpuResourceManager` lock —
+//! Lemonade Server routes llamacpp embedding calls through a different execution
+//! path from whispercpp STT.  The `embedding` field is therefore independent of
+//! the `gpu` resource manager.
 //!
 //! # Supported capabilities
 //!
@@ -23,6 +24,7 @@
 //! |-------------------|------------------------|-----------------------------|
 //! | [`Transcription`] | [`LemonadeSttProvider`]  | `Whisper-Large-v3-Turbo`  |
 //! | [`TextGeneration`]| [`LemonadeChatProvider`] | `GLM-4.7-Flash-GGUF`      |
+//! | [`Embedding`]     | [`LemonadeProvider`]     | `embeddinggemma-300M-GGUF` |
 //!
 //! # Usage
 //!
@@ -33,7 +35,7 @@
 //! # async fn run() -> anyhow::Result<()> {
 //! let registry = LemonadeModelRegistry::fetch("http://localhost:8000/api/v1").await?;
 //! let gpu = GpuResourceManager::new();
-//! let device = GpuDevice::from_registry(&registry, gpu);
+//! let device = GpuDevice::from_registry(&registry, gpu).await;
 //!
 //! // Transcribe audio
 //! if let Some(stt) = &device.stt {
@@ -52,13 +54,16 @@
 //!
 //! [`Transcription`]: crate::hardware::DeviceCapability::Transcription
 //! [`TextGeneration`]: crate::hardware::DeviceCapability::TextGeneration
+//! [`Embedding`]: crate::hardware::DeviceCapability::Embedding
 //! [`LemonadeSttProvider`]: crate::lemonade::LemonadeSttProvider
 //! [`LemonadeChatProvider`]: crate::lemonade::LemonadeChatProvider
+//! [`LemonadeProvider`]: crate::ai::embeddings::LemonadeProvider
 
 use std::sync::Arc;
 
 use tracing::info;
 
+use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
 use crate::lemonade::{
     GpuResourceManager, LemonadeChatProvider, LemonadeModelRegistry, LemonadeSttProvider,
 };
@@ -105,6 +110,16 @@ pub struct GpuDevice {
     ///
     /// `None` when no LLM model was found in the registry or provided explicitly.
     pub chat: Option<LemonadeChatProvider>,
+
+    /// GPU llamacpp embedding provider.
+    ///
+    /// Uses a llamacpp GGUF model (e.g. `embeddinggemma-300M-GGUF`) running on
+    /// the GPU via ROCm/Vulkan.  Does **not** require the `GpuResourceManager`
+    /// lock — Lemonade Server routes embedding calls separately from STT.
+    ///
+    /// `None` when no llamacpp embedding model was found in the registry or
+    /// explicitly provided.
+    pub embedding: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl GpuDevice {
@@ -118,10 +133,15 @@ impl GpuDevice {
     /// contains:
     /// - If an STT model is found → [`Transcription`] is advertised.
     /// - If an LLM model is found → [`TextGeneration`] is advertised.
+    /// - If a llamacpp embedding model is found → [`Embedding`] is advertised.
     ///
     /// [`Transcription`]: DeviceCapability::Transcription
     /// [`TextGeneration`]: DeviceCapability::TextGeneration
-    pub fn from_registry(registry: &LemonadeModelRegistry, gpu: Arc<GpuResourceManager>) -> Self {
+    /// [`Embedding`]: DeviceCapability::Embedding
+    pub async fn from_registry(
+        registry: &LemonadeModelRegistry,
+        gpu: Arc<GpuResourceManager>,
+    ) -> Self {
         let mut capabilities = Vec::new();
 
         let stt = LemonadeSttProvider::from_registry(registry, Arc::clone(&gpu))
@@ -138,9 +158,32 @@ impl GpuDevice {
                 info!(model = %p.model, "GpuDevice: Chat/LLM provider ready");
             });
 
+        // Embedding via llamacpp (does not need the GpuResourceManager lock).
+        let embedding =
+            if let Some(model_entry) = registry.llamacpp_embedding_model() {
+                let model_id = model_entry.id.clone();
+                match LemonadeProvider::new(&registry.base_url, &model_id).await {
+                    Ok(p) => {
+                        capabilities.push(DeviceCapability::Embedding);
+                        info!(model = %model_id, "GpuDevice: embedding provider ready");
+                        Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %model_id,
+                            error = %e,
+                            "GpuDevice: embedding model not reachable"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         if capabilities.is_empty() {
             tracing::warn!(
-                "GpuDevice::from_registry: no STT or LLM models found — \
+                "GpuDevice::from_registry: no STT, LLM, or embedding models found — \
                  device will advertise no capabilities"
             );
         }
@@ -152,6 +195,7 @@ impl GpuDevice {
             gpu,
             stt,
             chat,
+            embedding,
         }
     }
 
@@ -159,6 +203,9 @@ impl GpuDevice {
     ///
     /// Pass `None` for either model to skip that provider.  At least one
     /// model should be `Some` for the device to advertise any capabilities.
+    ///
+    /// Embedding is not set by `new()`; use the async
+    /// [`with_embedding`](Self::with_embedding) builder method to add it.
     ///
     /// # Arguments
     ///
@@ -195,7 +242,44 @@ impl GpuDevice {
             gpu,
             stt,
             chat,
+            embedding: None,
         }
+    }
+
+    /// Add a llamacpp embedding provider to this device (async builder).
+    ///
+    /// Probes the model dimensions once; if the model is not reachable the
+    /// device is returned unchanged (no capability added, no error propagated).
+    ///
+    /// Designed for builder-style chaining:
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use u_forge_core::hardware::gpu::GpuDevice;
+    /// # use u_forge_core::lemonade::GpuResourceManager;
+    /// # async fn run() {
+    /// let gpu = GpuResourceManager::new();
+    /// let device = GpuDevice::stt_only("http://localhost:8000/api/v1", "Whisper-Large-v3-Turbo", gpu)
+    ///     .with_embedding("http://localhost:8000/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF")
+    ///     .await;
+    /// # }
+    /// ```
+    pub async fn with_embedding(mut self, base_url: &str, model_id: &str) -> Self {
+        match LemonadeProvider::new(base_url, model_id).await {
+            Ok(p) => {
+                self.capabilities.push(DeviceCapability::Embedding);
+                info!(model = %model_id, "GpuDevice: embedding provider added");
+                self.embedding = Some(Arc::new(p) as Arc<dyn EmbeddingProvider>);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %model_id,
+                    error = %e,
+                    "GpuDevice::with_embedding: model not reachable — skipping"
+                );
+            }
+        }
+        self
     }
 
     /// Construct a `GpuDevice` with **STT only** (no LLM provider).
@@ -222,6 +306,11 @@ impl GpuDevice {
     /// Returns `true` if this device has an active LLM/chat provider.
     pub fn has_chat(&self) -> bool {
         self.chat.is_some()
+    }
+
+    /// Returns `true` if this device has an active llamacpp embedding provider.
+    pub fn has_embedding(&self) -> bool {
+        self.embedding.is_some()
     }
 
     /// Returns the current GPU workload state as a human-readable string.
@@ -254,6 +343,7 @@ impl std::fmt::Debug for GpuDevice {
             .field("capabilities", &self.capabilities)
             .field("stt_model", &self.stt.as_ref().map(|p| p.model.as_str()))
             .field("chat_model", &self.chat.as_ref().map(|p| p.model.as_str()))
+            .field("has_embedding", &self.embedding.is_some())
             .finish()
     }
 }
@@ -492,7 +582,7 @@ mod tests {
         let registry = registry.unwrap();
 
         let gpu = GpuResourceManager::new();
-        let device = GpuDevice::from_registry(&registry, gpu);
+        let device = GpuDevice::from_registry(&registry, gpu).await;
 
         // At least one capability must be present if the server is running
         // the expected models.
@@ -517,7 +607,7 @@ mod tests {
         };
 
         let gpu = GpuResourceManager::new();
-        let device = GpuDevice::from_registry(&registry, gpu);
+        let device = GpuDevice::from_registry(&registry, gpu).await;
 
         let Some(stt) = &device.stt else {
             eprintln!("Skipping: no STT model in registry");

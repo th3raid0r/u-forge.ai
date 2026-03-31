@@ -1,0 +1,7 @@
+{
+  "embed-gemma-300m-FLM": 2048,
+  "embed-gemma-300M-GGUF": 2048,
+  "user.ggml-org/embeddinggemma-300M-GGUF": 2048,
+  "nomic-embed-text-v2-moe-GGUF": 512,
+  "nomic-embed-text-v1-GGUF": 2048
+}

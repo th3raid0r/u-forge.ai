@@ -47,6 +47,9 @@ parking_lot = "0.12"
 # Regular expressions (schema property validation)
 regex = "1.10"
 
+# TOML configuration (device config files)
+toml = "0.8"
+
 # Temp directories (tests + examples)
 tempfile = "3.20"
 

@@ -203,15 +203,18 @@ fn test_add_text_chunk_long_content_stored_as_multiple_chunks() {
         .add_to_graph(&graph)
         .unwrap();
 
-    // 5000-char content: ~1250 tokens → must split into at least 3 chunks
-    let long_content = "word ".repeat(1000); // 5000 chars
+    // Generate content that is 3× the character limit so it must split into ≥3 chunks.
+    let max_chars = MAX_CHUNK_TOKENS * 4;
+    let word_repeats = (max_chars * 3 / 5) + 1; // "word " is 5 chars
+    let long_content = "word ".repeat(word_repeats);
     let chunk_ids = graph
         .add_text_chunk(obj_id, long_content.clone(), ChunkType::Description)
         .unwrap();
 
     assert!(
         chunk_ids.len() >= 3,
-        "expected ≥3 chunks for 5000-char content, got {}",
+        "expected ≥3 chunks for {}-char content, got {}",
+        long_content.len(),
         chunk_ids.len()
     );
 

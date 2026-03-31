@@ -214,6 +214,56 @@ impl ObjectMetadata {
     pub fn touch(&mut self) {
         self.updated_at = chrono::Utc::now();
     }
+
+    /// Flatten all node metadata into a single string for embedding and reranking.
+    ///
+    /// Produces a structured key-value representation that includes the name,
+    /// type, description, all properties, tags, and any pre-formatted edge lines.
+    /// Pass `edge_lines` as `&[]` when edges are not available.
+    ///
+    /// Properties whose keys duplicate the explicit fields (`name`, `type`,
+    /// `description`) are skipped to avoid redundant text.
+    pub fn flatten_for_embedding(&self, edge_lines: &[String]) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        parts.push(format!("Name: {}", self.name));
+        parts.push(format!("Type: {}", self.object_type));
+
+        if let Some(desc) = &self.description {
+            if !desc.is_empty() {
+                parts.push(format!("Description: {}", desc));
+            }
+        }
+
+        if let Some(props) = self.properties.as_object() {
+            for (key, val) in props {
+                let val_str = match val {
+                    serde_json::Value::String(s) if !s.is_empty() => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Array(arr) => {
+                        let items: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                        if items.is_empty() {
+                            continue;
+                        }
+                        items.join(", ")
+                    }
+                    _ => continue,
+                };
+                parts.push(format!("{}: {}", key, val_str));
+            }
+        }
+
+        if !self.tags.is_empty() {
+            parts.push(format!("Tags: {}", self.tags.join(", ")));
+        }
+
+        if !edge_lines.is_empty() {
+            parts.push(format!("Relationships:\n{}", edge_lines.join("\n")));
+        }
+
+        parts.join("\n")
+    }
 }
 
 /// A text chunk associated with an object (for vector search and AI context)

@@ -37,10 +37,12 @@ use std::env;
 use std::sync::Arc;
 use u_forge_core::{
     ai::embeddings::LemonadeProvider,
+    config::AppConfig,
     hardware::npu::NpuDevice,
     ingest::DataIngestion,
     lemonade::{
-        resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
+        effective_ctx_size, resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider,
+        ModelLoadOptions, ModelRole, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
@@ -342,7 +344,7 @@ async fn main() -> Result<()> {
                             // Group by role for a tidy display
                             let all_roles = [
                                 ModelRole::NpuEmbedding,
-                                ModelRole::CpuEmbedding,
+                                ModelRole::LlamacppEmbedding,
                                 ModelRole::NpuLlm,
                                 ModelRole::GpuLlm,
                                 ModelRole::Reranker,
@@ -378,7 +380,7 @@ async fn main() -> Result<()> {
                             // Summarise which canonical models will be used
                             println!("   Active model selection:");
                             print_model_choice("   Embed (NPU)  ", registry.npu_embedding_model());
-                            print_model_choice("   Embed (CPU)  ", registry.cpu_embedding_model());
+                            print_model_choice("   Embed (llamacpp)", registry.llamacpp_embedding_model());
                             print_model_choice("   LLM (NPU)   ", registry.npu_llm_model());
                             print_model_choice("   LLM (GPU)   ", registry.llm_model());
                             print_model_choice("   Reranker     ", registry.reranker_model());
@@ -393,16 +395,39 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("   ⚠️  No reranker available: {e}"),
                             }
 
-                            // Build a multi-worker embedding InferenceQueue.
-                            // Each compatible model (matching EMBEDDING_DIMENSIONS) becomes
-                            // its own Tokio worker competing on the shared embed_queue so
-                            // bulk embedding jobs are spread across all devices at once.
+                            // Build a multi-worker embedding InferenceQueue with weighted dispatch.
+                            // Load app config (u-forge.toml) to determine which
+                            // backends to use and their priority weights.
+                            let device_cfg = AppConfig::load_default();
+                            println!("   Device config:");
+                            println!(
+                                "     NPU embed: {} (weight={})",
+                                if device_cfg.embedding.npu_enabled { "enabled" } else { "disabled" },
+                                device_cfg.embedding.npu_weight
+                            );
+                            println!(
+                                "     GPU embed: {} (weight={})",
+                                if device_cfg.embedding.gpu_enabled { "enabled" } else { "disabled" },
+                                device_cfg.embedding.gpu_weight
+                            );
+                            println!(
+                                "     CPU embed: {} (weight={})",
+                                if device_cfg.embedding.cpu_enabled { "enabled" } else { "disabled" },
+                                device_cfg.embedding.cpu_weight
+                            );
+
                             println!("   Building embedding workers…");
-                            let mut eq_builder = InferenceQueueBuilder::new();
+                            let mut eq_builder = InferenceQueueBuilder::new()
+                                .with_config(device_cfg.clone());
                             let mut worker_count = 0usize;
 
                             // NPU worker (FLM embed-gemma-300m-FLM)
-                            match NpuDevice::embedding_only(url, None).await {
+                            // ctx_size capped to the model's actual max sequence length.
+                            let npu_load_opts = ModelLoadOptions {
+                                ctx_size: Some(effective_ctx_size("embed-gemma-300m-FLM")),
+                                ..Default::default()
+                            };
+                            match NpuDevice::embedding_only(url, None, Some(&npu_load_opts)).await {
                                 Ok(npu) => {
                                     let dims = npu.embedding.dimensions().unwrap_or(0);
                                     if dims == EMBEDDING_DIMENSIONS {
@@ -419,14 +444,24 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("     ⚠️  NPU embedding unavailable: {e}"),
                             }
 
-                            // llamacpp workers — two instances of the preferred model
-                            // (nomic-embed-text-v2-moe-GGUF), one served via ROCm and
-                            // one via CPU, so both iGPU and CPU cores stay busy during
-                            // bulk embedding.  The server allows up to 3 concurrent
-                            // instances of the same model class.
-                            if let Some(model) = registry.cpu_embedding_model() {
+                            // llamacpp worker — embedding-gemma GGUF variant (GPU or CPU).
+                            // Must be the same model family as the NPU embed-gemma-300m-FLM
+                            // so that all workers produce vectors in the same embedding
+                            // space.  Mixing model families (e.g. nomic + gemma) causes
+                            // meaningless distance scores.
+                            if let Some(model) = registry.llamacpp_embedding_model() {
                                 let model_id = model.id.clone();
-                                match LemonadeProvider::new(url, &model_id).await {
+                                let cpu_load_opts = ModelLoadOptions {
+                                    ctx_size: Some(effective_ctx_size(&model_id)),
+                                    ..Default::default()
+                                };
+                                match LemonadeProvider::new_with_load(
+                                    url,
+                                    &model_id,
+                                    &cpu_load_opts,
+                                )
+                                .await
+                                {
                                     Err(e) => {
                                         println!("     ⚠️  llamacpp({model_id}) unavailable: {e}")
                                     }
@@ -438,41 +473,22 @@ async fn main() -> Result<()> {
                                                  {dims}-dim ≠ {EMBEDDING_DIMENSIONS}-dim"
                                             );
                                         } else {
-                                            // Instance 1 — ROCm
                                             println!(
-                                                "     ✅ llamacpp worker (ROCm): \
+                                                "     ✅ llamacpp worker: \
                                                  {model_id} ({dims}-dim)"
                                             );
                                             eq_builder = eq_builder.with_embedding_provider(
                                                 Arc::new(provider),
-                                                format!("llamacpp({model_id})/ROCm"),
+                                                format!("llamacpp({model_id})"),
                                             );
                                             worker_count += 1;
-
-                                            // Instance 2 — CPU (second connection to same model)
-                                            match LemonadeProvider::new(url, &model_id).await {
-                                                Err(e) => println!(
-                                                    "     ⚠️  llamacpp({model_id})/CPU \
-                                                     unavailable: {e}"
-                                                ),
-                                                Ok(provider2) => {
-                                                    println!(
-                                                        "     ✅ llamacpp worker (CPU): \
-                                                         {model_id} ({dims}-dim)"
-                                                    );
-                                                    eq_builder = eq_builder
-                                                        .with_embedding_provider(
-                                                            Arc::new(provider2),
-                                                            format!("llamacpp({model_id})/CPU"),
-                                                        );
-                                                    worker_count += 1;
-                                                }
-                                            }
                                         }
                                     }
                                 }
                             } else {
                                 println!("     ⚠️  No llamacpp embedding model found in registry");
+                                println!("        Add embedding-gemma GGUF via Lemonade UI —");
+                                println!("        see README.md for instructions.");
                             }
 
                             if worker_count > 0 {
@@ -585,32 +601,28 @@ async fn main() -> Result<()> {
 
     println!("🔍 Indexing text for full-text search…");
     let all_objects = graph.get_all_objects()?;
+    // Build a fast id→name lookup for edge label resolution.
+    let id_to_name: std::collections::HashMap<u_forge_core::types::ObjectId, String> =
+        all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
     let mut indexed = 0usize;
 
     for obj in &all_objects {
+        // Flatten the entire node (name, type, description, all properties, tags,
+        // and incident edges) into one chunk so FTS5 and semantic search both
+        // see the full node context including its relationships.
+        let edges = graph.get_relationships(obj.id).unwrap_or_default();
+        let edge_lines: Vec<String> = edges
+            .iter()
+            .filter_map(|e| {
+                let from_name = id_to_name.get(&e.from)?;
+                let to_name = id_to_name.get(&e.to)?;
+                Some(format!("{} {} {}", from_name, e.edge_type.as_str(), to_name))
+            })
+            .collect();
+        let text = obj.flatten_for_embedding(&edge_lines);
         indexed += graph
-            .add_text_chunk(obj.id, obj.name.clone(), ChunkType::Description)?
+            .add_text_chunk(obj.id, text, ChunkType::Imported)?
             .len();
-
-        if let Some(desc) = &obj.description {
-            if !desc.is_empty() {
-                indexed += graph
-                    .add_text_chunk(obj.id, desc.clone(), ChunkType::Description)?
-                    .len();
-            }
-        }
-
-        if let Some(props) = obj.properties.as_object() {
-            for (_key, val) in props {
-                if let Some(s) = val.as_str() {
-                    if !s.is_empty() {
-                        indexed += graph
-                            .add_text_chunk(obj.id, s.to_string(), ChunkType::Imported)?
-                            .len();
-                    }
-                }
-            }
-        }
     }
 
     println!("    ✅ {indexed} text chunks indexed\n");
@@ -725,9 +737,8 @@ async fn main() -> Result<()> {
                 .map(|o| format!("{} [{}]", o.name, o.object_type))
                 .unwrap_or_else(|| obj_id.to_string());
             println!("    {}. {}", i + 1, label);
-            println!("       Matched: \"{}\"", snippet);
             if let Some(ref n) = node {
-                print_node_full(n, "       ");
+                print_node_full(n, &graph, "       ");
             }
         }
         println!();
@@ -776,9 +787,8 @@ async fn main() -> Result<()> {
                                 .map(|o| format!("{} [{}]", o.name, o.object_type))
                                 .unwrap_or_else(|| obj_id.to_string());
                             println!("    {}. [dist {:.4}] {}", i + 1, distance, label);
-                            println!("       Matched: \"{}\"", snippet);
                             if let Some(ref n) = node {
-                                print_node_full(n, "       ");
+                                print_node_full(n, &graph, "       ");
                             }
                         }
                         println!();
@@ -839,17 +849,44 @@ async fn main() -> Result<()> {
             }
 
             // Collect candidate documents with their obj_id so reranked results
-            // can load full node data.
+            // can load full node data.  Send the full flattened node (not just the
+            // matched chunk) so the reranker scores on complete node context.
             let candidates: Vec<(u_forge_core::types::ObjectId, String, String)> = sem_results
                 .iter()
-                .map(|(_chunk_id, obj_id, content, distance)| {
-                    let label = graph
-                        .get_object(*obj_id)
-                        .ok()
-                        .flatten()
+                .map(|(_chunk_id, obj_id, _content, distance)| {
+                    let node_opt = graph.get_object(*obj_id).ok().flatten();
+                    let label = node_opt
+                        .as_ref()
                         .map(|o| format!("{} [{}]", o.name, o.object_type))
                         .unwrap_or_else(|| obj_id.to_string());
-                    (*obj_id, label, format!("[dist:{distance:.4}] {content}"))
+                    let node_text = node_opt
+                        .map(|o| {
+                            let edges = graph.get_relationships(o.id).unwrap_or_default();
+                            let edge_lines: Vec<String> = edges
+                                .iter()
+                                .filter_map(|e| {
+                                    let from = if e.from == o.id {
+                                        Some(o.name.clone())
+                                    } else {
+                                        graph.get_object(e.from).ok().flatten().map(|n| n.name)
+                                    };
+                                    let to = if e.to == o.id {
+                                        Some(o.name.clone())
+                                    } else {
+                                        graph.get_object(e.to).ok().flatten().map(|n| n.name)
+                                    };
+                                    Some(format!(
+                                        "{} {} {}",
+                                        from?,
+                                        e.edge_type.as_str(),
+                                        to?
+                                    ))
+                                })
+                                .collect();
+                            format!("[dist:{distance:.4}]\n{}", o.flatten_for_embedding(&edge_lines))
+                        })
+                        .unwrap_or_else(|| format!("[dist:{distance:.4}] (node not found)"));
+                    (*obj_id, label, node_text)
                 })
                 .collect();
 
@@ -871,9 +908,8 @@ async fn main() -> Result<()> {
                         // server doesn't echo the document text back.
                         let text = doc.document.as_deref().unwrap_or(original_text.as_str());
                         println!("     {}. [score {:.4}] {}", rank + 1, doc.score, label,);
-                        println!("        Matched: \"{}\"", text);
                         if let Ok(Some(node)) = graph.get_object(*obj_id) {
-                            print_node_full(&node, "        ");
+                            print_node_full(&node, &graph, "        ");
                         }
                     }
                     println!();
@@ -960,16 +996,7 @@ async fn main() -> Result<()> {
                             result.chunks.len(),
                             result.edges.len(),
                         );
-                        print_node_full(&result.node, "       ");
-                        if !result.connected_node_names.is_empty() {
-                            let mut connected: Vec<String> = result
-                                .connected_node_names
-                                .values()
-                                .map(|cn| format!("{} [{}]", cn.name, cn.object_type))
-                                .collect();
-                            connected.sort();
-                            println!("       → {}", connected.join(", "));
-                        }
+                        print_node_full(&result.node, &graph, "       ");
                     }
                     println!();
                 }
@@ -1144,7 +1171,7 @@ fn capability_icon(available: bool) -> &'static str {
 fn role_label(role: &ModelRole) -> &'static str {
     match role {
         ModelRole::NpuEmbedding => "Embedding (NPU / FLM)",
-        ModelRole::CpuEmbedding => "Embedding (CPU / llamacpp)",
+        ModelRole::LlamacppEmbedding => "Embedding (GPU/CPU llamacpp)",
         ModelRole::NpuStt => "Speech-to-Text (NPU / FLM)",
         ModelRole::GpuStt => "Speech-to-Text (GPU / whispercpp)",
         ModelRole::NpuLlm => "LLM (NPU / FLM)",
@@ -1164,9 +1191,9 @@ fn print_model_choice(label: &str, model: Option<&u_forge_core::lemonade::Lemona
     }
 }
 
-/// Print the full metadata for a node: description, properties, and tags.
+/// Print the full metadata for a node: description, properties, tags, and edges.
 /// `indent` is prepended to every output line.
-fn print_node_full(node: &ObjectMetadata, indent: &str) {
+fn print_node_full(node: &ObjectMetadata, graph: &KnowledgeGraph, indent: &str) {
     if let Some(desc) = &node.description {
         if !desc.is_empty() {
             println!("{indent}Description: {desc}");
@@ -1187,6 +1214,9 @@ fn print_node_full(node: &ObjectMetadata, indent: &str) {
     }
     if !node.tags.is_empty() {
         println!("{indent}Tags: {}", node.tags.join(", "));
+    }
+    for line in graph.edge_display_lines(node) {
+        println!("{indent}{line}");
     }
 }
 

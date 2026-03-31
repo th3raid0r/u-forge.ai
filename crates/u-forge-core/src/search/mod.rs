@@ -376,6 +376,30 @@ pub async fn search_hybrid(
         semantic_results.len()
     );
 
+    // ── Diagnostic: Stage 1 (FTS5) results ──────────────────────────────────
+    {
+        use std::fmt::Write as _;
+        let mut buf = format!("── HYBRID STAGE 1: FTS5 ({} chunks) ──\n", fts_results.len());
+        for (rank, (chunk_id, obj_id, content)) in fts_results.iter().enumerate() {
+            let snippet: String = content.chars().take(80).collect();
+            let _ = writeln!(buf, "  FTS[{rank}] chunk={} obj={} content={snippet:?}…",
+                chunk_id.hyphenated(), obj_id.hyphenated());
+        }
+        info!("{buf}");
+    }
+
+    // ── Diagnostic: Stage 2+3 (Semantic ANN) results ────────────────────────
+    {
+        use std::fmt::Write as _;
+        let mut buf = format!("── HYBRID STAGE 2+3: Semantic ANN ({} chunks) ──\n", semantic_results.len());
+        for (rank, (chunk_id, obj_id, content, distance)) in semantic_results.iter().enumerate() {
+            let snippet: String = content.chars().take(80).collect();
+            let _ = writeln!(buf, "  SEM[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
+                chunk_id.hyphenated(), obj_id.hyphenated());
+        }
+        info!("{buf}");
+    }
+
     // ── Stage 4: Reciprocal Rank Fusion merge (chunk level) ───────────────────
     //
     // Deduplicate chunks by chunk_id and accumulate RRF scores from both paths.
@@ -412,6 +436,19 @@ pub async fn search_hybrid(
         entry.semantic_distance = Some(distance);
     }
 
+    // ── Diagnostic: Stage 4 (RRF merge) results ──────────────────────────────
+    {
+        use std::fmt::Write as _;
+        let mut sorted_chunks: Vec<_> = chunk_merge.iter().collect();
+        sorted_chunks.sort_by(|a, b| b.1.rrf_score.partial_cmp(&a.1.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
+        let mut buf = format!("── HYBRID STAGE 4: RRF chunk merge ({} unique chunks) ──\n", chunk_merge.len());
+        for (chunk_key, cm) in &sorted_chunks {
+            let _ = writeln!(buf, "  RRF chunk={chunk_key} obj={} score={:.6} fts_rank={:?} sem_dist={:?}",
+                cm.object_id_str, cm.rrf_score, cm.fts_rank, cm.semantic_distance);
+        }
+        info!("{buf}");
+    }
+
     // ── Stage 5: Node-level aggregation ───────────────────────────────────────
     //
     // Group chunk RRF scores by parent node.  A node's total score is the sum
@@ -435,6 +472,19 @@ pub async fn search_hybrid(
         }
     }
 
+    // ── Diagnostic: Stage 5 (Node aggregation) before sort ─────────────────
+    {
+        use std::fmt::Write as _;
+        let mut sorted_nodes: Vec<_> = node_accum.iter().collect();
+        sorted_nodes.sort_by(|a, b| b.1.total_score.partial_cmp(&a.1.total_score).unwrap_or(std::cmp::Ordering::Equal));
+        let mut buf = format!("── HYBRID STAGE 5: Node aggregation ({} nodes, before sort) ──\n", node_accum.len());
+        for (obj_id, acc) in &sorted_nodes {
+            let _ = writeln!(buf, "  NODE obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?}",
+                acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance);
+        }
+        info!("{buf}");
+    }
+
     // Sort nodes by descending aggregated score and cap at config.limit.
     let mut ranked_nodes: Vec<(String, NodeAccumulator)> = node_accum.into_iter().collect();
     ranked_nodes.sort_by(|a, b| {
@@ -454,6 +504,17 @@ pub async fn search_hybrid(
             .collect::<Vec<_>>()
             .join(", ")
     );
+
+    // ── Diagnostic: Stage 5 (after sort + truncate) ───────────────────────────
+    {
+        use std::fmt::Write as _;
+        let mut buf = format!("── HYBRID STAGE 5: After sort + truncate to {} ──\n", config.limit);
+        for (obj_id, acc) in &ranked_nodes {
+            let _ = writeln!(buf, "  KEPT obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?}",
+                acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance);
+        }
+        info!("{buf}");
+    }
 
     // ── Stage 6: Node hydration ───────────────────────────────────────────────
     //
@@ -524,6 +585,18 @@ pub async fn search_hybrid(
         });
     }
 
+    // ── Diagnostic: Stage 6 (Hydrated nodes) ──────────────────────────────────
+    {
+        use std::fmt::Write as _;
+        let mut buf = format!("── HYBRID STAGE 6: Hydrated nodes ({}) ──\n", results.len());
+        for (i, r) in results.iter().enumerate() {
+            let _ = writeln!(buf, "  HYDRATED[{i}] name={:?} type={:?} score={:.6} fts_rank={:?} sem_dist={:?}",
+                r.node.name, r.node.object_type, r.score,
+                r.sources.fts_rank, r.sources.semantic_distance);
+        }
+        info!("{buf}");
+    }
+
     // ── Stage 7: Optional reranking ───────────────────────────────────────────
 
     let do_rerank = config.rerank && queue.has_reranking() && !results.is_empty();
@@ -538,17 +611,43 @@ pub async fn search_hybrid(
     if do_rerank {
         debug!("Submitting {} nodes to reranker", results.len());
 
-        // Build one document per node by concatenating all chunk content.
+        // Build one document per node using the full flattened node representation.
+        // This gives the cross-encoder the complete node context (name, type,
+        // description, all properties, tags, and edges) rather than isolated chunk snippets.
         let documents: Vec<String> = results
             .iter()
             .map(|r| {
-                r.chunks
+                let edge_lines: Vec<String> = r
+                    .edges
                     .iter()
-                    .map(|c| c.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .filter_map(|e| {
+                        let from_name = if e.from == r.node.id {
+                            r.node.name.clone()
+                        } else {
+                            r.connected_node_names.get(&e.from)?.name.clone()
+                        };
+                        let to_name = if e.to == r.node.id {
+                            r.node.name.clone()
+                        } else {
+                            r.connected_node_names.get(&e.to)?.name.clone()
+                        };
+                        Some(format!("{} {} {}", from_name, e.edge_type.as_str(), to_name))
+                    })
+                    .collect();
+                r.node.flatten_for_embedding(&edge_lines)
             })
             .collect();
+
+        // ── Diagnostic: Stage 7 (Rerank input) ─────────────────────────────
+        {
+            use std::fmt::Write as _;
+            let mut buf = format!("── HYBRID STAGE 7: Rerank input ({} docs) ──\n", documents.len());
+            for (i, doc) in documents.iter().enumerate() {
+                let snippet: String = doc.chars().take(120).collect();
+                let _ = writeln!(buf, "  RERANK_IN[{i}] ({} chars) {snippet:?}…", doc.len());
+            }
+            info!("{buf}");
+        }
 
         match queue.rerank(query, documents, Some(results.len())).await {
             Err(e) => {
@@ -574,6 +673,20 @@ pub async fn search_hybrid(
                         .partial_cmp(&a.score)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
+
+                // ── Diagnostic: Stage 7 (Rerank output) ─────────────────────
+                {
+                    use std::fmt::Write as _;
+                    let mut buf = String::from("── HYBRID STAGE 7: Rerank output ──\n");
+                    for (i, r) in results.iter().enumerate() {
+                        let _ = writeln!(buf, "  RERANK_OUT[{i}] name={:?} type={:?} score={:.6} rerank_score={:?} fts_rank={:?} sem_dist={:?}",
+                            r.node.name, r.node.object_type,
+                            r.score, r.sources.rerank_score,
+                            r.sources.fts_rank, r.sources.semantic_distance);
+                    }
+                    info!("{buf}");
+                }
+
                 debug!("Returning {} reranked node results", results.len());
                 return Ok(results);
             }

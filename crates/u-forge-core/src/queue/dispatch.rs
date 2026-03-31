@@ -9,6 +9,7 @@ use tracing::instrument;
 use crate::lemonade::{ChatCompletionResponse, ChatRequest, KokoroVoice, RerankDocument};
 
 use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
+use super::weighted::WeightedEmbedDispatcher;
 
 // ── Public queue state exposed via QueueStats ─────────────────────────────────
 
@@ -39,7 +40,7 @@ pub struct QueueStats {
 /// as many callers as needed.
 #[derive(Clone)]
 pub struct InferenceQueue {
-    pub(super) embed_queue: Arc<WorkQueue<EmbedJob>>,
+    pub(super) embed_dispatcher: Arc<WeightedEmbedDispatcher>,
     pub(super) transcribe_queue: Arc<WorkQueue<TranscribeJob>>,
     pub(super) synthesize_queue: Arc<WorkQueue<SynthesizeJob>>,
     pub(super) generate_queue: Arc<WorkQueue<GenerateJob>>,
@@ -89,7 +90,7 @@ impl InferenceQueue {
         tracing::Span::current().record("text_len", text.len());
 
         let (tx, rx) = oneshot::channel();
-        self.embed_queue.push(EmbedJob { text, response: tx });
+        self.embed_dispatcher.submit(EmbedJob { text, response: tx });
 
         rx.await
             .map_err(|_| anyhow!("InferenceQueue: embedding worker dropped the response channel"))?
@@ -331,7 +332,7 @@ impl InferenceQueue {
     /// Returns the current number of pending jobs for each capability type.
     pub fn stats(&self) -> QueueStats {
         QueueStats {
-            pending_embeddings: self.embed_queue.pending(),
+            pending_embeddings: self.embed_dispatcher.pending(),
             pending_transcriptions: self.transcribe_queue.pending(),
             pending_syntheses: self.synthesize_queue.pending(),
             pending_generations: self.generate_queue.pending(),
@@ -421,7 +422,8 @@ mod tests {
     use crate::test_helpers::lemonade_url;
 
     use super::super::builder::InferenceQueueBuilder;
-    use super::super::jobs::{EmbedJob, TranscribeJob, WorkQueue};
+    use super::super::jobs::{TranscribeJob, WorkQueue};
+    use super::super::weighted::WeightedEmbedDispatcher;
     use super::super::workers::{run_embed_worker, run_transcribe_worker};
     use super::*;
 
@@ -514,16 +516,26 @@ mod tests {
     fn build_mock_queue() -> InferenceQueue {
         // We bypass the builder's device constructors and create the queue
         // internals directly so we can inject mock providers without a server.
-        let embed_queue = Arc::new(WorkQueue::<EmbedJob>::new());
+        //
+        // Two-phase pattern (mirrors InferenceQueueBuilder::build):
+        // 1. Register all embed workers with the dispatcher.
+        // 2. Wrap dispatcher in Arc, then spawn tasks with the Arc.
+        let mut embed_dispatcher = WeightedEmbedDispatcher::new();
         let transcribe_queue = Arc::new(WorkQueue::<TranscribeJob>::new());
         let synthesize_queue = Arc::new(WorkQueue::new());
 
-        // Spawn a mock embedding worker
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider);
+        let (embed_q, embed_idle, embed_ewma) = embed_dispatcher.add_worker(100, "mock-npu");
+
+        // Wrap before spawning so the worker can call steal_from_busiest.
+        let embed_dispatcher = Arc::new(embed_dispatcher);
         {
-            let q = Arc::clone(&embed_queue);
-            let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider);
+            let dispatcher = Arc::clone(&embed_dispatcher);
             tokio::spawn(async move {
-                run_embed_worker(q, provider, "mock-npu".to_string()).await;
+                run_embed_worker(
+                    embed_q, provider, "mock-npu".to_string(), embed_idle, embed_ewma, dispatcher,
+                )
+                .await;
             });
         }
 
@@ -540,7 +552,7 @@ mod tests {
         }
 
         InferenceQueue {
-            embed_queue,
+            embed_dispatcher,
             transcribe_queue,
             synthesize_queue,
             generate_queue: Arc::new(WorkQueue::new()),
@@ -677,7 +689,7 @@ mod tests {
     async fn test_embed_errors_when_no_embedding_device() {
         // Build a queue with no embedding workers
         let q = InferenceQueue {
-            embed_queue: Arc::new(WorkQueue::new()),
+            embed_dispatcher: Arc::new(WeightedEmbedDispatcher::new()),
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
@@ -705,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn test_transcribe_errors_when_no_transcription_device() {
         let q = InferenceQueue {
-            embed_queue: Arc::new(WorkQueue::new()),
+            embed_dispatcher: Arc::new(WeightedEmbedDispatcher::new()),
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
@@ -757,17 +769,19 @@ mod tests {
             }
         }
 
-        let embed_queue = Arc::new(WorkQueue::<EmbedJob>::new());
+        let mut embed_dispatcher = WeightedEmbedDispatcher::new();
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(SlowProvider);
+        let (q, idle, ewma) = embed_dispatcher.add_worker(100, "slow-npu");
+        let embed_dispatcher = Arc::new(embed_dispatcher);
         {
-            let q = Arc::clone(&embed_queue);
-            let provider: Arc<dyn EmbeddingProvider> = Arc::new(SlowProvider);
+            let dispatcher = Arc::clone(&embed_dispatcher);
             tokio::spawn(async move {
-                run_embed_worker(q, provider, "slow-npu".to_string()).await;
+                run_embed_worker(q, provider, "slow-npu".to_string(), idle, ewma, dispatcher).await;
             });
         }
 
         let queue = InferenceQueue {
-            embed_queue,
+            embed_dispatcher,
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
@@ -815,7 +829,7 @@ mod tests {
     #[test]
     fn test_queue_debug_format() {
         let q = InferenceQueue {
-            embed_queue: Arc::new(WorkQueue::new()),
+            embed_dispatcher: Arc::new(WeightedEmbedDispatcher::new()),
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
@@ -849,7 +863,7 @@ mod tests {
     #[test]
     fn test_worker_count_accessors() {
         let q = InferenceQueue {
-            embed_queue: Arc::new(WorkQueue::new()),
+            embed_dispatcher: Arc::new(WeightedEmbedDispatcher::new()),
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
@@ -873,7 +887,7 @@ mod tests {
     #[test]
     fn test_capability_flags() {
         let q = InferenceQueue {
-            embed_queue: Arc::new(WorkQueue::new()),
+            embed_dispatcher: Arc::new(WeightedEmbedDispatcher::new()),
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
@@ -903,7 +917,7 @@ mod tests {
             return;
         };
 
-        let npu = match NpuDevice::embedding_only(&url, None).await {
+        let npu = match NpuDevice::embedding_only(&url, None, None).await {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("Skipping: NpuDevice construction failed: {e}");

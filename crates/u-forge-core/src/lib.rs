@@ -18,6 +18,7 @@ pub(crate) mod test_helpers;
 
 pub mod ai;
 pub mod builder;
+pub mod config;
 pub mod error;
 pub mod graph;
 pub mod hardware;
@@ -36,15 +37,16 @@ pub use ai::embeddings::{
     LemonadeProvider,
 };
 pub use builder::ObjectBuilder;
+pub use config::{AppConfig, EmbeddingDeviceConfig};
 pub use graph::{
-    GraphStats, KnowledgeGraphStorage, EMBEDDING_DIMENSIONS, ENABLE_HIGH_QUALITY_EMBEDDING,
-    MAX_CHUNK_TOKENS,
+    GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
+    ENABLE_HIGH_QUALITY_EMBEDDING, MAX_CHUNK_TOKENS,
 };
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
     GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeModelEntry, LemonadeModelRegistry,
-    LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, ModelRole, SttGuard,
-    TranscriptionResult,
+    LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, ModelLoadOptions,
+    ModelRole, SttGuard, TranscriptionResult, load_model,
 };
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
@@ -172,6 +174,30 @@ impl KnowledgeGraph {
     /// All edges incident to `id` (both outgoing and incoming).
     pub fn get_relationships(&self, id: ObjectId) -> Result<Vec<Edge>> {
         self.storage.get_edges(id)
+    }
+
+    /// Format all edges incident on `node` as human-readable `"From edgeType To"` strings.
+    ///
+    /// Endpoint names are resolved by looking up the connected node; edges
+    /// whose endpoints cannot be resolved are silently dropped.
+    pub fn edge_display_lines(&self, node: &ObjectMetadata) -> Vec<String> {
+        self.get_relationships(node.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let from = if e.from == node.id {
+                    node.name.clone()
+                } else {
+                    self.get_object(e.from).ok().flatten()?.name
+                };
+                let to = if e.to == node.id {
+                    node.name.clone()
+                } else {
+                    self.get_object(e.to).ok().flatten()?.name
+                };
+                Some(format!("{} {} {}", from, e.edge_type.as_str(), to))
+            })
+            .collect()
     }
 
     /// Return every edge in the graph in a single query.

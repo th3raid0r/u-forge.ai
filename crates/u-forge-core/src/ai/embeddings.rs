@@ -115,6 +115,11 @@ pub struct LemonadeProvider {
 impl LemonadeProvider {
     /// Connect to a Lemonade Server instance and probe the embedding dimensions.
     ///
+    /// Does **not** call `/api/v1/load` first — the model must already be loaded
+    /// (or auto-loaded by the server on first request).  Use
+    /// [`new_with_load`](Self::new_with_load) to explicitly load the model with
+    /// custom options such as a larger context window.
+    ///
     /// # Errors
     /// Returns an error if the server is unreachable or the model is not loaded.
     pub async fn new(base_url: &str, model: &str) -> Result<Self> {
@@ -156,6 +161,33 @@ impl LemonadeProvider {
             model: model.to_string(),
             dimensions,
         })
+    }
+
+    /// Explicitly load `model` via `POST /api/v1/load` with the given options,
+    /// then connect and probe embedding dimensions.
+    ///
+    /// Use this instead of [`new`](Self::new) when you need to override server
+    /// defaults — most importantly `ctx_size`, which determines the maximum
+    /// token length the model will accept per request.
+    ///
+    /// # Errors
+    /// Returns an error if the load call fails, the server is unreachable, or
+    /// the model does not produce a valid embedding response.
+    pub async fn new_with_load(
+        base_url: &str,
+        model: &str,
+        load_opts: &crate::lemonade::ModelLoadOptions,
+    ) -> Result<Self> {
+        crate::lemonade::load_model(base_url, model, load_opts)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to load model '{}' before connecting to Lemonade Server: {}",
+                    model,
+                    e
+                )
+            })?;
+        Self::new(base_url, model).await
     }
 }
 
@@ -241,8 +273,7 @@ impl EmbeddingProvider for LemonadeProvider {
     }
 
     fn max_tokens(&self) -> Result<usize> {
-        // nomic-embed-text and most Lemonade models support 8 K context.
-        Ok(8192)
+        Ok(crate::lemonade::effective_ctx_size(&self.model))
     }
 
     fn provider_type(&self) -> EmbeddingProviderType {

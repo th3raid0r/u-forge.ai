@@ -16,9 +16,9 @@
   "hybrid": {
     "config": {
       "alpha": 0.5,
-      "fts_limit": 15,
-      "semantic_limit": 15,
-      "rerank": true,
+      "fts_limit": 10,
+      "semantic_limit": 10,
+      "rerank": false,
       "limit": 3
     },
     "queries": ["Who is the leader of the Foundation?"],
