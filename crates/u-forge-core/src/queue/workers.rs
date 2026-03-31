@@ -12,7 +12,7 @@
 //! This is the canonical race-free pattern from the Tokio `Notify` docs.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -23,6 +23,7 @@ use crate::ai::transcription::TranscriptionProvider;
 use crate::lemonade::{LemonadeChatProvider, LemonadeRerankProvider, LemonadeSttProvider, LemonadeTtsProvider};
 
 use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
+use super::weighted::WeightedEmbedDispatcher;
 
 /// Maximum number of attempts for a single embed job before the error is
 /// returned to the caller.  Retries guard against transient server hiccups
@@ -102,69 +103,110 @@ pub(super) async fn run_rerank_worker(
 /// completion and the `true` store is also small (just before `notified.await`).
 /// Both races are acceptable — they cause a job to go to a slightly non-optimal
 /// worker, never to be lost.
+/// Execute a single embedding job: retry loop, EWMA update, send result.
+async fn execute_embed_job(
+    job: EmbedJob,
+    provider: &Arc<dyn EmbeddingProvider>,
+    device_name: &str,
+    ewma_us: &Arc<AtomicU64>,
+) {
+    let start = std::time::Instant::now();
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut result: Option<Vec<f32>> = None;
+
+    for attempt in 1..=EMBED_MAX_ATTEMPTS {
+        match provider.embed(&job.text).await {
+            Ok(vec) => {
+                result = Some(vec);
+                break;
+            }
+            Err(e) => {
+                let delay_ms = EMBED_RETRY_BASE_MS * (1 << (attempt - 1));
+                debug!(
+                    device = %device_name,
+                    attempt,
+                    EMBED_MAX_ATTEMPTS,
+                    delay_ms,
+                    error = %e,
+                    "Embed attempt failed — retrying"
+                );
+                last_err = Some(e);
+                if attempt < EMBED_MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    let final_result = result.ok_or_else(|| {
+        last_err.unwrap_or_else(|| anyhow::anyhow!("embed failed with no error detail"))
+    });
+
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    debug!(
+        device = %device_name,
+        text_len = job.text.len(),
+        ok = final_result.is_ok(),
+        duration_ms = elapsed_us / 1000,
+        "Embed job complete"
+    );
+
+    // Update EWMA (α = 0.5): first sample is used directly; subsequent samples
+    // converge quickly to the actual device latency.
+    let old = ewma_us.load(Ordering::Relaxed);
+    let new_ewma = if old == 0 { elapsed_us } else { old / 2 + elapsed_us / 2 };
+    ewma_us.store(new_ewma, Ordering::Relaxed);
+
+    let _ = job.response.send(final_result);
+}
+
+/// Embedding worker loop with work stealing.
+///
+/// On each iteration:
+/// 1. Check own queue.
+/// 2. If empty, try to steal from the most-loaded other worker.
+/// 3. If still nothing, sleep until either the per-queue Notify or the
+///    dispatcher's global Notify fires — whichever comes first.
+///
+/// The global Notify fires on every `submit()`, so an idle worker wakes
+/// immediately when work lands in any queue (including a slow neighbour's).
+/// Once awake, the steal loop keeps the worker busy until all queues are
+/// empty, eliminating the "GPU idle while NPU backlog burns" scenario.
 pub(super) async fn run_embed_worker(
     queue: Arc<WorkQueue<EmbedJob>>,
     provider: Arc<dyn EmbeddingProvider>,
     device_name: String,
     idle: Arc<AtomicBool>,
+    ewma_us: Arc<AtomicU64>,
+    dispatcher: Arc<WeightedEmbedDispatcher>,
 ) {
     loop {
-        // Step 1: register before checking
-        let notified = queue.notify.notified();
+        // Register interest in both notifiers BEFORE any queue checks so we
+        // cannot miss a wakeup that fires between checking and sleeping.
+        let local_notified = queue.notify.notified();
+        let global_notified = dispatcher.global_notify.notified();
 
-        // Step 2: try to pop
+        // Own queue first.
         if let Some(job) = queue.try_pop() {
             idle.store(false, Ordering::Relaxed);
-            drop(notified);
-            let start = std::time::Instant::now();
+            execute_embed_job(job, &provider, &device_name, &ewma_us).await;
+            continue;
+        }
 
-            // Retry loop — attempt up to EMBED_MAX_ATTEMPTS times before
-            // giving up and forwarding the final error to the caller.
-            let mut last_err: Option<anyhow::Error> = None;
-            let mut result: Option<Vec<f32>> = None;
+        // Try to steal from the most-loaded other worker.  This drains
+        // backlogged neighbours without any additional synchronisation.
+        if let Some(job) = dispatcher.steal_from_busiest(&queue) {
+            idle.store(false, Ordering::Relaxed);
+            debug!(device = %device_name, "Work-stealing embed job from neighbour queue");
+            execute_embed_job(job, &provider, &device_name, &ewma_us).await;
+            continue;
+        }
 
-            for attempt in 1..=EMBED_MAX_ATTEMPTS {
-                match provider.embed(&job.text).await {
-                    Ok(vec) => {
-                        result = Some(vec);
-                        break;
-                    }
-                    Err(e) => {
-                        let delay_ms = EMBED_RETRY_BASE_MS * (1 << (attempt - 1));
-                        debug!(
-                            device = %device_name,
-                            attempt,
-                            EMBED_MAX_ATTEMPTS,
-                            delay_ms,
-                            error = %e,
-                            "Embed attempt failed — retrying"
-                        );
-                        last_err = Some(e);
-                        if attempt < EMBED_MAX_ATTEMPTS {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        }
-                    }
-                }
-            }
-
-            let final_result = result.ok_or_else(|| {
-                last_err.unwrap_or_else(|| anyhow::anyhow!("embed failed with no error detail"))
-            });
-
-            debug!(
-                device = %device_name,
-                text_len = job.text.len(),
-                ok = final_result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
-                "Embed job complete"
-            );
-
-            // Ignore send errors — caller may have timed out and dropped the receiver.
-            let _ = job.response.send(final_result);
-        } else {
-            // Step 3b: nothing in queue — mark idle then sleep until notified.
-            idle.store(true, Ordering::Relaxed);
-            notified.await;
+        // Nothing to do — sleep until our queue or any other queue gets work.
+        idle.store(true, Ordering::Relaxed);
+        tokio::select! {
+            _ = local_notified => {}
+            _ = global_notified => {}
         }
     }
 }

@@ -516,16 +516,26 @@ mod tests {
     fn build_mock_queue() -> InferenceQueue {
         // We bypass the builder's device constructors and create the queue
         // internals directly so we can inject mock providers without a server.
+        //
+        // Two-phase pattern (mirrors InferenceQueueBuilder::build):
+        // 1. Register all embed workers with the dispatcher.
+        // 2. Wrap dispatcher in Arc, then spawn tasks with the Arc.
         let mut embed_dispatcher = WeightedEmbedDispatcher::new();
         let transcribe_queue = Arc::new(WorkQueue::<TranscribeJob>::new());
         let synthesize_queue = Arc::new(WorkQueue::new());
 
-        // Spawn a mock embedding worker via the dispatcher
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider);
+        let (embed_q, embed_idle, embed_ewma) = embed_dispatcher.add_worker(100, "mock-npu");
+
+        // Wrap before spawning so the worker can call steal_from_busiest.
+        let embed_dispatcher = Arc::new(embed_dispatcher);
         {
-            let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider);
-            let (q, idle) = embed_dispatcher.add_worker(100, "mock-npu");
+            let dispatcher = Arc::clone(&embed_dispatcher);
             tokio::spawn(async move {
-                run_embed_worker(q, provider, "mock-npu".to_string(), idle).await;
+                run_embed_worker(
+                    embed_q, provider, "mock-npu".to_string(), embed_idle, embed_ewma, dispatcher,
+                )
+                .await;
             });
         }
 
@@ -542,7 +552,7 @@ mod tests {
         }
 
         InferenceQueue {
-            embed_dispatcher: Arc::new(embed_dispatcher),
+            embed_dispatcher,
             transcribe_queue,
             synthesize_queue,
             generate_queue: Arc::new(WorkQueue::new()),
@@ -760,16 +770,18 @@ mod tests {
         }
 
         let mut embed_dispatcher = WeightedEmbedDispatcher::new();
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(SlowProvider);
+        let (q, idle, ewma) = embed_dispatcher.add_worker(100, "slow-npu");
+        let embed_dispatcher = Arc::new(embed_dispatcher);
         {
-            let provider: Arc<dyn EmbeddingProvider> = Arc::new(SlowProvider);
-            let (q, idle) = embed_dispatcher.add_worker(100, "slow-npu");
+            let dispatcher = Arc::clone(&embed_dispatcher);
             tokio::spawn(async move {
-                run_embed_worker(q, provider, "slow-npu".to_string(), idle).await;
+                run_embed_worker(q, provider, "slow-npu".to_string(), idle, ewma, dispatcher).await;
             });
         }
 
         let queue = InferenceQueue {
-            embed_dispatcher: Arc::new(embed_dispatcher),
+            embed_dispatcher,
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),

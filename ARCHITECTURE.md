@@ -36,7 +36,7 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/hardware/npu.rs` | AMD NPU device (embedding + STT + LLM) | `NpuDevice` |
 | `src/hardware/gpu.rs` | AMD GPU ROCm device (STT + LLM) | `GpuDevice` |
 | `src/hardware/cpu.rs` | CPU device (TTS) | `CpuDevice` |
-| `src/config.rs` | Device configuration (TOML file loading, device weights) | `DeviceConfig`, `EmbeddingDeviceConfig` |
+| `src/config.rs` | Application configuration (TOML file loading, device weights, model context limits) | `AppConfig`, `EmbeddingDeviceConfig`, `ModelConfig` |
 | `src/queue/dispatch.rs` | Unified MPMC capability-based dispatch queue | `InferenceQueue`, `QueueStats` |
 | `src/queue/builder.rs` | Queue builder + device wiring | `InferenceQueueBuilder` |
 | `src/queue/jobs.rs` | Internal job types + WorkQueue primitive | `EmbedJob`, `WorkQueue<T>` |
@@ -308,28 +308,38 @@ Convenience methods: `speak(text)`, `speak_with_voice(text, voice)`, `has_embedd
 MPMC work queue built from `parking_lot::Mutex<VecDeque<T>> + tokio::sync::Notify`
 per capability type — no additional crate dependencies.
 
-#### Weighted Embedding Dispatch
+#### Weighted Embedding Dispatch with Throughput Awareness and Work Stealing
 
-Embedding jobs are routed via `WeightedEmbedDispatcher` (`src/queue/weighted.rs`):
+Embedding jobs are routed via `WeightedEmbedDispatcher` (`src/queue/weighted.rs`), which adapts to actual device throughput:
 
-- Each embedding worker registers with a **weight** (e.g., NPU=100, GPU=50, CPU=10)
-- When a job arrives, the dispatcher **selects the highest-weight idle worker**
-- If all workers are busy, the job is queued and the **highest-weight worker** claims it when free
-- Each worker maintains an atomic `idle` flag set before sleeping and cleared after popping a job
-- This allows best-effort selection without coordination — slightly non-optimal assignments are acceptable
+**Dispatch algorithm:**
+- Each worker tracks an EWMA (exponential weighted moving average, α=0.5) of job duration in microseconds
+- Cost of routing a job to a worker: `(pending_jobs + 1) × ewma_duration_us`
+- The dispatcher picks the worker with the **lowest predicted completion time**
+- Static `weight` (NPU=100, GPU=50, CPU=10) is used only as a tiebreaker when costs are equal
+- After the first job completes on each worker, the EWMA converges quickly to actual latency, causing the dispatcher to route new jobs to the faster device
 
-**Device weights** (configurable via `DeviceConfig`):
-- NPU embedding: 100 (fastest, preferred)
-- GPU embedding: 50 (medium speed, lower power than CPU)
-- CPU embedding: 10 (slowest, always available)
+**Work stealing (solves NPU backlog drain problem):**
+- When a worker finishes a job and its own queue is empty, it calls `steal_from_busiest()` to grab one job from the most-loaded other worker's queue
+- A `global_notify` broadcast on every `submit()` wakes all idle workers, so a GPU worker sleeping while NPU has a backlog immediately wakes and steals
+- The steal loop keeps the fast worker busy draining the slow worker's backlog without any additional synchronisation
+- Worst-case latency when GPU is faster by 10×: GPU drains the initial NPU backlog in ~1/10 the time NPU alone would take
+
+**Device weights** (configurable via `AppConfig`):
+- NPU embedding: 100 (highest static priority for new jobs when costs tie)
+- GPU embedding: 50 (medium static priority)
+- CPU embedding: 10 (lowest static priority)
 
 #### Configuration
 
-Device capabilities and dispatch weights are controlled by `DeviceConfig` (`src/config.rs`):
+Application-level configuration is controlled by `AppConfig` (`src/config.rs`), which includes:
+- Device capabilities and dispatch weights (embedding configuration)
+- Per-model context-window limits (for prompt truncation)
 
 ```rust
-pub struct DeviceConfig {
+pub struct AppConfig {
     pub embedding: EmbeddingDeviceConfig,
+    pub models: ModelConfig,
 }
 
 pub struct EmbeddingDeviceConfig {
@@ -340,28 +350,36 @@ pub struct EmbeddingDeviceConfig {
     pub cpu_enabled: bool,   // default: true
     pub cpu_weight: u32,     // default: 10
 }
+
+pub struct ModelConfig {
+    pub context_limits: HashMap<String, usize>,  // model ID → token limit
+}
 ```
 
-`DeviceConfig::load_default()` loads from:
-1. `$XDG_CONFIG_HOME/u-forge-devices.toml` (or `~/.config/u-forge-devices.toml`)
-2. `./u-forge-devices.toml` (current directory)
-3. Built-in defaults (all enabled, standard weights)
+`AppConfig::load_default()` loads from:
+1. `./u-forge.toml` (current directory)
+2. `$XDG_CONFIG_HOME/u-forge/config.toml` (or `~/.config/u-forge/config.toml`)
+3. Built-in defaults (all devices enabled, standard weights, known model limits)
 
-Example `u-forge-devices.toml`:
+Example `u-forge.toml`:
 ```toml
 [embedding]
 npu_enabled = true
 npu_weight = 100
 gpu_enabled = true
-gpu_weight = 40    # prefer NPU over GPU
-cpu_enabled = false  # disable CPU embedding
+gpu_weight = 40
+cpu_enabled = false
+
+[models.context_limits]
+"embed-gemma-300m-FLM"     = 2048
+"custom-embedding-model"   = 4096
 ```
 
 **Public API:**
 
 ```rust
 // Load config (uses defaults if no file found)
-let config = DeviceConfig::load_default();
+let config = AppConfig::load_default();
 
 // Build the queue with config
 let queue = InferenceQueueBuilder::new()

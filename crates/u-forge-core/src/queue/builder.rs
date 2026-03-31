@@ -1,23 +1,36 @@
 //! [`InferenceQueueBuilder`] — register device workers and spawn background tasks.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64},
+    Arc,
+};
 
 use tracing::{debug, warn};
 
 use crate::ai::embeddings::EmbeddingProvider;
-use crate::config::DeviceConfig;
+use crate::config::AppConfig;
 use crate::hardware::cpu::CpuDevice;
 use crate::hardware::gpu::GpuDevice;
 use crate::hardware::npu::NpuDevice;
 use crate::lemonade::LemonadeRerankProvider;
 
 use super::dispatch::InferenceQueue;
-use super::jobs::{GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
+use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
 use super::weighted::WeightedEmbedDispatcher;
 use super::workers::{
     run_embed_worker, run_gpu_stt_worker, run_llm_worker, run_rerank_worker, run_transcribe_worker,
     run_tts_worker,
 };
+
+/// Collected information for a single embedding worker, deferred until the
+/// dispatcher is fully built and wrapped in an `Arc`.
+struct EmbedWorkerSpec {
+    queue: Arc<WorkQueue<EmbedJob>>,
+    idle: Arc<AtomicBool>,
+    ewma_us: Arc<AtomicU64>,
+    provider: Arc<dyn EmbeddingProvider>,
+    name: String,
+}
 
 // ── InferenceQueueBuilder ─────────────────────────────────────────────────────
 
@@ -51,8 +64,8 @@ pub struct InferenceQueueBuilder {
     /// Standalone embedding providers registered directly (e.g. llamacpp ROCm/CPU).
     /// Each entry becomes its own `run_embed_worker` Tokio task with the given weight.
     extra_embedding_providers: Vec<(Arc<dyn EmbeddingProvider>, String, u32)>,
-    /// Device configuration controlling which backends to use and their weights.
-    config: DeviceConfig,
+    /// Application configuration controlling which backends to use and their weights.
+    config: AppConfig,
 }
 
 impl InferenceQueueBuilder {
@@ -64,7 +77,7 @@ impl InferenceQueueBuilder {
             cpu_devices: Vec::new(),
             rerankers: Vec::new(),
             extra_embedding_providers: Vec::new(),
-            config: DeviceConfig::default(),
+            config: AppConfig::default(),
         }
     }
 
@@ -146,12 +159,12 @@ impl InferenceQueueBuilder {
         self
     }
 
-    /// Override the device configuration used to control which backends are
-    /// enabled and their dispatch weights.
+    /// Override the application configuration used to control which backends are
+    /// enabled, their dispatch weights, and model context limits.
     ///
-    /// Defaults to [`DeviceConfig::default()`] (all backends enabled, standard
+    /// Defaults to [`AppConfig::default()`] (all backends enabled, standard
     /// weights) if this method is not called.
-    pub fn with_device_config(mut self, config: DeviceConfig) -> Self {
+    pub fn with_config(mut self, config: AppConfig) -> Self {
         self.config = config;
         self
     }
@@ -170,7 +183,7 @@ impl InferenceQueueBuilder {
         let generate_queue = Arc::new(WorkQueue::<GenerateJob>::new());
         let rerank_queue = Arc::new(WorkQueue::<RerankJob>::new());
 
-        let mut embedding_workers: usize = 0;
+        let mut embed_specs: Vec<EmbedWorkerSpec> = Vec::new();
         let mut transcription_workers: usize = 0;
         let mut tts_workers: usize = 0;
         let mut llm_workers: usize = 0;
@@ -178,23 +191,23 @@ impl InferenceQueueBuilder {
 
         let cfg = &self.config.embedding;
 
+        // ── Phase 1: register workers with the dispatcher (no spawning yet) ──
+        //
+        // Embed workers need an Arc<WeightedEmbedDispatcher> for work-stealing,
+        // so we collect their specs here and spawn after wrapping the dispatcher.
+
         // ── NPU workers ──────────────────────────────────────────────────────
         for device in self.npu_devices {
             let device = Arc::new(device) as Arc<NpuDevice>;
 
-            // Embedding worker (config-gated)
             if cfg.npu_enabled && device.has_embedding() {
                 let provider = Arc::clone(&device.embedding);
                 let name = device.name.clone();
-                let (q, idle) = embed_dispatcher.add_worker(cfg.npu_weight, &name);
-                embedding_workers += 1;
-                debug!(device = %name, weight = cfg.npu_weight, "Spawning NPU embedding worker");
-                tokio::spawn(async move {
-                    run_embed_worker(q, provider, name, idle).await;
-                });
+                let (queue, idle, ewma_us) = embed_dispatcher.add_worker(cfg.npu_weight, &name);
+                debug!(device = %name, weight = cfg.npu_weight, "Registered NPU embedding worker");
+                embed_specs.push(EmbedWorkerSpec { queue, idle, ewma_us, provider, name });
             }
 
-            // Transcription worker (NPU FLM whisper)
             if let Some(provider) = device.transcription.clone() {
                 let q = Arc::clone(&transcribe_queue);
                 let name = device.name.clone();
@@ -205,7 +218,6 @@ impl InferenceQueueBuilder {
                 });
             }
 
-            // LLM worker (NPU FLM chat)
             if let Some(chat) = device.chat.clone() {
                 let q = Arc::clone(&generate_queue);
                 let name = device.name.clone();
@@ -219,20 +231,16 @@ impl InferenceQueueBuilder {
 
         // ── GPU workers ──────────────────────────────────────────────────────
         for device in self.gpu_devices {
-            // GPU embedding (config-gated)
             if cfg.gpu_enabled {
                 if let Some(provider) = device.embedding {
                     let name = format!("{} (embed)", device.name);
-                    let (q, idle) = embed_dispatcher.add_worker(cfg.gpu_weight, &name);
-                    embedding_workers += 1;
-                    debug!(device = %name, weight = cfg.gpu_weight, "Spawning GPU embedding worker");
-                    tokio::spawn(async move {
-                        run_embed_worker(q, provider, name, idle).await;
-                    });
+                    let (queue, idle, ewma_us) =
+                        embed_dispatcher.add_worker(cfg.gpu_weight, &name);
+                    debug!(device = %name, weight = cfg.gpu_weight, "Registered GPU embedding worker");
+                    embed_specs.push(EmbedWorkerSpec { queue, idle, ewma_us, provider, name });
                 }
             }
 
-            // GPU STT (whispercpp via Vulkan/ROCm)
             if let Some(stt) = device.stt {
                 let q = Arc::clone(&transcribe_queue);
                 let name = device.name.clone();
@@ -243,7 +251,6 @@ impl InferenceQueueBuilder {
                 });
             }
 
-            // GPU LLM (llamacpp via ROCm/Vulkan)
             if let Some(chat) = device.chat {
                 let q = Arc::clone(&generate_queue);
                 let name = device.name.clone();
@@ -257,16 +264,13 @@ impl InferenceQueueBuilder {
 
         // ── CPU workers ──────────────────────────────────────────────────────
         for device in self.cpu_devices {
-            // CPU embedding (config-gated)
             if cfg.cpu_enabled {
                 if let Some(provider) = device.embedding {
                     let name = format!("{} (embed)", device.name);
-                    let (q, idle) = embed_dispatcher.add_worker(cfg.cpu_weight, &name);
-                    embedding_workers += 1;
-                    debug!(device = %name, weight = cfg.cpu_weight, "Spawning CPU embedding worker");
-                    tokio::spawn(async move {
-                        run_embed_worker(q, provider, name, idle).await;
-                    });
+                    let (queue, idle, ewma_us) =
+                        embed_dispatcher.add_worker(cfg.cpu_weight, &name);
+                    debug!(device = %name, weight = cfg.cpu_weight, "Registered CPU embedding worker");
+                    embed_specs.push(EmbedWorkerSpec { queue, idle, ewma_us, provider, name });
                 }
             }
 
@@ -283,11 +287,32 @@ impl InferenceQueueBuilder {
 
         // ── Extra standalone embedding workers ───────────────────────────────
         for (provider, name, weight) in self.extra_embedding_providers {
-            let (q, idle) = embed_dispatcher.add_worker(weight, &name);
-            embedding_workers += 1;
-            debug!(device = %name, weight, "Spawning standalone embedding worker");
+            let (queue, idle, ewma_us) = embed_dispatcher.add_worker(weight, &name);
+            debug!(device = %name, weight, "Registered standalone embedding worker");
+            embed_specs.push(EmbedWorkerSpec { queue, idle, ewma_us, provider, name });
+        }
+
+        // ── Phase 2: wrap dispatcher in Arc, then spawn embed workers ─────────
+        //
+        // Workers need Arc<WeightedEmbedDispatcher> to call steal_from_busiest
+        // and to sleep on global_notify, so we wrap only after all workers are
+        // registered.
+        let embed_dispatcher = Arc::new(embed_dispatcher);
+        let embedding_workers = embed_specs.len();
+
+        for spec in embed_specs {
+            let dispatcher = Arc::clone(&embed_dispatcher);
+            debug!(device = %spec.name, "Spawning embed worker");
             tokio::spawn(async move {
-                run_embed_worker(q, provider, name, idle).await;
+                run_embed_worker(
+                    spec.queue,
+                    spec.provider,
+                    spec.name,
+                    spec.idle,
+                    spec.ewma_us,
+                    dispatcher,
+                )
+                .await;
             });
         }
 
@@ -322,7 +347,7 @@ impl InferenceQueueBuilder {
         }
 
         InferenceQueue {
-            embed_dispatcher: Arc::new(embed_dispatcher),
+            embed_dispatcher,
             transcribe_queue,
             synthesize_queue,
             generate_queue,

@@ -37,7 +37,7 @@ use std::env;
 use std::sync::Arc;
 use u_forge_core::{
     ai::embeddings::LemonadeProvider,
-    config::DeviceConfig,
+    config::AppConfig,
     hardware::npu::NpuDevice,
     ingest::DataIngestion,
     lemonade::{
@@ -396,9 +396,9 @@ async fn main() -> Result<()> {
                             }
 
                             // Build a multi-worker embedding InferenceQueue with weighted dispatch.
-                            // Load device config (u-forge-devices.toml) to determine which
+                            // Load app config (u-forge.toml) to determine which
                             // backends to use and their priority weights.
-                            let device_cfg = DeviceConfig::load_default();
+                            let device_cfg = AppConfig::load_default();
                             println!("   Device config:");
                             println!(
                                 "     NPU embed: {} (weight={})",
@@ -418,7 +418,7 @@ async fn main() -> Result<()> {
 
                             println!("   Building embedding workers…");
                             let mut eq_builder = InferenceQueueBuilder::new()
-                                .with_device_config(device_cfg.clone());
+                                .with_config(device_cfg.clone());
                             let mut worker_count = 0usize;
 
                             // NPU worker (FLM embed-gemma-300m-FLM)

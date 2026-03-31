@@ -1,13 +1,13 @@
-//! Device configuration — which hardware backends to use for each capability.
+//! Application configuration — devices, model limits, and other tunables.
 //!
 //! Loaded from a TOML file at startup.  All fields have sensible defaults so
 //! the file is entirely optional; the project runs correctly with zero config.
 //!
 //! # File locations (checked in order)
 //!
-//! 1. `./u-forge-devices.toml` (working directory)
-//! 2. `$XDG_CONFIG_HOME/u-forge/devices.toml`
-//!    (falls back to `$HOME/.config/u-forge/devices.toml` on Linux)
+//! 1. `./u-forge.toml` (working directory)
+//! 2. `$XDG_CONFIG_HOME/u-forge/config.toml`
+//!    (falls back to `$HOME/.config/u-forge/config.toml` on Linux)
 //! 3. Built-in defaults (NPU weight=100, GPU weight=50, CPU weight=10)
 //!
 //! # Example file
@@ -20,6 +20,10 @@
 //! npu_weight   = 100
 //! gpu_weight   = 50
 //! cpu_weight   = 10
+//!
+//! [models.context_limits]
+//! "embed-gemma-300m-FLM"                = 2048
+//! "some-new-model-FLM"                  = 4096
 //! ```
 //!
 //! # Typical use-cases for disabling a device
@@ -31,6 +35,7 @@
 //! NPU embedding uses a separate FLM model (not llamacpp), so the NPU worker
 //! never conflicts with GPU/CPU llamacpp workers and can always remain enabled.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -41,7 +46,7 @@ use tracing::info;
 
 /// Per-device settings for the embedding subsystem.
 ///
-/// Corresponds to the `[embedding]` section of `u-forge-devices.toml`.
+/// Corresponds to the `[embedding]` section of `u-forge.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingDeviceConfig {
     /// Whether to use the NPU embedding worker (FLM model, highest quality).
@@ -82,23 +87,54 @@ impl Default for EmbeddingDeviceConfig {
     }
 }
 
-// ── DeviceConfig ──────────────────────────────────────────────────────────────
+// ── ModelConfig ───────────────────────────────────────────────────────────────
 
-/// Top-level device configuration.
+/// Model-level settings, primarily per-model context-window overrides.
 ///
-/// Loaded from `u-forge-devices.toml` by [`DeviceConfig::load_default`].
-/// Use [`DeviceConfig::default`] when no config file is present or required.
+/// Corresponds to the `[models]` section of `u-forge.toml`.
+///
+/// The built-in defaults mirror `assets/model_context_limits.json`.  Add
+/// entries here to teach u-forge about new models without recompiling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// Per-model context-window size in tokens.
+    ///
+    /// Keys are the exact model IDs reported by Lemonade Server.  Values are
+    /// the model's published maximum sequence length.  The effective context
+    /// used at runtime is `min(value, DEFAULT_EMBEDDING_CONTEXT_TOKENS)`.
+    #[serde(default = "default_model_context_limits")]
+    pub context_limits: HashMap<String, usize>,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            context_limits: default_model_context_limits(),
+        }
+    }
+}
+
+// ── AppConfig ─────────────────────────────────────────────────────────────────
+
+/// Top-level application configuration.
+///
+/// Loaded from `u-forge.toml` by [`AppConfig::load_default`].
+/// Use [`AppConfig::default`] when no config file is present or required.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DeviceConfig {
+pub struct AppConfig {
     /// Embedding-specific device settings.
     #[serde(default)]
     pub embedding: EmbeddingDeviceConfig,
+
+    /// Model-level settings (context-window limits, etc.).
+    #[serde(default)]
+    pub models: ModelConfig,
 }
 
-impl DeviceConfig {
+impl AppConfig {
     /// Load from a specific TOML file path.
     ///
-    /// Returns `Ok(DeviceConfig::default())` if the file does not exist, so
+    /// Returns `Ok(AppConfig::default())` if the file does not exist, so
     /// callers never need to treat a missing config file as an error.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
@@ -108,7 +144,7 @@ impl DeviceConfig {
         let text = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&text)?;
 
-        info!(path = %path.display(), "DeviceConfig loaded");
+        info!(path = %path.display(), "AppConfig loaded");
 
         Ok(config)
     }
@@ -116,9 +152,9 @@ impl DeviceConfig {
     /// Load from the canonical search path, returning defaults if nothing is found.
     ///
     /// Search order:
-    /// 1. `./u-forge-devices.toml`
-    /// 2. `$XDG_CONFIG_HOME/u-forge/devices.toml`
-    ///    (or `$HOME/.config/u-forge/devices.toml` on Linux)
+    /// 1. `./u-forge.toml`
+    /// 2. `$XDG_CONFIG_HOME/u-forge/config.toml`
+    ///    (or `$HOME/.config/u-forge/config.toml` on Linux)
     /// 3. Built-in defaults
     pub fn load_default() -> Self {
         for path in Self::candidate_paths() {
@@ -128,19 +164,19 @@ impl DeviceConfig {
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
-                        "DeviceConfig: failed to load — skipping"
+                        "AppConfig: failed to load — skipping"
                     );
                 }
             }
         }
 
-        info!("DeviceConfig: no config file found — using defaults");
+        info!("AppConfig: no config file found — using defaults");
         Self::default()
     }
 
     /// Ordered list of paths to check when loading the default config.
     fn candidate_paths() -> Vec<PathBuf> {
-        let mut paths = vec![PathBuf::from("u-forge-devices.toml")];
+        let mut paths = vec![PathBuf::from("u-forge.toml")];
 
         // XDG_CONFIG_HOME / fallback to $HOME/.config
         let xdg_base = std::env::var("XDG_CONFIG_HOME")
@@ -150,7 +186,7 @@ impl DeviceConfig {
             });
 
         if !xdg_base.as_os_str().is_empty() {
-            paths.push(xdg_base.join("u-forge").join("devices.toml"));
+            paths.push(xdg_base.join("u-forge").join("config.toml"));
         }
 
         paths
@@ -180,6 +216,17 @@ fn default_cpu_weight() -> u32 {
     10
 }
 
+/// Built-in context-window limits matching `assets/model_context_limits.json`.
+fn default_model_context_limits() -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    m.insert("embed-gemma-300m-FLM".to_string(), 2048);
+    m.insert("embed-gemma-300M-GGUF".to_string(), 2048);
+    m.insert("user.ggml-org/embeddinggemma-300M-GGUF".to_string(), 2048);
+    m.insert("nomic-embed-text-v2-moe-GGUF".to_string(), 512);
+    m.insert("nomic-embed-text-v1-GGUF".to_string(), 2048);
+    m
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -190,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_default_values() {
-        let cfg = DeviceConfig::default();
+        let cfg = AppConfig::default();
         assert!(cfg.embedding.npu_enabled);
         assert!(cfg.embedding.gpu_enabled);
         assert!(cfg.embedding.cpu_enabled);
@@ -200,9 +247,17 @@ mod tests {
     }
 
     #[test]
+    fn test_default_model_context_limits() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.models.context_limits.get("embed-gemma-300m-FLM"), Some(&2048));
+        assert_eq!(cfg.models.context_limits.get("nomic-embed-text-v2-moe-GGUF"), Some(&512));
+        assert_eq!(cfg.models.context_limits.get("nomic-embed-text-v1-GGUF"), Some(&2048));
+    }
+
+    #[test]
     fn test_load_missing_file_returns_defaults() {
         let path = PathBuf::from("/tmp/u-forge-nonexistent-config-xyz.toml");
-        let cfg = DeviceConfig::load(&path).unwrap();
+        let cfg = AppConfig::load(&path).unwrap();
         assert!(cfg.embedding.npu_enabled);
         assert_eq!(cfg.embedding.npu_weight, 100);
     }
@@ -224,13 +279,31 @@ cpu_weight   = 5
         )
         .unwrap();
 
-        let cfg = DeviceConfig::load(f.path()).unwrap();
+        let cfg = AppConfig::load(f.path()).unwrap();
         assert!(cfg.embedding.npu_enabled);
         assert!(cfg.embedding.gpu_enabled);
         assert!(!cfg.embedding.cpu_enabled);
         assert_eq!(cfg.embedding.npu_weight, 200);
         assert_eq!(cfg.embedding.gpu_weight, 75);
         assert_eq!(cfg.embedding.cpu_weight, 5);
+    }
+
+    #[test]
+    fn test_load_model_context_limits_from_toml() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"
+[models.context_limits]
+"embed-gemma-300m-FLM" = 1024
+"my-custom-model-FLM"  = 8192
+"#
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.models.context_limits.get("embed-gemma-300m-FLM"), Some(&1024));
+        assert_eq!(cfg.models.context_limits.get("my-custom-model-FLM"), Some(&8192));
     }
 
     #[test]
@@ -245,7 +318,7 @@ cpu_enabled = false
         )
         .unwrap();
 
-        let cfg = DeviceConfig::load(f.path()).unwrap();
+        let cfg = AppConfig::load(f.path()).unwrap();
         assert!(cfg.embedding.npu_enabled);      // default
         assert!(cfg.embedding.gpu_enabled);      // default
         assert!(!cfg.embedding.cpu_enabled);     // overridden
@@ -255,7 +328,7 @@ cpu_enabled = false
     #[test]
     fn test_load_empty_toml_uses_all_defaults() {
         let f = NamedTempFile::new().unwrap();
-        let cfg = DeviceConfig::load(f.path()).unwrap();
+        let cfg = AppConfig::load(f.path()).unwrap();
         assert!(cfg.embedding.npu_enabled);
         assert_eq!(cfg.embedding.npu_weight, 100);
         assert_eq!(cfg.embedding.gpu_weight, 50);
