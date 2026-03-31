@@ -14,22 +14,36 @@
 //!   LEMONADE_URL         Lemonade Server base URL (e.g. http://localhost:8000/api/v1)
 //!   UFORGE_DATA_FILE     override DATA_FILE
 //!   UFORGE_SCHEMA_DIR    override SCHEMA_DIR
-//!   UFORGE_DEMO_CONFIG   path to demo config JSON file
+//!   UFORGE_DEMO_CONFIG   path to demo config TOML file
 //!   RUST_LOG             log verbosity (error/warn/info/debug/trace)
 //!
-//! Config file format (JSON):
-//! ```json
-//! {
-//!   "fts":      { "queries": [{"query": "empire", "limit": 3}] },
-//!   "semantic": { "queries": [{"query": "collapse of civilization", "limit": 3}] },
-//!   "rerank":   { "queries": [{"query": "Who founded the Foundation?", "semantic_limit": 6}] },
-//!   "hybrid": {
-//!     "config": {"alpha": 0.5, "fts_limit": 15, "semantic_limit": 15, "rerank": true, "limit": 3},
-//!     "queries": ["Who founded the Foundation and why?"],
-//!     "alpha_sweep_query": "the collapse of an interstellar civilization",
-//!     "alpha_sweep_values": [0.0, 0.5, 1.0]
-//!   }
-//! }
+//! Config file format (TOML):
+//! ```toml
+//! [fts]
+//! [[fts.queries]]
+//! query = "empire"
+//! limit = 3
+//!
+//! [semantic]
+//! [[semantic.queries]]
+//! query = "collapse of civilization"
+//! limit = 3
+//!
+//! [rerank]
+//! [[rerank.queries]]
+//! query = "Who founded the Foundation?"
+//! semantic_limit = 6
+//!
+//! [hybrid]
+//! [hybrid.config]
+//! alpha = 0.5
+//! fts_limit = 15
+//! semantic_limit = 15
+//! rerank = true
+//! limit = 3
+//! queries = ["Who founded the Foundation and why?"]
+//! alpha_sweep_query = "the collapse of an interstellar civilization"
+//! alpha_sweep_values = [0.0, 0.5, 1.0]
 //! ```
 
 use anyhow::Result;
@@ -141,8 +155,7 @@ fn default_hybrid_sem_limit() -> usize {
 fn load_demo_config(path: &str) -> Result<DemoConfig> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Could not read config file '{path}': {e}"))?;
-    serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Could not parse config file '{path}': {e}"))
+    toml::from_str(&text).map_err(|e| anyhow::anyhow!("Could not parse config file '{path}': {e}"))
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -176,9 +189,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR")));
 
     // Optional demo config: --config <path>, UFORGE_DEMO_CONFIG env var, or
-    // defaults/demo_config.json next to the data file / schema dir.
+    // defaults/demo_config.toml next to the data file / schema dir.
     let default_config_path = format!(
-        "{}/../../defaults/demo_config.json",
+        "{}/../../defaults/demo_config.toml",
         env!("CARGO_MANIFEST_DIR")
     );
 
@@ -380,7 +393,10 @@ async fn main() -> Result<()> {
                             // Summarise which canonical models will be used
                             println!("   Active model selection:");
                             print_model_choice("   Embed (NPU)  ", registry.npu_embedding_model());
-                            print_model_choice("   Embed (llamacpp)", registry.llamacpp_embedding_model());
+                            print_model_choice(
+                                "   Embed (llamacpp)",
+                                registry.llamacpp_embedding_model(),
+                            );
                             print_model_choice("   LLM (NPU)   ", registry.npu_llm_model());
                             print_model_choice("   LLM (GPU)   ", registry.llm_model());
                             print_model_choice("   Reranker     ", registry.reranker_model());
@@ -402,23 +418,35 @@ async fn main() -> Result<()> {
                             println!("   Device config:");
                             println!(
                                 "     NPU embed: {} (weight={})",
-                                if device_cfg.embedding.npu_enabled { "enabled" } else { "disabled" },
+                                if device_cfg.embedding.npu_enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                },
                                 device_cfg.embedding.npu_weight
                             );
                             println!(
                                 "     GPU embed: {} (weight={})",
-                                if device_cfg.embedding.gpu_enabled { "enabled" } else { "disabled" },
+                                if device_cfg.embedding.gpu_enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                },
                                 device_cfg.embedding.gpu_weight
                             );
                             println!(
                                 "     CPU embed: {} (weight={})",
-                                if device_cfg.embedding.cpu_enabled { "enabled" } else { "disabled" },
+                                if device_cfg.embedding.cpu_enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                },
                                 device_cfg.embedding.cpu_weight
                             );
 
                             println!("   Building embedding workers…");
-                            let mut eq_builder = InferenceQueueBuilder::new()
-                                .with_config(device_cfg.clone());
+                            let mut eq_builder =
+                                InferenceQueueBuilder::new().with_config(device_cfg.clone());
                             let mut worker_count = 0usize;
 
                             // NPU worker (FLM embed-gemma-300m-FLM)
@@ -616,7 +644,12 @@ async fn main() -> Result<()> {
             .filter_map(|e| {
                 let from_name = id_to_name.get(&e.from)?;
                 let to_name = id_to_name.get(&e.to)?;
-                Some(format!("{} {} {}", from_name, e.edge_type.as_str(), to_name))
+                Some(format!(
+                    "{} {} {}",
+                    from_name,
+                    e.edge_type.as_str(),
+                    to_name
+                ))
             })
             .collect();
         let text = obj.flatten_for_embedding(&edge_lines);
@@ -716,7 +749,11 @@ async fn main() -> Result<()> {
     ];
 
     let fts_queries: Vec<(String, usize)> = match &demo_cfg.fts {
-        Some(cfg) => cfg.queries.iter().map(|q| (q.query.clone(), q.limit)).collect(),
+        Some(cfg) => cfg
+            .queries
+            .iter()
+            .map(|q| (q.query.clone(), q.limit))
+            .collect(),
         None => default_fts_queries
             .iter()
             .map(|(q, l)| (q.to_string(), *l))
@@ -761,7 +798,11 @@ async fn main() -> Result<()> {
         ];
 
         let semantic_queries: Vec<(String, usize)> = match &demo_cfg.semantic {
-            Some(cfg) => cfg.queries.iter().map(|q| (q.query.clone(), q.limit)).collect(),
+            Some(cfg) => cfg
+                .queries
+                .iter()
+                .map(|q| (q.query.clone(), q.limit))
+                .collect(),
             None => default_semantic
                 .iter()
                 .map(|(q, l)| (q.to_string(), *l))
@@ -875,15 +916,13 @@ async fn main() -> Result<()> {
                                     } else {
                                         graph.get_object(e.to).ok().flatten().map(|n| n.name)
                                     };
-                                    Some(format!(
-                                        "{} {} {}",
-                                        from?,
-                                        e.edge_type.as_str(),
-                                        to?
-                                    ))
+                                    Some(format!("{} {} {}", from?, e.edge_type.as_str(), to?))
                                 })
                                 .collect();
-                            format!("[dist:{distance:.4}]\n{}", o.flatten_for_embedding(&edge_lines))
+                            format!(
+                                "[dist:{distance:.4}]\n{}",
+                                o.flatten_for_embedding(&edge_lines)
+                            )
                         })
                         .unwrap_or_else(|| format!("[dist:{distance:.4}] (node not found)"));
                     (*obj_id, label, node_text)
@@ -917,7 +956,9 @@ async fn main() -> Result<()> {
             }
         }
     } else if lemonade_url.is_some() {
-        println!("ℹ️  Rerank demo skipped — requires both an embedding model and a reranker model.\n");
+        println!(
+            "ℹ️  Rerank demo skipped — requires both an embedding model and a reranker model.\n"
+        );
     } else {
         println!("ℹ️  Rerank demo skipped — set LEMONADE_URL to enable AI features.\n");
     }
@@ -971,7 +1012,10 @@ async fn main() -> Result<()> {
 
         let hybrid_queries: Vec<String> = match &demo_cfg.hybrid {
             Some(h) if !h.queries.is_empty() => h.queries.clone(),
-            _ => default_hybrid_queries.iter().map(|q| q.to_string()).collect(),
+            _ => default_hybrid_queries
+                .iter()
+                .map(|q| q.to_string())
+                .collect(),
         };
 
         for query in &hybrid_queries {
@@ -1035,8 +1079,7 @@ async fn main() -> Result<()> {
                 limit: 3,
             };
             print!("  alpha={alpha:.1} ({label}): ");
-            match search_hybrid(&graph, eq, sweep_query, &sweep_config).await
-            {
+            match search_hybrid(&graph, eq, sweep_query, &sweep_config).await {
                 Err(e) => println!("⚠️  {e}"),
                 Ok(rs) if rs.is_empty() => println!("(no results)"),
                 Ok(rs) => {
@@ -1231,24 +1274,42 @@ fn print_usage(prog: &str) {
     println!("Arguments:");
     println!("  DATA_FILE      JSONL data file       (default: ./defaults/data/memory.json)");
     println!("  SCHEMA_DIR     schema directory      (default: ./defaults/schemas)");
-    println!("  --config PATH  demo config JSON file (optional)");
+    println!("  --config PATH  demo config TOML file (optional)");
     println!();
     println!("Environment:");
     println!("  UFORGE_DATA_FILE    override DATA_FILE");
     println!("  UFORGE_SCHEMA_DIR   override SCHEMA_DIR");
-    println!("  UFORGE_DEMO_CONFIG  path to demo config JSON file");
+    println!("  UFORGE_DEMO_CONFIG  path to demo config TOML file");
     println!("  LEMONADE_URL        Lemonade Server base URL for AI features");
     println!("                      e.g. http://localhost:8000/api/v1");
     println!("  RUST_LOG            log level (error/warn/info/debug/trace)");
     println!();
-    println!("Config file format (JSON) — all sections are optional:");
-    println!(r#"  {{"fts": {{"queries": [{{"query": "empire", "limit": 3}}]}}}}"#);
-    println!(r#"  {{"semantic": {{"queries": [{{"query": "collapse of empire", "limit": 3}}]}}}}"#);
-    println!(r#"  {{"rerank": {{"queries": [{{"query": "Who founded it?", "fts_keyword": "foundation", "fts_limit": 6}}]}}}}"#);
-    println!(r#"  {{"hybrid": {{"config": {{"alpha": 0.5, "fts_limit": 15, "semantic_limit": 15, "rerank": true, "limit": 3}},"#);
-    println!(r#"              "queries": ["Who founded the Foundation?"],"#);
-    println!(r#"              "alpha_sweep_query": "collapse of civilization","#);
-    println!(r#"              "alpha_sweep_values": [0.0, 0.5, 1.0]}}}}"#);
+    println!("Config file format (TOML) — all sections are optional:");
+    println!(r#"  [fts]"#);
+    println!(r#"  [[fts.queries]]"#);
+    println!(r#"  query = "empire""#);
+    println!(r#"  limit = 3"#);
+    println!();
+    println!(r#"  [semantic]"#);
+    println!(r#"  [[semantic.queries]]"#);
+    println!(r#"  query = "collapse of empire""#);
+    println!(r#"  limit = 3"#);
+    println!();
+    println!(r#"  [rerank]"#);
+    println!(r#"  [[rerank.queries]]"#);
+    println!(r#"  query = "Who founded it?"#);
+    println!(r#"  semantic_limit = 6"#);
+    println!();
+    println!(r#"  [hybrid]"#);
+    println!(r#"  [hybrid.config]"#);
+    println!(r#"  alpha = 0.5"#);
+    println!(r#"  fts_limit = 15"#);
+    println!(r#"  semantic_limit = 15"#);
+    println!(r#"  rerank = true"#);
+    println!(r#"  limit = 3"#);
+    println!(r#"  queries = ["Who founded the Foundation?"],"#);
+    println!(r#"  alpha_sweep_query = "collapse of civilization","#);
+    println!(r#"  alpha_sweep_values = [0.0, 0.5, 1.0]"#);
     println!();
     println!("AI features (requires LEMONADE_URL):");
     println!("  • Hardware capability detection (NPU / iGPU / CPU)");
