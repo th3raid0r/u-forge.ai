@@ -55,7 +55,10 @@ impl SchemaDefinition {
         );
 
         // Add default object types
-        schema.add_object_type("character".to_string(), ObjectTypeSchema::default_character());
+        schema.add_object_type(
+            "character".to_string(),
+            ObjectTypeSchema::default_character(),
+        );
         schema.add_object_type("location".to_string(), ObjectTypeSchema::default_location());
         schema.add_object_type("faction".to_string(), ObjectTypeSchema::default_faction());
         schema.add_object_type("item".to_string(), ObjectTypeSchema::default_item());
@@ -63,7 +66,10 @@ impl SchemaDefinition {
         schema.add_object_type("session".to_string(), ObjectTypeSchema::default_session());
 
         // Add default edge types
-        schema.add_edge_type("related_to".to_string(), EdgeTypeSchema::default_related_to());
+        schema.add_edge_type(
+            "related_to".to_string(),
+            EdgeTypeSchema::default_related_to(),
+        );
         schema.add_edge_type("contains".to_string(), EdgeTypeSchema::default_contains());
         schema.add_edge_type("member_of".to_string(), EdgeTypeSchema::default_member_of());
         schema.add_edge_type("knows".to_string(), EdgeTypeSchema::default_knows());
@@ -120,67 +126,145 @@ impl ObjectTypeSchema {
 
     // Default object type schemas based on current hardcoded types
     pub fn default_character() -> Self {
-        Self::new("character".to_string(), "A character in the game world".to_string())
-            .with_property("age".to_string(), PropertySchema::string("Character's age"))
-            .with_property("gender".to_string(), PropertySchema::string("Character's gender"))
-            .with_property("occupation".to_string(), PropertySchema::string("Character's occupation"))
-            .with_property("status".to_string(), PropertySchema::string("Character's current status"))
-            .with_property("species".to_string(), PropertySchema::string("Character's species"))
-            .with_property("background".to_string(), PropertySchema::text("Character's background story"))
-            .with_property("equipment".to_string(), PropertySchema::array(PropertyType::String))
-            .with_property("secrets".to_string(), PropertySchema::array(PropertyType::String))
-            .with_property("goals".to_string(), PropertySchema::array(PropertyType::String))
-            .with_required_property("name".to_string())
-            .with_allowed_edge("knows".to_string())
-            .with_allowed_edge("enemy_of".to_string())
-            .with_allowed_edge("ally_of".to_string())
-            .with_allowed_edge("member_of".to_string())
+        Self::new(
+            "character".to_string(),
+            "A character in the game world".to_string(),
+        )
+        .with_property("age".to_string(), PropertySchema::string("Character's age"))
+        .with_property(
+            "gender".to_string(),
+            PropertySchema::string("Character's gender"),
+        )
+        .with_property(
+            "occupation".to_string(),
+            PropertySchema::string("Character's occupation"),
+        )
+        .with_property(
+            "status".to_string(),
+            PropertySchema::string("Character's current status"),
+        )
+        .with_property(
+            "species".to_string(),
+            PropertySchema::string("Character's species"),
+        )
+        .with_property(
+            "background".to_string(),
+            PropertySchema::text("Character's background story"),
+        )
+        .with_property(
+            "equipment".to_string(),
+            PropertySchema::array(PropertyType::String),
+        )
+        .with_property(
+            "secrets".to_string(),
+            PropertySchema::array(PropertyType::String),
+        )
+        .with_property(
+            "goals".to_string(),
+            PropertySchema::array(PropertyType::String),
+        )
+        .with_required_property("name".to_string())
+        .with_allowed_edge("knows".to_string())
+        .with_allowed_edge("enemy_of".to_string())
+        .with_allowed_edge("ally_of".to_string())
+        .with_allowed_edge("member_of".to_string())
     }
 
     pub fn default_location() -> Self {
-        Self::new("location".to_string(), "A location in the game world".to_string())
-            .with_property("type".to_string(), PropertySchema::string("Type of location"))
-            .with_property("status".to_string(), PropertySchema::string("Current state of location"))
-            .with_property("atmosphere".to_string(), PropertySchema::string("General feel/mood"))
-            .with_property("size".to_string(), PropertySchema::string("Size or scale"))
-            .with_property("danger_level".to_string(), PropertySchema::string("Level of danger"))
-            .with_property("notable_features".to_string(), PropertySchema::array(PropertyType::String))
-            .with_required_property("name".to_string())
-            .with_required_property("type".to_string())
-            .with_allowed_edge("contains".to_string())
-            .with_allowed_edge("connected_to".to_string())
+        Self::new(
+            "location".to_string(),
+            "A location in the game world".to_string(),
+        )
+        .with_property(
+            "type".to_string(),
+            PropertySchema::string("Type of location"),
+        )
+        .with_property(
+            "status".to_string(),
+            PropertySchema::string("Current state of location"),
+        )
+        .with_property(
+            "atmosphere".to_string(),
+            PropertySchema::string("General feel/mood"),
+        )
+        .with_property("size".to_string(), PropertySchema::string("Size or scale"))
+        .with_property(
+            "danger_level".to_string(),
+            PropertySchema::string("Level of danger"),
+        )
+        .with_property(
+            "notable_features".to_string(),
+            PropertySchema::array(PropertyType::String),
+        )
+        .with_required_property("name".to_string())
+        .with_required_property("type".to_string())
+        .with_allowed_edge("contains".to_string())
+        .with_allowed_edge("connected_to".to_string())
     }
 
     pub fn default_faction() -> Self {
-        Self::new("faction".to_string(), "An organization or group".to_string())
-            .with_property("type".to_string(), PropertySchema::string("Type of faction"))
-            .with_property("goals".to_string(), PropertySchema::array(PropertyType::String))
-            .with_property("resources".to_string(), PropertySchema::array(PropertyType::String))
-            .with_property("reputation".to_string(), PropertySchema::string("Public reputation"))
-            .with_required_property("name".to_string())
-            .with_required_property("type".to_string())
-            .with_allowed_edge("allied_with".to_string())
-            .with_allowed_edge("enemy_of".to_string())
-            .with_allowed_edge("led_by".to_string())
+        Self::new(
+            "faction".to_string(),
+            "An organization or group".to_string(),
+        )
+        .with_property(
+            "type".to_string(),
+            PropertySchema::string("Type of faction"),
+        )
+        .with_property(
+            "goals".to_string(),
+            PropertySchema::array(PropertyType::String),
+        )
+        .with_property(
+            "resources".to_string(),
+            PropertySchema::array(PropertyType::String),
+        )
+        .with_property(
+            "reputation".to_string(),
+            PropertySchema::string("Public reputation"),
+        )
+        .with_required_property("name".to_string())
+        .with_required_property("type".to_string())
+        .with_allowed_edge("allied_with".to_string())
+        .with_allowed_edge("enemy_of".to_string())
+        .with_allowed_edge("led_by".to_string())
     }
 
     pub fn default_item() -> Self {
-        Self::new("item".to_string(), "An item, artifact, or object".to_string())
-            .with_property("type".to_string(), PropertySchema::string("Type of item"))
-            .with_property("rarity".to_string(), PropertySchema::string("Item rarity"))
-            .with_property("value".to_string(), PropertySchema::string("Item value"))
-            .with_property("properties".to_string(), PropertySchema::array(PropertyType::String))
-            .with_required_property("name".to_string())
-            .with_allowed_edge("owned_by".to_string())
-            .with_allowed_edge("located_in".to_string())
+        Self::new(
+            "item".to_string(),
+            "An item, artifact, or object".to_string(),
+        )
+        .with_property("type".to_string(), PropertySchema::string("Type of item"))
+        .with_property("rarity".to_string(), PropertySchema::string("Item rarity"))
+        .with_property("value".to_string(), PropertySchema::string("Item value"))
+        .with_property(
+            "properties".to_string(),
+            PropertySchema::array(PropertyType::String),
+        )
+        .with_required_property("name".to_string())
+        .with_allowed_edge("owned_by".to_string())
+        .with_allowed_edge("located_in".to_string())
     }
 
     pub fn default_event() -> Self {
         Self::new("event".to_string(), "An event or happening".to_string())
-            .with_property("date".to_string(), PropertySchema::string("When the event occurred"))
-            .with_property("location".to_string(), PropertySchema::reference("location"))
-            .with_property("participants".to_string(), PropertySchema::array(PropertyType::Reference("character".to_string())))
-            .with_property("outcome".to_string(), PropertySchema::string("Result of the event"))
+            .with_property(
+                "date".to_string(),
+                PropertySchema::string("When the event occurred"),
+            )
+            .with_property(
+                "location".to_string(),
+                PropertySchema::reference("location"),
+            )
+            .with_property(
+                "participants".to_string(),
+                PropertySchema::array(PropertyType::Reference("character".to_string())),
+            )
+            .with_property(
+                "outcome".to_string(),
+                PropertySchema::string("Result of the event"),
+            )
             .with_required_property("name".to_string())
             .with_allowed_edge("happened_at".to_string())
             .with_allowed_edge("caused_by".to_string())
@@ -190,8 +274,14 @@ impl ObjectTypeSchema {
     pub fn default_session() -> Self {
         Self::new("session".to_string(), "A game session".to_string())
             .with_property("date".to_string(), PropertySchema::string("Session date"))
-            .with_property("participants".to_string(), PropertySchema::array(PropertyType::Reference("character".to_string())))
-            .with_property("summary".to_string(), PropertySchema::text("Session summary"))
+            .with_property(
+                "participants".to_string(),
+                PropertySchema::array(PropertyType::Reference("character".to_string())),
+            )
+            .with_property(
+                "summary".to_string(),
+                PropertySchema::text("Session summary"),
+            )
             .with_property("notes".to_string(), PropertySchema::text("Session notes"))
             .with_required_property("name".to_string())
             .with_allowed_edge("includes".to_string())
@@ -238,11 +328,17 @@ impl PropertySchema {
     }
 
     pub fn array(element_type: PropertyType) -> Self {
-        Self::new(PropertyType::Array(Box::new(element_type)), "Array of items".to_string())
+        Self::new(
+            PropertyType::Array(Box::new(element_type)),
+            "Array of items".to_string(),
+        )
     }
 
     pub fn reference(target_type: &str) -> Self {
-        Self::new(PropertyType::Reference(target_type.to_string()), format!("Reference to {}", target_type))
+        Self::new(
+            PropertyType::Reference(target_type.to_string()),
+            format!("Reference to {}", target_type),
+        )
     }
 
     pub fn with_validation(mut self, validation: ValidationRule) -> Self {
@@ -270,8 +366,8 @@ pub enum PropertyType {
     Boolean,
     Array(Box<PropertyType>),
     Object(HashMap<String, PropertySchema>), // Nested object
-    Reference(String), // Reference to another object type
-    Enum(Vec<String>), // Enumerated values
+    Reference(String),                       // Reference to another object type
+    Enum(Vec<String>),                       // Enumerated values
 }
 
 impl PropertyType {
@@ -313,7 +409,15 @@ impl ValidationRule {
             required: false,
         }
     }
+}
 
+impl Default for ValidationRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ValidationRule {
     pub fn required() -> Self {
         Self {
             required: true,
@@ -431,37 +535,62 @@ impl EdgeTypeSchema {
     // Default edge type schemas
     pub fn default_related_to() -> Self {
         Self::new("related_to".to_string(), "Generic relationship".to_string())
-            .with_property("context".to_string(), PropertySchema::string("Context of the relationship"))
+            .with_property(
+                "context".to_string(),
+                PropertySchema::string("Context of the relationship"),
+            )
             .bidirectional()
     }
 
     pub fn default_contains() -> Self {
-        Self::new("contains".to_string(), "Containment relationship".to_string())
-            .with_source_types(vec!["location".to_string(), "faction".to_string()])
-            .with_target_types(vec!["location".to_string(), "character".to_string(), "item".to_string()])
+        Self::new(
+            "contains".to_string(),
+            "Containment relationship".to_string(),
+        )
+        .with_source_types(vec!["location".to_string(), "faction".to_string()])
+        .with_target_types(vec![
+            "location".to_string(),
+            "character".to_string(),
+            "item".to_string(),
+        ])
     }
 
     pub fn default_member_of() -> Self {
-        Self::new("member_of".to_string(), "Membership relationship".to_string())
-            .with_source_types(vec!["character".to_string()])
-            .with_target_types(vec!["faction".to_string()])
-            .with_property("role".to_string(), PropertySchema::string("Role within the organization"))
-            .with_property("rank".to_string(), PropertySchema::string("Rank or level"))
+        Self::new(
+            "member_of".to_string(),
+            "Membership relationship".to_string(),
+        )
+        .with_source_types(vec!["character".to_string()])
+        .with_target_types(vec!["faction".to_string()])
+        .with_property(
+            "role".to_string(),
+            PropertySchema::string("Role within the organization"),
+        )
+        .with_property("rank".to_string(), PropertySchema::string("Rank or level"))
     }
 
     pub fn default_knows() -> Self {
-        Self::new("knows".to_string(), "Knowledge relationship between characters".to_string())
-            .with_source_types(vec!["character".to_string()])
-            .with_target_types(vec!["character".to_string()])
-            .with_property("relationship".to_string(), PropertySchema::string("Nature of the relationship"))
-            .bidirectional()
+        Self::new(
+            "knows".to_string(),
+            "Knowledge relationship between characters".to_string(),
+        )
+        .with_source_types(vec!["character".to_string()])
+        .with_target_types(vec!["character".to_string()])
+        .with_property(
+            "relationship".to_string(),
+            PropertySchema::string("Nature of the relationship"),
+        )
+        .bidirectional()
     }
 
     pub fn default_enemy_of() -> Self {
         Self::new("enemy_of".to_string(), "Hostile relationship".to_string())
             .with_source_types(vec!["character".to_string(), "faction".to_string()])
             .with_target_types(vec!["character".to_string(), "faction".to_string()])
-            .with_property("reason".to_string(), PropertySchema::string("Reason for hostility"))
+            .with_property(
+                "reason".to_string(),
+                PropertySchema::string("Reason for hostility"),
+            )
             .bidirectional()
     }
 
@@ -469,7 +598,10 @@ impl EdgeTypeSchema {
         Self::new("ally_of".to_string(), "Allied relationship".to_string())
             .with_source_types(vec!["character".to_string(), "faction".to_string()])
             .with_target_types(vec!["character".to_string(), "faction".to_string()])
-            .with_property("alliance_type".to_string(), PropertySchema::string("Type of alliance"))
+            .with_property(
+                "alliance_type".to_string(),
+                PropertySchema::string("Type of alliance"),
+            )
             .bidirectional()
     }
 }
@@ -551,15 +683,19 @@ mod tests {
         let character_schema = ObjectTypeSchema::default_character();
         assert_eq!(character_schema.name, "character");
         assert!(character_schema.properties.contains_key("age"));
-        assert!(character_schema.required_properties.contains(&"name".to_string()));
-        assert!(character_schema.allowed_edges.contains(&"knows".to_string()));
+        assert!(character_schema
+            .required_properties
+            .contains(&"name".to_string()));
+        assert!(character_schema
+            .allowed_edges
+            .contains(&"knows".to_string()));
     }
 
     #[test]
     fn test_property_schema() {
         let prop = PropertySchema::string("Test description")
             .with_validation(ValidationRule::required().with_length_range(Some(1), Some(100)));
-        
+
         assert_eq!(prop.property_type.name(), "string");
         assert!(prop.validation.is_some());
         assert!(prop.validation.unwrap().required);
@@ -570,7 +706,9 @@ mod tests {
         let edge_schema = EdgeTypeSchema::default_knows();
         assert_eq!(edge_schema.name, "knows");
         assert!(edge_schema.bidirectional);
-        assert!(edge_schema.allowed_source_types.contains(&"character".to_string()));
+        assert!(edge_schema
+            .allowed_source_types
+            .contains(&"character".to_string()));
     }
 
     #[test]

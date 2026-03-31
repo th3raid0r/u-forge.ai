@@ -37,35 +37,17 @@ pub type ObjectId = ForgeUuid;
 pub type ChunkId = ForgeUuid;
 
 /// Edge relationship types - primarily string-based for schema flexibility
+#[allow(deprecated)] // suppress warnings from #[derive]-generated code matching deprecated variants
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EdgeType {
     /// Custom relationship type (primary variant)
     Custom(String),
-    
-    /// Legacy core types for backward compatibility only
-    /// Use Custom(String) for all new relationships
-    #[deprecated(note = "Use Custom(String) for new relationships")]
-    Contains,
-    #[deprecated(note = "Use Custom(String) for new relationships")]
-    OwnedBy,
-    #[deprecated(note = "Use Custom(String) for new relationships")]
-    LocatedIn,
-    #[deprecated(note = "Use Custom(String) for new relationships")]
-    MemberOf,
 }
 
 impl EdgeType {
     pub fn as_str(&self) -> &str {
         match self {
             EdgeType::Custom(name) => name,
-            #[allow(deprecated)]
-            EdgeType::Contains => "contains",
-            #[allow(deprecated)]
-            EdgeType::OwnedBy => "owned_by",
-            #[allow(deprecated)]
-            EdgeType::LocatedIn => "located_in",
-            #[allow(deprecated)]
-            EdgeType::MemberOf => "member_of",
         }
     }
 
@@ -102,12 +84,12 @@ impl Edge {
             metadata: HashMap::new(),
         }
     }
-    
+
     pub fn with_weight(mut self, weight: f32) -> Self {
         self.weight = weight;
         self
     }
-    
+
     pub fn with_metadata(mut self, key: String, value: String) -> Self {
         self.metadata.insert(key, value);
         self
@@ -148,12 +130,12 @@ impl ObjectMetadata {
     pub fn new_with_type(object_type: ObjectType, name: String) -> Self {
         Self::new(object_type.as_str().to_string(), name)
     }
-    
+
     pub fn with_description(mut self, description: String) -> Self {
         self.description = Some(description);
         self
     }
-    
+
     pub fn with_property(mut self, key: String, value: String) -> Self {
         if let Some(obj) = self.properties.as_object_mut() {
             obj.insert(key, serde_json::Value::String(value));
@@ -177,7 +159,8 @@ impl ObjectMetadata {
 
     /// Get a property value as a string
     pub fn get_property(&self, key: &str) -> Option<String> {
-        self.properties.as_object()
+        self.properties
+            .as_object()
             .and_then(|obj| obj.get(key))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -185,8 +168,7 @@ impl ObjectMetadata {
 
     /// Get a property value as JSON
     pub fn get_json_property(&self, key: &str) -> Option<&serde_json::Value> {
-        self.properties.as_object()
-            .and_then(|obj| obj.get(key))
+        self.properties.as_object().and_then(|obj| obj.get(key))
     }
 
     /// Set a property value
@@ -204,13 +186,13 @@ impl ObjectMetadata {
         }
         self.touch();
     }
-    
+
     pub fn add_tag(&mut self, tag: String) {
         if !self.tags.contains(&tag) {
             self.tags.push(tag);
         }
     }
-    
+
     pub fn touch(&mut self) {
         self.updated_at = chrono::Utc::now();
     }
@@ -329,20 +311,28 @@ impl QueryResult {
             total_tokens: 0,
         }
     }
-    
+}
+
+impl Default for QueryResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueryResult {
     pub fn add_object(&mut self, object: ObjectMetadata) {
         self.objects.push(object);
     }
-    
+
     pub fn add_edge(&mut self, edge: Edge) {
         self.edges.push(edge);
     }
-    
+
     pub fn add_chunk(&mut self, chunk: TextChunk) {
         self.total_tokens += chunk.token_count;
         self.chunks.push(chunk);
     }
-    
+
     /// Check if adding a chunk would exceed the token budget
     pub fn would_exceed_budget(&self, chunk: &TextChunk, budget: usize) -> bool {
         self.total_tokens + chunk.token_count > budget
@@ -358,12 +348,12 @@ mod tests {
         let mut obj = ObjectMetadata::new("character".to_string(), "Gandalf".to_string())
             .with_description("A wise wizard".to_string())
             .with_property("race".to_string(), "Maiar".to_string());
-        
+
         assert_eq!(obj.name, "Gandalf");
         assert_eq!(obj.object_type, "character");
         assert_eq!(obj.description, Some("A wise wizard".to_string()));
         assert_eq!(obj.get_property("race"), Some("Maiar".to_string()));
-        
+
         obj.add_tag("wizard".to_string());
         obj.add_tag("wizard".to_string()); // Should not duplicate
         assert_eq!(obj.tags.len(), 1);
@@ -373,9 +363,15 @@ mod tests {
     #[test]
     fn test_object_metadata_json_properties() {
         let obj = ObjectMetadata::new("spell".to_string(), "Fireball".to_string())
-            .with_json_property("level".to_string(), serde_json::Value::Number(serde_json::Number::from(3)))
-            .with_json_property("damage".to_string(), serde_json::json!({"dice": "8d6", "type": "fire"}));
-        
+            .with_json_property(
+                "level".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(3)),
+            )
+            .with_json_property(
+                "damage".to_string(),
+                serde_json::json!({"dice": "8d6", "type": "fire"}),
+            );
+
         assert_eq!(obj.get_json_property("level").unwrap().as_u64(), Some(3));
         assert!(obj.get_json_property("damage").unwrap().is_object());
     }
@@ -390,23 +386,26 @@ mod tests {
     fn test_edge_creation() {
         let id1 = ForgeUuid::new_v4();
         let id2 = ForgeUuid::new_v4();
-        
+
         let edge = Edge::new(id1, id2, EdgeType::from_str("knows"))
             .with_weight(0.8)
             .with_metadata("context".to_string(), "fellowship".to_string());
-        
+
         assert_eq!(edge.from, id1);
         assert_eq!(edge.to, id2);
         assert_eq!(edge.edge_type, EdgeType::from_str("knows"));
         assert_eq!(edge.weight, 0.8);
-        assert_eq!(edge.metadata.get("context"), Some(&"fellowship".to_string()));
+        assert_eq!(
+            edge.metadata.get("context"),
+            Some(&"fellowship".to_string())
+        );
     }
 
     #[test]
     fn test_edge_type_from_string() {
         let edge_type = EdgeType::from_string("led_by".to_string());
         assert_eq!(edge_type.as_str(), "led_by");
-        
+
         let edge_type2 = EdgeType::from_str("governs");
         assert_eq!(edge_type2.as_str(), "governs");
     }
@@ -415,9 +414,9 @@ mod tests {
     fn test_text_chunk_creation() {
         let obj_id = ForgeUuid::new_v4();
         let content = "This is a test description with some content.".to_string();
-        
+
         let chunk = TextChunk::new(obj_id, content.clone(), ChunkType::Description);
-        
+
         assert_eq!(chunk.object_id, obj_id);
         assert_eq!(chunk.content, content);
         assert!(chunk.token_count > 0);
@@ -427,13 +426,17 @@ mod tests {
     fn test_query_result_token_budget() {
         let mut result = QueryResult::new();
         let obj_id = ForgeUuid::new_v4();
-        
+
         let chunk1 = TextChunk::new(obj_id, "Short text".to_string(), ChunkType::Description);
-        let chunk2 = TextChunk::new(obj_id, "This is a much longer piece of text that should have more tokens".to_string(), ChunkType::UserNote);
-        
+        let chunk2 = TextChunk::new(
+            obj_id,
+            "This is a much longer piece of text that should have more tokens".to_string(),
+            ChunkType::UserNote,
+        );
+
         result.add_chunk(chunk1);
         assert!(!result.would_exceed_budget(&chunk2, 100));
-        
+
         result.add_chunk(chunk2);
         let large_chunk = TextChunk::new(obj_id, "x".repeat(1000), ChunkType::Description);
         assert!(result.would_exceed_budget(&large_chunk, 100));

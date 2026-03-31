@@ -65,6 +65,7 @@ struct WeightedWorkerSlot {
     weight: u32,
     #[allow(dead_code)]
     name: String,
+    #[allow(dead_code)]
     idle: Arc<AtomicBool>,
     /// EWMA job duration in microseconds.  `0` = no completed job yet.
     ewma_us: Arc<AtomicU64>,
@@ -166,6 +167,7 @@ impl WeightedEmbedDispatcher {
     }
 
     /// Number of registered worker slots.
+    #[allow(dead_code)]
     pub(super) fn worker_count(&self) -> usize {
         self.workers.len()
     }
@@ -192,9 +194,18 @@ mod tests {
     use super::*;
     use crate::queue::jobs::EmbedJob;
 
-    fn make_job() -> (EmbedJob, tokio::sync::oneshot::Receiver<anyhow::Result<Vec<f32>>>) {
+    fn make_job() -> (
+        EmbedJob,
+        tokio::sync::oneshot::Receiver<anyhow::Result<Vec<f32>>>,
+    ) {
         let (tx, rx) = oneshot::channel();
-        (EmbedJob { text: "test".into(), response: tx }, rx)
+        (
+            EmbedJob {
+                text: "test".into(),
+                response: tx,
+            },
+            rx,
+        )
     }
 
     #[test]
@@ -254,8 +265,12 @@ mod tests {
         let mut d = WeightedEmbedDispatcher::new();
         let (q_npu, _, _) = d.add_worker(100, "NPU");
         let (q_gpu, _, _) = d.add_worker(50, "GPU");
-        for _ in 0..3 { let (j, _) = make_job(); q_npu.push(j); }
-        let (j, _) = make_job(); q_gpu.push(j);
+        for _ in 0..3 {
+            let (j, _) = make_job();
+            q_npu.push(j);
+        }
+        let (j, _) = make_job();
+        q_gpu.push(j);
         let (new_job, _) = make_job();
         d.submit(new_job);
         assert_eq!(q_npu.pending(), 3);
@@ -284,7 +299,10 @@ mod tests {
         let (q_gpu, _, ewma_gpu) = d.add_worker(50, "GPU");
         ewma_npu.store(500_000, Ordering::Relaxed);
         ewma_gpu.store(50_000, Ordering::Relaxed);
-        for _ in 0..9 { let (j, _) = make_job(); q_gpu.push(j); }
+        for _ in 0..9 {
+            let (j, _) = make_job();
+            q_gpu.push(j);
+        }
         let (job, _) = make_job();
         d.submit(job);
         // cost(NPU) = 1*500k, cost(GPU) = 10*50k = 500k → tie → NPU wins weight
@@ -299,7 +317,10 @@ mod tests {
         let (q_gpu, _, ewma_gpu) = d.add_worker(50, "GPU");
         ewma_npu.store(500_000, Ordering::Relaxed);
         ewma_gpu.store(50_000, Ordering::Relaxed);
-        for _ in 0..8 { let (j, _) = make_job(); q_gpu.push(j); }
+        for _ in 0..8 {
+            let (j, _) = make_job();
+            q_gpu.push(j);
+        }
         let (job, _) = make_job();
         d.submit(job);
         // cost(GPU) = 9*50k = 450k < 500k = cost(NPU)
@@ -315,7 +336,10 @@ mod tests {
         let (q_npu, _, _) = d.add_worker(100, "NPU");
         let (q_gpu, _, _) = d.add_worker(50, "GPU");
         // Put two jobs in NPU's queue
-        for _ in 0..2 { let (j, _) = make_job(); q_npu.push(j); }
+        for _ in 0..2 {
+            let (j, _) = make_job();
+            q_npu.push(j);
+        }
         // GPU steals one
         let stolen = d.steal_from_busiest(&q_gpu);
         assert!(stolen.is_some(), "GPU should steal from NPU");
@@ -325,10 +349,13 @@ mod tests {
     #[test]
     fn test_steal_does_not_steal_from_self() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, _) = d.add_worker(100, "NPU");
+        let (_q_npu, _, _) = d.add_worker(100, "NPU");
         let (q_gpu, _, _) = d.add_worker(50, "GPU");
         // Only GPU has work
-        for _ in 0..2 { let (j, _) = make_job(); q_gpu.push(j); }
+        for _ in 0..2 {
+            let (j, _) = make_job();
+            q_gpu.push(j);
+        }
         // GPU tries to steal from others — should find nothing (NPU is empty)
         let stolen = d.steal_from_busiest(&q_gpu);
         assert!(stolen.is_none(), "cannot steal from self");
@@ -352,8 +379,14 @@ mod tests {
         let (q_gpu, _, _) = d.add_worker(50, "GPU");
         let (q_cpu, _, _) = d.add_worker(10, "CPU");
         // NPU: 5 jobs, GPU: 2 jobs
-        for _ in 0..5 { let (j, _) = make_job(); q_npu.push(j); }
-        for _ in 0..2 { let (j, _) = make_job(); q_gpu.push(j); }
+        for _ in 0..5 {
+            let (j, _) = make_job();
+            q_npu.push(j);
+        }
+        for _ in 0..2 {
+            let (j, _) = make_job();
+            q_gpu.push(j);
+        }
         // CPU steals — should take from NPU (most loaded)
         let _ = d.steal_from_busiest(&q_cpu);
         assert_eq!(q_npu.pending(), 4, "NPU lost one job to CPU steal");

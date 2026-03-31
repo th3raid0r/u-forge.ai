@@ -1,0 +1,13 @@
+[embedding]
+npu_enabled = true
+npu_weight = 100
+gpu_enabled = true
+gpu_weight = 40
+cpu_enabled = false
+cpu_enabled = 10
+
+[models.context_limits]
+"embed-gemma-300m-FLM"     = 2048
+"user.ggml-org/embeddinggemma-300M-GGUF"   = 2048
+"nomic-embed-text-v1-GGUF"  = 2048
+"Qwen3-Embedding-8B-GGUF"  = 32768

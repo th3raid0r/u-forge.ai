@@ -50,8 +50,8 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
-use crate::lemonade::{LemonadeChatProvider, LemonadeModelRegistry, ModelLoadOptions};
 use crate::ai::transcription::{LemonadeTranscriptionProvider, TranscriptionProvider};
+use crate::lemonade::{LemonadeChatProvider, LemonadeModelRegistry, ModelLoadOptions};
 
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
 
@@ -221,8 +221,6 @@ impl NpuDevice {
         registry: &LemonadeModelRegistry,
         load_opts: Option<&ModelLoadOptions>,
     ) -> Result<Self> {
-        use crate::lemonade::ModelRole;
-
         let emb_entry = registry.npu_embedding_model().ok_or_else(|| {
             anyhow::anyhow!("No NPU embedding model found in the Lemonade registry")
         })?;
