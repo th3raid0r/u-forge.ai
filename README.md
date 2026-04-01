@@ -127,7 +127,7 @@ Device weights and enable/disable state are controlled by an optional TOML file 
 
 If no file exists, defaults are used (all devices enabled: NPU=100, GPU=50, CPU=10).
 
-Example `u-forge-devices.toml`:
+Example `u-forge.toml`:
 ```toml
 [embedding]
 npu_enabled = true
