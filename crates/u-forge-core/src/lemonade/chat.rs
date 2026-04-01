@@ -84,6 +84,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     /// Overrides `LemonadeChatProvider::default_temperature`.
     pub temperature: Option<f32>,
+    /// Overrides the model id set on the provider (e.g. `"GLM-4.7-Flash-GGUF"`).
+    pub model: Option<String>,
 }
 
 impl ChatRequest {
@@ -92,6 +94,7 @@ impl ChatRequest {
             messages,
             max_tokens: None,
             temperature: None,
+            model: None,
         }
     }
 
@@ -102,6 +105,11 @@ impl ChatRequest {
 
     pub fn with_temperature(mut self, t: f32) -> Self {
         self.temperature = Some(t);
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 }
@@ -240,12 +248,13 @@ impl LemonadeChatProvider {
         let start = std::time::Instant::now();
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
         let temperature = req.temperature.unwrap_or(self.default_temperature);
+        let model = req.model.as_deref().unwrap_or(&self.model);
 
         let messages: Result<Vec<_>> = req.messages.iter().map(to_oa_message).collect();
         let messages = messages.context("Failed to convert chat messages")?;
 
         let oa_req = CreateChatCompletionRequestArgs::default()
-            .model(&self.model)
+            .model(model)
             .messages(messages)
             .max_completion_tokens(max_tokens)
             .temperature(temperature)
@@ -260,7 +269,7 @@ impl LemonadeChatProvider {
             .context("Chat HTTP request failed")?;
 
         tracing::debug!(
-            model         = %self.model,
+            model         = %model,
             n_messages    = req.messages.len(),
             finish_reason = ?oa_resp.choices.first().and_then(|c| c.finish_reason.as_ref()),
             total_tokens  = ?oa_resp.usage.as_ref().map(|u| u.total_tokens),

@@ -13,24 +13,16 @@
 //!   LEMONADE_URL         Lemonade Server base URL (e.g. http://localhost:8000/api/v1)
 //!   UFORGE_DATA_FILE     override DATA_FILE
 //!   UFORGE_SCHEMA_DIR    override SCHEMA_DIR
-//!   UFORGE_DEMO_CONFIG   path to demo config TOML file
+//!   UFORGE_DEMO_CONFIG   path to demo config TOML file (for database overrides)
 //!   RUST_LOG             log verbosity (error/warn/info/debug/trace)
+//!
+//! Chat options are read from `u-forge.toml` (the `[chat]` section).
+//! See `AppConfig` / `ChatConfig` for the full list of knobs.
 //!
 //! REPL commands:
 //!   /quit    — exit
 //!   /clear   — reset conversation history
 //!   /context — toggle showing retrieved knowledge graph context
-//!
-//! Config file format (TOML):
-//! ```toml
-//! [chat]
-//! system_prompt = "You are a knowledgeable assistant..."
-//! max_history_turns = 10
-//! max_tokens = 1024
-//! temperature = 0.7
-//! alpha = 0.5
-//! search_limit = 3
-//! ```
 
 use anyhow::Result;
 use std::env;
@@ -40,14 +32,17 @@ use u_forge_core::{
     config::AppConfig,
     hardware::{gpu::GpuDevice, npu::NpuDevice},
     ingest::DataIngestion,
-    lemonade::{resolve_lemonade_url, GpuResourceManager, LemonadeModelRegistry, LemonadeRerankProvider},
+    lemonade::{
+        load_model, resolve_lemonade_url, GpuResourceManager, LemonadeHealth,
+        LemonadeModelRegistry, LemonadeRerankProvider, ModelLoadOptions,
+    },
     queue::InferenceQueueBuilder,
     rag::{build_rag_messages, format_search_context},
     search::{search_hybrid, HybridSearchConfig},
-    ChatRequest, ChunkType, KnowledgeGraph, SchemaIngestion,
+    ChatDevice, ChatRequest, ChunkType, KnowledgeGraph, SchemaIngestion,
 };
 
-// ── Demo config ───────────────────────────────────────────────────────────────
+// ── Demo config (database overrides only) ────────────────────────────────────
 
 #[derive(serde::Deserialize, Default)]
 struct DatabaseChatConfig {
@@ -56,67 +51,9 @@ struct DatabaseChatConfig {
     clear: bool,
 }
 
-fn default_system_prompt() -> String {
-    "You are a knowledgeable assistant for a TTRPG worldbuilding tool. \
-     Answer questions accurately based on the provided knowledge graph context. \
-     Be concise and informative."
-        .to_string()
-}
-
-fn default_max_history_turns() -> usize {
-    10
-}
-
-fn default_max_tokens() -> u32 {
-    1024
-}
-
-fn default_temperature() -> f32 {
-    0.7
-}
-
-fn default_alpha() -> f32 {
-    0.5
-}
-
-fn default_search_limit() -> usize {
-    3
-}
-
-#[derive(serde::Deserialize)]
-struct ChatDemoConfig {
-    #[serde(default = "default_system_prompt")]
-    system_prompt: String,
-    #[serde(default = "default_max_history_turns")]
-    max_history_turns: usize,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: u32,
-    #[serde(default = "default_temperature")]
-    temperature: f32,
-    /// Balance between FTS5 (0.0) and semantic (1.0) search.
-    #[serde(default = "default_alpha")]
-    alpha: f32,
-    #[serde(default = "default_search_limit")]
-    search_limit: usize,
-}
-
-impl Default for ChatDemoConfig {
-    fn default() -> Self {
-        Self {
-            system_prompt: default_system_prompt(),
-            max_history_turns: default_max_history_turns(),
-            max_tokens: default_max_tokens(),
-            temperature: default_temperature(),
-            alpha: default_alpha(),
-            search_limit: default_search_limit(),
-        }
-    }
-}
-
 #[derive(serde::Deserialize, Default)]
 struct DemoConfig {
     database: Option<DatabaseChatConfig>,
-    chat: Option<ChatDemoConfig>,
 }
 
 fn load_demo_config(path: &str) -> Result<DemoConfig> {
@@ -186,7 +123,8 @@ async fn main() -> Result<()> {
         },
     };
 
-    let chat_cfg = demo_cfg.chat.unwrap_or_default();
+    let app_cfg = AppConfig::load_default();
+    let chat_cfg = &app_cfg.chat;
 
     // ── Lemonade discovery ────────────────────────────────────────────────────
 
@@ -227,42 +165,59 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Report which LLM models are available.
-    let llm_gpu = registry.llm_model();
-    let llm_npu = registry.npu_llm_model();
+    // Desired LLM models — from config or hardcoded defaults.
+    const DEFAULT_GPU_LLM: &str = "Qwen3.5-9B-GGUF";
+    const DEFAULT_NPU_LLM: &str = "qwen3.5-9b-FLM";
+    let desired_gpu_llm: String = chat_cfg.gpu.model.clone()
+        .unwrap_or_else(|| DEFAULT_GPU_LLM.to_string());
+    let desired_npu_llm: String = chat_cfg.npu.model.clone()
+        .unwrap_or_else(|| DEFAULT_NPU_LLM.to_string());
 
-    match (&llm_gpu, &llm_npu) {
-        (None, None) => {
-            eprintln!("   ❌ No LLM model found in the Lemonade registry.");
-            eprintln!();
-            eprintln!("   Load a language model, for example:");
-            eprintln!("     lemonade-server pull GLM-4.7-Flash-GGUF");
+    // Fetch health to see which models are actually running in memory right now.
+    // Falls back to an empty snapshot (all models considered not loaded) on failure.
+    let health = LemonadeHealth::fetch(url).await.unwrap_or_default();
 
-            // List all available (non-LLM) models for context.
-            if !registry.models.is_empty() {
-                eprintln!();
-                eprintln!("   Models currently in registry:");
-                for m in &registry.models {
-                    eprintln!("     • {} (recipe: {})", m.id, m.recipe);
-                }
-            }
-            return Err(anyhow::anyhow!("No LLM model available"));
-        }
-        _ => {
-            if let Some(m) = &llm_gpu {
-                println!("   LLM (GPU) : ✅ {}", m.id);
-            }
-            if let Some(m) = &llm_npu {
-                println!("   LLM (NPU) : ✅ {}", m.id);
-            }
+    // Ensure the GPU LLM is loaded before the REPL starts (pre-warms first request).
+    if !health.is_model_loaded(&desired_gpu_llm) {
+        print!("   Loading   : {desired_gpu_llm}…");
+        std::io::stdout().flush()?;
+        match load_model(url, &desired_gpu_llm, &ModelLoadOptions::default()).await {
+            Ok(()) => println!(" ✅"),
+            Err(e) => println!(" ⚠️  {e}"),
         }
     }
+    print_llm_line("GPU", &desired_gpu_llm, chat_cfg.gpu.model.is_none());
+
+    // Pre-load the NPU LLM only when an NPU embedding model is present in the
+    // registry — NpuDevice::from_registry requires one; without it the NPU
+    // path is skipped entirely.
+    let npu_available = registry.npu_embedding_model().is_some();
+    if npu_available {
+        if !health.is_model_loaded(&desired_npu_llm) {
+            print!("   Loading   : {desired_npu_llm}…");
+            std::io::stdout().flush()?;
+            match load_model(url, &desired_npu_llm, &ModelLoadOptions::default()).await {
+                Ok(()) => println!(" ✅"),
+                Err(e) => println!(" ⚠️  {e}"),
+            }
+        }
+        print_llm_line("NPU", &desired_npu_llm, chat_cfg.npu.model.is_none());
+    }
+
+    println!(
+        "   Active device: {}",
+        match chat_cfg.preferred_device {
+            ChatDevice::Auto => "auto (→ gpu)",
+            ChatDevice::Gpu  => "gpu",
+            ChatDevice::Npu  => "npu",
+            ChatDevice::Cpu  => "cpu",
+        }
+    );
 
     // ── Build InferenceQueue with LLM + embedding ─────────────────────────────
 
     let gpu = GpuResourceManager::new();
-    let device_cfg = AppConfig::load_default();
-    let mut builder = InferenceQueueBuilder::new().with_config(device_cfg.clone());
+    let mut builder = InferenceQueueBuilder::new().with_config(app_cfg.clone());
     let mut embedding_available = false;
 
     // NPU device: embedding + optional LLM (FLM models).
@@ -300,6 +255,13 @@ async fn main() -> Result<()> {
     // Reranker (optional — improves result quality when available).
     match LemonadeRerankProvider::from_registry(&registry) {
         Ok(r) => {
+            let load_opts = ModelLoadOptions {
+                ctx_size: Some(u_forge_core::DEFAULT_EMBEDDING_CONTEXT_TOKENS),
+                ..Default::default()
+            };
+            if let Err(e) = r.load(&load_opts).await {
+                eprintln!("   Reranker  : load failed ({e}), continuing without explicit ctx");
+            }
             println!("   Reranker  : ✅ {}", r.model);
             builder = builder.with_reranker(r);
         }
@@ -546,9 +508,18 @@ async fn main() -> Result<()> {
             &input,
         );
 
-        let request = ChatRequest::new(messages)
-            .with_max_tokens(chat_cfg.max_tokens)
-            .with_temperature(chat_cfg.temperature);
+        let device_cfg = chat_cfg.active_device_config();
+        let effective_model = match chat_cfg.preferred_device {
+            ChatDevice::Npu => desired_npu_llm.as_str(),
+            _ => desired_gpu_llm.as_str(),
+        };
+        let mut request = ChatRequest::new(messages).with_model(effective_model);
+        if let Some(max_tokens) = device_cfg.max_tokens {
+            request = request.with_max_tokens(max_tokens);
+        }
+        if let Some(temperature) = device_cfg.temperature {
+            request = request.with_temperature(temperature);
+        }
 
         print!("Assistant: ");
         std::io::stdout().flush()?;
@@ -593,6 +564,15 @@ fn print_usage(prog: &str) {
     println!("  UFORGE_SCHEMA_DIR  Override schema directory");
     println!("  UFORGE_DEMO_CONFIG Override config file path");
     println!("  RUST_LOG           Log verbosity (error/warn/info/debug/trace)");
+}
+
+/// Print a single LLM capability line.
+///
+/// `is_default` is true when the model name came from the hardcoded fallback
+/// rather than an explicit `[chat.gpu]` / `[chat.npu]` config entry.
+fn print_llm_line(device: &str, model: &str, is_default: bool) {
+    let suffix = if is_default { " (default)" } else { "" };
+    println!("   LLM ({device:<3}) : ✅ {model}{suffix}");
 }
 
 /// Prefix every line of `text` with `prefix` for indented display.

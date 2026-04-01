@@ -124,6 +124,134 @@ impl Default for ModelConfig {
     }
 }
 
+// ── ChatConfig ────────────────────────────────────────────────────────────────
+
+/// Which device to use for LLM chat inference.
+///
+/// Corresponds to the `preferred_device` key in the `[chat]` section of
+/// `u-forge.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatDevice {
+    /// Let u-forge choose based on available hardware.
+    ///
+    /// Currently resolves to `gpu`.  A smarter selection policy (latency,
+    /// model quality, task complexity) will be added in a future release.
+    #[default]
+    Auto,
+    /// AMD/Nvidia GPU — llamacpp GGUF models via ROCm / Vulkan / CUDA.
+    Gpu,
+    /// AMD NPU — FLM models via the Ryzen AI stack.
+    Npu,
+    /// Host CPU — llamacpp GGUF models, lowest power.
+    Cpu,
+}
+
+/// Per-device LLM model and generation overrides.
+///
+/// Corresponds to `[chat.gpu]`, `[chat.npu]`, and `[chat.cpu]` in
+/// `u-forge.toml`.  All fields are optional; `None` falls back to the
+/// provider default baked into [`LemonadeChatProvider`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChatDeviceConfig {
+    /// Override the model id for this device (e.g. `"GLM-4.7-Flash-GGUF"`).
+    ///
+    /// When `None`, the model is auto-selected from the Lemonade registry.
+    pub model: Option<String>,
+
+    /// Token ceiling for generation requests on this device.
+    pub max_tokens: Option<u32>,
+
+    /// Sampling temperature for this device (0.0 = deterministic, 1.0 = creative).
+    pub temperature: Option<f32>,
+}
+
+/// Global chat / RAG settings.
+///
+/// Corresponds to the `[chat]` section of `u-forge.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatConfig {
+    /// Preferred inference device (`auto` | `gpu` | `npu` | `cpu`).
+    #[serde(default)]
+    pub preferred_device: ChatDevice,
+
+    /// GPU device overrides — model, token limit, temperature.
+    #[serde(default)]
+    pub gpu: ChatDeviceConfig,
+
+    /// NPU device overrides — model, token limit, temperature.
+    #[serde(default)]
+    pub npu: ChatDeviceConfig,
+
+    /// CPU device overrides — model, token limit, temperature.
+    #[serde(default)]
+    pub cpu: ChatDeviceConfig,
+
+    /// System prompt sent to the LLM before every conversation.
+    #[serde(default = "ChatConfig::default_system_prompt")]
+    pub system_prompt: String,
+
+    /// Maximum number of prior turns (user + assistant pairs) kept in context.
+    #[serde(default = "ChatConfig::default_max_history_turns")]
+    pub max_history_turns: usize,
+
+    /// Hybrid-search balance: 0.0 = FTS5-only, 1.0 = semantic-only.
+    #[serde(default = "ChatConfig::default_alpha")]
+    pub alpha: f32,
+
+    /// Number of knowledge-graph nodes returned per query.
+    #[serde(default = "ChatConfig::default_search_limit")]
+    pub search_limit: usize,
+}
+
+impl ChatConfig {
+    /// Return the device config that matches the current `preferred_device`.
+    ///
+    /// `Auto` currently resolves to `Gpu`.  When a smarter selection policy
+    /// lands, this method is the single place to update.
+    pub fn active_device_config(&self) -> &ChatDeviceConfig {
+        match self.preferred_device {
+            ChatDevice::Auto | ChatDevice::Gpu => &self.gpu,
+            ChatDevice::Npu => &self.npu,
+            ChatDevice::Cpu => &self.cpu,
+        }
+    }
+
+    fn default_system_prompt() -> String {
+        "You are a knowledgeable assistant for a TTRPG worldbuilding tool. \
+         Answer questions accurately based on the provided knowledge graph context. \
+         Be concise and informative."
+            .to_string()
+    }
+
+    fn default_max_history_turns() -> usize {
+        10
+    }
+
+    fn default_alpha() -> f32 {
+        0.5
+    }
+
+    fn default_search_limit() -> usize {
+        3
+    }
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            preferred_device: ChatDevice::Auto,
+            gpu: ChatDeviceConfig::default(),
+            npu: ChatDeviceConfig::default(),
+            cpu: ChatDeviceConfig::default(),
+            system_prompt: Self::default_system_prompt(),
+            max_history_turns: Self::default_max_history_turns(),
+            alpha: Self::default_alpha(),
+            search_limit: Self::default_search_limit(),
+        }
+    }
+}
+
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 /// Top-level application configuration.
@@ -139,6 +267,10 @@ pub struct AppConfig {
     /// Model-level settings (context-window limits, etc.).
     #[serde(default)]
     pub models: ModelConfig,
+
+    /// Global chat / RAG settings.
+    #[serde(default)]
+    pub chat: ChatConfig,
 }
 
 impl AppConfig {

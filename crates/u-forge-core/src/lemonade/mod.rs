@@ -28,6 +28,7 @@
 pub mod chat;
 pub(crate) mod client;
 pub mod gpu_manager;
+pub mod health;
 pub mod load;
 pub mod model_limits;
 pub mod registry;
@@ -44,6 +45,7 @@ pub use chat::{
     LemonadeChatProvider,
 };
 pub use client::{make_lemonade_openai_client, LemonadeHttpClient};
+pub use health::{LemonadeHealth, LoadedModelEntry};
 pub use gpu_manager::{GpuResourceManager, GpuWorkload, LlmGuard, SttGuard};
 pub use load::{load_model, ModelLoadOptions};
 pub use model_limits::effective_ctx_size;
