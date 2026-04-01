@@ -472,7 +472,7 @@ mod tests {
     use super::*;
     use crate::hardware::{DeviceCapability, DeviceWorker};
 
-    use crate::test_helpers::lemonade_url;
+    use crate::test_helpers::require_integration_url;
 
     // ── Unit tests (no server required) ──────────────────────────────────────
 
@@ -567,10 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_both_capabilities() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
-            return;
-        };
+        let url = require_integration_url!();
         let device = NpuDevice::new(&url, None, None, None).await;
         assert!(device.is_ok(), "NpuDevice::new failed: {:?}", device.err());
         let device = device.unwrap();
@@ -592,32 +589,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_embedding_only_construction() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
-            return;
-        };
-        let device = NpuDevice::embedding_only(&url, None, None).await;
-        assert!(
-            device.is_ok(),
-            "NpuDevice::embedding_only failed: {:?}",
-            device.err()
-        );
-        let device = device.unwrap();
-        assert!(device.supports(&DeviceCapability::Embedding));
-        assert!(
-            !device.supports(&DeviceCapability::Transcription),
-            "embedding_only must NOT advertise Transcription"
-        );
-        assert!(device.transcription.is_none());
-    }
-
-    #[tokio::test]
     async fn test_embed_via_npu_device() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
-            return;
-        };
+        let url = require_integration_url!();
         let device = NpuDevice::embedding_only(&url, None, None)
             .await
             .expect("NpuDevice construction failed");

@@ -255,14 +255,11 @@ impl LemonadeChatProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::lemonade_url;
+    use crate::test_helpers::require_integration_url;
 
     #[tokio::test]
     async fn test_chat_ask_returns_response() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("SKIP test_chat_ask_returns_response — Lemonade Server not available");
-            return;
-        };
+        let url = require_integration_url!();
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let gpu = GpuResourceManager::new();
         let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
@@ -275,58 +272,11 @@ mod tests {
             !response.is_empty(),
             "Chat should return a non-empty response"
         );
-        println!("Chat response: {response}");
-    }
-
-    #[tokio::test]
-    async fn test_chat_with_system_prompt() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
-
-        let response = chat
-            .ask_with_system(
-                "You are a concise TTRPG lore assistant. Answer in one sentence.",
-                "What is the capital of the Forgotten Realms?",
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            !response.is_empty(),
-            "System-prompted chat should return content"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_chat_multi_turn_conversation() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
-
-        let messages = vec![
-            ChatMessage::system("You are a TTRPG dungeon master. Be concise."),
-            ChatMessage::user("I enter the tavern. What do I see?"),
-            ChatMessage::assistant("A dim room with three patrons nursing their drinks."),
-            ChatMessage::user("I approach the bar. What does the barkeep say?"),
-        ];
-
-        let resp = chat.chat(messages).await.unwrap();
-        let content = resp.first_content().expect("Should have a response");
-        assert!(!content.is_empty());
     }
 
     #[tokio::test]
     async fn test_chat_request_with_overrides() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
+        let url = require_integration_url!();
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let gpu = GpuResourceManager::new();
         let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();

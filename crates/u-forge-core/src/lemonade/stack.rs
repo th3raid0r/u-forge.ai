@@ -71,28 +71,22 @@ impl std::fmt::Debug for LemonadeStack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::lemonade_url;
+    use crate::test_helpers::require_integration_url;
     use super::super::gpu_manager::GpuWorkload;
 
     #[tokio::test]
     async fn test_stack_builds_successfully() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("SKIP test_stack_builds_successfully — Lemonade Server not available");
-            return;
-        };
+        let url = require_integration_url!();
 
         let stack = LemonadeStack::build(&url).await.unwrap();
         assert_eq!(stack.tts.model, "kokoro-v1");
         assert!(stack.stt.model.contains("Whisper"));
         assert!(stack.chat.model.contains("GLM"));
-        println!("{:?}", stack);
     }
 
     #[tokio::test]
     async fn test_stack_tts_and_chat_share_nothing_on_gpu() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
+        let url = require_integration_url!();
 
         let stack = LemonadeStack::build(&url).await.unwrap();
         // TTS runs on CPU — should not touch the GPU manager.
@@ -105,12 +99,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stack_stt_and_chat_share_gpu_manager() {
-        let Some(_url) = lemonade_url().await else {
-            return;
-        };
-
         // Structural check: both stt and chat must hold the *same* Arc.
         // We verify this by acquiring via stt and seeing it reflected in chat's gpu.
+        // No server needed — pure in-process Arc sharing test.
         let gpu = GpuResourceManager::new();
         let stt_gpu = Arc::clone(&gpu);
         let chat_gpu = Arc::clone(&gpu);

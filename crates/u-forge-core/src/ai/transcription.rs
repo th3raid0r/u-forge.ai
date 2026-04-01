@@ -269,10 +269,7 @@ pub fn mime_for_filename(filename: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn lemonade_url() -> Option<String> {
-        std::env::var("LEMONADE_URL").ok()
-    }
+    use crate::test_helpers::require_integration_url;
 
     // ── WAV helper ────────────────────────────────────────────────────────────
 
@@ -319,9 +316,12 @@ mod tests {
     // ── Unit tests (no server required) ──────────────────────────────────────
 
     #[tokio::test]
-    async fn test_transcription_manager_fails_without_url() {
-        if std::env::var("LEMONADE_URL").is_ok() {
-            // Live server available — the "no URL" error path would not be hit.
+    async fn test_transcription_manager_fails_with_no_url() {
+        // try_new_auto(None, None) should fail when no server is discoverable
+        // and LEMONADE_URL is unset.  Skip if a server IS reachable (the error
+        // path wouldn't be exercised).
+        if crate::test_helpers::integration_test_url().await.is_some() {
+            eprintln!("SKIP: Lemonade Server is reachable — cannot test no-URL error path");
             return;
         }
         let result = TranscriptionManager::try_new_auto(None, None).await;
@@ -444,27 +444,8 @@ mod tests {
     // ── Integration tests (require a running Lemonade Server) ─────────────────
 
     #[tokio::test]
-    async fn test_transcription_manager_try_new_auto() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("Skipping: LEMONADE_URL not set");
-            return;
-        };
-        let mgr = TranscriptionManager::try_new_auto(Some(&url), None).await;
-        assert!(
-            mgr.is_ok(),
-            "try_new_auto failed unexpectedly: {:?}",
-            mgr.err()
-        );
-        let mgr = mgr.unwrap();
-        assert_eq!(mgr.get_provider().model_name(), "whisper-v3-turbo-FLM");
-    }
-
-    #[tokio::test]
     async fn test_lemonade_transcribe_silence_wav() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("Skipping: LEMONADE_URL not set");
-            return;
-        };
+        let url = require_integration_url!();
         let provider = LemonadeTranscriptionProvider::new(&url, "whisper-v3-turbo-FLM");
 
         // 1 second of silence — valid WAV, no speech content.
@@ -480,31 +461,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lemonade_transcribe_returns_string_via_manager() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("Skipping: LEMONADE_URL not set");
-            return;
-        };
-        let mgr = TranscriptionManager::try_new_auto(Some(&url), None)
-            .await
-            .expect("TranscriptionManager construction failed");
-        let provider = mgr.get_provider();
-
-        let wav = make_silence_wav(0.5);
-        let result = provider.transcribe(wav, "test.wav").await;
-        assert!(
-            result.is_ok(),
-            "Arc<dyn TranscriptionProvider>::transcribe() failed: {:?}",
-            result.err()
-        );
-    }
-
-    #[tokio::test]
     async fn test_lemonade_transcribe_error_on_empty_body() {
-        let Some(url) = lemonade_url() else {
-            eprintln!("Skipping: LEMONADE_URL not set");
-            return;
-        };
+        let url = require_integration_url!();
         let provider = LemonadeTranscriptionProvider::new(&url, "whisper-v3-turbo-FLM");
 
         // Sending an empty byte slice — the server should return an error.

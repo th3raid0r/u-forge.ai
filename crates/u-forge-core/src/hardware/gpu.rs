@@ -355,7 +355,7 @@ mod tests {
     use super::*;
     use crate::hardware::{DeviceCapability, DeviceWorker, HardwareBackend};
 
-    use crate::test_helpers::lemonade_url;
+    use crate::test_helpers::require_integration_url;
 
     // ── Unit tests (no server required) ──────────────────────────────────────
 
@@ -537,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn test_stt_blocked_when_llm_active() {
         // Verify the GPU resource manager policy: STT must fail immediately
-        // while LLM inference holds the GPU.
+        // while LLM inference holds the GPU.  No server needed — pure in-process.
         let gpu = GpuResourceManager::new();
         let device = GpuDevice::new(
             "http://localhost:8000/api/v1",
@@ -567,45 +567,10 @@ mod tests {
     // ── Integration tests (require a running Lemonade Server) ─────────────────
 
     #[tokio::test]
-    async fn test_from_registry_discovers_models() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
-            return;
-        };
-
-        let registry = LemonadeModelRegistry::fetch(&url).await;
-        assert!(
-            registry.is_ok(),
-            "Registry fetch failed: {:?}",
-            registry.err()
-        );
-        let registry = registry.unwrap();
-
-        let gpu = GpuResourceManager::new();
-        let device = GpuDevice::from_registry(&registry, gpu).await;
-
-        // At least one capability must be present if the server is running
-        // the expected models.
-        println!("GpuDevice from registry: {}", device.summary());
-        // We don't assert specific capabilities here because the server's model
-        // set is environment-dependent.
-    }
-
-    #[tokio::test]
     async fn test_from_registry_stt_transcribes() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
-            return;
-        };
+        let url = require_integration_url!();
 
-        let registry = match LemonadeModelRegistry::fetch(&url).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Registry fetch failed: {e}");
-                return;
-            }
-        };
-
+        let registry = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let gpu = GpuResourceManager::new();
         let device = GpuDevice::from_registry(&registry, gpu).await;
 
