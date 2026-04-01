@@ -196,9 +196,13 @@ pub struct SearchSources {
     pub fts_rank: Option<usize>,
 
     /// Best (lowest) cosine distance among the node's chunks, if any chunk
-    /// was found by the semantic ANN path (0.0 = identical, 2.0 = maximally
+    /// was found by the 768-dim semantic ANN path (0.0 = identical, 2.0 = maximally
     /// dissimilar).
     pub semantic_distance: Option<f32>,
+
+    /// Best (lowest) cosine distance among the node's chunks from the
+    /// high-quality 4096-dim semantic ANN path, if available.
+    pub hq_semantic_distance: Option<f32>,
 
     /// Cross-encoder relevance score assigned by the reranker, if reranking
     /// was applied (higher = more relevant).
@@ -208,14 +212,17 @@ pub struct SearchSources {
 impl SearchSources {
     /// Human-readable bracketed label indicating which paths contributed.
     ///
-    /// Examples: `"[FTS]"`, `"[SEM]"`, `"[FTS+SEM]"`, `"[FTS+SEM+RR]"`.
+    /// Examples: `"[FTS]"`, `"[SEM]"`, `"[FTS+SEM+HQ]"`, `"[FTS+SEM+HQ+RR]"`.
     pub fn label(&self) -> String {
-        let mut parts: Vec<&str> = Vec::with_capacity(3);
+        let mut parts: Vec<&str> = Vec::with_capacity(4);
         if self.fts_rank.is_some() {
             parts.push("FTS");
         }
         if self.semantic_distance.is_some() {
             parts.push("SEM");
+        }
+        if self.hq_semantic_distance.is_some() {
+            parts.push("HQ");
         }
         if self.rerank_score.is_some() {
             parts.push("RR");
@@ -238,8 +245,10 @@ struct ChunkMerge {
     rrf_score: f32,
     /// FTS5 rank position, if this chunk was found by FTS.
     fts_rank: Option<usize>,
-    /// Cosine distance, if this chunk was found by semantic ANN.
+    /// Cosine distance, if this chunk was found by 768-dim semantic ANN.
     semantic_distance: Option<f32>,
+    /// Cosine distance, if this chunk was found by 4096-dim HQ semantic ANN.
+    hq_semantic_distance: Option<f32>,
 }
 
 /// Per-node accumulator produced by grouping chunk-level RRF scores.
@@ -249,8 +258,10 @@ struct NodeAccumulator {
     total_score: f32,
     /// Best (lowest) FTS rank among the node's matching chunks.
     best_fts_rank: Option<usize>,
-    /// Best (lowest) semantic distance among the node's matching chunks.
+    /// Best (lowest) 768-dim semantic distance among the node's matching chunks.
     best_semantic_distance: Option<f32>,
+    /// Best (lowest) 4096-dim HQ semantic distance among the node's matching chunks.
+    best_hq_semantic_distance: Option<f32>,
     /// Number of distinct chunks that contributed to this node's score.
     matching_chunk_count: usize,
 }
@@ -297,12 +308,13 @@ struct NodeAccumulator {
 /// Never returns an error due to a missing AI capability — always degrades
 /// gracefully to the next available path.
 #[instrument(
-    skip(graph, queue, config),
+    skip(graph, queue, hq_queue, config),
     fields(query, alpha = config.alpha, limit = config.limit)
 )]
 pub async fn search_hybrid(
     graph: &KnowledgeGraph,
     queue: &InferenceQueue,
+    hq_queue: Option<&InferenceQueue>,
     query: &str,
     config: &HybridSearchConfig,
 ) -> Result<Vec<NodeSearchResult>> {
@@ -370,10 +382,51 @@ pub async fn search_hybrid(
         Vec::new()
     };
 
+    // ── Stage 2b+3b: HQ embed query then HQ ANN search ───────────────────────
+    // Uses the 4096-dim model when an hq_queue is provided.  Contributes its
+    // own independent RRF signal alongside the standard 768-dim path.
+
+    let hq_semantic_results = if alpha > 0.0 {
+        match hq_queue {
+            None => Vec::new(),
+            Some(hq_q) if !hq_q.has_embedding() => {
+                info!(
+                    "HQ semantic search skipped — no embedding workers in hq_queue."
+                );
+                Vec::new()
+            }
+            Some(hq_q) => {
+                debug!("Embedding query for HQ semantic ANN search");
+                match hq_q.embed(query).await {
+                    Err(e) => {
+                        warn!("HQ query embedding failed — skipping HQ path: {e}");
+                        Vec::new()
+                    }
+                    Ok(query_vec) => {
+                        debug!(
+                            "Running HQ semantic ANN search (limit {})",
+                            config.semantic_limit
+                        );
+                        match graph.search_chunks_semantic_hq(&query_vec, config.semantic_limit) {
+                            Ok(results) => results,
+                            Err(e) => {
+                                warn!("HQ semantic ANN search failed — skipping HQ path: {e}");
+                                Vec::new()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     debug!(
-        "Candidate pool: {} FTS chunks, {} semantic chunks",
+        "Candidate pool: {} FTS chunks, {} semantic chunks, {} HQ semantic chunks",
         fts_results.len(),
-        semantic_results.len()
+        semantic_results.len(),
+        hq_semantic_results.len()
     );
 
     // ── Diagnostic: Stage 1 (FTS5) results ──────────────────────────────────
@@ -400,6 +453,18 @@ pub async fn search_hybrid(
         info!("{buf}");
     }
 
+    // ── Diagnostic: Stage 2b+3b (HQ Semantic ANN) results ───────────────────
+    {
+        use std::fmt::Write as _;
+        let mut buf = format!("── HYBRID STAGE 2b+3b: HQ Semantic ANN ({} chunks) ──\n", hq_semantic_results.len());
+        for (rank, (chunk_id, obj_id, content, distance)) in hq_semantic_results.iter().enumerate() {
+            let snippet: String = content.chars().take(80).collect();
+            let _ = writeln!(buf, "  HQ[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
+                chunk_id.hyphenated(), obj_id.hyphenated());
+        }
+        info!("{buf}");
+    }
+
     // ── Stage 4: Reciprocal Rank Fusion merge (chunk level) ───────────────────
     //
     // Deduplicate chunks by chunk_id and accumulate RRF scores from both paths.
@@ -417,6 +482,7 @@ pub async fn search_hybrid(
                 rrf_score: 0.0,
                 fts_rank: None,
                 semantic_distance: None,
+                hq_semantic_distance: None,
             });
         entry.rrf_score += score;
         entry.fts_rank = Some(rank);
@@ -431,9 +497,25 @@ pub async fn search_hybrid(
                 rrf_score: 0.0,
                 fts_rank: None,
                 semantic_distance: None,
+                hq_semantic_distance: None,
             });
         entry.rrf_score += score;
         entry.semantic_distance = Some(distance);
+    }
+
+    for (rank, (chunk_id, obj_id, _content, distance)) in hq_semantic_results.into_iter().enumerate() {
+        let score = alpha / (K + rank as f32);
+        let entry = chunk_merge
+            .entry(chunk_id.hyphenated().to_string())
+            .or_insert_with(|| ChunkMerge {
+                object_id_str: obj_id.hyphenated().to_string(),
+                rrf_score: 0.0,
+                fts_rank: None,
+                semantic_distance: None,
+                hq_semantic_distance: None,
+            });
+        entry.rrf_score += score;
+        entry.hq_semantic_distance = Some(distance);
     }
 
     // ── Diagnostic: Stage 4 (RRF merge) results ──────────────────────────────
@@ -470,6 +552,12 @@ pub async fn search_hybrid(
                     .map_or(dist, |prev| prev.min(dist)),
             );
         }
+        if let Some(dist) = cm.hq_semantic_distance {
+            acc.best_hq_semantic_distance = Some(
+                acc.best_hq_semantic_distance
+                    .map_or(dist, |prev| prev.min(dist)),
+            );
+        }
     }
 
     // ── Diagnostic: Stage 5 (Node aggregation) before sort ─────────────────
@@ -479,8 +567,8 @@ pub async fn search_hybrid(
         sorted_nodes.sort_by(|a, b| b.1.total_score.partial_cmp(&a.1.total_score).unwrap_or(std::cmp::Ordering::Equal));
         let mut buf = format!("── HYBRID STAGE 5: Node aggregation ({} nodes, before sort) ──\n", node_accum.len());
         for (obj_id, acc) in &sorted_nodes {
-            let _ = writeln!(buf, "  NODE obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?}",
-                acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance);
+            let _ = writeln!(buf, "  NODE obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
+                acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance, acc.best_hq_semantic_distance);
         }
         info!("{buf}");
     }
@@ -510,8 +598,8 @@ pub async fn search_hybrid(
         use std::fmt::Write as _;
         let mut buf = format!("── HYBRID STAGE 5: After sort + truncate to {} ──\n", config.limit);
         for (obj_id, acc) in &ranked_nodes {
-            let _ = writeln!(buf, "  KEPT obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?}",
-                acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance);
+            let _ = writeln!(buf, "  KEPT obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
+                acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance, acc.best_hq_semantic_distance);
         }
         info!("{buf}");
     }
@@ -580,6 +668,7 @@ pub async fn search_hybrid(
             sources: SearchSources {
                 fts_rank: acc.best_fts_rank,
                 semantic_distance: acc.best_semantic_distance,
+                hq_semantic_distance: acc.best_hq_semantic_distance,
                 rerank_score: None,
             },
         });
@@ -878,7 +967,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "wizard magic staff", &config)
+        let results = search_hybrid(&graph, &queue, None, "wizard magic staff", &config)
             .await
             .unwrap();
 
@@ -910,7 +999,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "wizard magic", &config)
+        let results = search_hybrid(&graph, &queue, None, "wizard magic", &config)
             .await
             .unwrap();
 
@@ -949,7 +1038,7 @@ mod tests {
         };
 
         // "hobbit ring journey" should strongly match Frodo, who has 3 edges.
-        let results = search_hybrid(&graph, &queue, "hobbit ring journey", &config)
+        let results = search_hybrid(&graph, &queue, None, "hobbit ring journey", &config)
             .await
             .unwrap();
 
@@ -996,7 +1085,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "hobbit", &config)
+        let results = search_hybrid(&graph, &queue, None, "hobbit", &config)
             .await
             .unwrap();
 
@@ -1025,7 +1114,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "hobbit homeland hills peaceful", &config)
+        let results = search_hybrid(&graph, &queue, None, "hobbit homeland hills peaceful", &config)
             .await
             .unwrap();
 
@@ -1057,7 +1146,7 @@ mod tests {
             limit: 10,
         };
 
-        let results = search_hybrid(&graph, &queue, "hobbit ring", &config)
+        let results = search_hybrid(&graph, &queue, None, "hobbit ring", &config)
             .await
             .unwrap();
 
@@ -1085,7 +1174,7 @@ mod tests {
             limit: 10,
         };
 
-        let results = search_hybrid(&graph, &queue, "hobbit ring journey", &config)
+        let results = search_hybrid(&graph, &queue, None, "hobbit ring journey", &config)
             .await
             .unwrap();
 
@@ -1125,7 +1214,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "wizard", &config)
+        let results = search_hybrid(&graph, &queue, None, "wizard", &config)
             .await
             .unwrap();
 
@@ -1155,7 +1244,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "fortress darkness tower", &config)
+        let results = search_hybrid(&graph, &queue, None, "fortress darkness tower", &config)
             .await
             .unwrap();
 
@@ -1181,7 +1270,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let results = search_hybrid(&graph, &queue, "the", &config).await.unwrap();
+            let results = search_hybrid(&graph, &queue, None, "the", &config).await.unwrap();
 
             assert!(
                 results.len() <= limit,
@@ -1202,7 +1291,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "land tower ring", &config)
+        let results = search_hybrid(&graph, &queue, None, "land tower ring", &config)
             .await
             .unwrap();
 
@@ -1227,7 +1316,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "anything at all", &config)
+        let results = search_hybrid(&graph, &queue, None, "anything at all", &config)
             .await
             .unwrap();
 
@@ -1262,8 +1351,17 @@ mod tests {
             fts_rank: Some(0),
             semantic_distance: Some(0.05),
             rerank_score: Some(0.98),
+            ..Default::default()
         };
         assert_eq!(all_three.label(), "[FTS+SEM+RR]");
+
+        let all_four = SearchSources {
+            fts_rank: Some(0),
+            semantic_distance: Some(0.05),
+            hq_semantic_distance: Some(0.03),
+            rerank_score: Some(0.98),
+        };
+        assert_eq!(all_four.label(), "[FTS+SEM+HQ+RR]");
 
         let empty = SearchSources::default();
         assert_eq!(empty.label(), "[?]");
@@ -1290,7 +1388,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, "wizard", &config)
+        let results = search_hybrid(&graph, &queue, None, "wizard", &config)
             .await
             .unwrap();
 
@@ -1330,7 +1428,7 @@ mod tests {
         ];
 
         for query in &queries {
-            let result = search_hybrid(&graph, &queue, query, &config).await;
+            let result = search_hybrid(&graph, &queue, None, query, &config).await;
             assert!(
                 result.is_ok(),
                 "search_hybrid returned an error for query {query:?}: {:?}",

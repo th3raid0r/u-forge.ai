@@ -331,6 +331,48 @@ triggers defined in `SQL_SCHEMA` in `storage.rs`. Never manually INSERT into
 
 ---
 
+## Semantic Search via ANN (sqlite-vec)
+
+Both standard (768-dim) and high-quality (4096-dim) embedding vectors are stored in SQLite via
+the `vec0` virtual table from the `sqlite-vec` extension:
+- `chunks_vec` — standard 768-dim embeddings (populated by any standard embedding model like embed-gemma-300m-FLM)
+- `chunks_vec_hq` — high-quality 4096-dim embeddings (populated only when Qwen3-Embedding-8B-GGUF or similar HQ model is available)
+
+Both indexes support **cosine distance** similarity search. A chunk must be explicitly indexed
+before it becomes searchable via ANN:
+
+```rust
+// After generating a 768-dim embedding vector
+let vec = provider.embed("Some text").await?;
+graph.upsert_chunk_embedding(chunk_id, &vec)?;  // adds to chunks_vec
+
+// Or for high-quality embeddings (if available)
+graph.upsert_chunk_embedding_hq(chunk_id, &vec)?;  // adds to chunks_vec_hq
+```
+
+Search via `KnowledgeGraph::search_chunks_ann`:
+
+```rust
+// Returns Vec<(ChunkId, ObjectId, content_text, distance)> ordered by cosine distance
+let results = graph.search_chunks_ann(&query_vector, 10)?;
+
+for (chunk_id, obj_id, content, distance) in results {
+    println!("Distance: {:.4} — {}", distance, content);
+}
+```
+
+Both vector indexes are **kept in sync automatically** via DML triggers (see `SQL_SCHEMA`);
+deleting a chunk cascades to its vectors. Never manually manage `chunks_vec` or
+`chunks_vec_hq` — always go through `upsert_chunk_embedding` / `upsert_chunk_embedding_hq`.
+
+**Demo workflow:**
+1. `cli_demo` checks if embeddings already exist (via `GraphStats.embedded_count`).
+2. If data was loaded previously and embeddings exist, re-embedding is skipped.
+3. If `[database] clear = true` in config or the DB is new, embedding workers are built only if Lemonade Server is reachable.
+4. The reusable vector index means running the demo multiple times builds embeddings once.
+
+---
+
 ## Async Patterns
 
 ### Correct: fully async HTTP provider (no thread blocking)

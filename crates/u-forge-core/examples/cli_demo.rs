@@ -35,15 +35,16 @@
 //! semantic_limit = 6
 //!
 //! [hybrid]
+//! queries = ["Who founded the Foundation and why?"]
+//! alpha_sweep_query = "the collapse of an interstellar civilization"
+//! alpha_sweep_values = [0.0, 0.5, 1.0]
+//!
 //! [hybrid.config]
 //! alpha = 0.5
 //! fts_limit = 15
 //! semantic_limit = 15
 //! rerank = true
 //! limit = 3
-//! queries = ["Who founded the Foundation and why?"]
-//! alpha_sweep_query = "the collapse of an interstellar civilization"
-//! alpha_sweep_values = [0.0, 0.5, 1.0]
 //! ```
 
 use anyhow::Result;
@@ -62,7 +63,7 @@ use u_forge_core::{
     search::{search_hybrid, HybridSearchConfig},
     types::ObjectMetadata,
     ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
-    EMBEDDING_DIMENSIONS,
+    EMBEDDING_DIMENSIONS, HIGH_QUALITY_EMBEDDING_DIMENSIONS,
 };
 
 // ── Demo config ───────────────────────────────────────────────────────────────
@@ -70,7 +71,18 @@ use u_forge_core::{
 /// Optional per-section configuration loaded from a JSON file.
 /// Every field is optional; missing sections fall back to built-in defaults.
 #[derive(serde::Deserialize, Default)]
+struct DatabaseDemoConfig {
+    /// Path to the persistent database directory.  Relative paths are resolved
+    /// from the current working directory.  Defaults to `./demo_data/kg`.
+    path: Option<String>,
+    /// When `true`, clear all data from the database before loading.
+    #[serde(default)]
+    clear: bool,
+}
+
+#[derive(serde::Deserialize, Default)]
 struct DemoConfig {
+    database: Option<DatabaseDemoConfig>,
     fts: Option<FtsDemoConfig>,
     semantic: Option<SemanticDemoConfig>,
     rerank: Option<RerankDemoConfig>,
@@ -239,13 +251,39 @@ async fn main() -> Result<()> {
     }
     println!();
 
+    // Determine if we'll need to build embeddings: peek at persistent DB first.
+    let default_db_path = format!(
+        "{}/../../demo_data/kg",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let db_cfg = demo_cfg.database.as_ref();
+    let db_path_str = db_cfg
+        .and_then(|c| c.path.as_deref())
+        .unwrap_or(&default_db_path);
+    let will_load_existing_data = {
+        let db_path = std::path::PathBuf::from(db_path_str);
+        let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
+        if clear_db {
+            false
+        } else {
+            match KnowledgeGraph::new(&db_path) {
+                Ok(g) => g.get_stats().ok().map(|s| s.node_count > 0).unwrap_or(false),
+                Err(_) => false,
+            }
+        }
+    };
+
     // ── Lemonade capabilities & model discovery ───────────────────────────────
 
     // Capture reachable providers for later sections; these are all Option so
     // the demo degrades gracefully when no server is present.
     let mut reranker: Option<LemonadeRerankProvider> = None;
-    // Multi-worker embedding queue: NPU + all compatible llamacpp models.
+    // Multi-worker embedding queue: NPU + all compatible llamacpp models (768-dim).
+    // Only built if new data will be loaded.
     let mut embed_queue: Option<InferenceQueue> = None;
+    // High-quality embedding queue: Qwen3-Embedding-8B-GGUF (4096-dim).
+    // Only built if new data will be loaded.
+    let mut hq_embed_queue: Option<InferenceQueue> = None;
 
     if let Some(ref url) = lemonade_url {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -391,17 +429,25 @@ async fn main() -> Result<()> {
                             println!();
 
                             // Summarise which canonical models will be used
+                            let device_cfg = AppConfig::load_default();
                             println!("   Active model selection:");
                             print_model_choice("   Embed (NPU)  ", registry.npu_embedding_model());
                             print_model_choice(
                                 "   Embed (llamacpp)",
                                 registry.llamacpp_embedding_model(),
                             );
+                            print_model_choice(
+                                "   Embed (HQ)   ",
+                                registry.hq_embedding_model(device_cfg.embedding.high_quality_embedding),
+                            );
                             print_model_choice("   LLM (NPU)   ", registry.npu_llm_model());
                             print_model_choice("   LLM (GPU)   ", registry.llm_model());
                             print_model_choice("   Reranker     ", registry.reranker_model());
                             println!();
 
+                            if will_load_existing_data {
+                                println!("   (Skipping embedding worker setup — data already exists on disk)\n");
+                            } else {
                             // Build a reranker for the demo section below
                             match LemonadeRerankProvider::from_registry(&registry) {
                                 Ok(r) => {
@@ -412,9 +458,7 @@ async fn main() -> Result<()> {
                             }
 
                             // Build a multi-worker embedding InferenceQueue with weighted dispatch.
-                            // Load app config (u-forge.toml) to determine which
-                            // backends to use and their priority weights.
-                            let device_cfg = AppConfig::load_default();
+                            // device_cfg loaded above for model selection display.
                             println!("   Device config:");
                             println!(
                                 "     NPU embed: {} (weight={})",
@@ -442,6 +486,14 @@ async fn main() -> Result<()> {
                                     "disabled"
                                 },
                                 device_cfg.embedding.cpu_weight
+                            );
+                            println!(
+                                "     HQ embed : {} ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)",
+                                if device_cfg.embedding.high_quality_embedding {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                }
                             );
 
                             println!("   Building embedding workers…");
@@ -531,12 +583,57 @@ async fn main() -> Result<()> {
                                      embedding models found — semantic search disabled."
                                 );
                             }
+
+                            // ── High-quality embedding worker (Qwen3-Embedding-8B-GGUF) ─
+                            if let Some(hq_model) = registry.hq_embedding_model(
+                                device_cfg.embedding.high_quality_embedding,
+                            ) {
+                                let hq_model_id = hq_model.id.clone();
+                                let hq_load_opts = ModelLoadOptions {
+                                    ctx_size: Some(effective_ctx_size(&hq_model_id)),
+                                    ..Default::default()
+                                };
+                                println!("   Building HQ embedding worker ({hq_model_id})…");
+                                match LemonadeProvider::new_with_load(
+                                    url,
+                                    &hq_model_id,
+                                    &hq_load_opts,
+                                )
+                                .await
+                                {
+                                    Err(e) => {
+                                        println!("     ⚠️  HQ embed({hq_model_id}) unavailable: {e}");
+                                    }
+                                    Ok(provider) => {
+                                        let dims = provider.dimensions().unwrap_or(0);
+                                        if dims != HIGH_QUALITY_EMBEDDING_DIMENSIONS {
+                                            println!(
+                                                "     ⚠️  HQ embed({hq_model_id}) skipped: \
+                                                 {dims}-dim ≠ {HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim"
+                                            );
+                                        } else {
+                                            println!(
+                                                "     ✅ HQ worker: {hq_model_id} ({dims}-dim)"
+                                            );
+                                            let hq_builder = InferenceQueueBuilder::new()
+                                                .with_config(device_cfg.clone())
+                                                .with_embedding_provider_weighted(
+                                                    Arc::new(provider),
+                                                    format!("hq({hq_model_id})"),
+                                                    device_cfg.embedding.gpu_weight,
+                                                );
+                                            hq_embed_queue = Some(hq_builder.build());
+                                        }
+                                    }
+                                }
+                            }
                             println!();
                         }
                     }
                 }
             }
         }
+            } // end will_load_existing_data else
     }
 
     // ── Database ──────────────────────────────────────────────────────────────
@@ -545,124 +642,117 @@ async fn main() -> Result<()> {
     println!("🗄️  Knowledge Graph");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let temp_dir = tempfile::TempDir::new()?;
-    let db_path = temp_dir.path().join("kg");
-    std::fs::create_dir_all(&db_path)?;
+    let db_path = std::path::PathBuf::from(db_path_str);
+    let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
 
-    println!("🗄️  Opening knowledge graph…");
+    println!("🗄️  Opening knowledge graph at {db_path_str}…");
     let graph = KnowledgeGraph::new(&db_path)?;
-    println!("    ✅ Ready\n");
 
-    // ── Empty DB proof ────────────────────────────────────────────────────────
+    if clear_db {
+        println!("    🗑️  Clearing existing data…");
+        graph.clear_all()?;
+        println!("    ✅ Cleared\n");
+    }
 
-    let empty = graph.get_stats()?;
-    println!("🧪 Empty DB proof (before any load)");
-    assert_eq!(
-        empty.node_count, 0,
-        "Expected 0 nodes, got {}",
-        empty.node_count
-    );
-    assert_eq!(
-        empty.edge_count, 0,
-        "Expected 0 edges, got {}",
-        empty.edge_count
-    );
-    assert_eq!(
-        empty.chunk_count, 0,
-        "Expected 0 chunks, got {}",
-        empty.chunk_count
-    );
-    assert_eq!(
-        empty.total_tokens, 0,
-        "Expected 0 tokens, got {}",
-        empty.total_tokens
-    );
-    println!("   Nodes   : {} ✅", empty.node_count);
-    println!("   Edges   : {} ✅", empty.edge_count);
-    println!("   Chunks  : {} ✅", empty.chunk_count);
-    println!("   Tokens  : {} ✅", empty.total_tokens);
-    println!();
+    let pre_stats = graph.get_stats()?;
+    let data_already_loaded = pre_stats.node_count > 0;
 
-    // ── Schemas ───────────────────────────────────────────────────────────────
+    if data_already_loaded && !clear_db {
+        println!(
+            "    ✅ Loaded from disk ({} nodes, {} chunks)\n",
+            pre_stats.node_count, pre_stats.chunk_count
+        );
+    } else {
+        println!("    ✅ Ready (empty)\n");
 
-    println!("📚 Loading schemas from {schema_dir}");
-    match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0") {
-        Ok(schema_def) => {
-            let mgr = graph.get_schema_manager();
-            match mgr.save_schema(&schema_def).await {
-                Ok(()) => {
-                    println!(
-                        "    ✅ Loaded {} object types:",
-                        schema_def.object_types.len()
-                    );
-                    let mut names: Vec<_> = schema_def.object_types.keys().collect();
-                    names.sort();
-                    for name in names {
-                        println!("       • {name}");
+        // ── Schemas ───────────────────────────────────────────────────────────
+
+        println!("📚 Loading schemas from {schema_dir}");
+        match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0") {
+            Ok(schema_def) => {
+                let mgr = graph.get_schema_manager();
+                match mgr.save_schema(&schema_def).await {
+                    Ok(()) => {
+                        println!(
+                            "    ✅ Loaded {} object types:",
+                            schema_def.object_types.len()
+                        );
+                        let mut names: Vec<_> = schema_def.object_types.keys().collect();
+                        names.sort();
+                        for name in names {
+                            println!("       • {name}");
+                        }
                     }
+                    Err(e) => eprintln!("    ⚠️  Could not save schemas: {e}"),
                 }
-                Err(e) => eprintln!("    ⚠️  Could not save schemas: {e}"),
             }
+            Err(e) => eprintln!("    ⚠️  Could not load schemas from {schema_dir}: {e}"),
         }
-        Err(e) => eprintln!("    ⚠️  Could not load schemas from {schema_dir}: {e}"),
+        println!();
+
+        // ── Data import ───────────────────────────────────────────────────────
+
+        println!("📄 Importing data from {data_file}");
+        let mut ingestion = DataIngestion::new(&graph);
+        if let Err(e) = ingestion.import_json_data(&data_file).await {
+            eprintln!("    ❌ Import failed: {e}");
+            return Err(e);
+        }
+
+        let stats = ingestion.get_stats();
+        println!("    ✅ Objects   : {}", stats.objects_created);
+        println!("    ✅ Edges     : {}", stats.relationships_created);
+        if stats.parse_errors > 0 {
+            println!("    ⚠️  Parse errors: {}", stats.parse_errors);
+        }
+        println!();
+
+        // ── Index text chunks for FTS5 ────────────────────────────────────────
+
+        println!("🔍 Indexing text for full-text search…");
+        let all_objects = graph.get_all_objects()?;
+        // Build a fast id→name lookup for edge label resolution.
+        let id_to_name: std::collections::HashMap<u_forge_core::types::ObjectId, String> =
+            all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
+        let mut indexed = 0usize;
+
+        for obj in &all_objects {
+            // Flatten the entire node (name, type, description, all properties, tags,
+            // and incident edges) into one chunk so FTS5 and semantic search both
+            // see the full node context including its relationships.
+            let edges = graph.get_relationships(obj.id).unwrap_or_default();
+            let edge_lines: Vec<String> = edges
+                .iter()
+                .filter_map(|e| {
+                    let from_name = id_to_name.get(&e.from)?;
+                    let to_name = id_to_name.get(&e.to)?;
+                    Some(format!(
+                        "{} {} {}",
+                        from_name,
+                        e.edge_type.as_str(),
+                        to_name
+                    ))
+                })
+                .collect();
+            let text = obj.flatten_for_embedding(&edge_lines);
+            indexed += graph
+                .add_text_chunk(obj.id, text, ChunkType::Imported)?
+                .len();
+        }
+
+        println!("    ✅ {indexed} text chunks indexed\n");
     }
-    println!();
-
-    // ── Data import ───────────────────────────────────────────────────────────
-
-    println!("📄 Importing data from {data_file}");
-    let mut ingestion = DataIngestion::new(&graph);
-    if let Err(e) = ingestion.import_json_data(&data_file).await {
-        eprintln!("    ❌ Import failed: {e}");
-        return Err(e);
-    }
-
-    let stats = ingestion.get_stats();
-    println!("    ✅ Objects   : {}", stats.objects_created);
-    println!("    ✅ Edges     : {}", stats.relationships_created);
-    if stats.parse_errors > 0 {
-        println!("    ⚠️  Parse errors: {}", stats.parse_errors);
-    }
-    println!();
-
-    // ── Index text chunks for FTS5 ────────────────────────────────────────────
-
-    println!("🔍 Indexing text for full-text search…");
-    let all_objects = graph.get_all_objects()?;
-    // Build a fast id→name lookup for edge label resolution.
-    let id_to_name: std::collections::HashMap<u_forge_core::types::ObjectId, String> =
-        all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
-    let mut indexed = 0usize;
-
-    for obj in &all_objects {
-        // Flatten the entire node (name, type, description, all properties, tags,
-        // and incident edges) into one chunk so FTS5 and semantic search both
-        // see the full node context including its relationships.
-        let edges = graph.get_relationships(obj.id).unwrap_or_default();
-        let edge_lines: Vec<String> = edges
-            .iter()
-            .filter_map(|e| {
-                let from_name = id_to_name.get(&e.from)?;
-                let to_name = id_to_name.get(&e.to)?;
-                Some(format!(
-                    "{} {} {}",
-                    from_name,
-                    e.edge_type.as_str(),
-                    to_name
-                ))
-            })
-            .collect();
-        let text = obj.flatten_for_embedding(&edge_lines);
-        indexed += graph
-            .add_text_chunk(obj.id, text, ChunkType::Imported)?
-            .len();
-    }
-
-    println!("    ✅ {indexed} text chunks indexed\n");
 
     // ── Embed chunks for semantic (ANN) search ────────────────────────────────
 
+    let post_load_stats = graph.get_stats()?;
+    let needs_embedding = post_load_stats.chunk_count > post_load_stats.embedded_count;
+    let needs_hq_embedding = post_load_stats.chunk_count > post_load_stats.embedded_hq_count;
+
     if let Some(ref eq) = embed_queue {
+        if !needs_embedding {
+            println!("ℹ️  Embedding skipped — all {} chunks already embedded.\n", post_load_stats.chunk_count);
+        } else {
         println!("🧮 Embedding chunks for semantic search (sqlite-vec)…");
         println!("   Workers  : {}", eq.embedding_worker_count());
 
@@ -717,20 +807,83 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        } // end needs_embedding else
     } else if lemonade_url.is_some() {
         println!("ℹ️  Embedding skipped — no compatible embedding model available.\n");
     } else {
         println!("ℹ️  Embedding skipped — set LEMONADE_URL to enable semantic search.\n");
     }
 
+    // ── HQ embed chunks (4096-dim) ───────────────────────────────────────────
+
+    if let Some(ref hq_eq) = hq_embed_queue {
+        if !needs_hq_embedding {
+            println!("ℹ️  HQ embedding skipped — all {} chunks already HQ embedded.\n", post_load_stats.chunk_count);
+        } else {
+        println!("🧮 HQ embedding chunks ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)…");
+        println!("   Workers  : {}", hq_eq.embedding_worker_count());
+
+        let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
+            let mut all = Vec::new();
+            for obj in &objs {
+                for chunk in graph.get_text_chunks(obj.id)? {
+                    all.push(chunk);
+                }
+            }
+            Ok(all)
+        })?;
+
+        let total = chunks_to_embed.len();
+        println!("   Chunks   : {total}");
+
+        let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
+
+        let t0 = std::time::Instant::now();
+        match hq_eq.embed_many(texts).await {
+            Err(e) => {
+                eprintln!("    ❌ HQ embed_many failed: {e}");
+            }
+            Ok(vecs) => {
+                let elapsed = t0.elapsed();
+                let mut stored = 0usize;
+                let mut skipped = 0usize;
+                for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
+                    match graph.upsert_chunk_embedding_hq(chunk.id, vec) {
+                        Ok(()) => stored += 1,
+                        Err(e) => {
+                            skipped += 1;
+                            eprintln!(
+                                "    ⚠️  Could not store HQ embedding for chunk {}: {e}",
+                                chunk.id
+                            );
+                        }
+                    }
+                }
+                let rate = if elapsed.as_secs_f64() > 0.0 {
+                    stored as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                println!(
+                    "    ✅ {stored}/{total} HQ embedded in {:.1}s ({rate:.0} chunks/s, \
+                     {skipped} skipped)\n",
+                    elapsed.as_secs_f64()
+                );
+            }
+        }
+        } // end needs_hq_embedding else
+    }
+
     // ── Graph statistics ──────────────────────────────────────────────────────
 
     let gs = graph.get_stats()?;
     println!("📊 Graph statistics");
-    println!("   Nodes   : {}", gs.node_count);
-    println!("   Edges   : {}", gs.edge_count);
-    println!("   Chunks  : {}", gs.chunk_count);
-    println!("   Tokens  : {}", gs.total_tokens);
+    println!("   Nodes     : {}", gs.node_count);
+    println!("   Edges     : {}", gs.edge_count);
+    println!("   Chunks    : {}", gs.chunk_count);
+    println!("   Tokens    : {}", gs.total_tokens);
+    println!("   Embedded  : {}/{}", gs.embedded_count, gs.chunk_count);
+    println!("   Embedded HQ: {}/{}", gs.embedded_hq_count, gs.chunk_count);
     println!();
 
     // ── FTS5 search demo ──────────────────────────────────────────────────────
@@ -841,6 +994,62 @@ async fn main() -> Result<()> {
         println!("ℹ️  Semantic search demo skipped — no compatible {EMBEDDING_DIMENSIONS}-dim embedding model available.\n");
     } else {
         println!("ℹ️  Semantic search demo skipped — set LEMONADE_URL to enable AI features.\n");
+    }
+
+    // ── HQ Semantic search demo ──────────────────────────────────────────────
+
+    if let Some(ref hq_eq) = hq_embed_queue {
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("🔭 HQ Semantic search demos ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim ANN)");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+        let default_semantic: &[(&str, usize)] = &[
+            ("mathematical prediction of human behaviour", 3),
+            ("the collapse of a great interstellar civilization", 3),
+            ("a planet on the periphery of known space", 3),
+            ("a brilliant scientist and planner", 3),
+        ];
+
+        let semantic_queries: Vec<(String, usize)> = match &demo_cfg.semantic {
+            Some(cfg) => cfg
+                .queries
+                .iter()
+                .map(|q| (q.query.clone(), q.limit))
+                .collect(),
+            None => default_semantic
+                .iter()
+                .map(|(q, l)| (q.to_string(), *l))
+                .collect(),
+        };
+
+        for (query, limit) in &semantic_queries {
+            println!("  Query: \"{query}\"");
+            match hq_eq.embed(query.as_str()).await {
+                Err(e) => println!("    ⚠️  HQ embed failed: {e}\n"),
+                Ok(query_vec) => match graph.search_chunks_semantic_hq(&query_vec, *limit) {
+                    Err(e) => println!("    ⚠️  HQ semantic search failed: {e}\n"),
+                    Ok(results) if results.is_empty() => {
+                        println!("    (no HQ matches — are chunks HQ-embedded?)\n");
+                    }
+                    Ok(results) => {
+                        for (i, (_chunk_id, obj_id, _snippet, distance)) in
+                            results.iter().enumerate()
+                        {
+                            let node = graph.get_object(*obj_id)?;
+                            let label = node
+                                .as_ref()
+                                .map(|o| format!("{} [{}]", o.name, o.object_type))
+                                .unwrap_or_else(|| obj_id.to_string());
+                            println!("    {}. [dist {:.4}] {}", i + 1, distance, label);
+                            if let Some(ref n) = node {
+                                print_node_full(n, &graph, "       ");
+                            }
+                        }
+                        println!();
+                    }
+                },
+            }
+        }
     }
 
     // ── Rerank demo ───────────────────────────────────────────────────────────
@@ -1021,7 +1230,7 @@ async fn main() -> Result<()> {
         for query in &hybrid_queries {
             println!("  Query: \"{query}\"");
 
-            match search_hybrid(&graph, eq, query.as_str(), &config).await {
+            match search_hybrid(&graph, eq, hq_embed_queue.as_ref(), query.as_str(), &config).await {
                 Err(e) => {
                     println!("    ⚠️  Hybrid search error: {e}\n");
                 }
@@ -1079,7 +1288,7 @@ async fn main() -> Result<()> {
                 limit: 3,
             };
             print!("  alpha={alpha:.1} ({label}): ");
-            match search_hybrid(&graph, eq, sweep_query, &sweep_config).await {
+            match search_hybrid(&graph, eq, hq_embed_queue.as_ref(), sweep_query, &sweep_config).await {
                 Err(e) => println!("⚠️  {e}"),
                 Ok(rs) if rs.is_empty() => println!("(no results)"),
                 Ok(rs) => {
@@ -1106,6 +1315,7 @@ async fn main() -> Result<()> {
     println!("👥 Relationship exploration");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
+    let all_objects = graph.get_all_objects()?;
     let sample = all_objects.iter().find(|o| {
         o.object_type == "npc"
             || o.object_type == "character"

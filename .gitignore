@@ -7,3 +7,4 @@
 /backend/.fastembed_cache
 /backend/target
 /defaults/default_model_cache
+/demo_data

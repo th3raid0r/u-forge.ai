@@ -89,6 +89,9 @@ API surface: CRUD for objects (`add_object`, `get_object`, `update_object`,
 **Other notable methods:**
 - `search_chunks_fts(query: &str, limit: usize) -> Result<Vec<(ChunkId, ObjectId, String)>>` — wraps SQLite FTS5 full-text search over the `chunks_fts` virtual table.
 - `find_by_name_only(name: &str) -> Result<Option<ObjectId>>` — name lookup independent of object type; used by `DataIngestion` to resolve cross-session edge references.
+- `get_stats() -> Result<GraphStats>` — returns `GraphStats { node_count, edge_count, chunk_count, total_tokens, embedded_count, embedded_hq_count }`. Queries are O(1) via indexed counts. `embedded_count` tracks chunks with 768-dim vectors, `embedded_hq_count` tracks chunks with 4096-dim vectors. Used to detect whether embedding work needs to be done (e.g., in `cli_demo`).
+- `clear_all() -> Result<()>` — delete all nodes (cascades to edges/chunks), schemas, and vector indexes. Leaves the database schema intact. Useful for resetting between demo runs.
+- `search_chunks_ann(query_embedding: &[f32], limit: usize) -> Result<Vec<(ChunkId, ObjectId, String, f32)>>` — ANN search on `chunks_vec` (or `chunks_vec_hq` if calling `search_chunks_ann_hq`). Returns results ordered by ascending cosine distance. Only chunks indexed via `upsert_chunk_embedding()` are candidates.
 
 `ObjectBuilder` provides a fluent API unchanged from before:
 `ObjectBuilder::character("Name")`, `.with_description()`, `.with_property()`,
@@ -148,7 +151,7 @@ Auto-populated and auto-updated via `AFTER INSERT`, `AFTER UPDATE`, and
 `AFTER DELETE` triggers on the `chunks` table. Queried via standard FTS5
 `MATCH` syntax.
 
-**`chunks_vec`** — sqlite-vec `vec0` virtual table for ANN similarity search.
+**`chunks_vec`** — sqlite-vec `vec0` virtual table for standard ANN similarity search (768-dim).
 ```
 rowid   INTEGER  (maps to chunks.rowid — same identity as chunks_fts)
 embedding float[768] distance_metric=cosine
@@ -156,6 +159,17 @@ embedding float[768] distance_metric=cosine
 Populated explicitly via `upsert_chunk_embedding()`; not every chunk has an entry
 immediately after creation. Kept clean by a `chunks_vec_ad` trigger that fires
 `AFTER DELETE ON chunks`.
+
+**`chunks_vec_hq`** — sqlite-vec `vec0` virtual table for high-quality ANN search (4096-dim).
+```
+rowid   INTEGER  (maps to chunks.rowid)
+embedding float[4096] distance_metric=cosine
+```
+Stored alongside (not replacing) `chunks_vec` to allow both standard and high-quality
+embeddings to coexist. Populated only when a high-quality embedding model (e.g.
+Qwen3-Embedding-8B-GGUF) is available in Lemonade Server and enabled in config
+(`embedding.high_quality_embedding: true`). Kept clean by a `chunks_vec_hq_ad` trigger
+that fires `AFTER DELETE ON chunks`.
 
 ### Indexes
 
@@ -167,7 +181,8 @@ immediately after creation. Kept clean by a `chunks_vec_ad` trigger that fires
 | `idx_edges_source` | edges | source_id | Outgoing edge lookup |
 | `idx_edges_target` | edges | target_id | Incoming edge lookup, cascade perf |
 | `idx_chunks_object` | chunks | object_id | get_chunks_for_node |
-| `chunks_vec_ad` trigger | chunks | rowid | Cascade-deletes vec entries when a chunk is deleted |
+| `chunks_vec_ad` trigger | chunks | rowid | Cascade-deletes 768-dim vec entries when a chunk is deleted |
+| `chunks_vec_hq_ad` trigger | chunks | rowid | Cascade-deletes 4096-dim HQ vec entries when a chunk is deleted |
 
 ### Design Notes
 
@@ -184,7 +199,7 @@ immediately after creation. Kept clean by a `chunks_vec_ad` trigger that fires
 - The old `AdjacencyList` struct (with separate `outgoing`/`incoming` `Vec<Edge>`
   per node) is gone. Edge direction is now implicit in `source_id`/`target_id`.
 - `bincode` has been removed; all serialization is JSON via `serde_json`.
-- **Vector index live** — `chunks_vec` is a sqlite-vec `vec0` virtual table (768-dim cosine). `upsert_chunk_embedding()` maps chunk rowids into the index. `search_chunks_semantic()` returns results ordered by ascending cosine distance.
+- **Vector indexes live** — Both `chunks_vec` (768-dim) and `chunks_vec_hq` (4096-dim) are sqlite-vec `vec0` virtual tables supporting cosine distance. `upsert_chunk_embedding()` and `upsert_chunk_embedding_hq()` populate them respectively. `search_chunks_ann()` returns results ordered by ascending cosine distance. High-quality (HQ) embeddings are optional and only built when Qwen3-Embedding-8B-GGUF or similar is available and enabled.
 - **Chunk size enforcement** — `add_text_chunk` splits content at word boundaries into ≤350-token pieces (`MAX_CHUNK_TOKENS`) before storage. Guards against the llamacpp 512-token batch limit. Uses the same `len/4` heuristic as `estimate_token_count`.
 
 ---
@@ -678,11 +693,19 @@ Runs an FTS5 `MATCH` query against the `chunks_fts` virtual table. Supports phra
 
 ### Semantic (Vector) Search
 
-**`KnowledgeGraph::search_chunks_semantic(query_embedding: &[f32], limit: usize) -> Vec<(ChunkId, ObjectId, String, f32)>`**
+**Standard embeddings (768-dim):**
+`KnowledgeGraph::search_chunks_ann(query_embedding: &[f32], limit: usize) -> Result<Vec<(ChunkId, ObjectId, String, f32)>>`
 
-Queries the `chunks_vec` sqlite-vec `vec0` virtual table for the `limit` closest chunks by cosine distance. Returns `(chunk_id, object_id, content, distance)` tuples ordered by ascending distance (0.0 = identical, 2.0 = maximally dissimilar). Only chunks indexed via `upsert_chunk_embedding` are candidates.
+**High-quality embeddings (4096-dim):**
+`KnowledgeGraph::search_chunks_ann_hq(query_embedding: &[f32], limit: usize) -> Result<Vec<(ChunkId, ObjectId, String, f32)>>`
 
-The embedding dimension is fixed at `EMBEDDING_DIMENSIONS = 768` (matching the gemma embedding family: `embed-gemma-300m-FLM` on NPU and `embeddinggemma-300M-GGUF` on CPU/GPU). **Only gemma-family models are supported** — mixing models from different embedding families (e.g. nomic) produces vectors in incompatible spaces, making cosine distances meaningless. The constant and the `vec0` DDL must stay in sync; recreate the database if the model changes.
+Both query their respective sqlite-vec `vec0` virtual tables (`chunks_vec` and `chunks_vec_hq`) for the `limit` closest chunks by cosine distance. Returns `(chunk_id, object_id, content, distance)` tuples ordered by ascending distance (0.0 = identical, 2.0 = maximally dissimilar). Only chunks indexed via `upsert_chunk_embedding` or `upsert_chunk_embedding_hq` are candidates.
+
+**768-dim index:**
+Fixed at `EMBEDDING_DIMENSIONS = 768` (gemma family: `embed-gemma-300m-FLM` NPU, `embeddinggemma-300M-GGUF` CPU/GPU). **Mixing model families is forbidden** — incompatible spaces produce meaningless distances.
+
+**4096-dim HQ index (optional):**
+Fixed at `HIGH_QUALITY_EMBEDDING_DIMENSIONS = 4096` (e.g. Qwen3-Embedding-8B-GGUF). Only populated when the HQ model is available and `embedding.high_quality_embedding: true` in config. Allows finer-grained semantic search alongside the standard index.
 
 ### Hybrid Search (`src/search/`)
 
@@ -698,7 +721,7 @@ purely-synchronous, no-AI-dependency contract.
    Skipped when `alpha == 1.0`.
 2. **Embed** — `queue.embed(query)` for the query vector.
    Skipped when `alpha == 0.0` or no embedding worker registered.
-3. **Semantic ANN** — `graph.search_chunks_semantic(&vec, config.semantic_limit)`.
+3. **Semantic ANN** — `graph.search_chunks_ann(&vec, config.semantic_limit)` (or `search_chunks_ann_hq` if HQ embeddings are available).
    Skipped when step 2 was skipped or failed.
 4. **RRF merge** — Reciprocal Rank Fusion (`score = weight / (k + rank)`, k=60).
    Deduplicates by `chunk_id`, sums contributions from both paths, sorts descending,

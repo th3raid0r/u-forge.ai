@@ -1,6 +1,6 @@
 //! Full-text and semantic search methods for KnowledgeGraphStorage.
 
-use super::storage::*;
+use super::storage::{self, *};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::params;
 use uuid::Uuid;
@@ -162,6 +162,101 @@ impl KnowledgeGraphStorage {
                 })?,
                 Uuid::parse_str(&obj_id_s).with_context(|| {
                     format!("Invalid object UUID in semantic result: '{obj_id_s}'")
+                })?,
+                content,
+                distance,
+            ));
+        }
+        Ok(results)
+    }
+
+    // ── High-quality (4096-dim) embedding methods ───────────────────────────
+
+    /// Store or update the high-quality embedding vector for an existing chunk.
+    ///
+    /// Identical to [`upsert_chunk_embedding`] but writes to the `chunks_vec_hq`
+    /// table (4096-dim) instead of `chunks_vec` (768-dim).
+    pub fn upsert_chunk_embedding_hq(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
+        if embedding.len() != storage::HIGH_QUALITY_EMBEDDING_DIMENSIONS {
+            return Err(anyhow!(
+                "HQ embedding dimension mismatch: expected {}, got {}.",
+                storage::HIGH_QUALITY_EMBEDDING_DIMENSIONS,
+                embedding.len()
+            ));
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let rowid: i64 = conn
+            .query_row(
+                "SELECT rowid FROM chunks WHERE id = ?1",
+                params![chunk_id.hyphenated().to_string()],
+                |row| row.get(0),
+            )
+            .with_context(|| {
+                format!("upsert_chunk_embedding_hq: chunk '{chunk_id}' not found in chunks table")
+            })?;
+
+        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        conn.execute("DELETE FROM chunks_vec_hq WHERE rowid = ?1", params![rowid])
+            .context("Failed to delete old HQ embedding from chunks_vec_hq")?;
+
+        conn.execute(
+            "INSERT INTO chunks_vec_hq(rowid, embedding) VALUES (?1, ?2)",
+            params![rowid, bytes],
+        )
+        .context("Failed to insert HQ embedding into chunks_vec_hq")?;
+
+        Ok(())
+    }
+
+    /// Approximate nearest-neighbour search over the high-quality embedding index.
+    ///
+    /// Identical to [`search_chunks_semantic`] but queries `chunks_vec_hq`
+    /// (4096-dim) instead of `chunks_vec` (768-dim).
+    pub fn search_chunks_semantic_hq(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
+        let bytes: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.object_id, c.content, v.distance
+             FROM chunks c
+             INNER JOIN (
+                 SELECT rowid, distance
+                 FROM   chunks_vec_hq
+                 WHERE  embedding MATCH ?1
+                 ORDER  BY distance
+                 LIMIT  ?2
+             ) v ON c.rowid = v.rowid
+             ORDER BY v.distance",
+        )?;
+
+        let rows = stmt.query_map(params![bytes, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)? as f32,
+            ))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let (chunk_id_s, obj_id_s, content, distance) = row?;
+            results.push((
+                Uuid::parse_str(&chunk_id_s).with_context(|| {
+                    format!("Invalid chunk UUID in HQ semantic result: '{chunk_id_s}'")
+                })?,
+                Uuid::parse_str(&obj_id_s).with_context(|| {
+                    format!("Invalid object UUID in HQ semantic result: '{obj_id_s}'")
                 })?,
                 content,
                 distance,
