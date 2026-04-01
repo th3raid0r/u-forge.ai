@@ -131,10 +131,54 @@ Example `u-forge.toml`:
 ```toml
 [embedding]
 npu_enabled = true
-npu_weight = 100
+high_quality_embedding = true
 gpu_enabled = true
-gpu_weight = 40      # prefer NPU over GPU
-cpu_enabled = false  # disable CPU embedding
+gpu_weight = 40
+cpu_enabled = false
+cpu_weight = 10
+
+[models.context_limits]
+"embed-gemma-300m-FLM"     = 2048
+"user.ggml-org/embeddinggemma-300M-GGUF"   = 2048
+"nomic-embed-text-v1-GGUF"  = 2048
+"Qwen3-Embedding-8B-GGUF"  = 32768
+```
+
+Example `demo_config.toml`:
+```toml
+# It's separate from u-forge.toml which is used by the application.
+
+[database]
+# path = "./demo_data/kg"   # override the default DB location (default: <workspace>/demo_data/kg)
+# clear = true              # set to true to wipe the DB before loading (default: false)
+
+[fts]
+[[fts.queries]]
+query = "mayor"
+limit = 3
+
+[semantic]
+[[semantic.queries]]
+query = "Who is the leader of the Foundation?"
+limit = 5
+
+[rerank]
+[[rerank.queries]]
+query = "Who is the leader of the Foundation?"
+semantic_limit = 6
+
+[hybrid]
+queries = ["Mayor"]
+alpha_sweep_query = "Mayor"
+alpha_sweep_values = [0.0, 0.5, 1.0]
+
+[hybrid.config]
+alpha = 0.5
+fts_limit = 10
+semantic_limit = 10
+rerank = true
+limit = 3
+
 ```
 
 When multiple embedding workers are available, the highest-weight idle worker is selected. This configuration only affects the inference queue's device selection strategy — it does not require code changes.
