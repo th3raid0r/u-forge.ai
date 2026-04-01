@@ -11,6 +11,7 @@
 //! accessed without the Bearer token.
 
 use anyhow::{Context, Result};
+use async_openai::{Client, config::OpenAIConfig};
 use reqwest::multipart;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -124,6 +125,22 @@ impl LemonadeHttpClient {
             .with_context(|| format!("Failed to read response bytes from POST {url}"))?;
         Ok(bytes.to_vec())
     }
+}
+
+/// Create an `async-openai` client pre-configured for Lemonade Server.
+///
+/// Sets the base URL and injects the `Authorization: Bearer lemonade` token
+/// that all Lemonade endpoints require.  Use this for every standard
+/// OpenAI-compatible endpoint (chat, embeddings, audio, images, models).
+///
+/// Lemonade-specific endpoints (rerank, model load/unload, system-info, registry)
+/// continue to use [`LemonadeHttpClient`] since they carry Lemonade-specific
+/// request/response schemas.
+pub fn make_lemonade_openai_client(base_url: &str) -> Client<OpenAIConfig> {
+    let config = OpenAIConfig::new()
+        .with_api_base(base_url)
+        .with_api_key("lemonade");
+    Client::with_config(config)
 }
 
 #[cfg(test)]

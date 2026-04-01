@@ -32,3 +32,11 @@ fts_limit = 10
 semantic_limit = 10
 rerank = true
 limit = 3
+
+[chat]
+system_prompt = "You are a knowledgeable assistant for a TTRPG worldbuilding tool. Answer questions accurately based on the provided knowledge graph context. Be concise and informative."
+max_history_turns = 10
+max_tokens = 1024
+temperature = 0.7
+alpha = 0.5
+search_limit = 3

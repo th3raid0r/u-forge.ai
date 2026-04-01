@@ -21,12 +21,14 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+use async_openai::{Client, config::OpenAIConfig};
+use async_openai::types::embeddings::{CreateEmbeddingRequest, EmbeddingInput};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::lemonade::LemonadeHttpClient;
+use crate::lemonade::make_lemonade_openai_client;
 
 // ── Backward-compat re-exports ────────────────────────────────────────────────
 // Transcription types moved to `crate::transcription`.  Re-exported here so
@@ -105,9 +107,11 @@ pub trait EmbeddingProvider: Send + Sync {
 ///
 /// This provider is fully async — no Tokio threads are ever blocked (fixes BUG-5).
 pub struct LemonadeProvider {
-    client: LemonadeHttpClient,
+    client: Client<OpenAIConfig>,
     /// Model identifier, e.g. `"nomic-embed-text"`.
     model: String,
+    /// Human-readable base URL, stored for model_info display only.
+    base_url: String,
     /// Probed on construction.
     dimensions: usize,
 }
@@ -123,16 +127,19 @@ impl LemonadeProvider {
     /// # Errors
     /// Returns an error if the server is unreachable or the model is not loaded.
     pub async fn new(base_url: &str, model: &str) -> Result<Self> {
-        let client = LemonadeHttpClient::new(base_url);
+        let client = make_lemonade_openai_client(base_url);
 
-        let resp: serde_json::Value = client
-            .post_json(
-                "/embeddings",
-                &serde_json::json!({
-                    "model": model,
-                    "input": ["dimension probe"]
-                }),
-            )
+        let probe_req = CreateEmbeddingRequest {
+            model: model.to_string(),
+            input: EmbeddingInput::StringArray(vec!["dimension probe".to_string()]),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+        };
+
+        let probe_resp = client
+            .embeddings()
+            .create(probe_req)
             .await
             .map_err(|e| {
                 anyhow!(
@@ -142,9 +149,10 @@ impl LemonadeProvider {
                 )
             })?;
 
-        let dimensions = resp["data"][0]["embedding"]
-            .as_array()
-            .map(|a| a.len())
+        let dimensions = probe_resp
+            .data
+            .first()
+            .map(|e| e.embedding.len())
             .ok_or_else(|| {
                 anyhow!(
                     "Failed to probe embedding dimensions from Lemonade Server — \
@@ -159,6 +167,7 @@ impl LemonadeProvider {
         Ok(Self {
             client,
             model: model.to_string(),
+            base_url: base_url.to_string(),
             dimensions,
         })
     }
@@ -194,56 +203,42 @@ impl LemonadeProvider {
 #[async_trait]
 impl EmbeddingProvider for LemonadeProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let resp: serde_json::Value = self
-            .client
-            .post_json(
-                "/embeddings",
-                &serde_json::json!({
-                    "model": self.model,
-                    "input": [text]
-                }),
-            )
-            .await?;
+        let req = CreateEmbeddingRequest {
+            model: self.model.clone(),
+            input: EmbeddingInput::StringArray(vec![text.to_string()]),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+        };
 
-        let embedding: Vec<f32> = resp["data"][0]["embedding"]
-            .as_array()
-            .ok_or_else(|| {
-                anyhow!(
-                    "Lemonade Server returned no embedding in response (raw: {})",
-                    resp
-                )
-            })?
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
+        let resp = self.client.embeddings().create(req).await?;
 
-        Ok(embedding)
+        resp.data
+            .into_iter()
+            .next()
+            .map(|e| e.embedding)
+            .ok_or_else(|| anyhow!("Lemonade Server returned no embedding in response"))
     }
 
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        let resp: serde_json::Value = self
-            .client
-            .post_json(
-                "/embeddings",
-                &serde_json::json!({
-                    "model": self.model,
-                    "input": texts
-                }),
-            )
-            .await?;
+        let req = CreateEmbeddingRequest {
+            model: self.model.clone(),
+            input: EmbeddingInput::StringArray(texts.clone()),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+        };
 
-        let data = resp["data"]
-            .as_array()
-            .ok_or_else(|| anyhow!("Lemonade Server returned no 'data' array in batch response"))?;
+        let resp = self.client.embeddings().create(req).await?;
 
         // Some backends (e.g. FLM/NPU recipe) do not support true multi-input
         // batching and silently return only the first result.  Detect the mismatch
         // and fall back to sequential single-item calls so callers always receive
         // exactly one embedding per input regardless of backend capability.
-        if data.len() != texts.len() {
+        if resp.data.len() != texts.len() {
             tracing::debug!(
                 expected = texts.len(),
-                got = data.len(),
+                got = resp.data.len(),
                 model = %self.model,
                 "Batch size mismatch — falling back to sequential single-embed calls"
             );
@@ -254,18 +249,14 @@ impl EmbeddingProvider for LemonadeProvider {
             return Ok(results);
         }
 
-        data.iter()
-            .map(|item| {
-                item["embedding"]
-                    .as_array()
-                    .ok_or_else(|| anyhow!("Missing 'embedding' field in Lemonade batch item"))
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-                            .collect()
-                    })
-            })
-            .collect()
+        let mut embeddings: Vec<(usize, Vec<f32>)> = resp
+            .data
+            .into_iter()
+            .map(|e| (e.index as usize, e.embedding))
+            .collect();
+        // The API may return items out of order; sort by index to restore input order.
+        embeddings.sort_unstable_by_key(|(idx, _)| *idx);
+        Ok(embeddings.into_iter().map(|(_, v)| v).collect())
     }
 
     fn dimensions(&self) -> Result<usize> {
@@ -284,7 +275,7 @@ impl EmbeddingProvider for LemonadeProvider {
         Some(EmbeddingModelInfo {
             name: self.model.clone(),
             dimensions: self.dimensions,
-            description: Some(format!("Lemonade Server model at {}", self.client.base_url)),
+            description: Some(format!("Lemonade Server model at {}", self.base_url)),
         })
     }
 }

@@ -43,7 +43,7 @@ pub use chat::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage,
     LemonadeChatProvider,
 };
-pub use client::LemonadeHttpClient;
+pub use client::{make_lemonade_openai_client, LemonadeHttpClient};
 pub use gpu_manager::{GpuResourceManager, GpuWorkload, LlmGuard, SttGuard};
 pub use load::{load_model, ModelLoadOptions};
 pub use model_limits::effective_ctx_size;

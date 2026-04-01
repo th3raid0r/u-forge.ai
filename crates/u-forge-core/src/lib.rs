@@ -25,6 +25,7 @@ pub mod hardware;
 pub mod ingest;
 pub mod lemonade;
 pub mod queue;
+pub mod rag;
 pub mod schema;
 pub mod search;
 pub(crate) mod text;
@@ -52,6 +53,7 @@ pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
     SchemaIngestion, SchemaManager, SchemaStats,
 };
+pub use rag::{build_rag_messages, format_search_context, RagContext};
 pub use search::{
     search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
 };

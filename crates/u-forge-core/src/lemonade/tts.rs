@@ -1,9 +1,11 @@
 //! Text-to-speech via kokoro-v1 running on CPU.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
+use async_openai::{Client, config::OpenAIConfig};
+use async_openai::types::audio::{CreateSpeechRequestArgs, SpeechModel, Voice};
 use serde::{Deserialize, Serialize};
 
-use super::client::LemonadeHttpClient;
+use super::client::make_lemonade_openai_client;
 use super::registry::LemonadeModelRegistry;
 
 /// Built-in voices supported by kokoro-v1.
@@ -37,6 +39,10 @@ impl KokoroVoice {
             KokoroVoice::Custom(v) => v.as_str(),
         }
     }
+
+    fn to_oa_voice(&self) -> Voice {
+        Voice::Other(self.as_str().to_string())
+    }
 }
 
 impl Default for KokoroVoice {
@@ -61,7 +67,7 @@ impl std::fmt::Display for KokoroVoice {
 /// because kokoro runs entirely on the CPU.
 #[derive(Debug, Clone)]
 pub struct LemonadeTtsProvider {
-    client: LemonadeHttpClient,
+    client: Client<OpenAIConfig>,
     /// The model id sent to the API (e.g. `"kokoro-v1"`).
     pub model: String,
     /// Voice used when none is specified at call time.
@@ -72,7 +78,7 @@ impl LemonadeTtsProvider {
     /// Construct with an explicit base URL and model id.
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
-            client: LemonadeHttpClient::new(base_url),
+            client: make_lemonade_openai_client(base_url),
             model: model.to_string(),
             default_voice: KokoroVoice::default(),
         }
@@ -82,7 +88,7 @@ impl LemonadeTtsProvider {
     pub fn from_registry(registry: &LemonadeModelRegistry) -> Result<Self> {
         let model = registry
             .tts_model()
-            .ok_or_else(|| anyhow!("No TTS model found in the Lemonade registry"))?;
+            .ok_or_else(|| anyhow::anyhow!("No TTS model found in the Lemonade registry"))?;
         Ok(Self::new(&registry.base_url, &model.id))
     }
 
@@ -97,25 +103,30 @@ impl LemonadeTtsProvider {
     /// `voice` overrides `self.default_voice` for this call only.
     /// Returns raw audio bytes (typically WAV).
     pub async fn synthesize(&self, text: &str, voice: Option<&KokoroVoice>) -> Result<Vec<u8>> {
-        let voice_str = voice.unwrap_or(&self.default_voice).as_str();
+        let effective_voice = voice.unwrap_or(&self.default_voice);
         let start = std::time::Instant::now();
 
-        let body = serde_json::json!({
-            "model": self.model,
-            "input":  text,
-            "voice":  voice_str,
-        });
+        let req = CreateSpeechRequestArgs::default()
+            .model(SpeechModel::Other(self.model.clone()))
+            .input(text)
+            .voice(effective_voice.to_oa_voice())
+            .build()
+            .context("Failed to build TTS request")?;
 
-        let bytes = self
+        let response = self
             .client
-            .post_bytes("/audio/speech", &body)
+            .audio()
+            .speech()
+            .create(req)
             .await
             .context("TTS HTTP request failed")?;
 
+        let bytes = response.bytes.to_vec();
+
         tracing::debug!(
-            model    = %self.model,
-            voice    = %voice_str,
-            input_chars = text.len(),
+            model        = %self.model,
+            voice        = %effective_voice,
+            input_chars  = text.len(),
             output_bytes = bytes.len(),
             duration_ms  = start.elapsed().as_millis(),
             "TTS synthesis complete"
