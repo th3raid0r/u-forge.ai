@@ -251,7 +251,7 @@ async fn main() -> Result<()> {
     }
     println!();
 
-    // Determine if we'll need to build embeddings: peek at persistent DB first.
+    // Resolve DB config upfront (needed for the Database section below)
     let default_db_path = format!(
         "{}/../../demo_data/kg",
         env!("CARGO_MANIFEST_DIR")
@@ -260,18 +260,6 @@ async fn main() -> Result<()> {
     let db_path_str = db_cfg
         .and_then(|c| c.path.as_deref())
         .unwrap_or(&default_db_path);
-    let will_load_existing_data = {
-        let db_path = std::path::PathBuf::from(db_path_str);
-        let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
-        if clear_db {
-            false
-        } else {
-            match KnowledgeGraph::new(&db_path) {
-                Ok(g) => g.get_stats().ok().map(|s| s.node_count > 0).unwrap_or(false),
-                Err(_) => false,
-            }
-        }
-    };
 
     // ── Lemonade capabilities & model discovery ───────────────────────────────
 
@@ -279,10 +267,10 @@ async fn main() -> Result<()> {
     // the demo degrades gracefully when no server is present.
     let mut reranker: Option<LemonadeRerankProvider> = None;
     // Multi-worker embedding queue: NPU + all compatible llamacpp models (768-dim).
-    // Only built if new data will be loaded.
+    // Needed for query embedding in search demos.
     let mut embed_queue: Option<InferenceQueue> = None;
     // High-quality embedding queue: Qwen3-Embedding-8B-GGUF (4096-dim).
-    // Only built if new data will be loaded.
+    // Needed for HQ query embedding if available.
     let mut hq_embed_queue: Option<InferenceQueue> = None;
 
     if let Some(ref url) = lemonade_url {
@@ -445,9 +433,6 @@ async fn main() -> Result<()> {
                             print_model_choice("   Reranker     ", registry.reranker_model());
                             println!();
 
-                            if will_load_existing_data {
-                                println!("   (Skipping embedding worker setup — data already exists on disk)\n");
-                            } else {
                             // Build a reranker for the demo section below
                             match LemonadeRerankProvider::from_registry(&registry) {
                                 Ok(r) => {
@@ -633,7 +618,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-            } // end will_load_existing_data else
     }
 
     // ── Database ──────────────────────────────────────────────────────────────
