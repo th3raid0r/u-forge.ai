@@ -347,12 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_queues_behind_simulated_stt_integration() {
-        let Some(url) = crate::test_helpers::lemonade_url().await else {
-            eprintln!(
-                "SKIP test_llm_queues_behind_simulated_stt_integration — Lemonade Server not available"
-            );
-            return;
-        };
+        let url = crate::test_helpers::require_integration_url!();
         use tokio::time::{sleep, timeout, Duration};
 
         let reg = crate::lemonade::LemonadeModelRegistry::fetch(&url).await.unwrap();
@@ -392,11 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stt_blocked_during_simulated_llm_integration() {
-        let Some(_url) = crate::test_helpers::lemonade_url().await else {
-            return;
-        };
-
-        // This is purely a policy test — no real LLM request needed.
+        // This is purely a policy test — no server needed, no real LLM request.
         let gpu = GpuResourceManager::new();
         let _llm_guard = gpu.begin_llm().await;
 

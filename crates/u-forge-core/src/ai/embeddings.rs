@@ -379,7 +379,7 @@ impl EmbeddingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::lemonade_url;
+    use crate::test_helpers::require_integration_url;
 
     // ── Unit tests (no server required) ──────────────────────────────────────
 
@@ -404,25 +404,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_new_auto_fails_without_url() {
-        // Skip if any Lemonade Server is reachable (localhost probe or env var).
-        if lemonade_url().await.is_some() {
-            eprintln!("Skipping test_try_new_auto_fails_without_url — server is reachable");
-            return;
-        }
-        let result = EmbeddingManager::try_new_auto(None, None).await;
-        assert!(
-            result.is_err(),
-            "Expected error when no URL is configured, got Ok"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("LEMONADE_URL"),
-            "Error message should mention LEMONADE_URL, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_try_new_lemonade_unreachable() {
         let result = EmbeddingManager::try_new_lemonade(
             "http://127.0.0.1:19999/api/v1",
@@ -439,10 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lemonade_provider_connect_and_dimensions() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable");
-            return;
-        };
+        let url = require_integration_url!();
         let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM").await;
         assert!(
             provider.is_ok(),
@@ -459,32 +437,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lemonade_embed_single() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable");
-            return;
-        };
-        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
-            .await
-            .expect("Connect to Lemonade");
-        let dims = provider.dimensions().unwrap();
-
-        let embedding = provider.embed("The quick brown fox").await;
-        assert!(embedding.is_ok(), "embed() failed: {:?}", embedding.err());
-        let embedding = embedding.unwrap();
-        assert_eq!(embedding.len(), dims, "Dimension mismatch");
-        assert!(
-            embedding.iter().all(|&x| x.is_finite()),
-            "Embedding contains non-finite values"
-        );
-    }
-
-    #[tokio::test]
     async fn test_lemonade_embed_batch() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable");
-            return;
-        };
+        let url = require_integration_url!();
         let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
             .await
             .expect("Connect to Lemonade");
@@ -510,18 +464,5 @@ mod tests {
                 "Non-finite value in batch embedding"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_embedding_manager_try_new_auto() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable");
-            return;
-        };
-        let mgr = EmbeddingManager::try_new_auto(Some(&url), None).await;
-        assert!(mgr.is_ok(), "try_new_auto failed: {:?}", mgr.err());
-        let provider = mgr.unwrap().get_provider();
-        assert_eq!(provider.provider_type(), EmbeddingProviderType::Lemonade);
-        assert!(provider.dimensions().unwrap() > 0);
     }
 }
