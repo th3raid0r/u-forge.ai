@@ -438,6 +438,13 @@ async fn main() -> Result<()> {
                             // Build a reranker for the demo section below
                             match LemonadeRerankProvider::from_registry(&registry) {
                                 Ok(r) => {
+                                    let load_opts = ModelLoadOptions {
+                                        ctx_size: Some(u_forge_core::DEFAULT_EMBEDDING_CONTEXT_TOKENS),
+                                        ..Default::default()
+                                    };
+                                    if let Err(e) = r.load(&load_opts).await {
+                                        println!("   ⚠️  Reranker load failed ({e}), using server defaults");
+                                    }
                                     println!("   ✅ Reranker ready: {}", r.model);
                                     reranker = Some(r);
                                 }

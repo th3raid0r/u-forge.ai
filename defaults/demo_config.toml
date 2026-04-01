@@ -32,3 +32,4 @@ fts_limit = 10
 semantic_limit = 10
 rerank = true
 limit = 3
+

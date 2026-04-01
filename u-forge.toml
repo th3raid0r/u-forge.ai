@@ -11,3 +11,28 @@ cpu_weight = 10
 "user.ggml-org/embeddinggemma-300M-GGUF"   = 2048
 "nomic-embed-text-v1-GGUF"  = 2048
 "Qwen3-Embedding-8B-GGUF"  = 32768
+"bge-reranker-v2-m3-GGUF" = 8192
+
+[chat]
+preferred_device = "gpu"       # "auto" | "gpu" | "npu" | "cpu"
+system_prompt = "You are a knowledgeable assistant for a TTRPG worldbuilding tool. Answer questions accurately based on the provided knowledge graph context. Be concise and informative."
+max_history_turns = 10
+alpha = 0.5                     # 0.0 = FTS5-only, 1.0 = semantic-only
+search_limit = 3
+
+[chat.gpu]
+#model = "Qwen3.5-27B-GGUF"
+model = "Qwen3.5-35B-A3B-GGUF"
+# model = "Qwen3.5-122B-A10B-GGUF"
+max_tokens = 262144
+temperature = 0.7
+
+[chat.npu]
+model = "qwen3.5-9b-FLM"
+max_tokens = 32768
+temperature = 0.7
+
+# [chat.cpu]
+# model = "some-cpu-model-GGUF"
+# max_tokens = 256
+# temperature = 0.5

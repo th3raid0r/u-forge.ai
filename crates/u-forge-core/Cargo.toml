@@ -40,6 +40,9 @@ async-trait = "0.1"
 # HTTP client (required for Lemonade Server embedding/reranking API)
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 
+# OpenAI-compatible client (drives all standard Lemonade endpoints)
+async-openai = { version = "0.34", features = ["chat-completion", "embedding", "audio"] }
+
 # Concurrent data structures
 dashmap = "6.1"
 parking_lot = "0.12"

@@ -31,6 +31,7 @@ A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI
 | Unified inference queue (`InferenceQueue`) — embed, transcribe, TTS, LLM, rerank | ✅ Working |
 | Reranking via Lemonade Server (`LemonadeRerankProvider`) | ✅ Working |
 | `cli_demo` — hybrid search + rerank pipeline demo with Foundation universe data | ✅ Working |
+| `cli_chat` — interactive RAG chat REPL (hybrid search + LLM) | ✅ Working |
 | axum HTTP / WebSocket server | 🔜 Planned |
 | Streaming LLM responses | 🔜 Planned |
 | Web UI | 🔜 Planned |
@@ -109,6 +110,48 @@ cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 The CLI demo will detect hardware capabilities, list available models, run FTS5
 search over the Foundation universe dataset, and — when a reranker model is
 available — demonstrate the FTS5 → rerank pipeline.
+
+### Interactive RAG chat (`cli_chat`)
+
+`cli_chat` is an interactive REPL that grounds every response in the knowledge
+graph.  It requires an LLM model in addition to the embedding and reranker.
+
+```bash
+# Pull an LLM (if you haven't already)
+lemonade-server pull GLM-4.7-Flash-GGUF
+
+# Start the chat demo
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_chat
+```
+
+**REPL commands:**
+
+| Command | Effect |
+|---|---|
+| `/quit` | Exit |
+| `/clear` | Reset conversation history |
+| `/context` | Toggle display of retrieved knowledge graph nodes |
+
+**Graceful degradation:**
+
+| Scenario | Behaviour |
+|---|---|
+| No Lemonade Server | Prints setup instructions and exits |
+| Lemonade running but no LLM model | Lists available models and exits |
+| LLM available but no embedding model | Chat works with FTS5-only search (noted on startup) |
+| Full stack (embedding + LLM + reranker) | Hybrid search → rerank → LLM response |
+
+**Config** — add a `[chat]` section to `defaults/demo_config.toml` to override defaults:
+
+```toml
+[chat]
+system_prompt = "You are a knowledgeable assistant..."
+max_history_turns = 10   # turn-pairs retained in context
+max_tokens = 1024
+temperature = 0.7
+alpha = 0.5              # 0.0 = FTS-only, 1.0 = semantic-only
+search_limit = 3         # knowledge graph nodes to retrieve per turn
+```
 
 ### Environment Variables
 
@@ -203,9 +246,11 @@ u-forge.ai/
 │   │   │   ├── lemonade/           # LemonadeModelRegistry, GpuResourceManager, all Lemonade providers
 │   │   │   ├── schema/             # Schema definition types, load/validate/cache, JSON ingestion
 │   │   │   ├── ingest/             # JSONL two-pass import pipeline
+│   │   │   ├── rag.rs              # RAG context formatting + message assembly
 │   │   │   └── search/             # Hybrid FTS5 + ANN + rerank search pipeline
 │   │   └── examples/
-│   │       └── cli_demo.rs         # Demo: hardware caps, FTS5, reranking
+│   │       ├── cli_demo.rs         # Demo: hardware caps, FTS5, reranking
+│   │       └── cli_chat.rs         # Interactive RAG chat REPL
 │   ├── u-forge-graph-view/ # Graph view model + layout (skeleton — see feature_UI.md)
 │   ├── u-forge-ui-traits/  # Framework-agnostic rendering contracts (skeleton — see feature_UI.md)
 │   ├── u-forge-ui-gpui/    # GPUI native app (skeleton — see feature_UI.md)

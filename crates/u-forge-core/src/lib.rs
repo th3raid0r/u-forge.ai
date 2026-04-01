@@ -25,6 +25,7 @@ pub mod hardware;
 pub mod ingest;
 pub mod lemonade;
 pub mod queue;
+pub mod rag;
 pub mod schema;
 pub mod search;
 pub(crate) mod text;
@@ -37,21 +38,22 @@ pub use ai::embeddings::{
     LemonadeProvider,
 };
 pub use builder::ObjectBuilder;
-pub use config::{AppConfig, EmbeddingDeviceConfig};
+pub use config::{AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, EmbeddingDeviceConfig};
 pub use graph::{
     GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
     HIGH_QUALITY_EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS,
 };
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
-    GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeModelEntry, LemonadeModelRegistry,
-    LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, ModelLoadOptions,
-    ModelRole, SttGuard, TranscriptionResult, load_model,
+    GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth, LemonadeModelEntry,
+    LemonadeModelRegistry, LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard,
+    LoadedModelEntry, ModelLoadOptions, ModelRole, SttGuard, TranscriptionResult, load_model,
 };
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
     SchemaIngestion, SchemaManager, SchemaStats,
 };
+pub use rag::{build_rag_messages, format_search_context, RagContext};
 pub use search::{
     search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
 };

@@ -3,9 +3,15 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use async_openai::{Client, config::OpenAIConfig};
+use async_openai::types::chat::{
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+};
 use serde::{Deserialize, Serialize};
 
-use super::client::LemonadeHttpClient;
+use super::client::make_lemonade_openai_client;
 use super::gpu_manager::GpuResourceManager;
 use super::registry::LemonadeModelRegistry;
 
@@ -78,6 +84,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     /// Overrides `LemonadeChatProvider::default_temperature`.
     pub temperature: Option<f32>,
+    /// Overrides the model id set on the provider (e.g. `"GLM-4.7-Flash-GGUF"`).
+    pub model: Option<String>,
 }
 
 impl ChatRequest {
@@ -86,6 +94,7 @@ impl ChatRequest {
             messages,
             max_tokens: None,
             temperature: None,
+            model: None,
         }
     }
 
@@ -98,7 +107,65 @@ impl ChatRequest {
         self.temperature = Some(t);
         self
     }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
 }
+
+// ── Internal conversion helpers ───────────────────────────────────────────────
+
+fn to_oa_message(msg: &ChatMessage) -> Result<ChatCompletionRequestMessage> {
+    match msg.role.as_str() {
+        "system" => Ok(ChatCompletionRequestSystemMessageArgs::default()
+            .content(msg.content.clone())
+            .build()
+            .context("Failed to build system message")?
+            .into()),
+        "user" => Ok(ChatCompletionRequestUserMessageArgs::default()
+            .content(msg.content.clone())
+            .build()
+            .context("Failed to build user message")?
+            .into()),
+        "assistant" => Ok(ChatCompletionRequestAssistantMessageArgs::default()
+            .content(msg.content.clone())
+            .build()
+            .context("Failed to build assistant message")?
+            .into()),
+        role => Err(anyhow!("Unknown chat role: {role}")),
+    }
+}
+
+fn from_oa_response(resp: CreateChatCompletionResponse) -> ChatCompletionResponse {
+    ChatCompletionResponse {
+        id: resp.id,
+        choices: resp
+            .choices
+            .into_iter()
+            .map(|c| ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: c.message.content.unwrap_or_default(),
+                },
+                finish_reason: c.finish_reason.map(|r| {
+                    // FinishReason serialises to its lowercase OpenAI name via serde.
+                    serde_json::to_value(&r)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| format!("{r:?}").to_lowercase())
+                }),
+            })
+            .collect(),
+        usage: resp.usage.map(|u| ChatUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+        }),
+    }
+}
+
+// ── LemonadeChatProvider ──────────────────────────────────────────────────────
 
 /// Chat / LLM via `GLM-4.7-Flash-GGUF` (or another configured GPU model).
 ///
@@ -106,7 +173,7 @@ impl ChatRequest {
 /// See [`GpuResourceManager`] for the full policy description.
 #[derive(Debug, Clone)]
 pub struct LemonadeChatProvider {
-    client: LemonadeHttpClient,
+    client: Client<OpenAIConfig>,
     /// The model id sent to the API (e.g. `"GLM-4.7-Flash-GGUF"`).
     pub model: String,
     /// Shared GPU resource manager — also held by [`LemonadeSttProvider`](super::LemonadeSttProvider).
@@ -124,14 +191,9 @@ pub struct LemonadeChatProvider {
 
 impl LemonadeChatProvider {
     /// Construct with an explicit base URL, model id, and optional GPU manager.
-    ///
-    /// Pass `Some(gpu)` for GPU-backed llamacpp models (ROCm / Vulkan) so that
-    /// the GPU lock is acquired before each inference request.
-    /// Pass `None` for NPU-backed FLM models — the NPU is dedicated silicon
-    /// with no shared resource contention.
     pub fn new(base_url: &str, model: &str, gpu: Option<Arc<GpuResourceManager>>) -> Self {
         Self {
-            client: LemonadeHttpClient::new(base_url),
+            client: make_lemonade_openai_client(base_url),
             model: model.to_string(),
             gpu,
             default_max_tokens: 2048,
@@ -140,18 +202,11 @@ impl LemonadeChatProvider {
     }
 
     /// Construct for NPU use — no GPU resource manager needed.
-    ///
-    /// FLM models run on the AMD NPU, which is physically separate from the
-    /// GPU.  No locking is required between NPU LLM and GPU STT/LLM requests.
     pub fn new_npu(base_url: &str, model: &str) -> Self {
         Self::new(base_url, model, None)
     }
 
     /// Construct using the GPU LLM model discovered in `registry`.
-    ///
-    /// Looks for [`ModelRole::GpuLlm`](super::ModelRole::GpuLlm) (llamacpp recipe) models only — FLM NPU
-    /// LLMs are excluded.  Use [`from_registry_npu`](Self::from_registry_npu)
-    /// for NPU LLMs.
     pub fn from_registry(
         registry: &LemonadeModelRegistry,
         gpu: Option<Arc<GpuResourceManager>>,
@@ -163,8 +218,6 @@ impl LemonadeChatProvider {
     }
 
     /// Construct using the NPU FLM LLM model discovered in `registry`.
-    ///
-    /// Looks for [`ModelRole::NpuLlm`](super::ModelRole::NpuLlm) models only.  No GPU resource manager needed.
     pub fn from_registry_npu(registry: &LemonadeModelRegistry) -> Result<Self> {
         let model = registry
             .npu_llm_model()
@@ -185,12 +238,7 @@ impl LemonadeChatProvider {
     }
 
     /// Send a full `ChatRequest`, queuing if the GPU is busy.
-    ///
-    /// This is the primary entry point when you need fine-grained control.
     pub async fn complete(&self, req: ChatRequest) -> Result<ChatCompletionResponse> {
-        // Acquire the GPU — suspends if STT or another LLM is active.
-        // For NPU-backed providers (`gpu` is `None`), skip the lock entirely —
-        // the NPU runs independently of the GPU with no shared resource.
         let _guard = if let Some(gpu) = &self.gpu {
             Some(gpu.begin_llm().await)
         } else {
@@ -200,31 +248,36 @@ impl LemonadeChatProvider {
         let start = std::time::Instant::now();
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
         let temperature = req.temperature.unwrap_or(self.default_temperature);
+        let model = req.model.as_deref().unwrap_or(&self.model);
 
-        let body = serde_json::json!({
-            "model":       self.model,
-            "messages":    req.messages,
-            "max_tokens":  max_tokens,
-            "temperature": temperature,
-            "stream":      false,
-        });
+        let messages: Result<Vec<_>> = req.messages.iter().map(to_oa_message).collect();
+        let messages = messages.context("Failed to convert chat messages")?;
 
-        let resp: ChatCompletionResponse = self
+        let oa_req = CreateChatCompletionRequestArgs::default()
+            .model(model)
+            .messages(messages)
+            .max_completion_tokens(max_tokens)
+            .temperature(temperature)
+            .build()
+            .context("Failed to build chat completion request")?;
+
+        let oa_resp = self
             .client
-            .post_json("/chat/completions", &body)
+            .chat()
+            .create(oa_req)
             .await
             .context("Chat HTTP request failed")?;
 
         tracing::debug!(
-            model         = %self.model,
+            model         = %model,
             n_messages    = req.messages.len(),
-            finish_reason = ?resp.choices.first().and_then(|c| c.finish_reason.as_deref()),
-            total_tokens  = ?resp.usage.as_ref().map(|u| u.total_tokens),
+            finish_reason = ?oa_resp.choices.first().and_then(|c| c.finish_reason.as_ref()),
+            total_tokens  = ?oa_resp.usage.as_ref().map(|u| u.total_tokens),
             duration_ms   = start.elapsed().as_millis(),
             "Chat completion finished"
         );
 
-        Ok(resp)
+        Ok(from_oa_response(oa_resp))
         // _guard dropped here → GPU released.
     }
 

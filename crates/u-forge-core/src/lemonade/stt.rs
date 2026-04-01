@@ -3,9 +3,12 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use async_openai::{Client, config::OpenAIConfig};
+use async_openai::types::{InputSource};
+use async_openai::types::audio::{AudioInput, CreateTranscriptionRequestArgs};
 use serde::{Deserialize, Serialize};
 
-use super::client::LemonadeHttpClient;
+use super::client::make_lemonade_openai_client;
 use super::gpu_manager::GpuResourceManager;
 use super::registry::LemonadeModelRegistry;
 
@@ -23,7 +26,7 @@ pub struct TranscriptionResult {
 /// if LLM inference is currently active — STT must never queue behind slow inference.
 #[derive(Debug, Clone)]
 pub struct LemonadeSttProvider {
-    client: LemonadeHttpClient,
+    client: Client<OpenAIConfig>,
     /// The model id sent to the API (e.g. `"Whisper-Large-v3-Turbo"`).
     pub model: String,
     /// Shared GPU resource manager — also held by [`LemonadeChatProvider`](super::LemonadeChatProvider).
@@ -34,7 +37,7 @@ impl LemonadeSttProvider {
     /// Construct with an explicit base URL, model id, and GPU manager.
     pub fn new(base_url: &str, model: &str, gpu: Arc<GpuResourceManager>) -> Self {
         Self {
-            client: LemonadeHttpClient::new(base_url),
+            client: make_lemonade_openai_client(base_url),
             model: model.to_string(),
             gpu,
         }
@@ -69,29 +72,43 @@ impl LemonadeSttProvider {
 
         let start = std::time::Instant::now();
 
-        let audio_part = reqwest::multipart::Part::bytes(audio_data)
-            .file_name(filename.to_string())
-            .mime_str("audio/wav")
-            .context("Failed to set audio MIME type")?;
+        let audio_input = AudioInput {
+            source: InputSource::VecU8 {
+                filename: filename.to_string(),
+                vec: audio_data,
+            },
+        };
 
-        let form = reqwest::multipart::Form::new()
-            .text("model", self.model.clone())
-            .part("file", audio_part);
+        let req = CreateTranscriptionRequestArgs::default()
+            .model(&self.model)
+            .file(audio_input)
+            .build()
+            .context("Failed to build transcription request")?;
 
-        let result: TranscriptionResult = self
+        // Use create_raw() because Lemonade's transcription response omits the
+        // `usage` field that async-openai's typed `CreateTranscriptionResponseJson`
+        // requires.  We parse only the `text` field we actually need.
+        let raw = self
             .client
-            .post_multipart("/audio/transcriptions", form)
+            .audio()
+            .transcription()
+            .create_raw(req)
             .await
             .context("STT HTTP request failed")?;
 
+        let text = serde_json::from_slice::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v["text"].as_str().map(str::to_string))
+            .ok_or_else(|| anyhow::anyhow!("STT response missing 'text' field"))?;
+
         tracing::debug!(
             model        = %self.model,
-            text_len     = result.text.len(),
+            text_len     = text.len(),
             duration_ms  = start.elapsed().as_millis(),
             "STT transcription complete"
         );
 
-        Ok(result)
+        Ok(TranscriptionResult { text })
         // _guard is dropped here → GPU released, queued LLM requests are woken.
     }
 }

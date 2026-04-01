@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use super::client::LemonadeHttpClient;
+use super::load::{load_model, ModelLoadOptions};
 use super::registry::LemonadeModelRegistry;
 
 /// A single ranked document returned by [`LemonadeRerankProvider::rerank`].
@@ -46,6 +47,20 @@ impl LemonadeRerankProvider {
             .reranker_model()
             .ok_or_else(|| anyhow!("No reranker model found in the Lemonade registry"))?;
         Ok(Self::new(&registry.base_url, &model.id))
+    }
+
+    /// Explicitly load this model via `POST /api/v1/load` with the given options.
+    ///
+    /// Call this before the first [`rerank`](Self::rerank) to override server
+    /// defaults — in particular `ctx_size` and batch sizes.  Without an
+    /// explicit load the server may use a very small default context window
+    /// (e.g. 512 tokens) that causes truncation on longer document passages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server is unreachable or rejects the load request.
+    pub async fn load(&self, opts: &ModelLoadOptions) -> Result<()> {
+        load_model(&self.client.base_url, &self.model, opts).await
     }
 
     /// Rerank `documents` by relevance to `query`.
