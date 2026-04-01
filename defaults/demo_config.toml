@@ -22,8 +22,8 @@ query = "Who is the leader of the Foundation?"
 semantic_limit = 6
 
 [hybrid]
-queries = ["Who is the leader of the Foundation?"]
-alpha_sweep_query = "Who is the leader of the Foundation?"
+queries = ["Mayor"]
+alpha_sweep_query = "Mayor"
 alpha_sweep_values = [0.0, 0.5, 1.0]
 
 [hybrid.config]
