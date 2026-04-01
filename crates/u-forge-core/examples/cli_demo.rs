@@ -221,16 +221,18 @@ async fn main() -> Result<()> {
         });
 
     let demo_cfg: DemoConfig = match config_path {
-        None => DemoConfig::default(),
+        None => {
+            eprintln!("❌ No demo config file found.");
+            eprintln!("   Pass --config <path>, set UFORGE_DEMO_CONFIG, or place");
+            eprintln!("   defaults/demo_config.toml relative to the project root.");
+            return Err(anyhow::anyhow!("Demo config file required but not found"));
+        }
         Some(ref path) => match load_demo_config(path) {
             Ok(c) => {
                 println!("   Config    : {path} (loaded)");
                 c
             }
-            Err(e) => {
-                eprintln!("   ⚠️  Config  : {e} — using built-in defaults");
-                DemoConfig::default()
-            }
+            Err(e) => return Err(e),
         },
     };
 
@@ -876,26 +878,18 @@ async fn main() -> Result<()> {
     println!("🔎 Full-text search demos (SQLite FTS5)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let default_fts_queries: &[(&str, usize)] = &[
-        ("empire", 3),
-        ("foundation", 3),
-        ("terminus", 3),
-        ("psychohistory", 3),
-        ("robot", 3),
-        ("galaxy", 3),
-    ];
-
     let fts_queries: Vec<(String, usize)> = match &demo_cfg.fts {
         Some(cfg) => cfg
             .queries
             .iter()
             .map(|q| (q.query.clone(), q.limit))
             .collect(),
-        None => default_fts_queries
-            .iter()
-            .map(|(q, l)| (q.to_string(), *l))
-            .collect(),
+        None => Vec::new(),
     };
+
+    if fts_queries.is_empty() {
+        println!("ℹ️  FTS search demo skipped — add an [fts] section with queries to your config file.\n");
+    }
 
     for (query, limit) in &fts_queries {
         println!("  Query: \"{query}\"");
@@ -927,24 +921,18 @@ async fn main() -> Result<()> {
         println!("   Strategy: embed the query with the same model used to index");
         println!("   chunks, then find nearest neighbours by cosine distance.\n");
 
-        let default_semantic: &[(&str, usize)] = &[
-            ("mathematical prediction of human behaviour", 3),
-            ("the collapse of a great interstellar civilization", 3),
-            ("a planet on the periphery of known space", 3),
-            ("a brilliant scientist and planner", 3),
-        ];
-
         let semantic_queries: Vec<(String, usize)> = match &demo_cfg.semantic {
             Some(cfg) => cfg
                 .queries
                 .iter()
                 .map(|q| (q.query.clone(), q.limit))
                 .collect(),
-            None => default_semantic
-                .iter()
-                .map(|(q, l)| (q.to_string(), *l))
-                .collect(),
+            None => Vec::new(),
         };
+
+        if semantic_queries.is_empty() {
+            println!("ℹ️  Semantic search demo skipped — add a [semantic] section with queries to your config file.\n");
+        }
 
         for (query, limit) in &semantic_queries {
             println!("  Query: \"{query}\"");
@@ -987,24 +975,18 @@ async fn main() -> Result<()> {
         println!("🔭 HQ Semantic search demos ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim ANN)");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-        let default_semantic: &[(&str, usize)] = &[
-            ("mathematical prediction of human behaviour", 3),
-            ("the collapse of a great interstellar civilization", 3),
-            ("a planet on the periphery of known space", 3),
-            ("a brilliant scientist and planner", 3),
-        ];
-
         let semantic_queries: Vec<(String, usize)> = match &demo_cfg.semantic {
             Some(cfg) => cfg
                 .queries
                 .iter()
                 .map(|q| (q.query.clone(), q.limit))
                 .collect(),
-            None => default_semantic
-                .iter()
-                .map(|(q, l)| (q.to_string(), *l))
-                .collect(),
+            None => Vec::new(),
         };
+
+        if semantic_queries.is_empty() {
+            println!("ℹ️  HQ semantic search demo skipped — add a [semantic] section with queries to your config file.\n");
+        }
 
         for (query, limit) in &semantic_queries {
             println!("  Query: \"{query}\"");
@@ -1046,23 +1028,18 @@ async fn main() -> Result<()> {
         println!("   candidate chunks, then ask the reranker to re-order them by");
         println!("   relevance to the original query.\n");
 
-        let default_rerank: &[(&str, usize)] = &[
-            ("Who founded the Foundation?", 6),
-            ("mathematics and prediction of civilisation", 5),
-            ("Galactic Empire collapse", 6),
-        ];
-
         let rerank_queries: Vec<(String, usize)> = match &demo_cfg.rerank {
             Some(cfg) => cfg
                 .queries
                 .iter()
                 .map(|q| (q.query.clone(), q.semantic_limit))
                 .collect(),
-            None => default_rerank
-                .iter()
-                .map(|(q, l)| (q.to_string(), *l))
-                .collect(),
+            None => Vec::new(),
         };
+
+        if rerank_queries.is_empty() {
+            println!("ℹ️  Rerank demo skipped — add a [rerank] section with queries to your config file.\n");
+        }
 
         for (query, semantic_limit) in &rerank_queries {
             println!("  Query: \"{query}\"");
@@ -1196,20 +1173,14 @@ async fn main() -> Result<()> {
             config.alpha, config.fts_limit, config.semantic_limit, config.rerank, config.limit,
         );
 
-        let default_hybrid_queries: &[&str] = &[
-            "Who founded the Foundation and why?",
-            "What happened to the Galactic Empire?",
-            "psychohistory and mathematical prediction",
-            "robotic civilizations and machine intelligence",
-        ];
-
         let hybrid_queries: Vec<String> = match &demo_cfg.hybrid {
             Some(h) if !h.queries.is_empty() => h.queries.clone(),
-            _ => default_hybrid_queries
-                .iter()
-                .map(|q| q.to_string())
-                .collect(),
+            _ => Vec::new(),
         };
+
+        if hybrid_queries.is_empty() {
+            println!("ℹ️  Hybrid search demo skipped — add a [hybrid] section with queries to your config file.\n");
+        }
 
         for query in &hybrid_queries {
             println!("  Query: \"{query}\"");
@@ -1246,9 +1217,9 @@ async fn main() -> Result<()> {
         let sweep_query = demo_cfg
             .hybrid
             .as_ref()
-            .and_then(|h| h.alpha_sweep_query.as_deref())
-            .unwrap_or("the collapse of an interstellar civilization");
+            .and_then(|h| h.alpha_sweep_query.as_deref());
 
+        if let Some(sweep_query) = sweep_query {
         let default_sweep_alphas = [0.0f32, 0.5, 1.0];
         let sweep_alphas: &[f32] = demo_cfg
             .hybrid
@@ -1285,6 +1256,7 @@ async fn main() -> Result<()> {
             }
         }
         println!();
+        } // end if let Some(sweep_query)
     } else if lemonade_url.is_some() {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("🔀 Hybrid search demo skipped — no compatible {EMBEDDING_DIMENSIONS}-dim embedding model available.\n");
