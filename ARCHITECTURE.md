@@ -426,7 +426,7 @@ arrives between the check and the sleep. Embedding workers also manage an atomic
 same Lemonade Server concurrently, causing intermittent GPU/NPU resource contention
 on the server side. Always run the full test suite with `--test-threads=1`.
 `dev.sh` sets this unconditionally. Integration tests auto-discover a running server
-on `localhost:8000` via `GET /api/v1/health` — no `LEMONADE_URL` env var required.
+on `localhost:13305` via `GET /api/v1/health` — no `LEMONADE_URL` env var required.
 
 ---
 
@@ -476,8 +476,8 @@ Holds a single `Arc<dyn EmbeddingProvider>`. `try_new_auto()` constructs a
 
 1. Explicit `lemonade_url` argument (if provided)
 2. `LEMONADE_URL` environment variable
-3. Localhost probe — `resolve_lemonade_url()` tries `http://localhost:8000` then
-   `http://127.0.0.1:8000` via `GET /api/v1/health` (2 s timeout)
+3. Localhost probe — `resolve_lemonade_url()` tries `http://localhost:13305` then
+   `http://127.0.0.1:13305` via `GET /api/v1/health` (2 s timeout)
 4. Hard error — no server could be found
 
 Defaults to model `embed-gemma-300m-FLM` when no model is specified.
@@ -536,7 +536,7 @@ let mgr = TranscriptionManager::try_new_auto(None, None)?;
 
 // Explicit
 let mgr = TranscriptionManager::new_lemonade(
-    "http://localhost:8000/api/v1",
+    "http://localhost:13305/api/v1",
     "whisper-v3-turbo-FLM",
 );
 
@@ -676,7 +676,7 @@ One-call builder that fetches the registry and wires all three providers to a
 single shared `Arc<GpuResourceManager>`:
 
 ```rust
-let stack = LemonadeStack::build("http://127.0.0.1:8000/api/v1").await?;
+let stack = LemonadeStack::build("http://127.0.0.1:13305/api/v1").await?;
 let audio  = stack.tts.synthesize_default("Roll for initiative.").await?;
 let answer = stack.chat.ask("Describe a dragon.").await?;
 ```
@@ -807,6 +807,22 @@ before failing, allowing edges to reference nodes from prior import sessions.
 - **Tests everywhere** — unit tests in every module using `TempDir` for isolation.
 
 ## Design Decisions — Questionable / Still Open
+
+- **`chat.rs` must use hand-crafted HTTP, not `async-openai`** — Lemonade Server's
+  chat endpoint deviates from the OpenAI spec at the thinking/reasoning parameter.
+  OpenAI uses a `reasoning` object (or `reasoning_effort` string); Lemonade uses a
+  flat `enable_thinking: bool` field at the request body root.  `async-openai`'s
+  typed `CreateChatCompletionRequest` has no way to inject this field, so the crate
+  cannot be used to drive the chat endpoint when thinking must be controlled.
+  The other Lemonade endpoints (embeddings, TTS, STT) remain genuinely OpenAI-compatible
+  and continue to use `async-openai` via `make_lemonade_openai_client`.
+  Files that must change when `chat.rs` is migrated to direct `reqwest` calls:
+  `src/lemonade/chat.rs` (replace `Client<OpenAIConfig>` + builder API with a
+  `LemonadeHttpClient` + hand-rolled request/response structs, swap
+  `ReasoningEffort` for `enable_thinking: Option<bool>`),
+  `src/lemonade/mod.rs` (drop the `ChatReasoningEffort` re-export).
+  `Cargo.toml` retains the `async-openai` dependency for the remaining three
+  endpoints.
 
 - **`embedding_manager` not in `KnowledgeGraph`** — embedding is now a caller
   concern. This simplifies the core struct but means callers must manage the

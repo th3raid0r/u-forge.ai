@@ -88,7 +88,7 @@ AMD NPU.  For CPU/GPU embedding — needed for hybrid search on all other
 hardware — you must manually add `embeddinggemma-300M-GGUF` via the
 **Lemonade UI**:
 
-1. Open the Lemonade Server UI (default: `http://localhost:8000`)
+1. Open the Lemonade Server UI (default: `http://localhost:13305`)
 2. Navigate to **Models** and click **Add Custom Model**
 3. Enter the HuggingFace checkpoint: `ggml-org/embeddinggemma-300M-GGUF:Q8_0`
 4. Select the **llamacpp** recipe and add the **embeddings** label
@@ -100,9 +100,9 @@ produce vectors in the same embedding space.  Using a different embedding model
 results.
 
 ```bash
-# u-forge.ai auto-discovers Lemonade on localhost:8000
+# u-forge.ai auto-discovers Lemonade on localhost:13305
 # Set LEMONADE_URL only to override (e.g. non-standard port):
-export LEMONADE_URL="http://localhost:8000/api/v1"
+export LEMONADE_URL="http://localhost:13305/api/v1"
 
 cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 ```

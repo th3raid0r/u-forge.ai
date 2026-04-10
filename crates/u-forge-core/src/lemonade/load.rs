@@ -15,7 +15,7 @@
 //!     ctx_size: Some(4096),
 //!     ..Default::default()
 //! };
-//! load_model("http://localhost:8000/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF", &opts).await?;
+//! load_model("http://localhost:13305/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF", &opts).await?;
 //! # Ok(()) }
 //! ```
 
@@ -36,25 +36,41 @@ fn is_flm_model(model_name: &str) -> bool {
 
 /// Build the effective `llamacpp_args` string for a non-FLM model.
 ///
-/// If `ctx_size` is set and `--ubatch-size` is not already present in
-/// `opts.llamacpp_args`, appends `--ubatch-size {ctx_size}` so the
-/// micro-batch is kept in sync with the context window.  This prevents
-/// llamacpp from rejecting prompts that fill the full context.
+/// Injects `--ubatch-size` and `--batch-size` when they are not already
+/// present in `opts.llamacpp_args`:
+///
+/// - `--ubatch-size`: uses `opts.ubatch_size` when set, otherwise falls back
+///   to `opts.ctx_size` (the legacy behaviour that keeps micro-batch in sync
+///   with the context window).
+/// - `--batch-size`: injected only when `opts.batch_size` is set.
 fn build_llamacpp_args(opts: &ModelLoadOptions) -> Option<String> {
     let base = opts.llamacpp_args.as_deref().unwrap_or("");
+    let mut injections: Vec<String> = Vec::new();
 
-    if let Some(ctx) = opts.ctx_size {
-        if !base.contains("--ubatch-size") {
-            let extra = format!("--ubatch-size {ctx}");
-            return Some(if base.is_empty() {
-                extra
-            } else {
-                format!("{base} {extra}")
-            });
+    if !base.contains("--ubatch-size") {
+        if let Some(ubatch) = opts.ubatch_size {
+            injections.push(format!("--ubatch-size {ubatch}"));
+        } else if let Some(ctx) = opts.ctx_size {
+            injections.push(format!("--ubatch-size {ctx}"));
         }
     }
 
-    opts.llamacpp_args.clone()
+    if !base.contains("--batch-size") {
+        if let Some(batch) = opts.batch_size {
+            injections.push(format!("--batch-size {batch}"));
+        }
+    }
+
+    if injections.is_empty() {
+        return opts.llamacpp_args.clone();
+    }
+
+    let extra = injections.join(" ");
+    Some(if base.is_empty() {
+        extra
+    } else {
+        format!("{base} {extra}")
+    })
 }
 
 // ── ModelLoadOptions ──────────────────────────────────────────────────────────
@@ -65,6 +81,9 @@ fn build_llamacpp_args(opts: &ModelLoadOptions) -> Option<String> {
 /// the server uses its built-in defaults.  The mandatory `model_name` field is
 /// passed separately to [`load_model`].
 ///
+/// Prefer building this from [`ModelConfig::load_options_for`](crate::config::ModelConfig::load_options_for)
+/// so that per-model settings come from `u-forge.toml`.
+///
 /// See the [Lemonade Server API docs](https://github.com/lemonade-sdk/lemonade)
 /// for the full parameter reference.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -73,10 +92,24 @@ pub struct ModelLoadOptions {
     ///
     /// Applies to `llamacpp`, `flm`, and `ryzenai-llm` recipes.  Overrides
     /// the server default, which is often 512 or 2 K for embedding models.
-    /// Use [`DEFAULT_EMBEDDING_CONTEXT_TOKENS`](crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS)
-    /// as a sensible starting value for embedding workloads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctx_size: Option<usize>,
+
+    /// Batch size for prompt processing (`--batch-size`).
+    ///
+    /// Applies only to `llamacpp` recipes.  When `None` the server uses its
+    /// built-in default.  Injected into [`llamacpp_args`](Self::llamacpp_args)
+    /// automatically by [`build_llamacpp_args`] unless already present.
+    #[serde(skip)]
+    pub batch_size: Option<usize>,
+
+    /// Micro-batch (physical batch) size (`--ubatch-size`).
+    ///
+    /// Applies only to `llamacpp` recipes.  When `None` and [`ctx_size`](Self::ctx_size)
+    /// is set, `--ubatch-size` is auto-injected to match `ctx_size`.  Set this
+    /// explicitly to override that behaviour.
+    #[serde(skip)]
+    pub ubatch_size: Option<usize>,
 
     /// LlamaCpp backend to use: `"vulkan"`, `"rocm"`, `"metal"`, or `"cpu"`.
     ///
@@ -87,13 +120,14 @@ pub struct ModelLoadOptions {
 
     /// Extra arguments forwarded verbatim to `llama-server`.
     ///
-    /// Useful for batch / micro-batch tuning, e.g.
-    /// `"--batch-size 512 --ubatch-size 512"`.
+    /// Useful for flags not covered by the typed fields above.  Note that
+    /// `--batch-size` and `--ubatch-size` are injected automatically from
+    /// [`batch_size`](Self::batch_size) / [`ubatch_size`](Self::ubatch_size) /
+    /// [`ctx_size`](Self::ctx_size) — set those fields instead.
     ///
     /// The following flags are **not** allowed here (the server rejects them):
     /// `-m`, `--port`, `--ctx-size`, `-ngl`, `--jinja`, `--mmproj`,
-    /// `--embeddings`, `--reranking`.  Use [`ctx_size`](Self::ctx_size) instead
-    /// of `--ctx-size`.
+    /// `--embeddings`, `--reranking`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llamacpp_args: Option<String>,
 }
@@ -230,9 +264,49 @@ mod tests {
     }
 
     #[test]
+    fn test_build_llamacpp_args_explicit_ubatch_overrides_ctx() {
+        let opts = ModelLoadOptions {
+            ctx_size: Some(4096),
+            ubatch_size: Some(256),
+            ..Default::default()
+        };
+        let args = build_llamacpp_args(&opts).unwrap();
+        // explicit ubatch_size wins over ctx_size auto-injection
+        assert_eq!(args, "--ubatch-size 256");
+        assert_eq!(args.matches("--ubatch-size").count(), 1);
+    }
+
+    #[test]
+    fn test_build_llamacpp_args_injects_batch_size() {
+        let opts = ModelLoadOptions {
+            ctx_size: Some(8192),
+            batch_size: Some(512),
+            ..Default::default()
+        };
+        let args = build_llamacpp_args(&opts).unwrap();
+        assert!(args.contains("--ubatch-size 8192"), "ubatch not found: {args}");
+        assert!(args.contains("--batch-size 512"), "batch not found: {args}");
+    }
+
+    #[test]
+    fn test_build_llamacpp_args_no_duplicate_batch() {
+        let opts = ModelLoadOptions {
+            batch_size: Some(512),
+            llamacpp_args: Some("--batch-size 256".to_string()),
+            ..Default::default()
+        };
+        let args = build_llamacpp_args(&opts).unwrap();
+        // Already present in base args — must not be added again
+        assert_eq!(args, "--batch-size 256");
+        assert_eq!(args.matches("--batch-size").count(), 1);
+    }
+
+    #[test]
     fn test_model_load_options_default_is_all_none() {
         let opts = ModelLoadOptions::default();
         assert!(opts.ctx_size.is_none());
+        assert!(opts.batch_size.is_none());
+        assert!(opts.ubatch_size.is_none());
         assert!(opts.llamacpp_backend.is_none());
         assert!(opts.llamacpp_args.is_none());
     }
@@ -268,6 +342,7 @@ mod tests {
             ctx_size: Some(8192),
             llamacpp_backend: Some("rocm".to_string()),
             llamacpp_args: Some("--batch-size 512 --ubatch-size 256".to_string()),
+            ..Default::default()
         };
         let body = LoadRequest {
             model_name: "nomic-embed-text-v2-moe-GGUF",

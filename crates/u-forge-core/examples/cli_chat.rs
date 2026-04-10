@@ -10,7 +10,7 @@
 //!   cargo run --example cli_chat [DATA_FILE] [SCHEMA_DIR] --config <CONFIG_FILE>
 //!
 //! Environment:
-//!   LEMONADE_URL         Lemonade Server base URL (e.g. http://localhost:8000/api/v1)
+//!   LEMONADE_URL         Lemonade Server base URL (e.g. http://localhost:13305/api/v1)
 //!   UFORGE_DATA_FILE     override DATA_FILE
 //!   UFORGE_SCHEMA_DIR    override SCHEMA_DIR
 //!   UFORGE_DEMO_CONFIG   path to demo config TOML file (for database overrides)
@@ -20,26 +20,29 @@
 //! See `AppConfig` / `ChatConfig` for the full list of knobs.
 //!
 //! REPL commands:
-//!   /quit    — exit
-//!   /clear   — reset conversation history
-//!   /context — toggle showing retrieved knowledge graph context
+//!   /quit     — exit
+//!   /clear    — reset conversation history
+//!   /context  — toggle showing retrieved knowledge graph context
+//!   /thinking — cycle reasoning effort: off → low → medium → high → off
 
 use anyhow::Result;
 use std::env;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use u_forge_core::{
+    ai::embeddings::LemonadeProvider,
     config::AppConfig,
     hardware::{gpu::GpuDevice, npu::NpuDevice},
     ingest::DataIngestion,
     lemonade::{
         load_model, resolve_lemonade_url, GpuResourceManager, LemonadeHealth,
-        LemonadeModelRegistry, LemonadeRerankProvider, ModelLoadOptions,
+        LemonadeModelRegistry, LemonadeRerankProvider,
     },
-    queue::InferenceQueueBuilder,
+    queue::{InferenceQueue, InferenceQueueBuilder},
     rag::{build_rag_messages, format_search_context},
     search::{search_hybrid, HybridSearchConfig},
-    ChatDevice, ChatRequest, ChunkType, KnowledgeGraph, SchemaIngestion,
+    ChatDevice, ChatRequest, ChunkType, EmbeddingProvider, KnowledgeGraph,
+    SchemaIngestion, StreamToken, HIGH_QUALITY_EMBEDDING_DIMENSIONS,
 };
 
 // ── Demo config (database overrides only) ────────────────────────────────────
@@ -90,9 +93,7 @@ async fn main() -> Result<()> {
         .get(2)
         .cloned()
         .or_else(|| env::var("UFORGE_SCHEMA_DIR").ok())
-        .unwrap_or_else(|| {
-            format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR"))
-        });
+        .unwrap_or_else(|| format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR")));
 
     let default_config_path = format!(
         "{}/../../defaults/demo_config.toml",
@@ -168,9 +169,15 @@ async fn main() -> Result<()> {
     // Desired LLM models — from config or hardcoded defaults.
     const DEFAULT_GPU_LLM: &str = "Qwen3.5-9B-GGUF";
     const DEFAULT_NPU_LLM: &str = "qwen3.5-9b-FLM";
-    let desired_gpu_llm: String = chat_cfg.gpu.model.clone()
+    let desired_gpu_llm: String = chat_cfg
+        .gpu
+        .model
+        .clone()
         .unwrap_or_else(|| DEFAULT_GPU_LLM.to_string());
-    let desired_npu_llm: String = chat_cfg.npu.model.clone()
+    let desired_npu_llm: String = chat_cfg
+        .npu
+        .model
+        .clone()
         .unwrap_or_else(|| DEFAULT_NPU_LLM.to_string());
 
     // Fetch health to see which models are actually running in memory right now.
@@ -181,7 +188,13 @@ async fn main() -> Result<()> {
     if !health.is_model_loaded(&desired_gpu_llm) {
         print!("   Loading   : {desired_gpu_llm}…");
         std::io::stdout().flush()?;
-        match load_model(url, &desired_gpu_llm, &ModelLoadOptions::default()).await {
+        match load_model(
+            url,
+            &desired_gpu_llm,
+            &app_cfg.models.load_options_for(&desired_gpu_llm),
+        )
+        .await
+        {
             Ok(()) => println!(" ✅"),
             Err(e) => println!(" ⚠️  {e}"),
         }
@@ -196,7 +209,13 @@ async fn main() -> Result<()> {
         if !health.is_model_loaded(&desired_npu_llm) {
             print!("   Loading   : {desired_npu_llm}…");
             std::io::stdout().flush()?;
-            match load_model(url, &desired_npu_llm, &ModelLoadOptions::default()).await {
+            match load_model(
+                url,
+                &desired_npu_llm,
+                &app_cfg.models.load_options_for(&desired_npu_llm),
+            )
+            .await
+            {
                 Ok(()) => println!(" ✅"),
                 Err(e) => println!(" ⚠️  {e}"),
             }
@@ -208,9 +227,9 @@ async fn main() -> Result<()> {
         "   Active device: {}",
         match chat_cfg.preferred_device {
             ChatDevice::Auto => "auto (→ gpu)",
-            ChatDevice::Gpu  => "gpu",
-            ChatDevice::Npu  => "npu",
-            ChatDevice::Cpu  => "cpu",
+            ChatDevice::Gpu => "gpu",
+            ChatDevice::Npu => "npu",
+            ChatDevice::Cpu => "cpu",
         }
     );
 
@@ -221,14 +240,11 @@ async fn main() -> Result<()> {
     let mut embedding_available = false;
 
     // NPU device: embedding + optional LLM (FLM models).
-    match NpuDevice::from_registry(&registry).await {
+    match NpuDevice::from_registry_with_config(&registry, &app_cfg.models).await {
         Ok(npu) => {
             let has_llm = npu.chat.is_some();
             let has_embed = npu.has_embedding();
-            println!(
-                "   NPU device: embed={} llm={}",
-                has_embed, has_llm
-            );
+            println!("   NPU device: embed={} llm={}", has_embed, has_llm);
             if has_embed {
                 embedding_available = true;
             }
@@ -240,13 +256,11 @@ async fn main() -> Result<()> {
     }
 
     // GPU device: STT + LLM + optional embedding (llamacpp models).
-    let gpu_device = GpuDevice::from_registry(&registry, Arc::clone(&gpu)).await;
+    let gpu_device =
+        GpuDevice::from_registry_with_config(&registry, Arc::clone(&gpu), &app_cfg.models).await;
     let has_gpu_llm = gpu_device.chat.is_some();
     let has_gpu_embed = gpu_device.embedding.is_some();
-    println!(
-        "   GPU device: embed={} llm={}",
-        has_gpu_embed, has_gpu_llm
-    );
+    println!("   GPU device: embed={} llm={}", has_gpu_embed, has_gpu_llm);
     if has_gpu_embed {
         embedding_available = true;
     }
@@ -255,10 +269,7 @@ async fn main() -> Result<()> {
     // Reranker (optional — improves result quality when available).
     match LemonadeRerankProvider::from_registry(&registry) {
         Ok(r) => {
-            let load_opts = ModelLoadOptions {
-                ctx_size: Some(u_forge_core::DEFAULT_EMBEDDING_CONTEXT_TOKENS),
-                ..Default::default()
-            };
+            let load_opts = app_cfg.models.load_options_for(&r.model);
             if let Err(e) = r.load(&load_opts).await {
                 eprintln!("   Reranker  : load failed ({e}), continuing without explicit ctx");
             }
@@ -271,6 +282,38 @@ async fn main() -> Result<()> {
     }
 
     let queue = builder.build();
+
+    // High-quality embedding queue (optional — only when hq embedding is enabled in config).
+    let mut hq_embed_queue: Option<InferenceQueue> = None;
+    if app_cfg.embedding.high_quality_embedding {
+        if let Some(hq_model) = registry.hq_embedding_model(true) {
+            let hq_model_id = hq_model.id.clone();
+            let hq_load_opts = app_cfg.models.load_options_for(&hq_model_id);
+            print!("   HQ embed  : loading {hq_model_id}…");
+            std::io::stdout().flush()?;
+            match LemonadeProvider::new_with_load(url, &hq_model_id, &hq_load_opts).await {
+                Err(e) => println!(" ⚠️  {e}"),
+                Ok(provider) => {
+                    let dims = provider.dimensions().unwrap_or(0);
+                    if dims != HIGH_QUALITY_EMBEDDING_DIMENSIONS {
+                        println!(" ⚠️  {dims}-dim ≠ {HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim, skipped");
+                    } else {
+                        println!(" ✅ ({dims}-dim)");
+                        hq_embed_queue = Some(
+                            InferenceQueueBuilder::new()
+                                .with_config(app_cfg.clone())
+                                .with_embedding_provider_weighted(
+                                    Arc::new(provider),
+                                    format!("hq({hq_model_id})"),
+                                    app_cfg.embedding.gpu_weight,
+                                )
+                                .build(),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     if !queue.has_text_generation() {
         eprintln!();
@@ -320,11 +363,8 @@ async fn main() -> Result<()> {
     } else {
         // Load schemas.
         println!("   Loading schemas from {schema_dir}…");
-        match SchemaIngestion::load_schemas_from_directory(
-            &schema_dir,
-            "imported_schemas",
-            "1.0.0",
-        ) {
+        match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0")
+        {
             Ok(schema_def) => {
                 let mgr = graph.get_schema_manager();
                 match mgr.save_schema(&schema_def).await {
@@ -365,11 +405,18 @@ async fn main() -> Result<()> {
                 .filter_map(|e| {
                     let from_name = id_to_name.get(&e.from)?;
                     let to_name = id_to_name.get(&e.to)?;
-                    Some(format!("{} {} {}", from_name, e.edge_type.as_str(), to_name))
+                    Some(format!(
+                        "{} {} {}",
+                        from_name,
+                        e.edge_type.as_str(),
+                        to_name
+                    ))
                 })
                 .collect();
             let text = obj.flatten_for_embedding(&edge_lines);
-            indexed += graph.add_text_chunk(obj.id, text, ChunkType::Imported)?.len();
+            indexed += graph
+                .add_text_chunk(obj.id, text, ChunkType::Imported)?
+                .len();
         }
         println!("   ✅ {indexed} text chunks indexed\n");
     }
@@ -422,19 +469,28 @@ async fn main() -> Result<()> {
         semantic_limit: chat_cfg.search_limit * 4,
         rerank: queue.has_reranking(),
         limit: chat_cfg.search_limit,
+        hq_semantic_boost: chat_cfg.hq_semantic_boost,
     };
+
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("hybrid search config: {:?}", search_config);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let gs = graph.get_stats()?;
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("💬 Chat ({} nodes, {} chunks indexed)", gs.node_count, gs.chunk_count);
+    println!(
+        "💬 Chat ({} nodes, {} chunks indexed)",
+        gs.node_count, gs.chunk_count
+    );
     if !queue.has_embedding() {
         println!("   ⚠️  FTS-only search (no embedding model)");
     }
-    println!("   Commands: /quit  /clear  /context");
+    println!("   Commands: /quit  /clear  /context  /thinking");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     let mut history: Vec<u_forge_core::ChatMessage> = Vec::new();
     let mut show_context = false;
+    let mut thinking_effort: Option<bool> = None;
     let stdin = std::io::stdin();
 
     loop {
@@ -480,11 +536,22 @@ async fn main() -> Result<()> {
                 );
                 continue;
             }
+            "/thinking" => {
+                thinking_effort = match thinking_effort {
+                    None => Some(true),
+                    Some(_) => None,
+                };
+                println!(
+                    "   Thinking: {}\n",
+                    if thinking_effort == Some(true) { "on" } else { "off" }
+                );
+                continue;
+            }
             _ => {}
         }
 
         // Retrieve relevant context from the knowledge graph.
-        let results = search_hybrid(&graph, &queue, None, &input, &search_config).await?;
+        let results = search_hybrid(&graph, &queue, hq_embed_queue.as_ref(), &input, &search_config).await?;
         let ctx = format_search_context(&results);
 
         if show_context {
@@ -520,26 +587,63 @@ async fn main() -> Result<()> {
         if let Some(temperature) = device_cfg.temperature {
             request = request.with_temperature(temperature);
         }
+        if thinking_effort == Some(true) {
+            request = request.with_thinking(true);
+        }
 
         print!("Assistant: ");
         std::io::stdout().flush()?;
 
-        match queue.generate(request).await {
+        let mut rx = match queue.generate_stream(request) {
             Err(e) => {
-                eprintln!("❌ Generation failed: {e}");
+                eprintln!("❌ Stream init failed: {e}");
                 continue;
             }
-            Ok(resp) => {
-                let reply = resp
-                    .first_content()
-                    .unwrap_or("[empty response]")
-                    .to_string();
-                println!("{}\n", reply);
+            Ok(rx) => rx,
+        };
 
-                // Append to history for next turn.
-                history.push(u_forge_core::ChatMessage::user(&input));
-                history.push(u_forge_core::ChatMessage::assistant(&reply));
+        let mut reply = String::new();
+        let mut stream_err = false;
+        let mut in_thinking = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                Ok(StreamToken::Thinking(text)) => {
+                    if !in_thinking {
+                        // \x1b[90m = dark grey; \x1b[0m = reset
+                        print!("\x1b[90m---think---\n");
+                        in_thinking = true;
+                    }
+                    print!("{text}");
+                    std::io::stdout().flush()?;
+                }
+                Ok(StreamToken::Content(text)) => {
+                    if in_thinking {
+                        print!("\n---think---\x1b[0m\n");
+                        in_thinking = false;
+                    }
+                    print!("{text}");
+                    std::io::stdout().flush()?;
+                    reply.push_str(&text);
+                }
+                Err(e) => {
+                    if in_thinking {
+                        print!("\n---think---\x1b[0m\n");
+                        in_thinking = false;
+                    }
+                    eprintln!("\n❌ Stream error: {e}");
+                    stream_err = true;
+                    break;
+                }
             }
+        }
+        if in_thinking {
+            print!("\n---think---\x1b[0m\n");
+        }
+        println!("\n");
+
+        if !stream_err && !reply.is_empty() {
+            history.push(u_forge_core::ChatMessage::user(&input));
+            history.push(u_forge_core::ChatMessage::assistant(&reply));
         }
     }
 
@@ -554,9 +658,10 @@ fn print_usage(prog: &str) {
     println!("Interactive RAG chat demo backed by the Foundation universe knowledge graph.");
     println!();
     println!("REPL commands:");
-    println!("  /quit    — exit");
-    println!("  /clear   — reset conversation history");
-    println!("  /context — toggle display of retrieved knowledge graph context");
+    println!("  /quit     — exit");
+    println!("  /clear    — reset conversation history");
+    println!("  /context  — toggle display of retrieved knowledge graph context");
+    println!("  /thinking — cycle reasoning effort: off → low → medium → high → off");
     println!();
     println!("Environment:");
     println!("  LEMONADE_URL       Override Lemonade Server URL");
@@ -582,3 +687,4 @@ fn indent_block(text: &str, prefix: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+

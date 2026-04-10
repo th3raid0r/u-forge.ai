@@ -17,7 +17,7 @@ A user must be able to clone this repo and run `cargo run --manifest-path crates
 Lemonade Server is present). Env vars like `LEMONADE_URL` exist only to override
 a non-standard location or port.
 
-- In code, always try a **sensible default first** (e.g. `http://localhost:8000/api/v1`),
+- In code, always try a **sensible default first** (e.g. `http://localhost:13305/api/v1`),
   then fall back to the env var if the default is unreachable or unset.
   `EmbeddingManager::try_new_auto` and `lemonade::resolve_lemonade_url()` already
   implement this pattern — follow them, never bypass them.

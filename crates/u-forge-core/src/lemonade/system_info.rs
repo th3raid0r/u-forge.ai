@@ -95,7 +95,7 @@ impl SystemInfo {
     /// Fetch system info from `GET {base_url}/system-info`.
     ///
     /// The Lemonade system-info endpoint lives at `/api/v1/system-info`.
-    /// Pass the `/api/v1` base URL directly (e.g. `http://localhost:8000/api/v1`)
+    /// Pass the `/api/v1` base URL directly (e.g. `http://localhost:13305/api/v1`)
     /// and this function will append `/system-info` to it.
     pub async fn fetch(base_url: &str) -> Result<Self> {
         let client = reqwest::Client::new();

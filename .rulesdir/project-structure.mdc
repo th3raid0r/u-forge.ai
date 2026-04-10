@@ -86,10 +86,10 @@ GPU/NPU resource contention on the server side.
 
 ```bash
 # Correct — single-threaded to avoid server contention
-LEMONADE_URL=http://localhost:8000/api/v1 cargo test -- --test-threads=1
+LEMONADE_URL=http://localhost:13305/api/v1 cargo test -- --test-threads=1
 
 # dev.sh handles this automatically
-export LEMONADE_URL=http://localhost:8000/api/v1
+export LEMONADE_URL=http://localhost:13305/api/v1
 ./dev.sh --backend-only
 ```
 

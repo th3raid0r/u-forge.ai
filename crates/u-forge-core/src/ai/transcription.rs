@@ -217,7 +217,7 @@ impl TranscriptionManager {
                 anyhow!(
                     "No Lemonade Server URL configured. Set the LEMONADE_URL environment \
                      variable or pass a URL explicitly:\n  \
-                     export LEMONADE_URL=http://localhost:8000/api/v1"
+                     export LEMONADE_URL=http://localhost:13305/api/v1"
                 )
             })?;
 
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn test_transcription_manager_debug_format() {
         let mgr = TranscriptionManager::new_lemonade(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             "whisper-v3-turbo-FLM",
         );
         let s = format!("{:?}", mgr);
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn test_lemonade_transcription_provider_model_name() {
         let p = LemonadeTranscriptionProvider::new(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             "whisper-v3-turbo-FLM",
         );
         assert_eq!(p.model_name(), "whisper-v3-turbo-FLM");
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn test_provider_trims_trailing_slash_from_url() {
         let p = LemonadeTranscriptionProvider::new(
-            "http://localhost:8000/api/v1/",
+            "http://localhost:13305/api/v1/",
             "whisper-v3-turbo-FLM",
         );
         // base_url should not end in '/'

@@ -5,8 +5,9 @@
 /// FTS5 has its own query syntax and rejects many characters that appear
 /// naturally in prose (e.g. `?`, `!`, `'`, `(`, `)`).  This function:
 ///
-/// 1. Keeps only alphanumeric characters, spaces, and the hyphen `-`
-///    (hyphens are common in proper nouns and are safe inside tokens).
+/// 1. Keeps only alphanumeric characters and spaces. Hyphens are converted to
+///    spaces because FTS5 treats a leading hyphen as a NOT operator, which
+///    breaks hyphenated proper nouns like "Z-Rho" (parsed as "Z NOT Rho").
 /// 2. Collapses runs of whitespace to a single space and trims the result.
 /// 3. Returns `None` when the sanitised string is empty, so callers can
 ///    skip the FTS stage rather than sending an empty query to SQLite.
@@ -16,13 +17,7 @@
 pub(super) fn fts5_sanitize(query: &str) -> Option<String> {
     let sanitized: String = query
         .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                ' '
-            }
-        })
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
 
     let collapsed = sanitized
@@ -66,10 +61,16 @@ mod tests {
     }
 
     #[test]
-    fn test_fts5_sanitize_preserves_hyphen() {
+    fn test_fts5_sanitize_converts_hyphen_to_space() {
+        // Hyphens become spaces so "Z-Rho" is tokenised as two terms rather
+        // than parsed by FTS5 as "Z NOT Rho".
+        assert_eq!(
+            fts5_sanitize("Z-Rho"),
+            Some("Z Rho".to_string())
+        );
         assert_eq!(
             fts5_sanitize("well-known mathematician"),
-            Some("well-known mathematician".to_string())
+            Some("well known mathematician".to_string())
         );
     }
 

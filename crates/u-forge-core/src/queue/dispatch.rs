@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing::instrument;
 
-use crate::lemonade::{ChatCompletionResponse, ChatRequest, KokoroVoice, RerankDocument};
+use crate::lemonade::{ChatCompletionResponse, ChatRequest, KokoroVoice, LemonadeChatProvider, RerankDocument, StreamToken};
 
 use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
 use super::weighted::WeightedEmbedDispatcher;
@@ -45,6 +45,10 @@ pub struct InferenceQueue {
     pub(super) synthesize_queue: Arc<WorkQueue<SynthesizeJob>>,
     pub(super) generate_queue: Arc<WorkQueue<GenerateJob>>,
     pub(super) rerank_queue: Arc<WorkQueue<RerankJob>>,
+
+    /// Cloned providers used for streaming (bypasses the job queue — the
+    /// provider's internal GPU lock handles serialisation).
+    pub(super) chat_providers: Arc<Vec<LemonadeChatProvider>>,
 
     // Capability presence flags — avoids dynamic trait-object dispatch for
     // the fast "no device registered" error path.
@@ -265,6 +269,29 @@ impl InferenceQueue {
 
         rx.await
             .map_err(|_| anyhow!("InferenceQueue: LLM worker dropped the response channel"))?
+    }
+
+    /// Submit a streaming LLM request; returns an mpsc receiver that yields
+    /// text deltas as the model generates them.
+    ///
+    /// Uses the first registered chat provider directly (bypassing the job
+    /// queue) — the provider's internal GPU lock serialises concurrent calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error immediately if no LLM-capable device is registered.
+    /// Stream-level errors are sent as `Err(_)` items through the receiver.
+    pub fn generate_stream(&self, request: ChatRequest) -> Result<mpsc::Receiver<Result<StreamToken>>> {
+        if !self.has_text_generation {
+            return Err(anyhow!(
+                "InferenceQueue: no LLM-capable device is registered."
+            ));
+        }
+        let provider = self
+            .chat_providers
+            .first()
+            .expect("has_text_generation is true but chat_providers is empty");
+        Ok(provider.complete_stream(request))
     }
 
     /// Convenience wrapper: submit a single-turn user prompt and return the
@@ -557,6 +584,7 @@ mod tests {
             synthesize_queue,
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
+            chat_providers: Arc::new(Vec::new()),
             has_embedding: true,
             has_transcription: true,
             has_tts: false,
@@ -694,6 +722,7 @@ mod tests {
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
+            chat_providers: Arc::new(Vec::new()),
             has_embedding: false,
             has_transcription: false,
             has_tts: false,
@@ -722,6 +751,7 @@ mod tests {
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
+            chat_providers: Arc::new(Vec::new()),
             has_embedding: false,
             has_transcription: false,
             has_tts: false,
@@ -786,6 +816,7 @@ mod tests {
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
+            chat_providers: Arc::new(Vec::new()),
             has_embedding: true,
             has_transcription: false,
             has_tts: false,
@@ -834,6 +865,7 @@ mod tests {
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
+            chat_providers: Arc::new(Vec::new()),
             has_embedding: true,
             has_transcription: true,
             has_tts: false,
@@ -868,6 +900,7 @@ mod tests {
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
+            chat_providers: Arc::new(Vec::new()),
             has_embedding: true,
             has_transcription: true,
             has_tts: true,
@@ -892,6 +925,7 @@ mod tests {
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
+            chat_providers: Arc::new(Vec::new()),
             has_embedding: true,
             has_transcription: false,
             has_tts: true,

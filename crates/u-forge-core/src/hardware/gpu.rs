@@ -33,7 +33,7 @@
 //! # use u_forge_core::hardware::gpu::GpuDevice;
 //! # use u_forge_core::lemonade::{GpuResourceManager, LemonadeModelRegistry};
 //! # async fn run() -> anyhow::Result<()> {
-//! let registry = LemonadeModelRegistry::fetch("http://localhost:8000/api/v1").await?;
+//! let registry = LemonadeModelRegistry::fetch("http://localhost:13305/api/v1").await?;
 //! let gpu = GpuResourceManager::new();
 //! let device = GpuDevice::from_registry(&registry, gpu).await;
 //!
@@ -64,6 +64,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
+use crate::config::ModelConfig;
 use crate::lemonade::{
     GpuResourceManager, LemonadeChatProvider, LemonadeModelRegistry, LemonadeSttProvider,
 };
@@ -138,6 +139,74 @@ impl GpuDevice {
     /// [`Transcription`]: DeviceCapability::Transcription
     /// [`TextGeneration`]: DeviceCapability::TextGeneration
     /// [`Embedding`]: DeviceCapability::Embedding
+    /// Like [`from_registry`](Self::from_registry) but loads the embedding model
+    /// with parameters sourced from `config` (`u-forge.toml` `[models.load_params]`).
+    ///
+    /// Calls `POST /api/v1/load` with per-model `ctx_size`, `batch_size`, and
+    /// `ubatch_size` before connecting, so the server uses the correct context
+    /// window and batch tuning for the embedding workload.
+    pub async fn from_registry_with_config(
+        registry: &LemonadeModelRegistry,
+        gpu: Arc<GpuResourceManager>,
+        config: &ModelConfig,
+    ) -> Self {
+        let mut capabilities = Vec::new();
+
+        let stt = LemonadeSttProvider::from_registry(registry, Arc::clone(&gpu))
+            .ok()
+            .inspect(|p| {
+                capabilities.push(DeviceCapability::Transcription);
+                info!(model = %p.model, "GpuDevice: STT provider ready");
+            });
+
+        let chat = LemonadeChatProvider::from_registry(registry, Some(Arc::clone(&gpu)))
+            .ok()
+            .inspect(|p| {
+                capabilities.push(DeviceCapability::TextGeneration);
+                info!(model = %p.model, "GpuDevice: Chat/LLM provider ready");
+            });
+
+        let embedding =
+            if let Some(model_entry) = registry.llamacpp_embedding_model() {
+                let model_id = model_entry.id.clone();
+                let load_opts = config.load_options_for(&model_id);
+                match LemonadeProvider::new_with_load(&registry.base_url, &model_id, &load_opts).await {
+                    Ok(p) => {
+                        capabilities.push(DeviceCapability::Embedding);
+                        info!(model = %model_id, "GpuDevice: embedding provider ready");
+                        Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %model_id,
+                            error = %e,
+                            "GpuDevice: embedding model not reachable"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        if capabilities.is_empty() {
+            tracing::warn!(
+                "GpuDevice::from_registry_with_config: no STT, LLM, or embedding models \
+                 found — device will advertise no capabilities"
+            );
+        }
+
+        Self {
+            name: "AMD GPU (ROCm)".to_string(),
+            backend: HardwareBackend::GpuRocm,
+            capabilities,
+            gpu,
+            stt,
+            chat,
+            embedding,
+        }
+    }
+
     pub async fn from_registry(
         registry: &LemonadeModelRegistry,
         gpu: Arc<GpuResourceManager>,
@@ -209,7 +278,7 @@ impl GpuDevice {
     ///
     /// # Arguments
     ///
-    /// * `base_url`   — Lemonade Server API root (e.g. `"http://localhost:8000/api/v1"`).
+    /// * `base_url`   — Lemonade Server API root (e.g. `"http://localhost:13305/api/v1"`).
     /// * `stt_model`  — STT model id (e.g. `"Whisper-Large-v3-Turbo"`).  `None`
     ///   to disable the STT provider.
     /// * `chat_model` — LLM model id (e.g. `"GLM-4.7-Flash-GGUF"`).  `None` to
@@ -259,8 +328,8 @@ impl GpuDevice {
     /// # use u_forge_core::lemonade::GpuResourceManager;
     /// # async fn run() {
     /// let gpu = GpuResourceManager::new();
-    /// let device = GpuDevice::stt_only("http://localhost:8000/api/v1", "Whisper-Large-v3-Turbo", gpu)
-    ///     .with_embedding("http://localhost:8000/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF")
+    /// let device = GpuDevice::stt_only("http://localhost:13305/api/v1", "Whisper-Large-v3-Turbo", gpu)
+    ///     .with_embedding("http://localhost:13305/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF")
     ///     .await;
     /// # }
     /// ```
@@ -362,7 +431,7 @@ mod tests {
     #[test]
     fn test_new_no_models_has_no_capabilities() {
         let gpu = GpuResourceManager::new();
-        let device = GpuDevice::new("http://localhost:8000/api/v1", None, None, gpu);
+        let device = GpuDevice::new("http://localhost:13305/api/v1", None, None, gpu);
         assert!(
             device.capabilities().is_empty(),
             "No models → no capabilities"
@@ -375,7 +444,7 @@ mod tests {
     fn test_new_stt_only_capabilities() {
         let gpu = GpuResourceManager::new();
         let device = GpuDevice::stt_only(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             "Whisper-Large-v3-Turbo",
             gpu,
         );
@@ -394,7 +463,7 @@ mod tests {
     #[test]
     fn test_new_llm_only_capabilities() {
         let gpu = GpuResourceManager::new();
-        let device = GpuDevice::llm_only("http://localhost:8000/api/v1", "GLM-4.7-Flash-GGUF", gpu);
+        let device = GpuDevice::llm_only("http://localhost:13305/api/v1", "GLM-4.7-Flash-GGUF", gpu);
         assert!(
             device.supports(&DeviceCapability::TextGeneration),
             "LLM-only must advertise TextGeneration"
@@ -411,7 +480,7 @@ mod tests {
     fn test_new_both_models_has_both_capabilities() {
         let gpu = GpuResourceManager::new();
         let device = GpuDevice::new(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             Some("Whisper-Large-v3-Turbo"),
             Some("GLM-4.7-Flash-GGUF"),
             gpu,
@@ -427,7 +496,7 @@ mod tests {
     #[test]
     fn test_device_worker_backend_is_rocm() {
         let gpu = GpuResourceManager::new();
-        let device = GpuDevice::llm_only("http://localhost:8000/api/v1", "model", gpu);
+        let device = GpuDevice::llm_only("http://localhost:13305/api/v1", "model", gpu);
         assert_eq!(
             device.backend(),
             HardwareBackend::GpuRocm,
@@ -438,7 +507,7 @@ mod tests {
     #[test]
     fn test_device_worker_name_is_nonempty() {
         let gpu = GpuResourceManager::new();
-        let device = GpuDevice::llm_only("http://localhost:8000/api/v1", "model", gpu);
+        let device = GpuDevice::llm_only("http://localhost:13305/api/v1", "model", gpu);
         assert!(!device.name().is_empty(), "Device name should not be empty");
     }
 
@@ -447,7 +516,7 @@ mod tests {
         // Both stt and chat should share the exact same GpuResourceManager.
         let gpu = GpuResourceManager::new();
         let device = GpuDevice::new(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             Some("Whisper-Large-v3-Turbo"),
             Some("GLM-4.7-Flash-GGUF"),
             Arc::clone(&gpu),
@@ -480,7 +549,7 @@ mod tests {
     #[test]
     fn test_gpu_workload_summary_is_idle_initially() {
         let gpu = GpuResourceManager::new();
-        let device = GpuDevice::new("http://localhost:8000/api/v1", None, None, gpu);
+        let device = GpuDevice::new("http://localhost:13305/api/v1", None, None, gpu);
         let summary = device.gpu_workload_summary();
         // GpuWorkload::Idle displays as "Idle"
         assert!(
@@ -493,7 +562,7 @@ mod tests {
     fn test_debug_format_includes_key_fields() {
         let gpu = GpuResourceManager::new();
         let device = GpuDevice::new(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             Some("Whisper-Large-v3-Turbo"),
             Some("GLM-4.7-Flash-GGUF"),
             gpu,
@@ -517,7 +586,7 @@ mod tests {
     fn test_summary_contains_backend_and_capabilities() {
         let gpu = GpuResourceManager::new();
         let device = GpuDevice::new(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             Some("Whisper-Large-v3-Turbo"),
             Some("GLM-4.7-Flash-GGUF"),
             gpu,
@@ -540,7 +609,7 @@ mod tests {
         // while LLM inference holds the GPU.
         let gpu = GpuResourceManager::new();
         let device = GpuDevice::new(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             Some("Whisper-Large-v3-Turbo"),
             Some("GLM-4.7-Flash-GGUF"),
             Arc::clone(&gpu),

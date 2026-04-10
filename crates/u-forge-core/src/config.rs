@@ -42,6 +42,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::lemonade::load::ModelLoadOptions;
+
 // ── EmbeddingDeviceConfig ─────────────────────────────────────────────────────
 
 /// Per-device settings for the embedding subsystem.
@@ -97,29 +99,87 @@ impl Default for EmbeddingDeviceConfig {
     }
 }
 
+// ── ModelLoadParams ───────────────────────────────────────────────────────────
+
+/// Per-model load parameters stored in `u-forge.toml` under `[models.load_params]`.
+///
+/// All fields are optional; unset fields fall back to server defaults.
+///
+/// # Example TOML
+///
+/// ```toml
+/// [models.load_params]
+/// "embed-gemma-300m-FLM"    = { ctx_size = 2048 }
+/// "bge-reranker-v2-m3-GGUF" = { ctx_size = 8192, batch_size = 512, ubatch_size = 512 }
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelLoadParams {
+    /// Context window size in tokens passed to `POST /api/v1/load`.
+    pub ctx_size: Option<usize>,
+
+    /// Physical batch size for prompt processing (`--batch-size`).
+    ///
+    /// Applies only to llamacpp GGUF models.
+    pub batch_size: Option<usize>,
+
+    /// Micro-batch size (`--ubatch-size`).
+    ///
+    /// When `None` and `ctx_size` is set, `--ubatch-size` is auto-injected to
+    /// match `ctx_size`.  Set this explicitly to use a different value.
+    pub ubatch_size: Option<usize>,
+}
+
 // ── ModelConfig ───────────────────────────────────────────────────────────────
 
-/// Model-level settings, primarily per-model context-window overrides.
+/// Model-level settings, primarily per-model load-parameter overrides.
 ///
 /// Corresponds to the `[models]` section of `u-forge.toml`.
 ///
-/// The built-in defaults mirror `assets/model_context_limits.json`.  Add
-/// entries here to teach u-forge about new models without recompiling.
+/// Built-in defaults cover all models shipped with u-forge.  Add entries to
+/// `u-forge.toml` under `[models.load_params]` to tune new models without
+/// recompiling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// Per-model context-window size in tokens.
+    /// Per-model load parameters (ctx window, batch sizes).
     ///
-    /// Keys are the exact model IDs reported by Lemonade Server.  Values are
-    /// the model's published maximum sequence length.  The effective context
-    /// used at runtime is `min(value, DEFAULT_EMBEDDING_CONTEXT_TOKENS)`.
-    #[serde(default = "default_model_context_limits")]
-    pub context_limits: HashMap<String, usize>,
+    /// Keys are the exact model IDs reported by Lemonade Server.
+    #[serde(default = "default_model_load_params")]
+    pub load_params: HashMap<String, ModelLoadParams>,
+}
+
+impl ModelConfig {
+    /// Build a [`ModelLoadOptions`] for `model_id` from the configured params.
+    ///
+    /// Returns an all-`None` (server-default) `ModelLoadOptions` when the
+    /// model is not listed in `[models.load_params]`.
+    pub fn load_options_for(&self, model_id: &str) -> ModelLoadOptions {
+        match self.load_params.get(model_id) {
+            Some(p) => ModelLoadOptions {
+                ctx_size: p.ctx_size,
+                batch_size: p.batch_size,
+                ubatch_size: p.ubatch_size,
+                ..Default::default()
+            },
+            None => ModelLoadOptions::default(),
+        }
+    }
+
+    /// Return the configured context-window size for `model_id`.
+    ///
+    /// Falls back to [`DEFAULT_EMBEDDING_CONTEXT_TOKENS`](crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS)
+    /// when the model is not listed or its `ctx_size` is unset.
+    pub fn ctx_size_for(&self, model_id: &str) -> usize {
+        self.load_params
+            .get(model_id)
+            .and_then(|p| p.ctx_size)
+            .unwrap_or(crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS)
+    }
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            context_limits: default_model_context_limits(),
+            load_params: default_model_load_params(),
         }
     }
 }
@@ -202,6 +262,12 @@ pub struct ChatConfig {
     /// Number of knowledge-graph nodes returned per query.
     #[serde(default = "ChatConfig::default_search_limit")]
     pub search_limit: usize,
+
+    /// RRF score multiplier for the high-quality 4096-dim semantic path.
+    ///
+    /// See [`HybridSearchConfig::hq_semantic_boost`] for full semantics.
+    #[serde(default = "ChatConfig::default_hq_semantic_boost")]
+    pub hq_semantic_boost: f32,
 }
 
 impl ChatConfig {
@@ -235,6 +301,10 @@ impl ChatConfig {
     fn default_search_limit() -> usize {
         3
     }
+
+    fn default_hq_semantic_boost() -> f32 {
+        3.0
+    }
 }
 
 impl Default for ChatConfig {
@@ -248,6 +318,7 @@ impl Default for ChatConfig {
             max_history_turns: Self::default_max_history_turns(),
             alpha: Self::default_alpha(),
             search_limit: Self::default_search_limit(),
+            hq_semantic_boost: Self::default_hq_semantic_boost(),
         }
     }
 }
@@ -358,15 +429,19 @@ fn default_cpu_weight() -> u32 {
     10
 }
 
-/// Built-in context-window limits matching `assets/model_context_limits.json`.
-fn default_model_context_limits() -> HashMap<String, usize> {
+/// Built-in load parameters for known models.
+fn default_model_load_params() -> HashMap<String, ModelLoadParams> {
+    fn ctx(ctx_size: usize) -> ModelLoadParams {
+        ModelLoadParams { ctx_size: Some(ctx_size), ..Default::default() }
+    }
     let mut m = HashMap::new();
-    m.insert("embed-gemma-300m-FLM".to_string(), 2048);
-    m.insert("embed-gemma-300M-GGUF".to_string(), 2048);
-    m.insert("user.ggml-org/embeddinggemma-300M-GGUF".to_string(), 2048);
-    m.insert("nomic-embed-text-v2-moe-GGUF".to_string(), 512);
-    m.insert("nomic-embed-text-v1-GGUF".to_string(), 2048);
-    m.insert("Qwen3-Embedding-8B-GGUF".to_string(), 32768);
+    m.insert("embed-gemma-300m-FLM".to_string(), ctx(2048));
+    m.insert("embed-gemma-300M-GGUF".to_string(), ctx(2048));
+    m.insert("user.ggml-org/embeddinggemma-300M-GGUF".to_string(), ctx(2048));
+    m.insert("nomic-embed-text-v2-moe-GGUF".to_string(), ctx(512));
+    m.insert("nomic-embed-text-v1-GGUF".to_string(), ctx(2048));
+    m.insert("Qwen3-Embedding-8B-GGUF".to_string(), ctx(32768));
+    m.insert("bge-reranker-v2-m3-GGUF".to_string(), ctx(8192));
     m
 }
 
@@ -390,11 +465,34 @@ mod tests {
     }
 
     #[test]
-    fn test_default_model_context_limits() {
+    fn test_default_model_load_params() {
         let cfg = AppConfig::default();
-        assert_eq!(cfg.models.context_limits.get("embed-gemma-300m-FLM"), Some(&2048));
-        assert_eq!(cfg.models.context_limits.get("nomic-embed-text-v2-moe-GGUF"), Some(&512));
-        assert_eq!(cfg.models.context_limits.get("nomic-embed-text-v1-GGUF"), Some(&2048));
+        assert_eq!(cfg.models.ctx_size_for("embed-gemma-300m-FLM"), 2048);
+        assert_eq!(cfg.models.ctx_size_for("nomic-embed-text-v2-moe-GGUF"), 512);
+        assert_eq!(cfg.models.ctx_size_for("nomic-embed-text-v1-GGUF"), 2048);
+        assert_eq!(cfg.models.ctx_size_for("bge-reranker-v2-m3-GGUF"), 8192);
+        assert_eq!(cfg.models.ctx_size_for("Qwen3-Embedding-8B-GGUF"), 32768);
+        // Unknown model falls back to default
+        assert_eq!(cfg.models.ctx_size_for("unknown-model-GGUF"), crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS);
+    }
+
+    #[test]
+    fn test_load_options_for_returns_full_params() {
+        let cfg = AppConfig::default();
+        let opts = cfg.models.load_options_for("bge-reranker-v2-m3-GGUF");
+        assert_eq!(opts.ctx_size, Some(8192));
+        // Default entry has no explicit batch/ubatch
+        assert!(opts.batch_size.is_none());
+        assert!(opts.ubatch_size.is_none());
+    }
+
+    #[test]
+    fn test_load_options_for_unknown_model_returns_defaults() {
+        let cfg = AppConfig::default();
+        let opts = cfg.models.load_options_for("unknown-model-GGUF");
+        assert!(opts.ctx_size.is_none());
+        assert!(opts.batch_size.is_none());
+        assert!(opts.ubatch_size.is_none());
     }
 
     #[test]
@@ -432,21 +530,27 @@ cpu_weight   = 5
     }
 
     #[test]
-    fn test_load_model_context_limits_from_toml() {
+    fn test_load_model_load_params_from_toml() {
         let mut f = NamedTempFile::new().unwrap();
         write!(
             f,
             r#"
-[models.context_limits]
-"embed-gemma-300m-FLM" = 1024
-"my-custom-model-FLM"  = 8192
+[models.load_params]
+"embed-gemma-300m-FLM"    = {{ ctx_size = 1024 }}
+"my-custom-model-FLM"     = {{ ctx_size = 8192 }}
+"bge-reranker-v2-m3-GGUF" = {{ ctx_size = 8192, batch_size = 512, ubatch_size = 512 }}
 "#
         )
         .unwrap();
 
         let cfg = AppConfig::load(f.path()).unwrap();
-        assert_eq!(cfg.models.context_limits.get("embed-gemma-300m-FLM"), Some(&1024));
-        assert_eq!(cfg.models.context_limits.get("my-custom-model-FLM"), Some(&8192));
+        assert_eq!(cfg.models.ctx_size_for("embed-gemma-300m-FLM"), 1024);
+        assert_eq!(cfg.models.ctx_size_for("my-custom-model-FLM"), 8192);
+
+        let rerank_opts = cfg.models.load_options_for("bge-reranker-v2-m3-GGUF");
+        assert_eq!(rerank_opts.ctx_size, Some(8192));
+        assert_eq!(rerank_opts.batch_size, Some(512));
+        assert_eq!(rerank_opts.ubatch_size, Some(512));
     }
 
     #[test]

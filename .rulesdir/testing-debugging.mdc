@@ -71,7 +71,7 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 
 ### Lemonade Server (integration tests — skipped when server unreachable)
 
-Use `crate::test_helpers::lemonade_url` — it probes `localhost:8000` via the
+Use `crate::test_helpers::lemonade_url` — it probes `localhost:13305` via the
 `GET /api/v1/health` endpoint first, then falls back to the `LEMONADE_URL`
 environment variable. Tests skip silently when neither yields a reachable server:
 
@@ -95,8 +95,8 @@ async fn test_lemonade_embed() {
 `lemonade_url()` is defined in `src/test_helpers.rs` (compiled `#[cfg(test)]`
 only) and delegates to the production `crate::lemonade::resolve_lemonade_url()`.
 Resolution order:
-1. `http://localhost:8000/api/v1` — probed via `GET /api/v1/health` (2 s timeout)
-2. `http://127.0.0.1:8000/api/v1` — same probe, explicit IPv4 loopback
+1. `http://localhost:13305/api/v1` — probed via `GET /api/v1/health` (2 s timeout)
+2. `http://127.0.0.1:13305/api/v1` — same probe, explicit IPv4 loopback
 3. `LEMONADE_URL` environment variable — accepted as-is, no liveness check
 
 > **There is no FastEmbed / local fallback.** FastEmbed and ONNX Runtime have been
@@ -234,7 +234,7 @@ tracing::warn!(
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `openssl-sys` compile error | Missing system OpenSSL headers | `apt install pkg-config libssl-dev` (Ubuntu) |
-| `Lemonade Server not available` | Server not running or `LEMONADE_URL` not set | `lemonade-server serve` + `export LEMONADE_URL=http://localhost:8000/api/v1` |
+| `Lemonade Server not available` | Server not running or `LEMONADE_URL` not set | `lemonade-server serve` + `export LEMONADE_URL=http://localhost:13305/api/v1` |
 | Transcription returns immediate error | Model not pulled or server can't open audio | Run `lemonade-server pull whisper-v3-turbo-FLM`; verify audio bytes are non-empty and a valid WAV/MP3/OGG |
 | Transcription test passes but text is noise | Silence input hallucinations are normal | Use real speech audio for content assertions; only check `result.is_ok()` for silence |
 | `TranscriptionManager::try_new_auto` returns err without server | `LEMONADE_URL` not set | Set env var; construction is sync so the error is URL-resolution, not connectivity |

@@ -103,7 +103,7 @@ impl EmbeddingProvider for MyProvider {
 
 4. Add tests — gate live-server tests using `crate::test_helpers::lemonade_url`
    (see `ai/embeddings.rs` pattern: `let Some(url) = lemonade_url().await else { return; }`).
-   The helper probes `localhost:8000` first, then falls back to `LEMONADE_URL`.
+   The helper probes `localhost:13305` first, then falls back to `LEMONADE_URL`.
 
 5. **Do NOT add `Mutex<T>` around synchronous work in async embedding paths** (BUG-5
    pattern). Use `tokio::task::spawn_blocking` if CPU-bound work is unavoidable, or
@@ -157,15 +157,15 @@ fully operational:
 lemonade-server serve
 
 # Verify
-curl http://localhost:8000/api/v1/health
+curl http://localhost:13305/api/v1/health
 
 # Pull models
 lemonade-server pull embed-gemma-300m-FLM        # embeddings (NPU, 0.62 GB) — default
 lemonade-server pull bge-reranker-v2-m3-GGUF     # reranking (GPU/CPU) — used by cli_demo
 lemonade-server pull whisper-v3-turbo-FLM        # transcription (NPU, 1.55 GB)
 
-# Point u-forge.ai at it (optional — localhost:8000 is auto-discovered)
-export LEMONADE_URL="http://localhost:8000/api/v1"
+# Point u-forge.ai at it (optional — localhost:13305 is auto-discovered)
+export LEMONADE_URL="http://localhost:13305/api/v1"
 ```
 
 **CPU/GPU embedding setup (required on non-NPU machines):**
@@ -177,7 +177,7 @@ The `embeddinggemma-300M-GGUF` model must be added manually via the Lemonade UI 
 URL in this order:
 1. Explicit argument passed to `try_new_auto`
 2. `LEMONADE_URL` environment variable
-3. Localhost probe — `GET http://localhost:8000/api/v1/health`, then `127.0.0.1:8000`
+3. Localhost probe — `GET http://localhost:13305/api/v1/health`, then `127.0.0.1:13305`
    via `lemonade::resolve_lemonade_url()`
 
 Setting `LEMONADE_URL` is therefore **optional** when Lemonade Server is running on
@@ -246,10 +246,10 @@ cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 | Problem | Fix |
 |---|---|
 | `openssl-sys` build error | `apt install pkg-config libssl-dev` (Ubuntu) / `brew install openssl` (macOS) |
-| `Lemonade Server not available` error | Run `lemonade-server serve` — server on `localhost:8000` is auto-discovered; `LEMONADE_URL` only needed for non-default URLs |
+| `Lemonade Server not available` error | Run `lemonade-server serve` — server on `localhost:13305` is auto-discovered; `LEMONADE_URL` only needed for non-default URLs |
 | Transcription error on first call | Model not loaded yet — first call triggers load; retry, or check `GET /api/v1/health` |
 | `transcribe()` returns error: "Could not open audio data" | Empty or corrupt audio bytes passed to provider |
-| `TranscriptionManager::try_new_auto` fails without server | No server on `localhost:8000` and `LEMONADE_URL` not set — construction is sync so this is a URL-resolution error, not a connectivity error |
+| `TranscriptionManager::try_new_auto` fails without server | No server on `localhost:13305` and `LEMONADE_URL` not set — construction is sync so this is a URL-resolution error, not a connectivity error |
 | Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
 | Dimension mismatch (future sqlite-vec) | Ensure embedding model matches vector column dimensions |
 | `database is locked` | Only one writer at a time; check for stale processes holding `knowledge.db` |
