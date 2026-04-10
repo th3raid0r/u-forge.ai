@@ -24,7 +24,7 @@ source env.sh   # optional — sets UFORGE_* path variables
 
 ### Runtime / Optional
 ```bash
-export LEMONADE_URL="http://localhost:8000/api/v1"  # Lemonade Server for embeddings
+export LEMONADE_URL="http://localhost:13305/api/v1"  # Lemonade Server for embeddings
 export UFORGE_SCHEMA_DIR="./defaults/schemas"       # Override schema directory
 export UFORGE_DATA_FILE="./defaults/data/memory.json" # Override data file
 export RUST_LOG=info                                # Log verbosity
@@ -66,10 +66,10 @@ lemonade-server pull bge-reranker-v2-m3      # reranking (GPU/CPU)
 lemonade-server serve
 
 # Verify health (also shows which models are currently loaded in RAM)
-curl http://localhost:8000/api/v1/health
+curl http://localhost:13305/api/v1/health
 
 # Point u-forge.ai at it
-export LEMONADE_URL="http://localhost:8000/api/v1"
+export LEMONADE_URL="http://localhost:13305/api/v1"
 ```
 
 `EmbeddingManager::try_new_auto(None, None)` resolves the URL in this order:

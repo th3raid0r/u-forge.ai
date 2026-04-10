@@ -124,7 +124,7 @@ Concrete implementation against `POST {base_url}/audio/transcriptions`:
 ```rust
 // Construction is synchronous and cheap — no probe request is made.
 let provider = LemonadeTranscriptionProvider::new(
-    "http://localhost:8000/api/v1",
+    "http://localhost:13305/api/v1",
     "whisper-v3-turbo-FLM",
 );
 
@@ -148,7 +148,7 @@ let mgr = TranscriptionManager::try_new_auto(None, None)?;
 
 // Explicit URL and model
 let mgr = TranscriptionManager::new_lemonade(
-    "http://localhost:8000/api/v1",
+    "http://localhost:13305/api/v1",
     "whisper-v3-turbo-FLM",
 );
 
@@ -174,7 +174,7 @@ let mgr = EmbeddingManager::try_new_auto(None, None).await?;
 
 // Explicit URL
 let mgr = EmbeddingManager::try_new_lemonade(
-    "http://localhost:8000/api/v1",
+    "http://localhost:13305/api/v1",
     "nomic-embed-text",
 ).await?;
 

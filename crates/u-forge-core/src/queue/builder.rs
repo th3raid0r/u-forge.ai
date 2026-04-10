@@ -5,6 +5,7 @@ use std::sync::{
     Arc,
 };
 
+
 use tracing::{debug, warn};
 
 use crate::ai::embeddings::EmbeddingProvider;
@@ -184,6 +185,7 @@ impl InferenceQueueBuilder {
         let rerank_queue = Arc::new(WorkQueue::<RerankJob>::new());
 
         let mut embed_specs: Vec<EmbedWorkerSpec> = Vec::new();
+        let mut chat_providers_for_stream: Vec<crate::lemonade::LemonadeChatProvider> = Vec::new();
         let mut transcription_workers: usize = 0;
         let mut tts_workers: usize = 0;
         let mut llm_workers: usize = 0;
@@ -222,6 +224,7 @@ impl InferenceQueueBuilder {
                 let q = Arc::clone(&generate_queue);
                 let name = device.name.clone();
                 llm_workers += 1;
+                chat_providers_for_stream.push(chat.clone());
                 debug!(device = %name, model = %chat.model, "Spawning NPU LLM worker");
                 tokio::spawn(async move {
                     run_llm_worker(q, chat, name).await;
@@ -255,6 +258,7 @@ impl InferenceQueueBuilder {
                 let q = Arc::clone(&generate_queue);
                 let name = device.name.clone();
                 llm_workers += 1;
+                chat_providers_for_stream.push(chat.clone());
                 debug!(device = %name, model = %chat.model, "Spawning GPU LLM worker");
                 tokio::spawn(async move {
                     run_llm_worker(q, chat, name).await;
@@ -352,6 +356,7 @@ impl InferenceQueueBuilder {
             synthesize_queue,
             generate_queue,
             rerank_queue,
+            chat_providers: Arc::new(chat_providers_for_stream),
             has_embedding,
             has_transcription,
             has_tts,

@@ -38,16 +38,17 @@ pub use ai::embeddings::{
     LemonadeProvider,
 };
 pub use builder::ObjectBuilder;
-pub use config::{AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, EmbeddingDeviceConfig};
+pub use config::{AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, EmbeddingDeviceConfig, ModelConfig, ModelLoadParams};
 pub use graph::{
     GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
     HIGH_QUALITY_EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS,
 };
 pub use lemonade::{
-    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
-    GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth, LemonadeModelEntry,
-    LemonadeModelRegistry, LemonadeStack, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard,
-    LoadedModelEntry, ModelLoadOptions, ModelRole, SttGuard, TranscriptionResult, load_model,
+    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, StreamToken,
+    GpuResourceManager, GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth,
+    LemonadeModelEntry, LemonadeModelRegistry, LemonadeStack, LemonadeSttProvider,
+    LemonadeTtsProvider, LlmGuard, LoadedModelEntry, ModelLoadOptions, ModelRole, SttGuard,
+    TranscriptionResult, load_model,
 };
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,

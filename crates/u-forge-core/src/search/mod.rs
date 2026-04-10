@@ -116,6 +116,18 @@ pub struct HybridSearchConfig {
     /// Default is 3 — enough to provide rich context to an LLM without
     /// overwhelming the context window.
     pub limit: usize,
+
+    /// Multiplier applied to HQ (4096-dim) semantic RRF contributions.
+    ///
+    /// The HQ embedding model captures substantially more semantic nuance
+    /// than the standard 768-dim path.  Boosting its RRF weight prevents
+    /// the lower-precision standard semantic results from diluting the
+    /// high-quality signal.
+    ///
+    /// Default is `3.0` — HQ contributions count three times as much as
+    /// standard semantic contributions at the same rank position.
+    /// Set to `1.0` to treat both paths equally.
+    pub hq_semantic_boost: f32,
 }
 
 impl Default for HybridSearchConfig {
@@ -126,6 +138,7 @@ impl Default for HybridSearchConfig {
             semantic_limit: 20,
             rerank: true,
             limit: 3,
+            hq_semantic_boost: 3.0,
         }
     }
 }
@@ -504,7 +517,7 @@ pub async fn search_hybrid(
     }
 
     for (rank, (chunk_id, obj_id, _content, distance)) in hq_semantic_results.into_iter().enumerate() {
-        let score = alpha / (K + rank as f32);
+        let score = alpha * config.hq_semantic_boost / (K + rank as f32);
         let entry = chunk_merge
             .entry(chunk_id.hyphenated().to_string())
             .or_insert_with(|| ChunkMerge {
@@ -1144,6 +1157,7 @@ mod tests {
             semantic_limit: 20,
             rerank: false,
             limit: 10,
+            hq_semantic_boost: 3.0,
         };
 
         let results = search_hybrid(&graph, &queue, None, "hobbit ring", &config)
@@ -1172,6 +1186,7 @@ mod tests {
             semantic_limit: 20,
             rerank: false,
             limit: 10,
+            hq_semantic_boost: 3.0,
         };
 
         let results = search_hybrid(&graph, &queue, None, "hobbit ring journey", &config)

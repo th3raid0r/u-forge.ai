@@ -20,6 +20,9 @@ serde_json = "1.0"
 # Async runtime
 tokio = { version = "1.45", features = ["full"] }
 
+# Stream combinators (used to drive reqwest byte streams for SSE parsing)
+futures = "0.3"
+
 # Identifiers
 uuid = { version = "1.17", features = ["v4", "serde"] }
 
@@ -40,8 +43,8 @@ async-trait = "0.1"
 # HTTP client (required for Lemonade Server embedding/reranking API)
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 
-# OpenAI-compatible client (drives all standard Lemonade endpoints)
-async-openai = { version = "0.34", features = ["chat-completion", "embedding", "audio"] }
+# OpenAI-compatible client (drives embeddings, TTS, STT — not chat, which deviates from spec)
+async-openai = { version = "0.34", features = ["embedding", "audio"] }
 
 # Concurrent data structures
 dashmap = "6.1"

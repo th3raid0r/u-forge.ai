@@ -41,8 +41,8 @@ pub mod tts;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use chat::{
-    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage,
-    LemonadeChatProvider,
+    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest,
+    ChatUsage, LemonadeChatProvider, StreamToken,
 };
 pub use client::{make_lemonade_openai_client, LemonadeHttpClient};
 pub use health::{LemonadeHealth, LoadedModelEntry};
@@ -95,9 +95,9 @@ pub async fn resolve_provider_url(
 /// This is the canonical URL-discovery routine used both at application startup
 /// and in integration tests.  Resolution order:
 ///
-/// 1. `http://localhost:8000/api/v1` — probed via `GET /api/v1/health` with a
+/// 1. `http://localhost:13305/api/v1` — probed via `GET /api/v1/health` with a
 ///    2-second timeout.  This is the default Lemonade Server port.
-/// 2. `http://127.0.0.1:8000/api/v1` — same probe against the explicit IPv4
+/// 2. `http://127.0.0.1:13305/api/v1` — same probe against the explicit IPv4
 ///    loopback address, in case `localhost` resolves to `::1` on the host.
 /// 3. The `LEMONADE_URL` environment variable — accepted as-is with no liveness
 ///    check, allowing non-standard or remote servers to be configured.
@@ -109,7 +109,7 @@ pub async fn resolve_lemonade_url() -> Option<String> {
         .build()
         .unwrap_or_default();
 
-    for base in &["http://localhost:8000", "http://127.0.0.1:8000"] {
+    for base in &["http://localhost:13305", "http://127.0.0.1:13305"] {
         if client
             .get(format!("{}/api/v1/health", base))
             .send()

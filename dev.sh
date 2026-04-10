@@ -4,7 +4,7 @@
 # Enhanced logging, process management, and multi-mode support
 #
 # Integration tests auto-discover a running Lemonade Server by probing
-# http://localhost:8000/api/v1/health before falling back to the LEMONADE_URL
+# http://localhost:13305/api/v1/health before falling back to the LEMONADE_URL
 # environment variable.  No env var is required when the server is on the
 # default port.
 #
@@ -228,12 +228,12 @@ case $MODE in
         print_system "Press Ctrl+C to exit"
         # Always single-threaded: integration tests share a Lemonade Server
         # (NPU/GPU hardware) and produce intermittent failures when run in
-        # parallel.  The server is auto-discovered on localhost:8000; set
+        # parallel.  The server is auto-discovered on localhost:13305; set
         # LEMONADE_URL only to point at a non-default or remote server.
         if [ -n "$LEMONADE_URL" ]; then
             print_system "LEMONADE_URL=$LEMONADE_URL — using explicit server URL"
         else
-            print_system "Probing http://localhost:8000/api/v1/health for Lemonade Server..."
+            print_system "Probing http://localhost:13305/api/v1/health for Lemonade Server..."
         fi
         cargo test -- --test-threads=1
         cargo run --example cli_demo

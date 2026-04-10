@@ -28,7 +28,7 @@ use serde::{de::DeserializeOwned, Serialize};
 pub struct LemonadeHttpClient {
     client: reqwest::Client,
     /// Lemonade Server API base URL with no trailing slash,
-    /// e.g. `"http://localhost:8000/api/v1"`.
+    /// e.g. `"http://localhost:13305/api/v1"`.
     pub base_url: String,
 }
 
@@ -105,6 +105,30 @@ impl LemonadeHttpClient {
             .with_context(|| format!("Failed to parse JSON response from POST {url}"))
     }
 
+    /// `POST {base_url}/{path}` with a JSON body, returning the raw streaming response.
+    ///
+    /// The caller is responsible for driving `response.bytes_stream()` and parsing the
+    /// SSE wire format.  Status is checked before returning — a non-2xx response is an
+    /// immediate error.  Used by `LemonadeChatProvider::complete_stream` to bypass
+    /// `async-openai`'s typed deserialisation when Lemonade's request schema deviates
+    /// from the OpenAI spec (e.g. `enable_thinking: bool`).
+    pub async fn post_stream<Req: Serialize>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<reqwest::Response> {
+        let url = self.url(path);
+        self.client
+            .post(&url)
+            .header("Authorization", "Bearer lemonade")
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url} (stream) failed"))?
+            .error_for_status()
+            .with_context(|| format!("POST {url} returned error status"))
+    }
+
     /// `POST {base_url}/{path}` with a JSON body, returning raw response bytes.
     ///
     /// Used for endpoints that return binary data such as TTS audio.
@@ -149,20 +173,20 @@ mod tests {
 
     #[test]
     fn test_url_joins_path_with_leading_slash() {
-        let client = LemonadeHttpClient::new("http://localhost:8000/api/v1");
-        assert_eq!(client.url("/models"), "http://localhost:8000/api/v1/models");
+        let client = LemonadeHttpClient::new("http://localhost:13305/api/v1");
+        assert_eq!(client.url("/models"), "http://localhost:13305/api/v1/models");
     }
 
     #[test]
     fn test_url_joins_path_without_leading_slash() {
-        let client = LemonadeHttpClient::new("http://localhost:8000/api/v1");
-        assert_eq!(client.url("models"), "http://localhost:8000/api/v1/models");
+        let client = LemonadeHttpClient::new("http://localhost:13305/api/v1");
+        assert_eq!(client.url("models"), "http://localhost:13305/api/v1/models");
     }
 
     #[test]
     fn test_base_url_strips_trailing_slash() {
-        let client = LemonadeHttpClient::new("http://localhost:8000/api/v1/");
+        let client = LemonadeHttpClient::new("http://localhost:13305/api/v1/");
         assert!(!client.base_url.ends_with('/'));
-        assert_eq!(client.base_url, "http://localhost:8000/api/v1");
+        assert_eq!(client.base_url, "http://localhost:13305/api/v1");
     }
 }

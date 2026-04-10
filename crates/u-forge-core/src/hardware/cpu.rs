@@ -17,7 +17,7 @@
 //! # use u_forge_core::lemonade::KokoroVoice;
 //! # async fn run() -> anyhow::Result<()> {
 //! let cpu = CpuDevice::new(
-//!     "http://localhost:8000/api/v1",
+//!     "http://localhost:13305/api/v1",
 //!     None,                        // kokoro-v1
 //!     KokoroVoice::default(),      // AfSky
 //! );
@@ -40,6 +40,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
+use crate::config::ModelConfig;
 use crate::lemonade::{KokoroVoice, LemonadeModelRegistry, LemonadeTtsProvider};
 
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
@@ -91,6 +92,62 @@ impl CpuDevice {
     /// model entry; otherwise `tts` is `None`.  Similarly, if a llamacpp
     /// embedding model is found in the registry the embedding provider is
     /// initialised; otherwise `embedding` is `None`.
+    /// Like [`from_registry`](Self::from_registry) but loads the embedding model
+    /// with parameters sourced from `config` (`u-forge.toml` `[models.load_params]`).
+    ///
+    /// Calls `POST /api/v1/load` with per-model `ctx_size`, `batch_size`, and
+    /// `ubatch_size` before connecting the embedding provider.
+    pub async fn from_registry_with_config(
+        registry: &LemonadeModelRegistry,
+        config: &ModelConfig,
+    ) -> Self {
+        let tts = LemonadeTtsProvider::from_registry(registry).ok();
+
+        let mut capabilities = Vec::new();
+
+        if tts.is_some() {
+            info!("CpuDevice: TTS provider ready (Kokoro)");
+            capabilities.push(DeviceCapability::TextToSpeech);
+        }
+
+        let embedding =
+            if let Some(model_entry) = registry.llamacpp_embedding_model() {
+                let model_id = model_entry.id.clone();
+                let load_opts = config.load_options_for(&model_id);
+                match LemonadeProvider::new_with_load(&registry.base_url, &model_id, &load_opts).await {
+                    Ok(p) => {
+                        capabilities.push(DeviceCapability::Embedding);
+                        info!(model = %model_id, "CpuDevice: embedding provider ready");
+                        Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %model_id,
+                            error = %e,
+                            "CpuDevice: embedding model not reachable"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        if capabilities.is_empty() {
+            tracing::warn!(
+                "CpuDevice::from_registry_with_config: no TTS or embedding models found — \
+                 device will advertise no capabilities"
+            );
+        }
+
+        Self {
+            name: "CPU (Kokoro TTS)".to_string(),
+            capabilities,
+            tts,
+            embedding,
+        }
+    }
+
     pub async fn from_registry(registry: &LemonadeModelRegistry) -> Self {
         let tts = LemonadeTtsProvider::from_registry(registry).ok();
 
@@ -146,7 +203,7 @@ impl CpuDevice {
     /// # Arguments
     ///
     /// * `base_url`      — Lemonade Server API root
-    ///   (e.g. `"http://localhost:8000/api/v1"`).
+    ///   (e.g. `"http://localhost:13305/api/v1"`).
     /// * `tts_model`     — Kokoro model id.  Defaults to
     ///   [`DEFAULT_CPU_TTS_MODEL`] when `None`.
     /// * `default_voice` — Voice used when
@@ -290,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_new_device_advertises_tts_capability() {
-        let device = CpuDevice::new("http://localhost:8000/api/v1", None, KokoroVoice::default());
+        let device = CpuDevice::new("http://localhost:13305/api/v1", None, KokoroVoice::default());
         assert!(
             device.supports(&DeviceCapability::TextToSpeech),
             "CpuDevice::new must advertise TextToSpeech"
@@ -312,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_new_uses_default_model_when_none() {
-        let device = CpuDevice::new("http://localhost:8000/api/v1", None, KokoroVoice::default());
+        let device = CpuDevice::new("http://localhost:13305/api/v1", None, KokoroVoice::default());
         let model = device.tts.as_ref().unwrap().model.clone();
         assert_eq!(
             model, DEFAULT_CPU_TTS_MODEL,
@@ -323,7 +380,7 @@ mod tests {
     #[test]
     fn test_new_uses_explicit_model() {
         let device = CpuDevice::new(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             Some("kokoro-v2"),
             KokoroVoice::default(),
         );
@@ -333,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_device_worker_backend_is_cpu() {
-        let device = CpuDevice::new("http://localhost:8000/api/v1", None, KokoroVoice::default());
+        let device = CpuDevice::new("http://localhost:13305/api/v1", None, KokoroVoice::default());
         assert_eq!(
             device.backend(),
             HardwareBackend::Cpu,
@@ -343,13 +400,13 @@ mod tests {
 
     #[test]
     fn test_device_worker_name_is_nonempty() {
-        let device = CpuDevice::new("http://localhost:8000/api/v1", None, KokoroVoice::default());
+        let device = CpuDevice::new("http://localhost:13305/api/v1", None, KokoroVoice::default());
         assert!(!device.name().is_empty(), "Device name must not be empty");
     }
 
     #[test]
     fn test_default_voice_is_used() {
-        let device = CpuDevice::new("http://localhost:8000/api/v1", None, KokoroVoice::AfHeart);
+        let device = CpuDevice::new("http://localhost:13305/api/v1", None, KokoroVoice::AfHeart);
         let voice = device.tts.as_ref().unwrap().default_voice.as_str();
         assert_eq!(
             voice,
@@ -361,7 +418,7 @@ mod tests {
     #[test]
     fn test_debug_format_includes_key_fields() {
         let device = CpuDevice::new(
-            "http://localhost:8000/api/v1",
+            "http://localhost:13305/api/v1",
             Some("kokoro-v1"),
             KokoroVoice::default(),
         );
@@ -375,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_summary_contains_backend_and_capability() {
-        let device = CpuDevice::new("http://localhost:8000/api/v1", None, KokoroVoice::default());
+        let device = CpuDevice::new("http://localhost:13305/api/v1", None, KokoroVoice::default());
         let summary = device.summary();
         assert!(
             summary.contains("CPU"),
@@ -398,7 +455,7 @@ mod tests {
     #[test]
     fn test_new_with_voice_stores_voice() {
         let device =
-            CpuDevice::new_with_voice("http://localhost:8000/api/v1", None, KokoroVoice::BmGeorge);
+            CpuDevice::new_with_voice("http://localhost:13305/api/v1", None, KokoroVoice::BmGeorge);
         let voice = device.tts.as_ref().unwrap().default_voice.as_str();
         assert_eq!(
             voice,

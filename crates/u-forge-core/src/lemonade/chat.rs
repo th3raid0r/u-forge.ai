@@ -1,19 +1,71 @@
 //! Chat / LLM provider via Lemonade Server.
+//!
+//! Lemonade's `/chat/completions` endpoint is *almost* OpenAI-compatible, but
+//! deviates at the thinking/reasoning parameter: OpenAI uses a `reasoning` object
+//! or `reasoning_effort` string, while Lemonade uses a flat `enable_thinking: bool`
+//! field in the request body.  Because `async-openai`'s typed builder cannot inject
+//! arbitrary fields, this module hand-rolls both the request struct and the SSE
+//! stream parser using `reqwest` directly (via [`LemonadeHttpClient::post_stream`]).
+//!
+//! All other Lemonade endpoints (embeddings, TTS, STT) remain on `async-openai`.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use async_openai::{Client, config::OpenAIConfig};
-use async_openai::types::chat::{
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
-use super::client::make_lemonade_openai_client;
+use super::client::LemonadeHttpClient;
 use super::gpu_manager::GpuResourceManager;
 use super::registry::LemonadeModelRegistry;
+
+// ── Wire types ────────────────────────────────────────────────────────────────
+
+/// Serialised body sent to `POST /chat/completions`.
+#[derive(Serialize)]
+struct LemonadeChatReq<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    max_completion_tokens: u32,
+    temperature: f32,
+    /// Lemonade-specific field — absent when `None` (uses model default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
+    stream: bool,
+}
+
+/// Minimal streaming chunk shape — only the fields we need.
+#[derive(Deserialize)]
+struct StreamChunk {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize)]
+struct StreamDelta {
+    content: Option<String>,
+    /// Reasoning/thinking tokens — present when `enable_thinking: true` is set.
+    /// Carried in `reasoning_content` per the Lemonade SSE wire format.
+    reasoning_content: Option<String>,
+}
+
+// ── Public stream token type ──────────────────────────────────────────────────
+
+/// A single token yielded by [`LemonadeChatProvider::complete_stream`].
+#[derive(Debug, Clone)]
+pub enum StreamToken {
+    /// Normal assistant response text.
+    Content(String),
+    /// Chain-of-thought reasoning token (only present when `enable_thinking` is active).
+    Thinking(String),
+}
+
+// ── Public types ──────────────────────────────────────────────────────────────
 
 /// A single message in a chat conversation, following the OpenAI `messages` format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +138,9 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     /// Overrides the model id set on the provider (e.g. `"GLM-4.7-Flash-GGUF"`).
     pub model: Option<String>,
+    /// When `Some(true)`, sends `enable_thinking: true` in the request body, activating
+    /// Lemonade's chain-of-thought reasoning.  `None` omits the field (model default).
+    pub enable_thinking: Option<bool>,
 }
 
 impl ChatRequest {
@@ -95,6 +150,7 @@ impl ChatRequest {
             max_tokens: None,
             temperature: None,
             model: None,
+            enable_thinking: None,
         }
     }
 
@@ -112,56 +168,14 @@ impl ChatRequest {
         self.model = Some(model.into());
         self
     }
-}
 
-// ── Internal conversion helpers ───────────────────────────────────────────────
-
-fn to_oa_message(msg: &ChatMessage) -> Result<ChatCompletionRequestMessage> {
-    match msg.role.as_str() {
-        "system" => Ok(ChatCompletionRequestSystemMessageArgs::default()
-            .content(msg.content.clone())
-            .build()
-            .context("Failed to build system message")?
-            .into()),
-        "user" => Ok(ChatCompletionRequestUserMessageArgs::default()
-            .content(msg.content.clone())
-            .build()
-            .context("Failed to build user message")?
-            .into()),
-        "assistant" => Ok(ChatCompletionRequestAssistantMessageArgs::default()
-            .content(msg.content.clone())
-            .build()
-            .context("Failed to build assistant message")?
-            .into()),
-        role => Err(anyhow!("Unknown chat role: {role}")),
-    }
-}
-
-fn from_oa_response(resp: CreateChatCompletionResponse) -> ChatCompletionResponse {
-    ChatCompletionResponse {
-        id: resp.id,
-        choices: resp
-            .choices
-            .into_iter()
-            .map(|c| ChatChoice {
-                message: ChatMessage {
-                    role: "assistant".to_string(),
-                    content: c.message.content.unwrap_or_default(),
-                },
-                finish_reason: c.finish_reason.map(|r| {
-                    // FinishReason serialises to its lowercase OpenAI name via serde.
-                    serde_json::to_value(&r)
-                        .ok()
-                        .and_then(|v| v.as_str().map(String::from))
-                        .unwrap_or_else(|| format!("{r:?}").to_lowercase())
-                }),
-            })
-            .collect(),
-        usage: resp.usage.map(|u| ChatUsage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-        }),
+    /// Enable or disable Lemonade's chain-of-thought reasoning for this request.
+    ///
+    /// Serialises to `enable_thinking: bool` in the request body — Lemonade's
+    /// deviation from the OpenAI `reasoning`/`reasoning_effort` convention.
+    pub fn with_thinking(mut self, enabled: bool) -> Self {
+        self.enable_thinking = Some(enabled);
+        self
     }
 }
 
@@ -173,7 +187,7 @@ fn from_oa_response(resp: CreateChatCompletionResponse) -> ChatCompletionRespons
 /// See [`GpuResourceManager`] for the full policy description.
 #[derive(Debug, Clone)]
 pub struct LemonadeChatProvider {
-    client: Client<OpenAIConfig>,
+    client: LemonadeHttpClient,
     /// The model id sent to the API (e.g. `"GLM-4.7-Flash-GGUF"`).
     pub model: String,
     /// Shared GPU resource manager — also held by [`LemonadeSttProvider`](super::LemonadeSttProvider).
@@ -193,7 +207,7 @@ impl LemonadeChatProvider {
     /// Construct with an explicit base URL, model id, and optional GPU manager.
     pub fn new(base_url: &str, model: &str, gpu: Option<Arc<GpuResourceManager>>) -> Self {
         Self {
-            client: make_lemonade_openai_client(base_url),
+            client: LemonadeHttpClient::new(base_url),
             model: model.to_string(),
             gpu,
             default_max_tokens: 2048,
@@ -250,35 +264,138 @@ impl LemonadeChatProvider {
         let temperature = req.temperature.unwrap_or(self.default_temperature);
         let model = req.model.as_deref().unwrap_or(&self.model);
 
-        let messages: Result<Vec<_>> = req.messages.iter().map(to_oa_message).collect();
-        let messages = messages.context("Failed to convert chat messages")?;
+        let body = LemonadeChatReq {
+            model,
+            messages: &req.messages,
+            max_completion_tokens: max_tokens,
+            temperature,
+            enable_thinking: req.enable_thinking,
+            stream: false,
+        };
 
-        let oa_req = CreateChatCompletionRequestArgs::default()
-            .model(model)
-            .messages(messages)
-            .max_completion_tokens(max_tokens)
-            .temperature(temperature)
-            .build()
-            .context("Failed to build chat completion request")?;
-
-        let oa_resp = self
+        let resp: ChatCompletionResponse = self
             .client
-            .chat()
-            .create(oa_req)
+            .post_json("/chat/completions", &body)
             .await
             .context("Chat HTTP request failed")?;
 
         tracing::debug!(
             model         = %model,
             n_messages    = req.messages.len(),
-            finish_reason = ?oa_resp.choices.first().and_then(|c| c.finish_reason.as_ref()),
-            total_tokens  = ?oa_resp.usage.as_ref().map(|u| u.total_tokens),
+            finish_reason = ?resp.choices.first().and_then(|c| c.finish_reason.as_ref()),
+            total_tokens  = ?resp.usage.as_ref().map(|u| u.total_tokens),
             duration_ms   = start.elapsed().as_millis(),
             "Chat completion finished"
         );
 
-        Ok(from_oa_response(oa_resp))
+        Ok(resp)
         // _guard dropped here → GPU released.
+    }
+
+    /// Send a streaming `ChatRequest`; returns an mpsc receiver that yields
+    /// [`StreamToken`]s as the model generates them.
+    ///
+    /// Spawns an internal Tokio task that holds the GPU lock and drives the
+    /// SSE stream.  The task exits (and the lock is released) when the stream
+    /// is exhausted, the receiver is dropped, or the first error occurs.
+    ///
+    /// # SSE parsing
+    ///
+    /// Lemonade follows the standard OpenAI SSE wire format:
+    /// `data: {…json…}\n\n` lines until `data: [DONE]\n\n`.
+    /// Non-`data:` lines (`event:`, `id:`, blank) are silently skipped.
+    ///
+    /// When `enable_thinking` is active, the model may emit `reasoning_content`
+    /// deltas alongside (or before) normal `content` deltas; these are surfaced
+    /// as [`StreamToken::Thinking`] items.
+    pub fn complete_stream(&self, req: ChatRequest) -> mpsc::Receiver<Result<StreamToken>> {
+        let (tx, rx) = mpsc::channel(64);
+        let provider = self.clone();
+
+        tokio::spawn(async move {
+            let _guard = if let Some(gpu) = &provider.gpu {
+                Some(gpu.begin_llm().await)
+            } else {
+                None
+            };
+
+            let max_tokens = req.max_tokens.unwrap_or(provider.default_max_tokens);
+            let temperature = req.temperature.unwrap_or(provider.default_temperature);
+            let model = req.model.as_deref().unwrap_or(&provider.model).to_string();
+
+            let body = LemonadeChatReq {
+                model: &model,
+                messages: &req.messages,
+                max_completion_tokens: max_tokens,
+                temperature,
+                enable_thinking: req.enable_thinking,
+                stream: true,
+            };
+
+            let response = match provider
+                .client
+                .post_stream("/chat/completions", &body)
+                .await
+                .context("Stream init failed")
+            {
+                Ok(r) => r,
+                Err(e) => { let _ = tx.send(Err(e)).await; return; }
+            };
+
+            // Drive the SSE byte stream, accumulating into a line buffer.
+            let mut line_buf = String::new();
+            let mut byte_stream = response.bytes_stream();
+
+            while let Some(chunk) = byte_stream.next().await {
+                let bytes = match chunk.context("Stream read error") {
+                    Ok(b) => b,
+                    Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                };
+
+                line_buf.push_str(&String::from_utf8_lossy(&bytes));
+
+                // Process all complete lines in the buffer.
+                loop {
+                    let Some(nl) = line_buf.find('\n') else { break };
+                    let line = line_buf[..nl].trim_end_matches('\r').to_string();
+                    line_buf.drain(..=nl);
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let Some(data) = line.strip_prefix("data: ") else {
+                        continue; // skip event:, id:, comment lines
+                    };
+
+                    if data == "[DONE]" {
+                        return;
+                    }
+
+                    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+                        for choice in chunk.choices {
+                            if let Some(thinking) = choice.delta.reasoning_content {
+                                if !thinking.is_empty()
+                                    && tx.send(Ok(StreamToken::Thinking(thinking))).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if let Some(content) = choice.delta.content {
+                                if !content.is_empty()
+                                    && tx.send(Ok(StreamToken::Content(content))).await.is_err()
+                                {
+                                    return; // receiver dropped
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // _guard dropped here → GPU released.
+        });
+
+        rx
     }
 
     /// Send a list of messages with provider defaults, queuing if GPU is busy.

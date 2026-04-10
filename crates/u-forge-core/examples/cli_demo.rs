@@ -11,7 +11,7 @@
 //!   cargo run --example cli_demo [DATA_FILE] [SCHEMA_DIR] --config <CONFIG_FILE>
 //!
 //! Environment:
-//!   LEMONADE_URL         Lemonade Server base URL (e.g. http://localhost:8000/api/v1)
+//!   LEMONADE_URL         Lemonade Server base URL (e.g. http://localhost:13305/api/v1)
 //!   UFORGE_DATA_FILE     override DATA_FILE
 //!   UFORGE_SCHEMA_DIR    override SCHEMA_DIR
 //!   UFORGE_DEMO_CONFIG   path to demo config TOML file
@@ -56,8 +56,7 @@ use u_forge_core::{
     hardware::npu::NpuDevice,
     ingest::DataIngestion,
     lemonade::{
-        effective_ctx_size, resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider,
-        ModelLoadOptions, ModelRole, SystemInfo,
+        resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
@@ -137,6 +136,8 @@ struct HybridSearchParams {
     rerank: bool,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default = "default_hq_semantic_boost")]
+    hq_semantic_boost: f32,
 }
 
 #[derive(serde::Deserialize)]
@@ -162,6 +163,9 @@ fn default_hybrid_fts_limit() -> usize {
 }
 fn default_hybrid_sem_limit() -> usize {
     15
+}
+fn default_hq_semantic_boost() -> f32 {
+    3.0
 }
 
 fn load_demo_config(path: &str) -> Result<DemoConfig> {
@@ -254,10 +258,7 @@ async fn main() -> Result<()> {
     println!();
 
     // Resolve DB config upfront (needed for the Database section below)
-    let default_db_path = format!(
-        "{}/../../demo_data/kg",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let default_db_path = format!("{}/../../demo_data/kg", env!("CARGO_MANIFEST_DIR"));
     let db_cfg = demo_cfg.database.as_ref();
     let db_path_str = db_cfg
         .and_then(|c| c.path.as_deref())
@@ -428,7 +429,9 @@ async fn main() -> Result<()> {
                             );
                             print_model_choice(
                                 "   Embed (HQ)   ",
-                                registry.hq_embedding_model(device_cfg.embedding.high_quality_embedding),
+                                registry.hq_embedding_model(
+                                    device_cfg.embedding.high_quality_embedding,
+                                ),
                             );
                             print_model_choice("   LLM (NPU)   ", registry.npu_llm_model());
                             print_model_choice("   LLM (GPU)   ", registry.llm_model());
@@ -438,10 +441,7 @@ async fn main() -> Result<()> {
                             // Build a reranker for the demo section below
                             match LemonadeRerankProvider::from_registry(&registry) {
                                 Ok(r) => {
-                                    let load_opts = ModelLoadOptions {
-                                        ctx_size: Some(u_forge_core::DEFAULT_EMBEDDING_CONTEXT_TOKENS),
-                                        ..Default::default()
-                                    };
+                                    let load_opts = device_cfg.models.load_options_for(&r.model);
                                     if let Err(e) = r.load(&load_opts).await {
                                         println!("   ⚠️  Reranker load failed ({e}), using server defaults");
                                     }
@@ -497,10 +497,8 @@ async fn main() -> Result<()> {
 
                             // NPU worker (FLM embed-gemma-300m-FLM)
                             // ctx_size capped to the model's actual max sequence length.
-                            let npu_load_opts = ModelLoadOptions {
-                                ctx_size: Some(effective_ctx_size("embed-gemma-300m-FLM")),
-                                ..Default::default()
-                            };
+                            let npu_load_opts =
+                                device_cfg.models.load_options_for("embed-gemma-300m-FLM");
                             match NpuDevice::embedding_only(url, None, Some(&npu_load_opts)).await {
                                 Ok(npu) => {
                                     let dims = npu.embedding.dimensions().unwrap_or(0);
@@ -525,10 +523,7 @@ async fn main() -> Result<()> {
                             // meaningless distance scores.
                             if let Some(model) = registry.llamacpp_embedding_model() {
                                 let model_id = model.id.clone();
-                                let cpu_load_opts = ModelLoadOptions {
-                                    ctx_size: Some(effective_ctx_size(&model_id)),
-                                    ..Default::default()
-                                };
+                                let cpu_load_opts = device_cfg.models.load_options_for(&model_id);
                                 match LemonadeProvider::new_with_load(
                                     url,
                                     &model_id,
@@ -579,14 +574,11 @@ async fn main() -> Result<()> {
                             }
 
                             // ── High-quality embedding worker (Qwen3-Embedding-8B-GGUF) ─
-                            if let Some(hq_model) = registry.hq_embedding_model(
-                                device_cfg.embedding.high_quality_embedding,
-                            ) {
+                            if let Some(hq_model) = registry
+                                .hq_embedding_model(device_cfg.embedding.high_quality_embedding)
+                            {
                                 let hq_model_id = hq_model.id.clone();
-                                let hq_load_opts = ModelLoadOptions {
-                                    ctx_size: Some(effective_ctx_size(&hq_model_id)),
-                                    ..Default::default()
-                                };
+                                let hq_load_opts = device_cfg.models.load_options_for(&hq_model_id);
                                 println!("   Building HQ embedding worker ({hq_model_id})…");
                                 match LemonadeProvider::new_with_load(
                                     url,
@@ -596,7 +588,9 @@ async fn main() -> Result<()> {
                                 .await
                                 {
                                     Err(e) => {
-                                        println!("     ⚠️  HQ embed({hq_model_id}) unavailable: {e}");
+                                        println!(
+                                            "     ⚠️  HQ embed({hq_model_id}) unavailable: {e}"
+                                        );
                                     }
                                     Ok(provider) => {
                                         let dims = provider.dimensions().unwrap_or(0);
@@ -661,7 +655,8 @@ async fn main() -> Result<()> {
         // ── Schemas ───────────────────────────────────────────────────────────
 
         println!("📚 Loading schemas from {schema_dir}");
-        match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0") {
+        match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0")
+        {
             Ok(schema_def) => {
                 let mgr = graph.get_schema_manager();
                 match mgr.save_schema(&schema_def).await {
@@ -744,62 +739,65 @@ async fn main() -> Result<()> {
 
     if let Some(ref eq) = embed_queue {
         if !needs_embedding {
-            println!("ℹ️  Embedding skipped — all {} chunks already embedded.\n", post_load_stats.chunk_count);
+            println!(
+                "ℹ️  Embedding skipped — all {} chunks already embedded.\n",
+                post_load_stats.chunk_count
+            );
         } else {
-        println!("🧮 Embedding chunks for semantic search (sqlite-vec)…");
-        println!("   Workers  : {}", eq.embedding_worker_count());
+            println!("🧮 Embedding chunks for semantic search (sqlite-vec)…");
+            println!("   Workers  : {}", eq.embedding_worker_count());
 
-        // Collect all chunks that need embeddings.
-        let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
-            let mut all = Vec::new();
-            for obj in &objs {
-                for chunk in graph.get_text_chunks(obj.id)? {
-                    all.push(chunk);
-                }
-            }
-            Ok(all)
-        })?;
-
-        let total = chunks_to_embed.len();
-        println!("   Chunks   : {total}");
-
-        // Fire all texts at once — embed_many() dispatches one job per chunk
-        // and each worker races to claim jobs, so all workers run concurrently.
-        let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
-
-        let t0 = std::time::Instant::now();
-        match eq.embed_many(texts).await {
-            Err(e) => {
-                eprintln!("    ❌ embed_many failed: {e}");
-            }
-            Ok(vecs) => {
-                let elapsed = t0.elapsed();
-                let mut stored = 0usize;
-                let mut skipped = 0usize;
-                for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
-                    match graph.upsert_chunk_embedding(chunk.id, vec) {
-                        Ok(()) => stored += 1,
-                        Err(e) => {
-                            skipped += 1;
-                            eprintln!(
-                                "    ⚠️  Could not store embedding for chunk {}: {e}",
-                                chunk.id
-                            );
-                        }
+            // Collect all chunks that need embeddings.
+            let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
+                let mut all = Vec::new();
+                for obj in &objs {
+                    for chunk in graph.get_text_chunks(obj.id)? {
+                        all.push(chunk);
                     }
                 }
-                let rate = if elapsed.as_secs_f64() > 0.0 {
-                    stored as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-                println!(
-                    "    ✅ {stored}/{total} embedded in {:.1}s ({rate:.0} chunks/s, \
+                Ok(all)
+            })?;
+
+            let total = chunks_to_embed.len();
+            println!("   Chunks   : {total}");
+
+            // Fire all texts at once — embed_many() dispatches one job per chunk
+            // and each worker races to claim jobs, so all workers run concurrently.
+            let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
+
+            let t0 = std::time::Instant::now();
+            match eq.embed_many(texts).await {
+                Err(e) => {
+                    eprintln!("    ❌ embed_many failed: {e}");
+                }
+                Ok(vecs) => {
+                    let elapsed = t0.elapsed();
+                    let mut stored = 0usize;
+                    let mut skipped = 0usize;
+                    for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
+                        match graph.upsert_chunk_embedding(chunk.id, vec) {
+                            Ok(()) => stored += 1,
+                            Err(e) => {
+                                skipped += 1;
+                                eprintln!(
+                                    "    ⚠️  Could not store embedding for chunk {}: {e}",
+                                    chunk.id
+                                );
+                            }
+                        }
+                    }
+                    let rate = if elapsed.as_secs_f64() > 0.0 {
+                        stored as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "    ✅ {stored}/{total} embedded in {:.1}s ({rate:.0} chunks/s, \
                      {skipped} skipped)\n",
-                    elapsed.as_secs_f64()
-                );
+                        elapsed.as_secs_f64()
+                    );
+                }
             }
-        }
         } // end needs_embedding else
     } else if lemonade_url.is_some() {
         println!("ℹ️  Embedding skipped — no compatible embedding model available.\n");
@@ -811,59 +809,62 @@ async fn main() -> Result<()> {
 
     if let Some(ref hq_eq) = hq_embed_queue {
         if !needs_hq_embedding {
-            println!("ℹ️  HQ embedding skipped — all {} chunks already HQ embedded.\n", post_load_stats.chunk_count);
+            println!(
+                "ℹ️  HQ embedding skipped — all {} chunks already HQ embedded.\n",
+                post_load_stats.chunk_count
+            );
         } else {
-        println!("🧮 HQ embedding chunks ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)…");
-        println!("   Workers  : {}", hq_eq.embedding_worker_count());
+            println!("🧮 HQ embedding chunks ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)…");
+            println!("   Workers  : {}", hq_eq.embedding_worker_count());
 
-        let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
-            let mut all = Vec::new();
-            for obj in &objs {
-                for chunk in graph.get_text_chunks(obj.id)? {
-                    all.push(chunk);
-                }
-            }
-            Ok(all)
-        })?;
-
-        let total = chunks_to_embed.len();
-        println!("   Chunks   : {total}");
-
-        let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
-
-        let t0 = std::time::Instant::now();
-        match hq_eq.embed_many(texts).await {
-            Err(e) => {
-                eprintln!("    ❌ HQ embed_many failed: {e}");
-            }
-            Ok(vecs) => {
-                let elapsed = t0.elapsed();
-                let mut stored = 0usize;
-                let mut skipped = 0usize;
-                for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
-                    match graph.upsert_chunk_embedding_hq(chunk.id, vec) {
-                        Ok(()) => stored += 1,
-                        Err(e) => {
-                            skipped += 1;
-                            eprintln!(
-                                "    ⚠️  Could not store HQ embedding for chunk {}: {e}",
-                                chunk.id
-                            );
-                        }
+            let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
+                let mut all = Vec::new();
+                for obj in &objs {
+                    for chunk in graph.get_text_chunks(obj.id)? {
+                        all.push(chunk);
                     }
                 }
-                let rate = if elapsed.as_secs_f64() > 0.0 {
-                    stored as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-                println!(
-                    "    ✅ {stored}/{total} HQ embedded in {:.1}s ({rate:.0} chunks/s, \
+                Ok(all)
+            })?;
+
+            let total = chunks_to_embed.len();
+            println!("   Chunks   : {total}");
+
+            let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
+
+            let t0 = std::time::Instant::now();
+            match hq_eq.embed_many(texts).await {
+                Err(e) => {
+                    eprintln!("    ❌ HQ embed_many failed: {e}");
+                }
+                Ok(vecs) => {
+                    let elapsed = t0.elapsed();
+                    let mut stored = 0usize;
+                    let mut skipped = 0usize;
+                    for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
+                        match graph.upsert_chunk_embedding_hq(chunk.id, vec) {
+                            Ok(()) => stored += 1,
+                            Err(e) => {
+                                skipped += 1;
+                                eprintln!(
+                                    "    ⚠️  Could not store HQ embedding for chunk {}: {e}",
+                                    chunk.id
+                                );
+                            }
+                        }
+                    }
+                    let rate = if elapsed.as_secs_f64() > 0.0 {
+                        stored as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "    ✅ {stored}/{total} HQ embedded in {:.1}s ({rate:.0} chunks/s, \
                      {skipped} skipped)\n",
-                    elapsed.as_secs_f64()
-                );
+                        elapsed.as_secs_f64()
+                    );
+                }
             }
-        }
         } // end needs_hq_embedding else
     }
 
@@ -876,7 +877,10 @@ async fn main() -> Result<()> {
     println!("   Chunks    : {}", gs.chunk_count);
     println!("   Tokens    : {}", gs.total_tokens);
     println!("   Embedded  : {}/{}", gs.embedded_count, gs.chunk_count);
-    println!("   Embedded HQ: {}/{}", gs.embedded_hq_count, gs.chunk_count);
+    println!(
+        "   Embedded HQ: {}/{}",
+        gs.embedded_hq_count, gs.chunk_count
+    );
     println!();
 
     // ── FTS5 search demo ──────────────────────────────────────────────────────
@@ -1165,6 +1169,7 @@ async fn main() -> Result<()> {
                 semantic_limit: p.semantic_limit,
                 rerank: p.rerank && has_rr,
                 limit: p.limit,
+                hq_semantic_boost: p.hq_semantic_boost,
             },
             None => HybridSearchConfig {
                 alpha: 0.5,
@@ -1172,12 +1177,13 @@ async fn main() -> Result<()> {
                 semantic_limit: 15,
                 rerank: has_rr,
                 limit: 3,
+                hq_semantic_boost: 3.0,
             },
         };
 
         println!(
-            "   Config: alpha={} | fts_limit={} | semantic_limit={} | rerank={} | limit={} nodes\n",
-            config.alpha, config.fts_limit, config.semantic_limit, config.rerank, config.limit,
+            "   Config: alpha={} | fts_limit={} | semantic_limit={} | rerank={} | semantic_boost={} | limit={} nodes\n",
+            config.alpha, config.fts_limit, config.semantic_limit, config.rerank, config.hq_semantic_boost, config.limit,
         );
 
         let hybrid_queries: Vec<String> = match &demo_cfg.hybrid {
@@ -1192,7 +1198,8 @@ async fn main() -> Result<()> {
         for query in &hybrid_queries {
             println!("  Query: \"{query}\"");
 
-            match search_hybrid(&graph, eq, hq_embed_queue.as_ref(), query.as_str(), &config).await {
+            match search_hybrid(&graph, eq, hq_embed_queue.as_ref(), query.as_str(), &config).await
+            {
                 Err(e) => {
                     println!("    ⚠️  Hybrid search error: {e}\n");
                 }
@@ -1248,9 +1255,18 @@ async fn main() -> Result<()> {
                 semantic_limit: 10,
                 rerank: false, // keep comparable — no reranker variance
                 limit: 3,
+                hq_semantic_boost: 3.0,
             };
             print!("  alpha={alpha:.1} ({label}): ");
-            match search_hybrid(&graph, eq, hq_embed_queue.as_ref(), sweep_query, &sweep_config).await {
+            match search_hybrid(
+                &graph,
+                eq,
+                hq_embed_queue.as_ref(),
+                sweep_query,
+                &sweep_config,
+            )
+            .await
+            {
                 Err(e) => println!("⚠️  {e}"),
                 Ok(rs) if rs.is_empty() => println!("(no results)"),
                 Ok(rs) => {
@@ -1454,7 +1470,7 @@ fn print_usage(prog: &str) {
     println!("  UFORGE_SCHEMA_DIR   override SCHEMA_DIR");
     println!("  UFORGE_DEMO_CONFIG  path to demo config TOML file");
     println!("  LEMONADE_URL        Lemonade Server base URL for AI features");
-    println!("                      e.g. http://localhost:8000/api/v1");
+    println!("                      e.g. http://localhost:13305/api/v1");
     println!("  RUST_LOG            log level (error/warn/info/debug/trace)");
     println!();
     println!("Config file format (TOML) — all sections are optional:");

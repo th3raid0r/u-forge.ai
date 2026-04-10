@@ -317,7 +317,7 @@ impl EmbeddingManager {
     /// Resolution order:
     /// 1. `lemonade_url` argument (if provided)
     /// 2. `LEMONADE_URL` environment variable
-    /// 3. Localhost probe — `http://localhost:8000` then `http://127.0.0.1:8000`
+    /// 3. Localhost probe — `http://localhost:13305` then `http://127.0.0.1:13305`
     ///    via [`crate::lemonade::resolve_lemonade_url`]
     /// 4. Hard error — no server could be found
     ///
@@ -352,7 +352,7 @@ impl EmbeddingManager {
                 "No Lemonade Server URL configured and none found on localhost. \
                  Start lemonade-server or set the LEMONADE_URL environment variable:\n  \
                  lemonade-server serve\n  \
-                 export LEMONADE_URL=http://localhost:8000/api/v1"
+                 export LEMONADE_URL=http://localhost:13305/api/v1"
             )),
         }
     }

@@ -20,7 +20,7 @@
 //! # async fn run() -> anyhow::Result<()> {
 //! // All three capabilities on the NPU
 //! let npu = NpuDevice::new(
-//!     "http://localhost:8000/api/v1",
+//!     "http://localhost:13305/api/v1",
 //!     None, // embed-gemma-300m-FLM
 //!     None, // whisper-v3-turbo-FLM
 //!     None, // qwen3-8b-FLM (pass Some("model-id") to override, or None to disable)
@@ -51,6 +51,7 @@ use tracing::info;
 
 use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
 use crate::ai::transcription::{LemonadeTranscriptionProvider, TranscriptionProvider};
+use crate::config::ModelConfig;
 use crate::lemonade::{LemonadeChatProvider, LemonadeModelRegistry, ModelLoadOptions};
 
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
@@ -64,7 +65,7 @@ pub const DEFAULT_NPU_EMBEDDING_MODEL: &str = "embed-gemma-300m-FLM";
 pub const DEFAULT_NPU_STT_MODEL: &str = "whisper-v3-turbo-FLM";
 
 /// Default NPU LLM model served by Lemonade (AMD FLM — lightweight for low latency).
-pub const DEFAULT_NPU_LLM_MODEL: &str = "qwen3-8b-FLM";
+pub const DEFAULT_NPU_LLM_MODEL: &str = "qwen3.5-9b-FLM";
 
 // ── NpuDevice ─────────────────────────────────────────────────────────────────
 
@@ -114,7 +115,7 @@ impl NpuDevice {
     ///
     /// # Arguments
     ///
-    /// * `base_url`        — Lemonade Server API root (e.g. `"http://localhost:8000/api/v1"`).
+    /// * `base_url`        — Lemonade Server API root (e.g. `"http://localhost:13305/api/v1"`).
     /// * `embedding_model` — FLM embedding model id.  Defaults to
     ///   [`DEFAULT_NPU_EMBEDDING_MODEL`] when `None`.
     /// * `stt_model`       — FLM whisper model id.  Defaults to
@@ -213,6 +214,24 @@ impl NpuDevice {
     /// embedding model at all, an error is returned immediately.
     pub async fn from_registry(registry: &LemonadeModelRegistry) -> Result<Self> {
         Self::from_registry_with_load(registry, None).await
+    }
+
+    /// Like [`from_registry`](Self::from_registry) but loads each model with
+    /// parameters sourced from `config` (`u-forge.toml` `[models.load_params]`).
+    ///
+    /// Passes the per-model `ctx_size`, `batch_size`, and `ubatch_size` from
+    /// config to `POST /api/v1/load` before connecting.  FLM models accept
+    /// `ctx_size`; `batch_size` / `ubatch_size` are silently dropped for them
+    /// by [`load_model`](crate::lemonade::load_model).
+    pub async fn from_registry_with_config(
+        registry: &LemonadeModelRegistry,
+        config: &ModelConfig,
+    ) -> Result<Self> {
+        let emb_entry = registry.npu_embedding_model().ok_or_else(|| {
+            anyhow::anyhow!("No NPU embedding model found in the Lemonade registry")
+        })?;
+        let emb_opts = config.load_options_for(&emb_entry.id);
+        Self::from_registry_with_load(registry, Some(&emb_opts)).await
     }
 
     /// Like [`from_registry`](Self::from_registry) but explicitly loads the
@@ -478,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_transcription_only_capabilities() {
-        let device = NpuDevice::transcription_only("http://localhost:8000/api/v1", None);
+        let device = NpuDevice::transcription_only("http://localhost:13305/api/v1", None);
         assert!(
             device.supports(&DeviceCapability::Transcription),
             "transcription_only must support Transcription"
@@ -493,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_transcription_only_uses_default_model() {
-        let device = NpuDevice::transcription_only("http://localhost:8000/api/v1", None);
+        let device = NpuDevice::transcription_only("http://localhost:13305/api/v1", None);
         let model = device
             .transcription
             .as_ref()
@@ -509,7 +528,7 @@ mod tests {
     #[test]
     fn test_transcription_only_custom_model() {
         let device =
-            NpuDevice::transcription_only("http://localhost:8000/api/v1", Some("my-whisper-FLM"));
+            NpuDevice::transcription_only("http://localhost:13305/api/v1", Some("my-whisper-FLM"));
         let model = device
             .transcription
             .as_ref()
@@ -521,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_device_worker_name_and_backend() {
-        let device = NpuDevice::transcription_only("http://localhost:8000/api/v1", None);
+        let device = NpuDevice::transcription_only("http://localhost:13305/api/v1", None);
         assert!(!device.name().is_empty(), "name should not be empty");
         assert_eq!(device.backend(), HardwareBackend::Npu);
     }
@@ -551,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_summary_format() {
-        let device = NpuDevice::transcription_only("http://localhost:8000/api/v1", None);
+        let device = NpuDevice::transcription_only("http://localhost:13305/api/v1", None);
         let summary = device.summary();
         assert!(
             summary.contains("NPU"),
