@@ -330,7 +330,7 @@ impl LemonadeModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::lemonade_url;
+    use crate::test_helpers::require_integration_url;
 
     fn make_entry(id: &str, labels: &[&str], recipe: &str) -> LemonadeModelEntry {
         LemonadeModelEntry {
@@ -472,98 +472,52 @@ mod tests {
         assert_eq!(m.role(), ModelRole::Other);
     }
 
-    // ── Integration: model registry (requires LEMONADE_URL) ──────────────────
+    // ── Integration: model registry (requires Lemonade Server) ─────────────────
 
     #[tokio::test]
-    async fn test_registry_fetch_returns_models() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("SKIP test_registry_fetch_returns_models — Lemonade Server not available");
-            return;
-        };
+    async fn test_registry_fetch_and_classify() {
+        let url = require_integration_url!();
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
+
+        // Basic fetch
         assert!(
             !reg.models.is_empty(),
             "Registry must contain at least one model"
         );
-        println!("Discovered {} models:\n{}", reg.models.len(), reg.summary());
-    }
 
-    #[tokio::test]
-    async fn test_registry_identifies_npu_embedding_model() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let m = reg.npu_embedding_model();
-        assert!(m.is_some(), "embed-gemma-300m-FLM should be present");
+        // Role classification via convenience accessors
+        let emb = reg.npu_embedding_model();
+        assert!(emb.is_some(), "embed-gemma-300m-FLM should be present");
         assert!(
-            m.unwrap().id.contains("embed-gemma"),
+            emb.unwrap().id.contains("embed-gemma"),
             "Expected embed-gemma model, got: {}",
-            m.unwrap().id
+            emb.unwrap().id
         );
-    }
 
-    #[tokio::test]
-    async fn test_registry_identifies_tts_model() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let m = reg.tts_model();
-        assert!(m.is_some(), "kokoro-v1 TTS model should be present");
-        assert_eq!(m.unwrap().id, "kokoro-v1");
-    }
+        let tts = reg.tts_model();
+        assert!(tts.is_some(), "kokoro-v1 TTS model should be present");
+        assert_eq!(tts.unwrap().id, "kokoro-v1");
 
-    #[tokio::test]
-    async fn test_registry_identifies_stt_model() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let m = reg.stt_model();
-        assert!(m.is_some(), "Whisper STT model should be present");
+        let stt = reg.stt_model();
+        assert!(stt.is_some(), "Whisper STT model should be present");
         assert!(
-            m.unwrap().id.contains("Whisper"),
+            stt.unwrap().id.contains("Whisper"),
             "Expected Whisper model, got: {}",
-            m.unwrap().id
+            stt.unwrap().id
         );
-    }
 
-    #[tokio::test]
-    async fn test_registry_identifies_llm_model() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let m = reg.llm_model();
-        assert!(m.is_some(), "GLM-4.7-Flash-GGUF LLM should be present");
+        let llm = reg.llm_model();
+        assert!(llm.is_some(), "GLM-4.7-Flash-GGUF LLM should be present");
         assert!(
-            m.unwrap().id.contains("GLM"),
+            llm.unwrap().id.contains("GLM"),
             "Expected GLM model, got: {}",
-            m.unwrap().id
-        );
-    }
-
-    #[tokio::test]
-    async fn test_registry_by_role_roundtrip() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-
-        let embeddings = reg.by_role(&ModelRole::NpuEmbedding);
-        assert!(
-            !embeddings.is_empty(),
-            "At least one NPU embedding model expected"
+            llm.unwrap().id
         );
 
-        let tts = reg.by_role(&ModelRole::CpuTts);
-        assert!(!tts.is_empty(), "At least one TTS model expected");
-
-        let stt = reg.by_role(&ModelRole::GpuStt);
-        assert!(!stt.is_empty(), "At least one STT model expected");
-
-        let llm = reg.by_role(&ModelRole::GpuLlm);
-        assert!(!llm.is_empty(), "At least one LLM model expected");
+        // by_role roundtrip
+        assert!(!reg.by_role(&ModelRole::NpuEmbedding).is_empty());
+        assert!(!reg.by_role(&ModelRole::CpuTts).is_empty());
+        assert!(!reg.by_role(&ModelRole::GpuStt).is_empty());
+        assert!(!reg.by_role(&ModelRole::GpuLlm).is_empty());
     }
 }

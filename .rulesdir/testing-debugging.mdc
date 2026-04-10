@@ -69,21 +69,20 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 }
 ```
 
-### Lemonade Server (integration tests — skipped when server unreachable)
+### Lemonade Server (integration tests — controlled by `UFORGE_INTEGRATION_TESTS`)
 
 Use `crate::test_helpers::lemonade_url` — it probes `localhost:13305` via the
 `GET /api/v1/health` endpoint first, then falls back to the `LEMONADE_URL`
 environment variable. Tests skip silently when neither yields a reachable server:
 
 ```rust
+use crate::test_helpers::require_integration_url;
+
 #[tokio::test]
 async fn test_lemonade_embed() {
-    let Some(url) = crate::test_helpers::lemonade_url().await else {
-        eprintln!("Skipping: no Lemonade Server reachable");
-        return;
-    };
+    let url = require_integration_url!();
 
-    let provider = u_forge_core::embeddings::LemonadeProvider::new(&url, "nomic-embed-text")
+    let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
         .await
         .expect("Connect to Lemonade");
 
@@ -92,8 +91,8 @@ async fn test_lemonade_embed() {
 }
 ```
 
-`lemonade_url()` is defined in `src/test_helpers.rs` (compiled `#[cfg(test)]`
-only) and delegates to the production `crate::lemonade::resolve_lemonade_url()`.
+Under the hood, `integration_test_url()` delegates to the production
+`crate::lemonade::resolve_lemonade_url()` for the default (unset) case.
 Resolution order:
 1. `http://localhost:13305/api/v1` — probed via `GET /api/v1/health` (2 s timeout)
 2. `http://127.0.0.1:13305/api/v1` — same probe, explicit IPv4 loopback
@@ -144,8 +143,8 @@ pattern when you need real audio bytes in a test.
 > Errors surface only when `transcribe()` is called. `LEMONADE_URL` is required;
 > `resolve_lemonade_url()` is not called by `TranscriptionManager`.
 
-Transcription integration tests follow the same `lemonade_url().await` skip pattern
-as embedding tests. See `src/ai/embeddings.rs` for working examples.
+Transcription integration tests use the same `require_integration_url!()` macro
+as all other integration tests. See `src/test_helpers.rs` for the implementation.
 
 ---
 
@@ -259,10 +258,10 @@ cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 No `source env.sh` required. No model downloads. All commands work offline.
 
 Integration tests are automatically skipped when no Lemonade Server is reachable
-(localhost probe finds nothing and `LEMONADE_URL` is unset). Always pass
-`--test-threads=1` — integration tests share GPU/NPU hardware on the server and
-must not run concurrently.
+(localhost probe finds nothing and `LEMONADE_URL` is unset). To **require** them
+in CI, set `UFORGE_INTEGRATION_TESTS=require` — tests will panic instead of
+silently skipping. To force-skip even when a server is present, set
+`UFORGE_INTEGRATION_TESTS=skip`.
 
-Transcription integration tests (`test_lemonade_transcribe_*`) require
-`whisper-v3-turbo-FLM` to be pulled on the server. They are automatically
-skipped when no server is reachable.
+Always pass `--test-threads=1` — integration tests share GPU/NPU hardware on
+the server and must not run concurrently.

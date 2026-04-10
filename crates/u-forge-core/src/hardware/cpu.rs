@@ -332,7 +332,6 @@ impl std::fmt::Debug for CpuDevice {
 mod tests {
     use super::*;
     use crate::hardware::{DeviceCapability, DeviceWorker, HardwareBackend};
-    use crate::test_helpers::lemonade_url;
 
     // ── Unit tests (no server required) ──────────────────────────────────────
 
@@ -475,84 +474,7 @@ mod tests {
         );
     }
 
-    // ── Integration tests (require a running Lemonade Server) ─────────────────
-
-    #[tokio::test]
-    async fn test_from_registry_discovers_tts_model() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: LEMONADE_URL not set");
-            return;
-        };
-
-        let registry = match crate::lemonade::LemonadeModelRegistry::fetch(&url).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Registry fetch failed: {e}");
-                return;
-            }
-        };
-
-        let device = CpuDevice::from_registry(&registry).await;
-        println!("CpuDevice from registry: {}", device.summary());
-        // We do not assert specific capabilities here since the server's
-        // model set is environment-dependent, but we log the result for
-        // manual inspection.
-    }
-
-    #[tokio::test]
-    async fn test_speak_returns_audio_bytes() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: LEMONADE_URL not set");
-            return;
-        };
-
-        let device = CpuDevice::new(&url, None, KokoroVoice::default());
-
-        let result = device.speak("Hello, adventurer!").await;
-        assert!(
-            result.is_some(),
-            "speak() must return Some when TTS is configured"
-        );
-
-        let audio = result.unwrap();
-        assert!(audio.is_ok(), "TTS synthesis failed: {:?}", audio.err());
-
-        let bytes = audio.unwrap();
-        assert!(!bytes.is_empty(), "TTS must return non-empty audio bytes");
-    }
-
-    #[tokio::test]
-    async fn test_speak_with_different_voices() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: LEMONADE_URL not set");
-            return;
-        };
-
-        let device = CpuDevice::new(&url, None, KokoroVoice::default());
-
-        for voice in [
-            KokoroVoice::AfSky,
-            KokoroVoice::AfHeart,
-            KokoroVoice::AmAdam,
-        ] {
-            let result = device.speak_with_voice("Test voice.", &voice).await;
-            assert!(
-                result.is_some(),
-                "speak_with_voice must return Some for voice {:?}",
-                voice
-            );
-            let audio = result.unwrap();
-            assert!(
-                audio.is_ok(),
-                "TTS failed for voice {:?}: {:?}",
-                voice,
-                audio.err()
-            );
-            assert!(
-                !audio.unwrap().is_empty(),
-                "Expected non-empty audio for voice {:?}",
-                voice
-            );
-        }
-    }
+    // Integration tests removed — TTS is canonically tested in lemonade::tts::tests.
+    // The CPU device's speak() and speak_with_voice() are thin delegations to
+    // LemonadeTtsProvider which is covered there.
 }

@@ -446,7 +446,7 @@ mod tests {
     use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
     use crate::ai::transcription::TranscriptionProvider;
     use crate::hardware::npu::NpuDevice;
-    use crate::test_helpers::lemonade_url;
+    use crate::test_helpers::require_integration_url;
 
     use super::super::builder::InferenceQueueBuilder;
     use super::super::jobs::{TranscribeJob, WorkQueue};
@@ -946,18 +946,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_embed_via_npu() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
-            return;
-        };
+        let url = require_integration_url!();
 
-        let npu = match NpuDevice::embedding_only(&url, None, None).await {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Skipping: NpuDevice construction failed: {e}");
-                return;
-            }
-        };
+        let npu = NpuDevice::embedding_only(&url, None, None)
+            .await
+            .expect("NpuDevice construction failed");
 
         let queue = InferenceQueueBuilder::new().with_npu_device(npu).build();
 
@@ -975,18 +968,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_transcribe_via_npu() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
-            return;
-        };
+        let url = require_integration_url!();
 
-        let npu = match NpuDevice::new(&url, None, None, None).await {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Skipping: NpuDevice construction failed: {e}");
-                return;
-            }
-        };
+        let npu = NpuDevice::new(&url, None, None, None)
+            .await
+            .expect("NpuDevice construction failed");
 
         let queue = InferenceQueueBuilder::new().with_npu_device(npu).build();
 
@@ -1001,25 +987,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_two_transcription_workers_compete() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable and LEMONADE_URL not set");
-            return;
-        };
+        let url = require_integration_url!();
 
-        let npu1 = match NpuDevice::new(&url, None, None, None).await {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Skipping: NpuDevice 1 construction failed: {e}");
-                return;
-            }
-        };
-        let npu2 = match NpuDevice::new(&url, None, None, None).await {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Skipping: NpuDevice 2 construction failed: {e}");
-                return;
-            }
-        };
+        let npu1 = NpuDevice::new(&url, None, None, None)
+            .await
+            .expect("NpuDevice 1 construction failed");
+        let npu2 = NpuDevice::new(&url, None, None, None)
+            .await
+            .expect("NpuDevice 2 construction failed");
 
         let queue = InferenceQueueBuilder::new()
             .with_npu_device(npu1)

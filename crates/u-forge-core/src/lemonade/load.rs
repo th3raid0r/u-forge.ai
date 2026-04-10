@@ -377,10 +377,7 @@ mod tests {
     /// Skips automatically when no Lemonade Server is reachable.
     #[tokio::test]
     async fn test_load_nomic_embed_v1_default_ctx() {
-        let Some(url) = crate::test_helpers::lemonade_url().await else {
-            eprintln!("Skipping: no Lemonade Server reachable");
-            return;
-        };
+        let url = crate::test_helpers::require_integration_url!();
 
         let opts = ModelLoadOptions {
             ctx_size: Some(crate::lemonade::effective_ctx_size(

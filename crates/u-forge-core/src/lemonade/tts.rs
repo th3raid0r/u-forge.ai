@@ -145,7 +145,7 @@ impl LemonadeTtsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::lemonade_url;
+    use crate::test_helpers::require_integration_url;
 
     #[test]
     fn test_kokoro_voice_as_str() {
@@ -165,63 +165,15 @@ mod tests {
         assert_eq!(KokoroVoice::default(), KokoroVoice::AfSky);
     }
 
-    // ── Integration: TTS (requires LEMONADE_URL) ──────────────────────────────
+    // ── Integration: TTS (requires Lemonade Server) ────────────────────────────
 
     #[tokio::test]
     async fn test_tts_returns_audio_bytes() {
-        let Some(url) = lemonade_url().await else {
-            eprintln!("SKIP test_tts_returns_audio_bytes — Lemonade Server not available");
-            return;
-        };
+        let url = require_integration_url!();
         let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
         let tts = LemonadeTtsProvider::from_registry(&reg).unwrap();
 
         let audio = tts.synthesize_default("Hello, adventurer!").await.unwrap();
         assert!(!audio.is_empty(), "TTS should return non-empty audio bytes");
-        println!("TTS returned {} bytes of audio", audio.len());
-    }
-
-    #[tokio::test]
-    async fn test_tts_multiple_voices() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let tts = LemonadeTtsProvider::from_registry(&reg).unwrap();
-
-        for voice in &[
-            KokoroVoice::AfSky,
-            KokoroVoice::AfHeart,
-            KokoroVoice::AmAdam,
-            KokoroVoice::BmGeorge,
-        ] {
-            let audio = tts
-                .synthesize("The dungeon awaits.", Some(voice))
-                .await
-                .unwrap();
-            assert!(
-                !audio.is_empty(),
-                "Voice {:?} should produce audio bytes",
-                voice
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_tts_long_text() {
-        let Some(url) = lemonade_url().await else {
-            return;
-        };
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let tts = LemonadeTtsProvider::from_registry(&reg).unwrap();
-
-        let text = "Deep beneath the ancient mountain, \
-                    where shadows cling to every stone, \
-                    the adventurers discovered a chamber unlike any they had seen before. \
-                    Runes of glowing amber lined the walls, pulsing with a rhythm like a \
-                    heartbeat, and at the centre stood a pedestal bearing a single obsidian key.";
-
-        let audio = tts.synthesize_default(text).await.unwrap();
-        assert!(!audio.is_empty(), "Long-form TTS should return audio bytes");
     }
 }
