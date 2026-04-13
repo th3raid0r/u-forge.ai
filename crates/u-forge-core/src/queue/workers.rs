@@ -20,9 +20,7 @@ use tracing::debug;
 
 use crate::ai::embeddings::EmbeddingProvider;
 use crate::ai::transcription::TranscriptionProvider;
-use crate::lemonade::{
-    LemonadeChatProvider, LemonadeRerankProvider, LemonadeSttProvider, LemonadeTtsProvider,
-};
+use crate::lemonade::{LemonadeChatProvider, LemonadeRerankProvider, LemonadeTtsProvider};
 
 use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
 use super::weighted::WeightedEmbedDispatcher;
@@ -36,6 +34,29 @@ const EMBED_MAX_ATTEMPTS: u32 = 3;
 /// (100 ms → 200 ms) so three attempts add at most ~300 ms of backoff.
 const EMBED_RETRY_BASE_MS: u64 = 100;
 
+/// Generic single-consumer worker loop shared by all non-embedding workers.
+///
+/// On each iteration:
+/// 1. Register a `notified` future BEFORE checking the queue (race-free).
+/// 2. Pop a job if one is ready, drop the future, and call `process`.
+/// 3. If the queue is empty, sleep until the queue is notified.
+async fn run_worker_loop<J, F, Fut>(queue: Arc<WorkQueue<J>>, process: F)
+where
+    J: Send,
+    F: Fn(J) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        let notified = queue.notify.notified();
+        if let Some(job) = queue.try_pop() {
+            drop(notified);
+            process(job).await;
+        } else {
+            notified.await;
+        }
+    }
+}
+
 /// LLM generation worker — services both GPU llamacpp and NPU FLM chat providers.
 ///
 /// When `provider.gpu` is `Some`, the [`GpuResourceManager`] inside the provider
@@ -46,11 +67,10 @@ pub(super) async fn run_llm_worker(
     provider: LemonadeChatProvider,
     device_name: String,
 ) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
+    run_worker_loop(queue, move |job| {
+        let provider = provider.clone();
+        let device_name = device_name.clone();
+        async move {
             let start = std::time::Instant::now();
             let n_messages = job.request.messages.len();
             let result = provider.complete(job.request).await;
@@ -62,10 +82,9 @@ pub(super) async fn run_llm_worker(
                 "LLM generation job complete"
             );
             let _ = job.response.send(result);
-        } else {
-            notified.await;
         }
-    }
+    })
+    .await;
 }
 
 pub(super) async fn run_rerank_worker(
@@ -73,11 +92,10 @@ pub(super) async fn run_rerank_worker(
     provider: LemonadeRerankProvider,
     device_name: String,
 ) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
+    run_worker_loop(queue, move |job| {
+        let provider = provider.clone();
+        let device_name = device_name.clone();
+        async move {
             let start = std::time::Instant::now();
             let n_docs = job.documents.len();
             let result = provider.rerank(&job.query, job.documents, job.top_n).await;
@@ -90,10 +108,9 @@ pub(super) async fn run_rerank_worker(
                 "Rerank job complete"
             );
             let _ = job.response.send(result);
-        } else {
-            notified.await;
         }
-    }
+    })
+    .await;
 }
 
 /// Embedding worker loop.
@@ -222,11 +239,10 @@ pub(super) async fn run_transcribe_worker(
     provider: Arc<dyn TranscriptionProvider>,
     device_name: String,
 ) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
+    run_worker_loop(queue, move |job| {
+        let provider = Arc::clone(&provider);
+        let device_name = device_name.clone();
+        async move {
             let start = std::time::Instant::now();
             let result = provider.transcribe(job.audio_bytes, &job.filename).await;
             debug!(
@@ -237,57 +253,21 @@ pub(super) async fn run_transcribe_worker(
                 "Transcription job complete"
             );
             let _ = job.response.send(result);
-        } else {
-            notified.await;
         }
-    }
+    })
+    .await;
 }
 
-/// Transcription worker backed by the GPU-managed [`LemonadeSttProvider`].
-///
-/// This is a separate function (rather than reusing `run_transcribe_worker`)
-/// because `LemonadeSttProvider` returns [`TranscriptionResult`](crate::lemonade::TranscriptionResult)
-/// (a struct) rather than `String`, so the result must be mapped before
-/// sending on the oneshot channel.
-pub(super) async fn run_gpu_stt_worker(
-    queue: Arc<WorkQueue<TranscribeJob>>,
-    stt: LemonadeSttProvider,
-    device_name: String,
-) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
-            let start = std::time::Instant::now();
-            let result = stt
-                .transcribe(job.audio_bytes, &job.filename)
-                .await
-                .map(|r| r.text);
-            debug!(
-                device = %device_name,
-                filename = %job.filename,
-                ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
-                "GPU STT job complete"
-            );
-            let _ = job.response.send(result);
-        } else {
-            notified.await;
-        }
-    }
-}
 
 pub(super) async fn run_tts_worker(
     queue: Arc<WorkQueue<SynthesizeJob>>,
     tts: LemonadeTtsProvider,
     device_name: String,
 ) {
-    loop {
-        let notified = queue.notify.notified();
-
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
+    run_worker_loop(queue, move |job| {
+        let tts = tts.clone();
+        let device_name = device_name.clone();
+        async move {
             let start = std::time::Instant::now();
             let result = match &job.voice {
                 Some(voice) => tts.synthesize(&job.text, Some(voice)).await,
@@ -302,8 +282,7 @@ pub(super) async fn run_tts_worker(
                 "TTS job complete"
             );
             let _ = job.response.send(result);
-        } else {
-            notified.await;
         }
-    }
+    })
+    .await;
 }

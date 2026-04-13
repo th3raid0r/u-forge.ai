@@ -452,7 +452,7 @@ async fn main() -> Result<()> {
                                 device_cfg.models.load_options_for("embed-gemma-300m-FLM");
                             match NpuDevice::embedding_only(url, None, Some(&npu_load_opts)).await {
                                 Ok(npu) => {
-                                    let dims = npu.embedding.dimensions().unwrap_or(0);
+                                    let dims = npu.embedding.as_ref().and_then(|p| p.dimensions().ok()).unwrap_or(0);
                                     if dims == EMBEDDING_DIMENSIONS {
                                         println!("     ✅ NPU worker: {} ({dims}-dim)", npu.name);
                                         eq_builder = eq_builder.with_npu_device(npu);

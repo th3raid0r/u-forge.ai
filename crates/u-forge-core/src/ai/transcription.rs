@@ -1,21 +1,10 @@
-//! transcription.rs — Audio-to-text transcription providers for u-forge.ai.
+//! Audio-to-text transcription trait and MIME helper.
 //!
-//! This module is the single home for all speech-to-text (STT) and
-//! voice-to-text (VTT) concerns.  It was split out of `embeddings.rs` so that
-//! embedding and transcription can evolve independently and be routed to
-//! different hardware by the
-//! [`InferenceQueue`](crate::inference_queue::InferenceQueue).
-//!
-//! # Providers
-//!
-//! | Type | Hardware | Notes |
-//! |------|----------|-------|
-//! | [`LemonadeTranscriptionProvider`] | NPU / GPU (via Lemonade) | Simple, no GPU contention logic |
-//!
-//! For GPU-managed STT (where the GPU is shared with LLM inference) use
-//! [`LemonadeSttProvider`](crate::lemonade::LemonadeSttProvider) from
-//! `lemonade.rs` together with its [`GpuResourceManager`](crate::lemonade::GpuResourceManager).
-//! The [`InferenceQueue`] wires both together transparently.
+//! The [`TranscriptionProvider`] trait and [`mime_for_filename`] utility live
+//! here and are dependency-free.  Provider implementations and the
+//! [`TranscriptionManager`] convenience wrapper live in
+//! [`crate::lemonade::transcription`] and are re-exported below for
+//! backward compatibility.
 //!
 //! # Quick start
 //!
@@ -30,12 +19,11 @@
 //! # Ok(()) }
 //! ```
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use std::sync::Arc;
-use tracing::{debug, info};
 
-use crate::lemonade::LemonadeHttpClient;
+// ── Re-exports ────────────────────────────────────────────────────────────────
+pub use crate::lemonade::transcription::{LemonadeTranscriptionProvider, TranscriptionManager};
 
 // ── TranscriptionProvider trait ───────────────────────────────────────────────
 
@@ -68,200 +56,16 @@ pub trait TranscriptionProvider: Send + Sync {
     fn model_name(&self) -> &str;
 }
 
-// ── LemonadeTranscriptionProvider ─────────────────────────────────────────────
+// ── MIME helper (public for reuse in lemonade modules) ───────────────────────
 
-/// Transcription provider backed by
-/// [Lemonade Server](https://github.com/lemonade-sdk/lemonade).
+/// Infer the audio MIME type from a filename extension via [`mime_guess`].
 ///
-/// Uses the OpenAI-compatible `POST /api/v1/audio/transcriptions` endpoint with
-/// a `multipart/form-data` body.  The server must be running and the whisper
-/// model must be pulled before use.
-///
-/// This provider is fully async — no Tokio threads are ever blocked.
-///
-/// Unlike [`LemonadeSttProvider`](crate::lemonade::LemonadeSttProvider), this
-/// provider has **no** [`GpuResourceManager`](crate::lemonade::GpuResourceManager)
-/// attached — it is intentionally simple and stateless.  Use it when:
-///
-/// * The model runs on the **NPU** (dedicated silicon, no GPU contention), or
-/// * You are managing resource exclusion at a higher level (e.g. the
-///   [`InferenceQueue`](crate::inference_queue::InferenceQueue)).
-pub struct LemonadeTranscriptionProvider {
-    client: LemonadeHttpClient,
-    /// Whisper model identifier, e.g. `"whisper-v3-turbo-FLM"`.
-    model: String,
-}
-
-impl LemonadeTranscriptionProvider {
-    /// Create a new provider pointed at the given Lemonade Server.
-    ///
-    /// Construction is cheap and **synchronous** — no probe request is made.
-    /// Errors are only surfaced when [`transcribe`] is called.
-    ///
-    /// [`transcribe`]: TranscriptionProvider::transcribe
-    pub fn new(base_url: &str, model: &str) -> Self {
-        Self {
-            client: LemonadeHttpClient::new(base_url),
-            model: model.to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl TranscriptionProvider for LemonadeTranscriptionProvider {
-    async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> Result<String> {
-        let start = std::time::Instant::now();
-
-        let mime = mime_for_filename(filename);
-
-        let part = reqwest::multipart::Part::bytes(audio_bytes)
-            .file_name(filename.to_string())
-            .mime_str(mime)
-            .map_err(|e| anyhow!("Invalid MIME type '{}': {}", mime, e))?;
-
-        let form = reqwest::multipart::Form::new()
-            .text("model", self.model.clone())
-            .part("file", part);
-
-        let resp: serde_json::Value = self
-            .client
-            .post_multipart("/audio/transcriptions", form)
-            .await
-            .map_err(|e| anyhow!("Lemonade transcription request failed: {}", e))?;
-
-        // Surface server-side errors as Rust errors.
-        if let Some(err) = resp.get("error") {
-            return Err(anyhow!("Lemonade transcription error: {}", err));
-        }
-
-        let text = resp["text"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing 'text' field in transcription response: {}", resp))?
-            .trim()
-            .to_string();
-
-        debug!(
-            model    = %self.model,
-            filename,
-            text_len = text.len(),
-            duration_ms = start.elapsed().as_millis(),
-            "Transcription completed"
-        );
-
-        Ok(text)
-    }
-
-    fn model_name(&self) -> &str {
-        &self.model
-    }
-}
-
-// ── TranscriptionManager ──────────────────────────────────────────────────────
-
-/// Owns a single [`TranscriptionProvider`] and hands out `Arc` references to it.
-///
-/// Mirrors the pattern of
-/// [`EmbeddingManager`](crate::embeddings::EmbeddingManager): construct once,
-/// clone the `Arc<dyn TranscriptionProvider>` into as many async tasks as needed.
-///
-/// # Example
-///
-/// ```no_run
-/// # use u_forge_core::ai::transcription::TranscriptionManager;
-/// # async fn run() -> anyhow::Result<()> {
-/// let mgr = TranscriptionManager::try_new_auto(None, None).await?;
-/// let provider = mgr.get_provider();       // Arc<dyn TranscriptionProvider>
-/// let wav = std::fs::read("session.wav")?;
-/// let text = provider.transcribe(wav, "session.wav").await?;
-/// # Ok(()) }
-/// ```
-pub struct TranscriptionManager {
-    provider: Arc<dyn TranscriptionProvider>,
-}
-
-impl std::fmt::Debug for TranscriptionManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TranscriptionManager")
-            .field("model", &self.provider.model_name())
-            .finish()
-    }
-}
-
-impl TranscriptionManager {
-    /// Create a manager backed directly by a Lemonade Server instance.
-    ///
-    /// Defaults to the NPU-optimised `whisper-v3-turbo-FLM` model when `model`
-    /// is `None`.
-    pub fn new_lemonade(base_url: &str, model: &str) -> Self {
-        info!(
-            base_url,
-            model, "TranscriptionManager: using Lemonade Server"
-        );
-        Self {
-            provider: Arc::new(LemonadeTranscriptionProvider::new(base_url, model)),
-        }
-    }
-
-    /// Auto-select a transcription provider from the environment.
-    ///
-    /// **Resolution order:**
-    /// 1. `lemonade_url` argument (if `Some`)
-    /// 2. `LEMONADE_URL` environment variable
-    /// 3. Hard error — there is no silent local fallback for transcription
-    ///
-    /// `model` defaults to `"whisper-v3-turbo-FLM"` when `None`.
-    pub async fn try_new_auto(lemonade_url: Option<&str>, model: Option<&str>) -> Result<Self> {
-        let url = crate::lemonade::resolve_provider_url(lemonade_url, "LEMONADE_URL", false)
-            .await
-            .ok_or_else(|| {
-                anyhow!(
-                    "No Lemonade Server URL configured. Set the LEMONADE_URL environment \
-                     variable or pass a URL explicitly:\n  \
-                     export LEMONADE_URL=http://localhost:13305/api/v1"
-                )
-            })?;
-
-        let whisper_model = model.unwrap_or("whisper-v3-turbo-FLM");
-        Ok(Self::new_lemonade(&url, whisper_model))
-    }
-
-    /// Wrap an arbitrary [`TranscriptionProvider`] implementation.
-    ///
-    /// Useful in tests where a mock provider is preferred over a live server.
-    pub fn from_provider(provider: Arc<dyn TranscriptionProvider>) -> Self {
-        Self { provider }
-    }
-
-    /// Return a clone of the inner provider, suitable for passing to async tasks.
-    pub fn get_provider(&self) -> Arc<dyn TranscriptionProvider> {
-        self.provider.clone()
-    }
-}
-
-// ── MIME helper (public for reuse in lemonade.rs / hardware modules) ──────────
-
-/// Infer the audio MIME type from a filename extension.
-///
-/// | Extension | Returns      |
-/// |-----------|--------------|
-/// | `.mp3`    | `audio/mpeg` |
-/// | `.ogg`    | `audio/ogg`  |
-/// | `.flac`   | `audio/flac` |
-/// | `.m4a`    | `audio/mp4`  |
-/// | anything  | `audio/wav`  |
-pub fn mime_for_filename(filename: &str) -> &'static str {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".mp3") {
-        "audio/mpeg"
-    } else if lower.ends_with(".ogg") {
-        "audio/ogg"
-    } else if lower.ends_with(".flac") {
-        "audio/flac"
-    } else if lower.ends_with(".m4a") {
-        "audio/mp4"
-    } else {
-        "audio/wav"
-    }
+/// Falls back to `"audio/wav"` when the extension is unrecognised.
+pub fn mime_for_filename(filename: &str) -> String {
+    mime_guess::from_path(filename)
+        .first()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "audio/wav".to_string())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -269,6 +73,8 @@ pub fn mime_for_filename(filename: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use anyhow::Result;
     use crate::test_helpers::require_integration_url;
 
     // ── WAV helper ────────────────────────────────────────────────────────────
@@ -417,9 +223,9 @@ mod tests {
         assert_eq!(mime_for_filename("track.mp3"), "audio/mpeg");
         assert_eq!(mime_for_filename("session.ogg"), "audio/ogg");
         assert_eq!(mime_for_filename("recording.flac"), "audio/flac");
-        assert_eq!(mime_for_filename("voice.m4a"), "audio/mp4");
+        assert_eq!(mime_for_filename("voice.m4a"), "audio/m4a");
         assert_eq!(mime_for_filename("audio.wav"), "audio/wav");
-        assert_eq!(mime_for_filename("unknown.xyz"), "audio/wav");
+        assert_eq!(mime_for_filename("unknown.zzz"), "audio/wav");
         // Case-insensitive
         assert_eq!(mime_for_filename("TRACK.MP3"), "audio/mpeg");
     }

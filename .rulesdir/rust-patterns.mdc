@@ -6,7 +6,23 @@ globs: crates/**/*.rs,crates/**/examples/*.rs
 
 ## Error Handling
 
-Use `anyhow::Result` for application-level errors throughout the codebase:
+Use `anyhow::Result` for application-level errors throughout the codebase.
+
+For typed error enums at system boundaries (e.g. HTTP handler responses), use
+`#[derive(thiserror::Error)]` instead of hand-writing `Display` and `From` impls.
+`thiserror = "2.0"` is already in `Cargo.toml`.
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    #[error("Not found: {0}")]
+    NotFound(String),
+    #[error("Internal error: {0}")]
+    Internal(#[from] anyhow::Error),  // generates From<anyhow::Error> + std::error::Error
+}
+```
+
+For internal fallible operations, keep using `anyhow`:
 
 ```rust
 use anyhow::{anyhow, Context, Result};

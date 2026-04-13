@@ -40,8 +40,8 @@
 //! // Transcribe audio
 //! if let Some(stt) = &device.stt {
 //!     let audio_bytes: Vec<u8> = std::fs::read("recording.wav")?;
-//!     let result = stt.transcribe(audio_bytes, "recording.wav").await?;
-//!     println!("{}", result.text);
+//!     let text = stt.transcribe(audio_bytes, "recording.wav").await?;
+//!     println!("{text}");
 //! }
 //!
 //! // Chat / LLM inference
@@ -63,48 +63,14 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
+use crate::ai::embeddings::EmbeddingProvider;
+use crate::ai::transcription::TranscriptionProvider;
 use crate::config::ModelConfig;
 use crate::lemonade::{
     GpuResourceManager, LemonadeChatProvider, LemonadeModelRegistry, LemonadeSttProvider,
 };
 
-use crate::lemonade::ModelLoadOptions;
-
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
-
-// ── Shared helper ─────────────────────────────────────────────────────────────
-
-/// Construct a llamacpp embedding provider from the registry's
-/// `llamacpp_embedding_model`, optionally loading it first.
-///
-/// Returns `None` when no llamacpp embedding model is registered or the
-/// provider fails to connect.  Pushes [`DeviceCapability::Embedding`] into
-/// `capabilities` on success.
-async fn init_llamacpp_embedding(
-    registry: &LemonadeModelRegistry,
-    load_opts: Option<&ModelLoadOptions>,
-    capabilities: &mut Vec<DeviceCapability>,
-    device_label: &str,
-) -> Option<Arc<dyn EmbeddingProvider>> {
-    let model_entry = registry.llamacpp_embedding_model()?;
-    let model_id = model_entry.id.clone();
-    let result = match load_opts {
-        Some(opts) => LemonadeProvider::new_with_load(&registry.base_url, &model_id, opts).await,
-        None => LemonadeProvider::new(&registry.base_url, &model_id).await,
-    };
-    match result {
-        Ok(p) => {
-            capabilities.push(DeviceCapability::Embedding);
-            info!(model = %model_id, "{device_label}: embedding provider ready");
-            Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
-        }
-        Err(e) => {
-            tracing::warn!(model = %model_id, error = %e, "{device_label}: embedding model not reachable");
-            None
-        }
-    }
-}
 
 // ── GpuDevice ─────────────────────────────────────────────────────────────────
 
@@ -140,7 +106,7 @@ pub struct GpuDevice {
     /// GPU speech-to-text provider.
     ///
     /// `None` when no STT model was found in the registry or provided explicitly.
-    pub stt: Option<LemonadeSttProvider>,
+    pub stt: Option<Arc<dyn TranscriptionProvider>>,
 
     /// GPU large-language-model chat provider.
     ///
@@ -185,84 +151,28 @@ impl GpuDevice {
         gpu: Arc<GpuResourceManager>,
         config: &ModelConfig,
     ) -> Self {
-        let mut capabilities = Vec::new();
-
-        let stt = LemonadeSttProvider::from_registry(registry, Arc::clone(&gpu))
-            .ok()
-            .inspect(|p| {
-                capabilities.push(DeviceCapability::Transcription);
-                info!(model = %p.model, "GpuDevice: STT provider ready");
-            });
-
-        let chat = LemonadeChatProvider::from_registry(registry, Some(Arc::clone(&gpu)))
-            .ok()
-            .inspect(|p| {
-                capabilities.push(DeviceCapability::TextGeneration);
-                info!(model = %p.model, "GpuDevice: Chat/LLM provider ready");
-            });
-
-        let load_opts_for_embed = registry
-            .llamacpp_embedding_model()
-            .map(|m| config.load_options_for(&m.id));
-        let embedding = init_llamacpp_embedding(
-            registry,
-            load_opts_for_embed.as_ref(),
-            &mut capabilities,
-            "GpuDevice",
-        )
-        .await;
-
-        if capabilities.is_empty() {
-            tracing::warn!(
-                "GpuDevice::from_registry_with_config: no STT, LLM, or embedding models \
-                 found — device will advertise no capabilities"
-            );
-        }
-
-        Self {
-            name: "AMD GPU (ROCm)".to_string(),
-            backend: HardwareBackend::GpuRocm,
-            capabilities,
-            gpu,
-            stt,
-            chat,
-            embedding,
-        }
+        crate::lemonade::device_factory::gpu_from_registry_with_config(registry, gpu, config).await
     }
 
     pub async fn from_registry(
         registry: &LemonadeModelRegistry,
         gpu: Arc<GpuResourceManager>,
     ) -> Self {
-        let mut capabilities = Vec::new();
+        crate::lemonade::device_factory::gpu_from_registry(registry, gpu).await
+    }
 
-        let stt = LemonadeSttProvider::from_registry(registry, Arc::clone(&gpu))
-            .ok()
-            .inspect(|p| {
-                capabilities.push(DeviceCapability::Transcription);
-                info!(model = %p.model, "GpuDevice: STT provider ready");
-            });
-
-        let chat = LemonadeChatProvider::from_registry(registry, Some(Arc::clone(&gpu)))
-            .ok()
-            .inspect(|p| {
-                capabilities.push(DeviceCapability::TextGeneration);
-                info!(model = %p.model, "GpuDevice: Chat/LLM provider ready");
-            });
-
-        // Embedding via llamacpp (does not need the GpuResourceManager lock).
-        let embedding =
-            init_llamacpp_embedding(registry, None, &mut capabilities, "GpuDevice").await;
-
-        if capabilities.is_empty() {
-            tracing::warn!(
-                "GpuDevice::from_registry: no STT, LLM, or embedding models found — \
-                 device will advertise no capabilities"
-            );
-        }
-
+    /// Low-level constructor: assemble a `GpuDevice` from already-resolved
+    /// providers.  Used by [`crate::lemonade::device_factory`].
+    pub(crate) fn from_parts(
+        name: String,
+        capabilities: Vec<DeviceCapability>,
+        gpu: Arc<GpuResourceManager>,
+        stt: Option<Arc<dyn TranscriptionProvider>>,
+        chat: Option<LemonadeChatProvider>,
+        embedding: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
         Self {
-            name: "AMD GPU (ROCm)".to_string(),
+            name,
             backend: HardwareBackend::GpuRocm,
             capabilities,
             gpu,
@@ -296,10 +206,11 @@ impl GpuDevice {
     ) -> Self {
         let mut capabilities = Vec::new();
 
-        let stt = stt_model.map(|model| {
+        let stt: Option<Arc<dyn TranscriptionProvider>> = stt_model.map(|model| {
             capabilities.push(DeviceCapability::Transcription);
             info!(model, "GpuDevice: STT provider configured");
-            LemonadeSttProvider::new(base_url, model, Arc::clone(&gpu))
+            Arc::new(LemonadeSttProvider::new(base_url, model, Arc::clone(&gpu)))
+                as Arc<dyn TranscriptionProvider>
         });
 
         let chat = chat_model.map(|model| {
@@ -338,20 +249,14 @@ impl GpuDevice {
     /// # }
     /// ```
     pub async fn with_embedding(mut self, base_url: &str, model_id: &str) -> Self {
-        match LemonadeProvider::new(base_url, model_id).await {
-            Ok(p) => {
-                self.capabilities.push(DeviceCapability::Embedding);
-                info!(model = %model_id, "GpuDevice: embedding provider added");
-                self.embedding = Some(Arc::new(p) as Arc<dyn EmbeddingProvider>);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    model = %model_id,
-                    error = %e,
-                    "GpuDevice::with_embedding: model not reachable — skipping"
-                );
-            }
-        }
+        super::attach_embedding_provider(
+            &self.name,
+            &mut self.capabilities,
+            &mut self.embedding,
+            base_url,
+            model_id,
+        )
+        .await;
         self
     }
 
@@ -414,7 +319,7 @@ impl std::fmt::Debug for GpuDevice {
             .field("name", &self.name)
             .field("backend", &self.backend)
             .field("capabilities", &self.capabilities)
-            .field("stt_model", &self.stt.as_ref().map(|p| p.model.as_str()))
+            .field("stt_model", &self.stt.as_ref().map(|p| p.model_name()))
             .field("chat_model", &self.chat.as_ref().map(|p| p.model.as_str()))
             .field("has_embedding", &self.embedding.is_some())
             .finish()
@@ -532,13 +437,8 @@ mod tests {
             "GpuDevice.gpu must be the same Arc as the one passed at construction"
         );
 
-        // The STT and chat providers must also share it.
-        if let Some(stt) = &device.stt {
-            assert!(
-                Arc::ptr_eq(&stt.gpu, &gpu),
-                "STT provider's GpuResourceManager must be shared with GpuDevice.gpu"
-            );
-        }
+        // The chat provider must also share it (STT is now a trait object — can't inspect internals).
+
         if let Some(chat) = &device.chat {
             assert!(
                 chat.gpu
@@ -686,5 +586,6 @@ mod tests {
             "GPU STT transcription failed: {:?}",
             result.err()
         );
+        // result is now String (via TranscriptionProvider trait)
     }
 }

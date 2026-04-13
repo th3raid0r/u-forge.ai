@@ -32,7 +32,7 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/search/sanitize.rs` | FTS5 query sanitisation | `fts5_sanitize` |
 | `src/ai/embeddings.rs` | Lemonade HTTP embedding providers | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager`, `EmbeddingModelInfo` |
 | `src/ai/transcription.rs` | Audio-to-text providers | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager`, `mime_for_filename` |
-| `src/hardware/mod.rs` | Device abstraction layer | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait) |
+| `src/hardware/mod.rs` | Device abstraction layer + shared `pub(crate)` helpers | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait), `init_llamacpp_embedding`, `attach_embedding_provider` |
 | `src/hardware/npu.rs` | AMD NPU device (embedding + STT + LLM) | `NpuDevice` |
 | `src/hardware/gpu.rs` | AMD GPU ROCm device (STT + LLM) | `GpuDevice` |
 | `src/hardware/cpu.rs` | CPU device (TTS) | `CpuDevice` |
@@ -269,6 +269,10 @@ coordination overhead.
 The queue uses only `DeviceCapability` for routing; `HardwareBackend` is
 informational (logs, metrics).
 
+Two `pub(crate)` helpers live here and are shared by all three device modules:
+- `init_llamacpp_embedding(registry, load_opts, capabilities, device_label)` — resolves the llamacpp embedding model from the registry, optionally loads it, and pushes `Embedding` into `capabilities` on success.
+- `attach_embedding_provider(device_name, capabilities, embedding, base_url, model_id)` — probes a model by URL+id and wires it into an existing device's `embedding` field; used by all `with_embedding()` builder methods.
+
 ### NpuDevice (`src/hardware/npu.rs`)
 
 Wraps a `LemonadeProvider` (embedding) and an optional `LemonadeTranscriptionProvider`
@@ -301,8 +305,6 @@ provider (llamacpp-based, independent of GPU resource manager).
 Constructors: `GpuDevice::from_registry()`, `GpuDevice::new()`,
 `GpuDevice::stt_only()`, `GpuDevice::llm_only()`.
 
-Both `from_registry` and `from_registry_with_config` share a private `init_llamacpp_embedding()` helper that handles connection + capability registration.
-
 Builder: `with_embedding(base_url, model_id)` — adds an embedding provider asynchronously.
 
 Convenience methods: `has_embedding()` → bool.
@@ -319,8 +321,6 @@ Wraps `LemonadeTtsProvider` (Kokoro) and optionally an embedding provider
 
 Constructors: `CpuDevice::from_registry()`, `CpuDevice::new()`,
 `CpuDevice::new_with_voice()`, `CpuDevice::empty()`.
-
-Both `from_registry` and `from_registry_with_config` share a private `init_llamacpp_embedding()` helper that handles connection + capability registration.
 
 Builder: `with_embedding(base_url, model_id)` — adds an embedding provider asynchronously.
 
@@ -838,8 +838,7 @@ before failing, allowing edges to reference nodes from prior import sessions.
 - **Schema naming `add_npc` vs `npc`** — `.schema.json` files are still named after
   MCP tool actions. `SchemaIngestion` strips the `add_` prefix, but the file names
   still leak an external convention.
-- **Async schema validation with no async work** — `SchemaManager` methods are
-  `async` but contain no `.await` points. Minor, but misleading.
+- **`save_schema` is `async` but contains no `.await`** — `list_schemas` and `delete_schema` have been made sync. `save_schema` remains `async` because it is called with `.await` by `load_schema`, `register_object_type`, and `register_edge_type`; making it sync would require updating all those callers. Minor, but misleading.
 - **`tags` and `properties` as JSON text** — stored as opaque strings, not as
   SQLite JSON1 columns. Filtering or querying inside these fields requires
   deserializing at the Rust layer. Acceptable for now; revisit if query patterns

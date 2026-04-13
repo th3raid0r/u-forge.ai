@@ -451,8 +451,8 @@ impl KnowledgeGraph {
     }
 
     /// Names of all schemas currently persisted.
-    pub async fn list_schemas(&self) -> Result<Vec<String>> {
-        self.schema_manager.list_schemas().await
+    pub fn list_schemas(&self) -> Result<Vec<String>> {
+        self.schema_manager.list_schemas()
     }
 }
 

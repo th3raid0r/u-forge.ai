@@ -31,15 +31,15 @@ The project is a Cargo workspace. All crates live under `crates/`:
 
 - **Facade**: [crates/u-forge-core/src/lib.rs](mdc:crates/u-forge-core/src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas). New bulk methods: `get_all_edges()`, `get_nodes_paginated(offset, limit)`.
 - **Storage**: [crates/u-forge-core/src/graph/storage.rs](mdc:crates/u-forge-core/src/graph/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts` + sqlite-vec virtual table `chunks_vec` (768-dim cosine ANN). Key constants: `EMBEDDING_DIMENSIONS = 768`, `MAX_CHUNK_TOKENS = 350`, `DEFAULT_EMBEDDING_CONTEXT_TOKENS = 2048`. `KnowledgeGraphStorage` is the only storage struct.
-- **Embeddings**: [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) — `EmbeddingProvider` trait + `LemonadeProvider` (HTTP) + `EmbeddingManager`.
-- **Transcription**: [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) — `TranscriptionProvider` trait + `LemonadeTranscriptionProvider` + `TranscriptionManager` + `mime_for_filename()`.
+- **Embeddings**: [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) — `EmbeddingProvider` trait, `EmbeddingModelInfo`, `EmbeddingProviderType`. Implementation lives in `lemonade/embedding.rs`; re-exported here.
+- **Transcription**: [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) — `TranscriptionProvider` trait + `mime_for_filename()`. Implementation lives in `lemonade/transcription.rs`; re-exported here.
 - **Hardware Abstraction**: [crates/u-forge-core/src/hardware/mod.rs](mdc:crates/u-forge-core/src/hardware/mod.rs) — `DeviceCapability` enum, `HardwareBackend` enum, `DeviceWorker` trait. Sub-modules:
   - [crates/u-forge-core/src/hardware/npu.rs](mdc:crates/u-forge-core/src/hardware/npu.rs) — `NpuDevice` (embedding + STT + LLM on AMD NPU via FLM)
   - [crates/u-forge-core/src/hardware/gpu.rs](mdc:crates/u-forge-core/src/hardware/gpu.rs) — `GpuDevice` (STT + LLM on AMD GPU via ROCm; optional embedding via llamacpp; shares `GpuResourceManager` only for STT/LLM, not embeddings)
   - [crates/u-forge-core/src/hardware/cpu.rs](mdc:crates/u-forge-core/src/hardware/cpu.rs) — `CpuDevice` (TTS via Kokoro; optional embedding via llamacpp)
 - **Device Configuration**: [crates/u-forge-core/src/config.rs](mdc:crates/u-forge-core/src/config.rs) — `DeviceConfig` + `EmbeddingDeviceConfig`. TOML file loading from standard paths; controls device enable/disable state and dispatch weights. Defaults: NPU=100, GPU=50, CPU=10.
 - **Inference Queue**: [crates/u-forge-core/src/queue/](mdc:crates/u-forge-core/src/queue) — `InferenceQueue` + `InferenceQueueBuilder` + `QueueStats`. Five capability channels: `WeightedEmbedDispatcher` (for embeddings), `transcribe_queue`, `synthesize_queue`, `generate_queue`, `rerank_queue`. Per-job retry: up to 3 attempts with exponential backoff in `run_embed_worker`. Weighted dispatch selects highest-weight idle embedding worker, falls back to highest-weight when all busy.
-- **Extended Lemonade Integration**: [crates/u-forge-core/src/lemonade/](mdc:crates/u-forge-core/src/lemonade) — `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack`, `LemonadeRerankProvider`, `SystemInfo`.
+- **Extended Lemonade Integration**: [crates/u-forge-core/src/lemonade/](mdc:crates/u-forge-core/src/lemonade) — `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeStack`, `LemonadeRerankProvider`, `SystemInfo`. Also hosts provider impls: `lemonade/embedding.rs` (`LemonadeProvider`, `EmbeddingManager`) and `lemonade/transcription.rs` (`LemonadeTranscriptionProvider`, `TranscriptionManager`). Device construction logic lives in `lemonade/device_factory.rs`.
 - **Hybrid Search**: [crates/u-forge-core/src/search/](mdc:crates/u-forge-core/src/search) — `search_hybrid(graph, queue, query, config)` free async function. RRF merge of FTS5 + ANN, optional rerank, graceful degradation.
 - **Schemas**: [crates/u-forge-core/src/schema/](mdc:crates/u-forge-core/src/schema)
 - **Data Import**: [crates/u-forge-core/src/ingest/data.rs](mdc:crates/u-forge-core/src/ingest/data.rs) — JSONL two-pass import.
@@ -47,8 +47,8 @@ The project is a Cargo workspace. All crates live under `crates/`:
 ## Lemonade Integration
 
 **Standard on [Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
-- Embeddings: `POST /api/v1/embeddings` (implemented — `LemonadeProvider` in `ai/embeddings.rs`)
-- Transcription: `POST /api/v1/audio/transcriptions` (implemented — `LemonadeTranscriptionProvider` in `ai/transcription.rs` for NPU/simple use; `LemonadeSttProvider` in `lemonade.rs` for GPU-managed use)
+- Embeddings: `POST /api/v1/embeddings` (implemented — `LemonadeProvider` in `lemonade/embedding.rs`; re-exported via `ai::embeddings`)
+- Transcription: `POST /api/v1/audio/transcriptions` (implemented — `LemonadeTranscriptionProvider` in `lemonade/transcription.rs` for NPU/simple use; `LemonadeSttProvider` in `lemonade/stt.rs` for GPU-managed use — both implement `TranscriptionProvider`)
 - Reranking: `POST /api/v1/reranking` (**implemented** — `LemonadeRerankProvider` in `lemonade.rs`; wired into `InferenceQueue` via `rerank_queue`)
 - Chat/LLM: `POST /api/v1/chat/completions` (**fully queued** — `LemonadeChatProvider` in `lemonade.rs`; dispatched via `generate_queue` for both GPU llamacpp and NPU FLM models)
 - System info: `GET /system-info` (**implemented** — `SystemInfo::fetch()` in `lemonade.rs`; derives `LemonadeCapabilities` from installed recipe backends)
@@ -63,9 +63,9 @@ The project is a Cargo workspace. All crates live under `crates/`:
 
 ## Key Integration Points
 
-The `EmbeddingProvider` trait in [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) is the primary abstraction for embedding work. Only `LemonadeProvider` currently implements it. Do NOT bypass the trait.
+The `EmbeddingProvider` trait in [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) is the primary abstraction for embedding work. The trait is dependency-free; `LemonadeProvider` (in `lemonade/embedding.rs`) is the only implementation. Do NOT bypass the trait.
 
-The `TranscriptionProvider` trait in [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) is the primary abstraction for STT work. Do NOT bypass the trait.
+The `TranscriptionProvider` trait in [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) is the primary abstraction for STT work. Both `LemonadeTranscriptionProvider` (lemonade/transcription.rs — NPU/simple) and `LemonadeSttProvider` (lemonade/stt.rs — GPU-managed) implement it. Do NOT bypass the trait.
 
 The `DeviceWorker` trait in [crates/u-forge-core/src/hardware/mod.rs](mdc:crates/u-forge-core/src/hardware/mod.rs) is the abstraction for physical compute devices. New hardware backends must implement it.
 
@@ -93,11 +93,6 @@ export LEMONADE_URL=http://localhost:13305/api/v1
 ./dev.sh --backend-only
 ```
 
-## Known Bugs — Current Status
-
-All bugs (BUG-1 through BUG-9) are **resolved**. There are no active tracked bugs.
-See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
-
 ## Important Files
 
 - [env.sh](mdc:env.sh) — Optional. Sets `UFORGE_*` path variables. **No longer required for compilation**.
@@ -123,9 +118,9 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/graph/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats`, `EMBEDDING_DIMENSIONS`, `MAX_CHUNK_TOKENS` |
 | `src/graph/edges.rs` | Edge CRUD + `get_all_edges()` bulk fetch | `KnowledgeGraphStorage` (impl) |
 | `src/graph/nodes.rs` | Node CRUD + `get_nodes_paginated()` | `KnowledgeGraphStorage` (impl) |
-| `src/ai/embeddings.rs` | Embedding providers | `EmbeddingProvider` (trait), `LemonadeProvider`, `EmbeddingManager` |
-| `src/ai/transcription.rs` | Audio-to-text providers | `TranscriptionProvider` (trait), `LemonadeTranscriptionProvider`, `TranscriptionManager` |
-| `src/hardware/mod.rs` | Device abstraction layer | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait) |
+| `src/ai/embeddings.rs` | Embedding trait + re-exports | `EmbeddingProvider` (trait), `EmbeddingModelInfo`, `EmbeddingProviderType`; re-exports `LemonadeProvider`, `EmbeddingManager` from `lemonade/embedding.rs` |
+| `src/ai/transcription.rs` | Transcription trait + MIME helper + re-exports | `TranscriptionProvider` (trait), `mime_for_filename`; re-exports `LemonadeTranscriptionProvider`, `TranscriptionManager` from `lemonade/transcription.rs` |
+| `src/hardware/mod.rs` | Device abstraction layer + shared `pub(crate)` helpers | `DeviceCapability`, `HardwareBackend`, `DeviceWorker` (trait), `init_llamacpp_embedding`, `attach_embedding_provider` |
 | `src/hardware/npu.rs` | AMD NPU device | `NpuDevice` |
 | `src/hardware/gpu.rs` | AMD GPU ROCm device | `GpuDevice` |
 | `src/hardware/cpu.rs` | CPU device | `CpuDevice` |
@@ -136,6 +131,9 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/queue/weighted.rs` | Weighted embedding job dispatcher (best-effort idle selection) | `WeightedEmbedDispatcher`, `WeightedWorkerSlot` |
 | `src/queue/workers.rs` | Background worker loops | `run_embed_worker`, `run_transcribe_worker`, etc. |
 | `src/lemonade/` | Extended Lemonade integration | `LemonadeModelRegistry`, `GpuResourceManager`, `LemonadeTtsProvider`, `LemonadeSttProvider`, `LemonadeChatProvider`, `LemonadeRerankProvider`, `SystemInfo`, `LemonadeStack` |
+| `src/lemonade/embedding.rs` | Embedding provider impl | `LemonadeProvider`, `EmbeddingManager` |
+| `src/lemonade/transcription.rs` | Transcription provider impl | `LemonadeTranscriptionProvider`, `TranscriptionManager` |
+| `src/lemonade/device_factory.rs` | Device construction from registry | `npu_from_url_with_load`, `npu_from_registry_*`, `gpu_from_registry*`, `cpu_from_registry*` |
 | `src/lemonade/load.rs` | Model load/unload (`POST /api/v1/load`); FLM vs llamacpp parameter handling | `load_model()`, `ModelLoadOptions` |
 | `src/lemonade/model_limits.rs` | Per-model context window lookup from compile-time JSON registry | `effective_ctx_size()`, `is_flm_model()` |
 | `src/search/mod.rs` | Hybrid search pipeline (FTS5 + ANN + rerank) | `search_hybrid`, `HybridSearchConfig`, `NodeSearchResult`, `SearchSources` |

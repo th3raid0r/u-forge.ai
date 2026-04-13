@@ -19,8 +19,7 @@ use super::dispatch::InferenceQueue;
 use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
 use super::weighted::WeightedEmbedDispatcher;
 use super::workers::{
-    run_embed_worker, run_gpu_stt_worker, run_llm_worker, run_rerank_worker, run_transcribe_worker,
-    run_tts_worker,
+    run_embed_worker, run_llm_worker, run_rerank_worker, run_transcribe_worker, run_tts_worker,
 };
 
 /// Collected information for a single embedding worker, deferred until the
@@ -203,7 +202,7 @@ impl InferenceQueueBuilder {
             let device = Arc::new(device) as Arc<NpuDevice>;
 
             if cfg.npu_enabled && device.has_embedding() {
-                let provider = Arc::clone(&device.embedding);
+                let provider = Arc::clone(device.embedding.as_ref().expect("has_embedding() true but embedding is None"));
                 let name = device.name.clone();
                 let (queue, idle, ewma_us) = embed_dispatcher.add_worker(cfg.npu_weight, &name);
                 debug!(device = %name, weight = cfg.npu_weight, "Registered NPU embedding worker");
@@ -250,7 +249,7 @@ impl InferenceQueueBuilder {
                 transcription_workers += 1;
                 debug!(device = %name, "Spawning GPU STT transcription worker");
                 tokio::spawn(async move {
-                    run_gpu_stt_worker(q, stt, name).await;
+                    run_transcribe_worker(q, stt, name).await;
                 });
             }
 
@@ -331,22 +330,16 @@ impl InferenceQueueBuilder {
             });
         }
 
-        let has_embedding = embedding_workers > 0;
-        let has_transcription = transcription_workers > 0;
-        let has_tts = tts_workers > 0;
-        let has_text_generation = llm_workers > 0;
-        let has_reranking = reranking_workers > 0;
-
-        if !has_embedding {
+        if embedding_workers == 0 {
             warn!("InferenceQueue built with no embedding-capable devices");
         }
-        if !has_transcription {
+        if transcription_workers == 0 {
             warn!("InferenceQueue built with no transcription-capable devices");
         }
-        if !has_tts {
+        if tts_workers == 0 {
             warn!("InferenceQueue built with no TTS-capable devices");
         }
-        if !has_text_generation {
+        if llm_workers == 0 {
             warn!("InferenceQueue built with no LLM-capable devices");
         }
 
@@ -357,11 +350,6 @@ impl InferenceQueueBuilder {
             generate_queue,
             rerank_queue,
             chat_providers: Arc::new(chat_providers_for_stream),
-            has_embedding,
-            has_transcription,
-            has_tts,
-            has_text_generation,
-            has_reranking,
             embedding_workers,
             transcription_workers,
             tts_workers,

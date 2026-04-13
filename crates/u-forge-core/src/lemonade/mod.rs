@@ -27,6 +27,8 @@
 
 pub mod chat;
 pub(crate) mod client;
+pub mod device_factory;
+pub mod embedding;
 pub mod gpu_manager;
 pub mod health;
 pub mod load;
@@ -36,6 +38,7 @@ pub mod rerank;
 pub mod stt;
 pub mod stack;
 pub mod system_info;
+pub mod transcription;
 pub mod tts;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
@@ -45,6 +48,8 @@ pub use chat::{
     ChatUsage, LemonadeChatProvider, StreamToken,
 };
 pub use client::{make_lemonade_openai_client, LemonadeHttpClient};
+pub use embedding::{EmbeddingManager, LemonadeProvider};
+pub use transcription::{LemonadeTranscriptionProvider, TranscriptionManager};
 pub use health::{LemonadeHealth, LoadedModelEntry};
 pub use gpu_manager::{GpuResourceManager, GpuWorkload, LlmGuard, SttGuard};
 pub use load::{load_model, ModelLoadOptions};

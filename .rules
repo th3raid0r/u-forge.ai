@@ -75,9 +75,16 @@ navigational aids.
 ## Current Project State (snapshot)
 
 Working prototype. Multi-crate Cargo workspace under `crates/`. SQLite + FTS5 storage,
-sqlite-vec ANN search, `LemonadeProvider` embeddings, hardware abstraction, unified
-inference queue, `LemonadeRerankProvider`, hybrid search pipeline, bulk graph access
+sqlite-vec ANN search, hardware abstraction (`NpuDevice`, `GpuDevice`, `CpuDevice`),
+unified inference queue (`InferenceQueue`), hybrid search pipeline, bulk graph access
 (`get_all_edges`, `get_nodes_paginated`). No active bugs.
+
+Core library has been fully refactored (`feature_core-refactor.md` — all phases done):
+`ai/embeddings.rs` and `ai/transcription.rs` are now trait-only files; implementations
+live in `lemonade/embedding.rs` and `lemonade/transcription.rs`. Device construction
+logic extracted to `lemonade/device_factory.rs`. `LemonadeSttProvider` implements
+`TranscriptionProvider`. Queue uses a single generic `run_worker_loop`. `InferenceQueue`
+derives `has_*` from worker counts rather than storing redundant booleans.
 
 ---
 

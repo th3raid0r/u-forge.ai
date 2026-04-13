@@ -110,27 +110,6 @@ impl<'a> DataIngestion<'a> {
         Ok(())
     }
 
-    /// Import data using environment variable or default path
-    ///
-    /// Uses UFORGE_DATA_FILE environment variable if set, otherwise defaults to ./defaults/data/memory.json
-    pub async fn import_default_data(&mut self) -> Result<()> {
-        let data_file = std::env::var("UFORGE_DATA_FILE")
-            .unwrap_or_else(|_| "./defaults/data/memory.json".to_string());
-
-        info!("Attempting to load data from: {}", data_file);
-
-        if std::path::Path::new(&data_file).exists() {
-            self.import_json_data(&data_file).await?;
-        } else {
-            return Err(anyhow::anyhow!(
-                "Data file not found: {}. Set UFORGE_DATA_FILE environment variable or place file at ./defaults/data/memory.json",
-                data_file
-            ));
-        }
-
-        Ok(())
-    }
-
     pub fn get_stats(&self) -> &IngestionStats {
         &self.stats
     }
@@ -272,7 +251,7 @@ impl<'a> DataIngestion<'a> {
 
         // First, check if this type exists in any available schema
         let schema_manager = self.graph.get_schema_manager();
-        let use_original_type = if let Ok(schemas) = schema_manager.list_schemas().await {
+        let use_original_type = if let Ok(schemas) = schema_manager.list_schemas() {
             // Try imported_schemas first, then default
             let mut found = false;
             for schema_name in ["imported_schemas", "default"] {

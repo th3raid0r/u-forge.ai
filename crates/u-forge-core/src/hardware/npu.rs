@@ -26,7 +26,7 @@
 //!     None, // qwen3-8b-FLM (pass Some("model-id") to override, or None to disable)
 //! ).await?;
 //!
-//! let vec  = npu.embedding.embed("Hello, world!").await?;
+//! let vec  = npu.embedding.as_ref().unwrap().embed("Hello, world!").await?;
 //! let audio_bytes: Vec<u8> = std::fs::read("session.wav")?;
 //! let text = npu.transcription
 //!     .as_ref()
@@ -47,10 +47,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::info;
 
-use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
-use crate::ai::transcription::{LemonadeTranscriptionProvider, TranscriptionProvider};
+use crate::ai::embeddings::EmbeddingProvider;
+use crate::ai::transcription::TranscriptionProvider;
 use crate::config::ModelConfig;
 use crate::lemonade::{LemonadeChatProvider, LemonadeModelRegistry, ModelLoadOptions};
 
@@ -90,9 +89,9 @@ pub struct NpuDevice {
 
     /// Embedding provider backed by the NPU.
     ///
-    /// Always present — construction fails if the embedding model is
-    /// unreachable.
-    pub embedding: Arc<dyn EmbeddingProvider>,
+    /// `None` when the device was constructed without an embedding model
+    /// (e.g. [`NpuDevice::llm_only`] or [`NpuDevice::transcription_only`]).
+    pub embedding: Option<Arc<dyn EmbeddingProvider>>,
 
     /// Transcription (STT) provider backed by the NPU.
     ///
@@ -139,11 +138,7 @@ impl NpuDevice {
         Self::new_with_load(base_url, embedding_model, stt_model, llm_model, None).await
     }
 
-    /// Like [`new`](Self::new) but explicitly loads the embedding model via
-    /// `POST /api/v1/load` before connecting.
-    ///
-    /// Pass `load_opts` to control `ctx_size` and other per-recipe parameters.
-    /// When `None`, behaves identically to [`new`](Self::new).
+    /// Like [`new`](Self::new) but explicitly loads the embedding model first.
     pub async fn new_with_load(
         base_url: &str,
         embedding_model: Option<&str>,
@@ -151,245 +146,68 @@ impl NpuDevice {
         llm_model: Option<&str>,
         load_opts: Option<&ModelLoadOptions>,
     ) -> Result<Self> {
-        let emb_model = embedding_model.unwrap_or(DEFAULT_NPU_EMBEDDING_MODEL);
-        let stt_model_id = stt_model.unwrap_or(DEFAULT_NPU_STT_MODEL);
-
-        let embedding = Arc::new(match load_opts {
-            Some(opts) => LemonadeProvider::new_with_load(base_url, emb_model, opts).await?,
-            None => LemonadeProvider::new(base_url, emb_model).await?,
-        }) as Arc<dyn EmbeddingProvider>;
-
-        let transcription: Option<Arc<dyn TranscriptionProvider>> = Some(Arc::new(
-            LemonadeTranscriptionProvider::new(base_url, stt_model_id),
-        ));
-
-        let mut capabilities = vec![DeviceCapability::Embedding, DeviceCapability::Transcription];
-
-        let chat = llm_model.map(|m| {
-            let model_id = if m.is_empty() {
-                DEFAULT_NPU_LLM_MODEL
-            } else {
-                m
-            };
-            capabilities.push(DeviceCapability::TextGeneration);
-            info!(model = model_id, "NpuDevice: LLM provider configured");
-            LemonadeChatProvider::new_npu(base_url, model_id)
-        });
-
-        info!(
-            embedding_model = emb_model,
-            stt_model = stt_model_id,
-            llm = chat
-                .as_ref()
-                .map(|c| c.model.as_str())
-                .unwrap_or("disabled"),
-            "NpuDevice initialised"
-        );
-
-        Ok(Self {
-            name: "AMD NPU (FLM)".to_string(),
-            backend: HardwareBackend::Npu,
-            capabilities,
-            embedding,
-            transcription,
-            chat,
-        })
+        crate::lemonade::device_factory::npu_from_url_with_load(
+            base_url, embedding_model, stt_model, llm_model, load_opts,
+        )
+        .await
     }
 
-    /// Construct an `NpuDevice` from an already-fetched [`LemonadeModelRegistry`].
-    ///
-    /// Capabilities are derived automatically from which FLM models the registry
-    /// contains:
-    /// - If a [`NpuEmbedding`](crate::lemonade::ModelRole::NpuEmbedding) model exists
-    ///   → [`Embedding`](DeviceCapability::Embedding) is advertised.
-    /// - If a [`NpuStt`](crate::lemonade::ModelRole::NpuStt) model exists
-    ///   → [`Transcription`](DeviceCapability::Transcription) is advertised.
-    /// - If a [`NpuLlm`](crate::lemonade::ModelRole::NpuLlm) model exists
-    ///   → [`TextGeneration`](DeviceCapability::TextGeneration) is advertised.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no embedding model is found **and** Lemonade Server
-    /// cannot be probed for dimension information.  If the registry contains no
-    /// embedding model at all, an error is returned immediately.
+    /// Construct from an already-fetched registry.
     pub async fn from_registry(registry: &LemonadeModelRegistry) -> Result<Self> {
-        Self::from_registry_with_load(registry, None).await
+        crate::lemonade::device_factory::npu_from_registry_with_load(registry, None).await
     }
 
-    /// Like [`from_registry`](Self::from_registry) but loads each model with
-    /// parameters sourced from `config` (`u-forge.toml` `[models.load_params]`).
-    ///
-    /// Passes the per-model `ctx_size`, `batch_size`, and `ubatch_size` from
-    /// config to `POST /api/v1/load` before connecting.  FLM models accept
-    /// `ctx_size`; `batch_size` / `ubatch_size` are silently dropped for them
-    /// by [`load_model`](crate::lemonade::load_model).
+    /// Like [`from_registry`](Self::from_registry) with per-model load params.
     pub async fn from_registry_with_config(
         registry: &LemonadeModelRegistry,
         config: &ModelConfig,
     ) -> Result<Self> {
-        let emb_entry = registry.npu_embedding_model().ok_or_else(|| {
-            anyhow::anyhow!("No NPU embedding model found in the Lemonade registry")
-        })?;
-        let emb_opts = config.load_options_for(&emb_entry.id);
-        Self::from_registry_with_load(registry, Some(&emb_opts)).await
+        crate::lemonade::device_factory::npu_from_registry_with_config(registry, config).await
     }
 
-    /// Like [`from_registry`](Self::from_registry) but explicitly loads the
-    /// embedding model via `POST /api/v1/load` before connecting.
+    /// Like [`from_registry`](Self::from_registry) with explicit load options.
     pub async fn from_registry_with_load(
         registry: &LemonadeModelRegistry,
         load_opts: Option<&ModelLoadOptions>,
     ) -> Result<Self> {
-        let emb_entry = registry.npu_embedding_model().ok_or_else(|| {
-            anyhow::anyhow!("No NPU embedding model found in the Lemonade registry")
-        })?;
-
-        let embedding = Arc::new(match load_opts {
-            Some(opts) => {
-                LemonadeProvider::new_with_load(&registry.base_url, &emb_entry.id, opts).await?
-            }
-            None => LemonadeProvider::new(&registry.base_url, &emb_entry.id).await?,
-        }) as Arc<dyn EmbeddingProvider>;
-
-        let mut capabilities = vec![DeviceCapability::Embedding];
-
-        let transcription: Option<Arc<dyn TranscriptionProvider>> =
-            registry.npu_stt_model().map(|m| {
-                capabilities.push(DeviceCapability::Transcription);
-                info!(model = %m.id, "NpuDevice: STT provider ready");
-                Arc::new(LemonadeTranscriptionProvider::new(
-                    &registry.base_url,
-                    &m.id,
-                )) as Arc<dyn TranscriptionProvider>
-            });
-
-        let chat = registry.npu_llm_model().map(|m| {
-            capabilities.push(DeviceCapability::TextGeneration);
-            info!(model = %m.id, "NpuDevice: LLM provider ready");
-            LemonadeChatProvider::new_npu(&registry.base_url, &m.id)
-        });
-
-        if capabilities.is_empty() {
-            tracing::warn!(
-                "NpuDevice::from_registry: no capabilities found — \
-                 device will advertise nothing"
-            );
-        }
-
-        info!(
-            embedding = %emb_entry.id,
-            stt = transcription.is_some(),
-            llm = chat.as_ref().map(|c| c.model.as_str()).unwrap_or("none"),
-            "NpuDevice from registry"
-        );
-
-        Ok(Self {
-            name: "AMD NPU (FLM)".to_string(),
-            backend: HardwareBackend::Npu,
-            capabilities,
-            embedding,
-            transcription,
-            chat,
-        })
+        crate::lemonade::device_factory::npu_from_registry_with_load(registry, load_opts).await
     }
 
-    /// Construct an `NpuDevice` with **embedding only** (no STT or LLM providers).
-    ///
-    /// Use this when the NPU whisper and LLM models are not available or not desired.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_url`   — Lemonade Server API root.
-    /// * `model`      — FLM embedding model id.  Defaults to
-    ///   [`DEFAULT_NPU_EMBEDDING_MODEL`] when `None`.
-    /// * `load_opts`  — Optional model load options (e.g. `ctx_size`).  When
-    ///   `Some`, the model is explicitly loaded via `POST /api/v1/load` with
-    ///   the given parameters before the dimension probe.  Pass `None` to rely
-    ///   on the server's default load behaviour.
+    /// Construct with **embedding only** (no STT or LLM).
     pub async fn embedding_only(
         base_url: &str,
         model: Option<&str>,
         load_opts: Option<&ModelLoadOptions>,
     ) -> Result<Self> {
-        let emb_model = model.unwrap_or(DEFAULT_NPU_EMBEDDING_MODEL);
-
-        let embedding = Arc::new(match load_opts {
-            Some(opts) => LemonadeProvider::new_with_load(base_url, emb_model, opts).await?,
-            None => LemonadeProvider::new(base_url, emb_model).await?,
-        }) as Arc<dyn EmbeddingProvider>;
-
-        info!(model = emb_model, "NpuDevice initialised (embedding only)");
-
-        Ok(Self {
-            name: "AMD NPU Embedding".to_string(),
-            backend: HardwareBackend::Npu,
-            capabilities: vec![DeviceCapability::Embedding],
-            embedding,
-            transcription: None,
-            chat: None,
-        })
+        crate::lemonade::device_factory::npu_embedding_only(base_url, model, load_opts).await
     }
 
-    /// Construct an `NpuDevice` with **LLM only** (no embedding or STT providers).
-    ///
-    /// Because the LLM provider performs no probe request, this constructor is
-    /// **synchronous**.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_url` — Lemonade Server API root.
-    /// * `model`    — FLM LLM model id.  Defaults to [`DEFAULT_NPU_LLM_MODEL`]
-    ///   when `None`.
+    /// Construct with **LLM only** (no embedding or STT).
     pub fn llm_only(base_url: &str, model: Option<&str>) -> Self {
-        let llm_model = model.unwrap_or(DEFAULT_NPU_LLM_MODEL);
-
-        info!(model = llm_model, "NpuDevice initialised (LLM only)");
-
-        Self {
-            name: "AMD NPU LLM".to_string(),
-            backend: HardwareBackend::Npu,
-            capabilities: vec![DeviceCapability::TextGeneration],
-            embedding: Arc::new(DisabledEmbeddingProvider),
-            transcription: None,
-            chat: Some(LemonadeChatProvider::new_npu(base_url, llm_model)),
-        }
+        crate::lemonade::device_factory::npu_llm_only(base_url, model)
     }
 
-    /// Construct an `NpuDevice` with **transcription only** (no embedding or LLM providers).
-    ///
-    /// Useful when embedding is handled by a different device and only the NPU
-    /// whisper model is desired.
-    ///
-    /// Unlike [`NpuDevice::new`], this constructor is **synchronous** because
-    /// the transcription provider performs no probe request.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_url` — Lemonade Server API root.
-    /// * `model` — FLM whisper model id.  Defaults to [`DEFAULT_NPU_STT_MODEL`]
-    ///   when `None`.
+    /// Construct with **transcription only** (no embedding or LLM).
     pub fn transcription_only(base_url: &str, model: Option<&str>) -> Self {
-        let stt_model = model.unwrap_or(DEFAULT_NPU_STT_MODEL);
+        crate::lemonade::device_factory::npu_transcription_only(base_url, model)
+    }
 
-        // We need a dummy embedding provider to satisfy the field type.
-        // Use a no-op placeholder so the type system is happy while keeping
-        // construction cheap.
-        let transcription: Arc<dyn TranscriptionProvider> =
-            Arc::new(LemonadeTranscriptionProvider::new(base_url, stt_model));
-
-        info!(
-            model = stt_model,
-            "NpuDevice initialised (transcription only)"
-        );
-
+    /// Low-level constructor: assemble an `NpuDevice` from already-resolved
+    /// providers.  Used by [`crate::lemonade::device_factory`].
+    pub(crate) fn from_parts(
+        name: String,
+        capabilities: Vec<DeviceCapability>,
+        embedding: Option<Arc<dyn EmbeddingProvider>>,
+        transcription: Option<Arc<dyn TranscriptionProvider>>,
+        chat: Option<LemonadeChatProvider>,
+    ) -> Self {
         Self {
-            name: "AMD NPU STT".to_string(),
+            name,
             backend: HardwareBackend::Npu,
-            capabilities: vec![DeviceCapability::Transcription],
-            // Use a disconnected placeholder — will error if embed() is called.
-            embedding: Arc::new(DisabledEmbeddingProvider),
-            transcription: Some(transcription),
-            chat: None,
+            capabilities,
+            embedding,
+            transcription,
+            chat,
         }
     }
 
@@ -429,7 +247,7 @@ impl std::fmt::Debug for NpuDevice {
             .field("name", &self.name)
             .field("backend", &self.backend)
             .field("capabilities", &self.capabilities)
-            .field("embedding_dims", &self.embedding.dimensions().ok())
+            .field("embedding_dims", &self.embedding.as_ref().and_then(|p| p.dimensions().ok()))
             .field(
                 "stt_model",
                 &self
@@ -442,47 +260,6 @@ impl std::fmt::Debug for NpuDevice {
     }
 }
 
-// ── DisabledEmbeddingProvider ─────────────────────────────────────────────────
-
-/// Internal placeholder used when `NpuDevice` is built transcription-only.
-///
-/// All methods return an error — this provider must never be registered in a
-/// queue's embedding pool.  Its sole purpose is to satisfy the `Arc<dyn
-/// EmbeddingProvider>` field without allocating a real HTTP client.
-struct DisabledEmbeddingProvider;
-
-#[async_trait::async_trait]
-impl crate::ai::embeddings::EmbeddingProvider for DisabledEmbeddingProvider {
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
-        Err(anyhow::anyhow!(
-            "DisabledEmbeddingProvider: this NpuDevice was built with transcription_only() \
-             and does not support embedding"
-        ))
-    }
-
-    async fn embed_batch(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        Err(anyhow::anyhow!(
-            "DisabledEmbeddingProvider: this NpuDevice was built with transcription_only() \
-             and does not support embedding"
-        ))
-    }
-
-    fn dimensions(&self) -> Result<usize> {
-        Err(anyhow::anyhow!("DisabledEmbeddingProvider: no dimensions"))
-    }
-
-    fn max_tokens(&self) -> Result<usize> {
-        Err(anyhow::anyhow!("DisabledEmbeddingProvider: no max_tokens"))
-    }
-
-    fn provider_type(&self) -> crate::ai::embeddings::EmbeddingProviderType {
-        crate::ai::embeddings::EmbeddingProviderType::Lemonade
-    }
-
-    fn model_info(&self) -> Option<crate::ai::embeddings::EmbeddingModelInfo> {
-        None
-    }
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -546,25 +323,11 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_embedding_provider_errors() {
-        let provider = DisabledEmbeddingProvider;
-        assert!(provider.dimensions().is_err());
-        assert!(provider.max_tokens().is_err());
-        assert!(provider.model_info().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_disabled_embedding_provider_embed_errors() {
-        let provider = DisabledEmbeddingProvider;
-        let result = provider.embed("hello").await;
+    fn test_transcription_only_has_no_embedding() {
+        let device = NpuDevice::transcription_only("http://localhost:13305/api/v1", None);
         assert!(
-            result.is_err(),
-            "Expected error from DisabledEmbeddingProvider"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("transcription_only"),
-            "Error should mention transcription_only: {msg}"
+            device.embedding.is_none(),
+            "transcription_only must have no embedding provider"
         );
     }
 
@@ -600,7 +363,7 @@ mod tests {
         assert!(device.has_transcription());
         assert!(!device.has_chat());
         // Embedding dimensions should be non-zero
-        let dims = device.embedding.dimensions().unwrap();
+        let dims = device.embedding.as_ref().unwrap().dimensions().unwrap();
         assert!(
             dims > 0,
             "Expected positive embedding dimensions, got {dims}"
@@ -613,7 +376,7 @@ mod tests {
         let device = NpuDevice::embedding_only(&url, None, None)
             .await
             .expect("NpuDevice construction failed");
-        let embedding = device.embedding.embed("The quick brown fox").await;
+        let embedding = device.embedding.as_ref().unwrap().embed("The quick brown fox").await;
         assert!(embedding.is_ok(), "embed() failed: {:?}", embedding.err());
         let embedding = embedding.unwrap();
         assert!(!embedding.is_empty(), "Expected non-empty embedding vector");

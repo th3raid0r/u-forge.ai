@@ -39,9 +39,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::info;
 
-use crate::ai::embeddings::{EmbeddingProvider, LemonadeProvider};
+use crate::ai::embeddings::EmbeddingProvider;
 use crate::config::ModelConfig;
-use crate::lemonade::load::ModelLoadOptions;
 use crate::lemonade::{KokoroVoice, LemonadeModelRegistry, LemonadeTtsProvider};
 
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
@@ -50,39 +49,6 @@ use super::{DeviceCapability, DeviceWorker, HardwareBackend};
 
 /// Default CPU TTS model served by Lemonade (Kokoro v1).
 pub const DEFAULT_CPU_TTS_MODEL: &str = "kokoro-v1";
-
-// ── Shared helper ─────────────────────────────────────────────────────────────
-
-/// Construct a llamacpp embedding provider from the registry's
-/// `llamacpp_embedding_model`, optionally loading it first.
-///
-/// Returns `None` when no llamacpp embedding model is registered or the
-/// provider fails to connect.  Pushes [`DeviceCapability::Embedding`] into
-/// `capabilities` on success.
-async fn init_llamacpp_embedding(
-    registry: &LemonadeModelRegistry,
-    load_opts: Option<&ModelLoadOptions>,
-    capabilities: &mut Vec<DeviceCapability>,
-    device_label: &str,
-) -> Option<Arc<dyn EmbeddingProvider>> {
-    let model_entry = registry.llamacpp_embedding_model()?;
-    let model_id = model_entry.id.clone();
-    let result = match load_opts {
-        Some(opts) => LemonadeProvider::new_with_load(&registry.base_url, &model_id, opts).await,
-        None => LemonadeProvider::new(&registry.base_url, &model_id).await,
-    };
-    match result {
-        Ok(p) => {
-            capabilities.push(DeviceCapability::Embedding);
-            info!(model = %model_id, "{device_label}: embedding provider ready");
-            Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
-        }
-        Err(e) => {
-            tracing::warn!(model = %model_id, error = %e, "{device_label}: embedding model not reachable");
-            None
-        }
-    }
-}
 
 // ── CpuDevice ─────────────────────────────────────────────────────────────────
 
@@ -99,6 +65,7 @@ async fn init_llamacpp_embedding(
 /// fully `Send + Sync` and safe to share across tasks.
 pub struct CpuDevice {
     pub name: String,
+    pub backend: HardwareBackend,
     capabilities: Vec<DeviceCapability>,
 
     /// Text-to-speech provider (Kokoro).
@@ -135,63 +102,24 @@ impl CpuDevice {
         registry: &LemonadeModelRegistry,
         config: &ModelConfig,
     ) -> Self {
-        let tts = LemonadeTtsProvider::from_registry(registry).ok();
-
-        let mut capabilities = Vec::new();
-
-        if tts.is_some() {
-            info!("CpuDevice: TTS provider ready (Kokoro)");
-            capabilities.push(DeviceCapability::TextToSpeech);
-        }
-
-        let load_opts_for_embed = registry
-            .llamacpp_embedding_model()
-            .map(|m| config.load_options_for(&m.id));
-        let embedding = init_llamacpp_embedding(
-            registry,
-            load_opts_for_embed.as_ref(),
-            &mut capabilities,
-            "CpuDevice",
-        )
-        .await;
-
-        if capabilities.is_empty() {
-            tracing::warn!(
-                "CpuDevice::from_registry_with_config: no TTS or embedding models found — \
-                 device will advertise no capabilities"
-            );
-        }
-
-        Self {
-            name: "CPU (Kokoro TTS)".to_string(),
-            capabilities,
-            tts,
-            embedding,
-        }
+        crate::lemonade::device_factory::cpu_from_registry_with_config(registry, config).await
     }
 
     pub async fn from_registry(registry: &LemonadeModelRegistry) -> Self {
-        let tts = LemonadeTtsProvider::from_registry(registry).ok();
+        crate::lemonade::device_factory::cpu_from_registry(registry).await
+    }
 
-        let mut capabilities = Vec::new();
-
-        if tts.is_some() {
-            info!("CpuDevice: TTS provider ready (Kokoro)");
-            capabilities.push(DeviceCapability::TextToSpeech);
-        }
-
-        let embedding =
-            init_llamacpp_embedding(registry, None, &mut capabilities, "CpuDevice").await;
-
-        if capabilities.is_empty() {
-            tracing::warn!(
-                "CpuDevice::from_registry: no TTS or embedding models found — \
-                 device will advertise no capabilities"
-            );
-        }
-
+    /// Low-level constructor: assemble a `CpuDevice` from already-resolved
+    /// providers.  Used by [`crate::lemonade::device_factory`].
+    pub(crate) fn from_parts(
+        name: String,
+        capabilities: Vec<DeviceCapability>,
+        tts: Option<LemonadeTtsProvider>,
+        embedding: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
         Self {
-            name: "CPU (Kokoro TTS)".to_string(),
+            name,
+            backend: HardwareBackend::Cpu,
             capabilities,
             tts,
             embedding,
@@ -219,6 +147,7 @@ impl CpuDevice {
 
         Self {
             name: "CPU (Kokoro TTS)".to_string(),
+            backend: HardwareBackend::Cpu,
             capabilities: vec![DeviceCapability::TextToSpeech],
             tts: Some(LemonadeTtsProvider::new(base_url, model).with_voice(default_voice)),
             embedding: None,
@@ -241,6 +170,7 @@ impl CpuDevice {
     pub fn empty() -> Self {
         Self {
             name: "CPU (no providers)".to_string(),
+            backend: HardwareBackend::Cpu,
             capabilities: vec![],
             tts: None,
             embedding: None,
@@ -252,20 +182,14 @@ impl CpuDevice {
     /// Probes the model dimensions once; if the model is not reachable the
     /// device is returned unchanged (no capability added, no error propagated).
     pub async fn with_embedding(mut self, base_url: &str, model_id: &str) -> Self {
-        match LemonadeProvider::new(base_url, model_id).await {
-            Ok(p) => {
-                self.capabilities.push(DeviceCapability::Embedding);
-                info!(model = %model_id, "CpuDevice: embedding provider added");
-                self.embedding = Some(Arc::new(p) as Arc<dyn EmbeddingProvider>);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    model = %model_id,
-                    error = %e,
-                    "CpuDevice::with_embedding: model not reachable — skipping"
-                );
-            }
-        }
+        super::attach_embedding_provider(
+            &self.name,
+            &mut self.capabilities,
+            &mut self.embedding,
+            base_url,
+            model_id,
+        )
+        .await;
         self
     }
 
@@ -309,7 +233,7 @@ impl DeviceWorker for CpuDevice {
     }
 
     fn backend(&self) -> HardwareBackend {
-        HardwareBackend::Cpu
+        self.backend.clone()
     }
 
     fn capabilities(&self) -> &[DeviceCapability] {
@@ -321,7 +245,7 @@ impl std::fmt::Debug for CpuDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CpuDevice")
             .field("name", &self.name)
-            .field("backend", &HardwareBackend::Cpu)
+            .field("backend", &self.backend)
             .field("capabilities", &self.capabilities)
             .field("tts_model", &self.tts.as_ref().map(|p| p.model.as_str()))
             .field("has_embedding", &self.embedding.is_some())

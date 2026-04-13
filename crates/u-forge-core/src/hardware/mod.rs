@@ -27,6 +27,73 @@ pub mod cpu;
 pub mod gpu;
 pub mod npu;
 
+// ── Shared embedding helpers ──────────────────────────────────────────────────
+
+use std::sync::Arc;
+
+use crate::ai::embeddings::EmbeddingProvider;
+use crate::lemonade::embedding::LemonadeProvider;
+use crate::lemonade::{LemonadeModelRegistry, ModelLoadOptions};
+
+/// Construct a llamacpp embedding provider from the registry's
+/// `llamacpp_embedding_model`, optionally loading it first.
+///
+/// Returns `None` when no llamacpp embedding model is registered or the
+/// provider fails to connect.  Pushes [`DeviceCapability::Embedding`] into
+/// `capabilities` on success.
+pub(crate) async fn init_llamacpp_embedding(
+    registry: &LemonadeModelRegistry,
+    load_opts: Option<&ModelLoadOptions>,
+    capabilities: &mut Vec<DeviceCapability>,
+    device_label: &str,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    let model_entry = registry.llamacpp_embedding_model()?;
+    let model_id = model_entry.id.clone();
+    let result = match load_opts {
+        Some(opts) => LemonadeProvider::new_with_load(&registry.base_url, &model_id, opts).await,
+        None => LemonadeProvider::new(&registry.base_url, &model_id).await,
+    };
+    match result {
+        Ok(p) => {
+            capabilities.push(DeviceCapability::Embedding);
+            tracing::info!(model = %model_id, "{device_label}: embedding provider ready");
+            Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
+        }
+        Err(e) => {
+            tracing::warn!(model = %model_id, error = %e, "{device_label}: embedding model not reachable");
+            None
+        }
+    }
+}
+
+/// Probe `model_id` at `base_url` and, on success, push
+/// [`DeviceCapability::Embedding`] and store the provider.
+///
+/// Called from `CpuDevice::with_embedding` and `GpuDevice::with_embedding`;
+/// the device name is used only for log messages.
+pub(crate) async fn attach_embedding_provider(
+    device_name: &str,
+    capabilities: &mut Vec<DeviceCapability>,
+    embedding: &mut Option<Arc<dyn EmbeddingProvider>>,
+    base_url: &str,
+    model_id: &str,
+) {
+    match LemonadeProvider::new(base_url, model_id).await {
+        Ok(p) => {
+            capabilities.push(DeviceCapability::Embedding);
+            tracing::info!(model = %model_id, "{device_name}: embedding provider added");
+            *embedding = Some(Arc::new(p) as Arc<dyn EmbeddingProvider>);
+        }
+        Err(e) => {
+            tracing::warn!(
+                model = %model_id,
+                error = %e,
+                "{device_name}::with_embedding: model not reachable — skipping"
+            );
+        }
+    }
+}
+
 // ── DeviceCapability ──────────────────────────────────────────────────────────
 
 /// The kind of inference work a [`DeviceWorker`] can perform.

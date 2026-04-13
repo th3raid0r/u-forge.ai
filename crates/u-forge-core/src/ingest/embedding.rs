@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::{info, warn};
 
-use crate::ai::embeddings::LemonadeProvider;
+use crate::lemonade::embedding::LemonadeProvider;
 use crate::config::AppConfig;
 use crate::lemonade::LemonadeModelRegistry;
 use crate::queue::{InferenceQueue, InferenceQueueBuilder};

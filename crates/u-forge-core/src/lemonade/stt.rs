@@ -8,6 +8,10 @@ use async_openai::types::{InputSource};
 use async_openai::types::audio::{AudioInput, CreateTranscriptionRequestArgs};
 use serde::{Deserialize, Serialize};
 
+use async_trait::async_trait;
+
+use crate::ai::transcription::TranscriptionProvider;
+
 use super::client::make_lemonade_openai_client;
 use super::gpu_manager::GpuResourceManager;
 use super::registry::LemonadeModelRegistry;
@@ -110,5 +114,19 @@ impl LemonadeSttProvider {
 
         Ok(TranscriptionResult { text })
         // _guard is dropped here → GPU released, queued LLM requests are woken.
+    }
+}
+
+#[async_trait]
+impl TranscriptionProvider for LemonadeSttProvider {
+    /// Delegates to the inherent [`transcribe`](Self::transcribe) method and
+    /// maps the result to a plain `String`.
+    async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> anyhow::Result<String> {
+        // Inherent `transcribe` has priority over this trait method.
+        self.transcribe(audio_bytes, filename).await.map(|r| r.text)
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
     }
 }
