@@ -50,7 +50,9 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/schema/manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
 | `src/schema/ingestion.rs` | JSON schema file → internal | `SchemaIngestion` |
 | `src/ingest/data.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
-| `examples/common/mod.rs` | Shared example helpers (config, args, KG setup, embedding) | `DatabaseConfig`, `DemoArgs`, `setup_knowledge_graph`, `build_hq_embed_queue`, `embed_all_chunks` |
+| `src/ingest/pipeline.rs` | Schema + data loading + FTS5 indexing | `setup_and_index()`, `SetupResult` |
+| `src/ingest/embedding.rs` | Batch chunk embedding (standard & HQ) | `embed_all_chunks()`, `build_hq_embed_queue()`, `EmbeddingTarget`, `EmbeddingResult` |
+| `examples/common/mod.rs` | Demo-specific helpers (config, CLI args) | `DatabaseConfig`, `DemoArgs`, `resolve_demo_args()`, `load_toml_config()` |
 | `examples/cli_demo.rs` | Demo: hardware caps, FTS5, semantic, rerank, hybrid search (includes `common` via `#[path]`) | — |
 | `examples/cli_chat.rs` | Interactive RAG chat REPL (includes `common` via `#[path]`) | — |
 

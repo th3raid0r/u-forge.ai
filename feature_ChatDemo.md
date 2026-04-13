@@ -51,7 +51,7 @@ Structure:
    - `GpuDevice::from_registry(&registry, gpu)` — gets STT + LLM + embedding if available
    - `InferenceQueueBuilder::new().with_npu_device(npu).with_gpu_device(gpu).build()`
    - This gives a queue with `has_text_generation() == true` AND `has_embedding() == true`
-4. **KnowledgeGraph setup** — Uses `common::setup_knowledge_graph()` and `common::embed_all_chunks()` from `examples/common/mod.rs`
+4. **KnowledgeGraph setup** — Uses `setup_and_index()` and `embed_all_chunks()` from `u_forge_core::ingest`
 5. **Capability gate** — If `!queue.has_text_generation()`, print helpful message and exit
 6. **REPL loop:**
    - Print `You: ` prompt, read line from stdin

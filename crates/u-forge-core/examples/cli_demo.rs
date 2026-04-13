@@ -54,13 +54,17 @@ use anyhow::Result;
 use std::sync::Arc;
 use u_forge_core::{
     ai::embeddings::LemonadeProvider,
+    build_hq_embed_queue,
     config::AppConfig,
+    embed_all_chunks,
     hardware::npu::NpuDevice,
+    ingest::EmbeddingTarget,
     lemonade::{
         resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
+    setup_and_index,
     types::ObjectMetadata,
     EmbeddingProvider, KnowledgeGraph, ObjectBuilder,
     EMBEDDING_DIMENSIONS, HIGH_QUALITY_EMBEDDING_DIMENSIONS,
@@ -522,7 +526,7 @@ async fn main() -> Result<()> {
 
                             // ── High-quality embedding worker (Qwen3-Embedding-8B-GGUF) ─
                             hq_embed_queue =
-                                common::build_hq_embed_queue(&registry, &device_cfg).await;
+                                build_hq_embed_queue(&registry, &device_cfg).await;
                             println!();
                         }
                     }
@@ -537,21 +541,35 @@ async fn main() -> Result<()> {
     println!("🗄️  Knowledge Graph");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let (graph, _fresh) = common::setup_knowledge_graph(
-        db_path_str,
-        clear_db,
-        &args.schema_dir,
-        &args.data_file,
-    )
-    .await?;
+    println!("   Opening knowledge graph at {db_path_str}…");
+    let graph = KnowledgeGraph::new(db_path_str)?;
+    if clear_db {
+        println!("   Clearing existing data…");
+        graph.clear_all()?;
+    }
+    let setup_result = setup_and_index(&graph, &args.schema_dir, &args.data_file).await?;
+    if setup_result.fresh_import {
+        println!(
+            "   ✅ {} objects, {} edges imported, {} chunks indexed\n",
+            setup_result.objects_created, setup_result.relationships_created, setup_result.chunks_indexed
+        );
+    } else {
+        let s = graph.get_stats()?;
+        println!(
+            "   ✅ Loaded from disk ({} nodes, {} chunks)\n",
+            s.node_count, s.chunk_count
+        );
+    }
 
     // ── Embed chunks for semantic (ANN) search ────────────────────────────────
 
-    let post_load_stats = graph.get_stats()?;
-    let needs_hq_embedding = post_load_stats.chunk_count > post_load_stats.embedded_hq_count;
-
     if let Some(ref eq) = embed_queue {
-        common::embed_all_chunks(&graph, eq).await?;
+        let emb = embed_all_chunks(&graph, eq, EmbeddingTarget::Standard).await?;
+        if emb.total > 0 {
+            println!("   ✅ {}/{} chunks embedded\n", emb.stored, emb.total);
+        } else if eq.has_embedding() {
+            println!("   ℹ️  Embedding skipped — all chunks already embedded.\n");
+        }
     } else if lemonade_url.is_some() {
         println!("ℹ️  Embedding skipped — no compatible embedding model available.\n");
     } else {
@@ -561,64 +579,17 @@ async fn main() -> Result<()> {
     // ── HQ embed chunks (4096-dim) ───────────────────────────────────────────
 
     if let Some(ref hq_eq) = hq_embed_queue {
-        if !needs_hq_embedding {
+        println!("🧮 HQ embedding chunks ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)…");
+        println!("   Workers  : {}", hq_eq.embedding_worker_count());
+        let hq_emb = embed_all_chunks(&graph, hq_eq, EmbeddingTarget::HighQuality).await?;
+        if hq_emb.total > 0 {
             println!(
-                "ℹ️  HQ embedding skipped — all {} chunks already HQ embedded.\n",
-                post_load_stats.chunk_count
+                "   ✅ {}/{} HQ embedded ({} skipped)\n",
+                hq_emb.stored, hq_emb.total, hq_emb.skipped
             );
         } else {
-            println!("🧮 HQ embedding chunks ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)…");
-            println!("   Workers  : {}", hq_eq.embedding_worker_count());
-
-            let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
-                let mut all = Vec::new();
-                for obj in &objs {
-                    for chunk in graph.get_text_chunks(obj.id)? {
-                        all.push(chunk);
-                    }
-                }
-                Ok(all)
-            })?;
-
-            let total = chunks_to_embed.len();
-            println!("   Chunks   : {total}");
-
-            let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
-
-            let t0 = std::time::Instant::now();
-            match hq_eq.embed_many(texts).await {
-                Err(e) => {
-                    eprintln!("    ❌ HQ embed_many failed: {e}");
-                }
-                Ok(vecs) => {
-                    let elapsed = t0.elapsed();
-                    let mut stored = 0usize;
-                    let mut skipped = 0usize;
-                    for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
-                        match graph.upsert_chunk_embedding_hq(chunk.id, vec) {
-                            Ok(()) => stored += 1,
-                            Err(e) => {
-                                skipped += 1;
-                                eprintln!(
-                                    "    ⚠️  Could not store HQ embedding for chunk {}: {e}",
-                                    chunk.id
-                                );
-                            }
-                        }
-                    }
-                    let rate = if elapsed.as_secs_f64() > 0.0 {
-                        stored as f64 / elapsed.as_secs_f64()
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "    ✅ {stored}/{total} HQ embedded in {:.1}s ({rate:.0} chunks/s, \
-                     {skipped} skipped)\n",
-                        elapsed.as_secs_f64()
-                    );
-                }
-            }
-        } // end needs_hq_embedding else
+            println!("   ℹ️  HQ embedding skipped — all chunks already HQ embedded.\n");
+        }
     }
 
     // ── Graph statistics ──────────────────────────────────────────────────────

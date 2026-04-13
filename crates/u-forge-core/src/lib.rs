@@ -50,6 +50,10 @@ pub use lemonade::{
     LemonadeTtsProvider, LlmGuard, LoadedModelEntry, ModelLoadOptions, ModelRole, SttGuard,
     TranscriptionResult, load_model,
 };
+pub use ingest::{
+    build_hq_embed_queue, embed_all_chunks, setup_and_index, DataIngestion, EmbeddingResult,
+    EmbeddingTarget, IngestionStats, SetupResult,
+};
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
     SchemaIngestion, SchemaManager, SchemaStats,

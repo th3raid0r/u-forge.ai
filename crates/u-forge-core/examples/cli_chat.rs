@@ -32,8 +32,11 @@ use anyhow::Result;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use u_forge_core::{
+    build_hq_embed_queue,
     config::AppConfig,
+    embed_all_chunks,
     hardware::{gpu::GpuDevice, npu::NpuDevice},
+    ingest::EmbeddingTarget,
     lemonade::{
         load_model, resolve_lemonade_url, GpuResourceManager, LemonadeHealth,
         LemonadeModelRegistry, LemonadeRerankProvider,
@@ -41,7 +44,7 @@ use u_forge_core::{
     queue::InferenceQueueBuilder,
     rag::{build_rag_messages, format_search_context},
     search::{search_hybrid, HybridSearchConfig},
-    ChatDevice, ChatRequest, StreamToken,
+    setup_and_index, ChatDevice, ChatRequest, KnowledgeGraph, StreamToken,
 };
 
 // ── Demo config (database overrides only) ────────────────────────────────────
@@ -235,7 +238,7 @@ async fn main() -> Result<()> {
     let queue = builder.build();
 
     // High-quality embedding queue (optional — only when hq embedding is enabled in config).
-    let hq_embed_queue = common::build_hq_embed_queue(&registry, &app_cfg).await;
+    let hq_embed_queue = build_hq_embed_queue(&registry, &app_cfg).await;
 
     if !queue.has_text_generation() {
         eprintln!();
@@ -266,15 +269,30 @@ async fn main() -> Result<()> {
         .unwrap_or(&default_db_path);
     let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
 
-    let (graph, _fresh) = common::setup_knowledge_graph(
-        db_path_str,
-        clear_db,
-        &args.schema_dir,
-        &args.data_file,
-    )
-    .await?;
+    println!("   Opening knowledge graph at {db_path_str}…");
+    let graph = KnowledgeGraph::new(db_path_str)?;
+    if clear_db {
+        println!("   Clearing existing data…");
+        graph.clear_all()?;
+    }
+    let setup_result = setup_and_index(&graph, &args.schema_dir, &args.data_file).await?;
+    if setup_result.fresh_import {
+        println!(
+            "   ✅ {} objects, {} edges imported, {} chunks indexed\n",
+            setup_result.objects_created, setup_result.relationships_created, setup_result.chunks_indexed
+        );
+    } else {
+        let s = graph.get_stats()?;
+        println!(
+            "   ✅ Loaded from disk ({} nodes, {} chunks)\n",
+            s.node_count, s.chunk_count
+        );
+    }
 
-    common::embed_all_chunks(&graph, &queue).await?;
+    let emb = embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard).await?;
+    if emb.total > 0 {
+        println!("   ✅ {}/{} chunks embedded\n", emb.stored, emb.total);
+    }
 
     // ── REPL ─────────────────────────────────────────────────────────────────
 
