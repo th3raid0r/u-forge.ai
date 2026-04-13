@@ -1,29 +1,15 @@
 //! Audio-to-text transcription trait and MIME helper.
 //!
 //! The [`TranscriptionProvider`] trait and [`mime_for_filename`] utility live
-//! here and are dependency-free.  Provider implementations and the
-//! [`TranscriptionManager`] convenience wrapper live in
-//! [`crate::lemonade::transcription`] and are re-exported below for
-//! backward compatibility.
-//!
-//! # Quick start
-//!
-//! ```no_run
-//! # use u_forge_core::ai::transcription::TranscriptionManager;
-//! # async fn example() -> anyhow::Result<()> {
-//! // Auto: reads LEMONADE_URL env var, defaults to whisper-v3-turbo-FLM
-//! let mgr = TranscriptionManager::try_new_auto(None, None).await?;
-//! let wav  = std::fs::read("session.wav")?;
-//! let text = mgr.get_provider().transcribe(wav, "session.wav").await?;
-//! println!("{text}");
-//! # Ok(()) }
-//! ```
+//! here and are dependency-free.  The [`LemonadeTranscriptionProvider`]
+//! implementation lives in [`crate::lemonade::transcription`] and is
+//! re-exported below.
 
 use anyhow::Result;
 use async_trait::async_trait;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
-pub use crate::lemonade::transcription::{LemonadeTranscriptionProvider, TranscriptionManager};
+pub use crate::lemonade::transcription::LemonadeTranscriptionProvider;
 
 // ── TranscriptionProvider trait ───────────────────────────────────────────────
 
@@ -73,8 +59,6 @@ pub fn mime_for_filename(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use anyhow::Result;
     use crate::test_helpers::require_integration_url;
 
     // ── WAV helper ────────────────────────────────────────────────────────────
@@ -120,44 +104,6 @@ mod tests {
     }
 
     // ── Unit tests (no server required) ──────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_transcription_manager_fails_with_no_url() {
-        // try_new_auto(None, None) should fail when no server is discoverable
-        // and LEMONADE_URL is unset.  Skip if a server IS reachable (the error
-        // path wouldn't be exercised).
-        if crate::test_helpers::integration_test_url().await.is_some() {
-            eprintln!("SKIP: Lemonade Server is reachable — cannot test no-URL error path");
-            return;
-        }
-        let result = TranscriptionManager::try_new_auto(None, None).await;
-        assert!(
-            result.is_err(),
-            "Expected error when no URL is configured, got Ok"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("LEMONADE_URL"),
-            "Error should mention LEMONADE_URL, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_transcription_manager_debug_format() {
-        let mgr = TranscriptionManager::new_lemonade(
-            "http://localhost:13305/api/v1",
-            "whisper-v3-turbo-FLM",
-        );
-        let s = format!("{:?}", mgr);
-        assert!(
-            s.contains("TranscriptionManager"),
-            "missing struct name: {s}"
-        );
-        assert!(
-            s.contains("whisper-v3-turbo-FLM"),
-            "missing model name: {s}"
-        );
-    }
 
     #[test]
     fn test_lemonade_transcription_provider_model_name() {
@@ -228,23 +174,6 @@ mod tests {
         assert_eq!(mime_for_filename("unknown.zzz"), "audio/wav");
         // Case-insensitive
         assert_eq!(mime_for_filename("TRACK.MP3"), "audio/mpeg");
-    }
-
-    #[test]
-    fn test_manager_from_provider() {
-        struct Echo;
-        #[async_trait::async_trait]
-        impl TranscriptionProvider for Echo {
-            async fn transcribe(&self, _: Vec<u8>, filename: &str) -> Result<String> {
-                Ok(filename.to_string())
-            }
-            fn model_name(&self) -> &str {
-                "echo"
-            }
-        }
-
-        let mgr = TranscriptionManager::from_provider(Arc::new(Echo));
-        assert_eq!(mgr.get_provider().model_name(), "echo");
     }
 
     // ── Integration tests (require a running Lemonade Server) ─────────────────

@@ -5,19 +5,17 @@
 //! (768-dim) and high-quality (4096-dim) targets.
 //!
 //! [`build_hq_embed_queue`] is a convenience constructor that builds a
-//! single-worker [`InferenceQueue`] for the high-quality embedding model
-//! advertised by the [`LemonadeModelRegistry`].
-
-use std::sync::Arc;
+//! single-worker [`InferenceQueue`] for the first high-quality embedding model
+//! selected by [`ModelSelector`] from a live [`LemonadeServerCatalog`].
 
 use anyhow::Result;
 use tracing::{info, warn};
 
-use crate::lemonade::embedding::LemonadeProvider;
 use crate::config::AppConfig;
-use crate::lemonade::LemonadeModelRegistry;
+use crate::lemonade::catalog::LemonadeServerCatalog;
+use crate::lemonade::provider_factory::{BuiltProvider, Capability, ProviderFactory};
+use crate::lemonade::selector::{ModelSelector, QualityTier};
 use crate::queue::{InferenceQueue, InferenceQueueBuilder};
-use crate::EmbeddingProvider;
 use crate::KnowledgeGraph;
 use crate::HIGH_QUALITY_EMBEDDING_DIMENSIONS;
 
@@ -127,31 +125,37 @@ pub async fn embed_all_chunks(
 }
 
 /// Build a single-worker [`InferenceQueue`] for the high-quality (4096-dim)
-/// embedding model, if the registry advertises one and HQ embedding is
+/// embedding model, if the catalog advertises one and HQ embedding is
 /// enabled in `app_cfg`.
 ///
 /// Returns `None` when:
 /// - HQ embedding is disabled in config
-/// - No suitable HQ embedding model is registered
+/// - No suitable HQ embedding model is downloaded
 /// - The model fails to load
 /// - The model's dimensions don't match [`HIGH_QUALITY_EMBEDDING_DIMENSIONS`]
 pub async fn build_hq_embed_queue(
-    registry: &LemonadeModelRegistry,
+    catalog: &LemonadeServerCatalog,
     app_cfg: &AppConfig,
 ) -> Option<InferenceQueue> {
     if !app_cfg.embedding.high_quality_embedding {
         return None;
     }
-    let hq_model = registry.hq_embedding_model(true)?;
-    let hq_model_id = hq_model.id.clone();
-    let hq_load_opts = app_cfg.models.load_options_for(&hq_model_id);
 
+    let selector = ModelSelector::new(catalog, &app_cfg.models, &app_cfg.embedding);
+    let hq_model = selector
+        .select_embedding_models()
+        .into_iter()
+        .find(|s| s.quality_tier == QualityTier::High)?;
+
+    let hq_model_id = hq_model.model_id.clone();
     info!(model = %hq_model_id, "Loading HQ embedding model");
 
-    let provider = match LemonadeProvider::new_with_load(
-        &registry.base_url,
-        &hq_model_id,
-        &hq_load_opts,
+    let built: BuiltProvider = match ProviderFactory::build(
+        &hq_model,
+        Capability::Embedding,
+        &catalog.base_url,
+        app_cfg.embedding.gpu_weight,
+        None,
     )
     .await
     {
@@ -162,26 +166,25 @@ pub async fn build_hq_embed_queue(
         Ok(p) => p,
     };
 
-    let dims = provider.dimensions().unwrap_or(0);
-    if dims != HIGH_QUALITY_EMBEDDING_DIMENSIONS {
-        warn!(
-            actual = dims,
-            expected = HIGH_QUALITY_EMBEDDING_DIMENSIONS,
-            model = %hq_model_id,
-            "HQ model dimension mismatch — skipped"
-        );
-        return None;
+    // Verify dimensions before registering.
+    if let crate::lemonade::provider_factory::ProviderSlot::Embedding(ref provider) = built.provider {
+        let dims = provider.dimensions().unwrap_or(0);
+        if dims != HIGH_QUALITY_EMBEDDING_DIMENSIONS {
+            warn!(
+                actual = dims,
+                expected = HIGH_QUALITY_EMBEDDING_DIMENSIONS,
+                model = %hq_model_id,
+                "HQ model dimension mismatch — skipped"
+            );
+            return None;
+        }
+        info!(model = %hq_model_id, dims, "HQ embedding model ready");
     }
 
-    info!(model = %hq_model_id, dims, "HQ embedding model ready");
     Some(
         InferenceQueueBuilder::new()
             .with_config(app_cfg.clone())
-            .with_embedding_provider_weighted(
-                Arc::new(provider),
-                format!("hq({hq_model_id})"),
-                app_cfg.embedding.gpu_weight,
-            )
+            .with_provider(built)
             .build(),
     )
 }

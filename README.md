@@ -25,9 +25,9 @@ A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI
 | Flexible JSON schema system with validation (13 TTRPG types) | ✅ Working |
 | JSONL data ingestion — two-pass node + edge import, deduplication | ✅ Working |
 | `ObjectBuilder` fluent API | ✅ Working |
-| Lemonade Server embedding provider (`EmbeddingManager`) | ✅ Working |
-| Lemonade Server transcription provider (`TranscriptionManager`) | ✅ Working |
-| Hardware device abstraction (NPU / GPU / CPU) | ✅ Working |
+| Catalog-driven model selection (`LemonadeServerCatalog`, `ModelSelector`) | ✅ Working |
+| Lemonade Server embedding provider (`LemonadeProvider`) | ✅ Working |
+| Lemonade Server transcription provider (`LemonadeTranscriptionProvider`) | ✅ Working |
 | Unified inference queue (`InferenceQueue`) — embed, transcribe, TTS, LLM, rerank | ✅ Working |
 | Reranking via Lemonade Server (`LemonadeRerankProvider`) | ✅ Working |
 | `cli_demo` — hybrid search + rerank pipeline demo with Foundation universe data | ✅ Working |
@@ -240,10 +240,9 @@ u-forge.ai/
 │   │   │   ├── text.rs             # split_text() word-boundary chunking
 │   │   │   ├── types.rs            # Domain types
 │   │   │   ├── graph/              # SQLite persistence + FTS5 + ANN
-│   │   │   ├── ai/                 # EmbeddingProvider + TranscriptionProvider traits + providers
-│   │   │   ├── hardware/           # DeviceCapability, NpuDevice, GpuDevice, CpuDevice
+│   │   │   ├── ai/                 # EmbeddingProvider + TranscriptionProvider traits + re-exports
 │   │   │   ├── queue/              # Unified MPMC inference dispatch (embed/transcribe/TTS/LLM/rerank)
-│   │   │   ├── lemonade/           # LemonadeModelRegistry, GpuResourceManager, all Lemonade providers
+│   │   │   ├── lemonade/           # Catalog, ModelSelector, ProviderFactory, all Lemonade providers
 │   │   │   ├── schema/             # Schema definition types, load/validate/cache, JSON ingestion
 │   │   │   ├── ingest/             # JSONL two-pass import pipeline
 │   │   │   ├── rag.rs              # RAG context formatting + message assembly

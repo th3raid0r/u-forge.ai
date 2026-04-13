@@ -18,7 +18,6 @@ use tokio::sync::mpsc;
 
 use super::client::LemonadeHttpClient;
 use super::gpu_manager::GpuResourceManager;
-use super::registry::LemonadeModelRegistry;
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
@@ -220,25 +219,6 @@ impl LemonadeChatProvider {
         Self::new(base_url, model, None)
     }
 
-    /// Construct using the GPU LLM model discovered in `registry`.
-    pub fn from_registry(
-        registry: &LemonadeModelRegistry,
-        gpu: Option<Arc<GpuResourceManager>>,
-    ) -> Result<Self> {
-        let model = registry
-            .llm_model()
-            .ok_or_else(|| anyhow!("No GPU LLM model found in the Lemonade registry"))?;
-        Ok(Self::new(&registry.base_url, &model.id, gpu))
-    }
-
-    /// Construct using the NPU FLM LLM model discovered in `registry`.
-    pub fn from_registry_npu(registry: &LemonadeModelRegistry) -> Result<Self> {
-        let model = registry
-            .npu_llm_model()
-            .ok_or_else(|| anyhow!("No NPU FLM LLM model found in the Lemonade registry"))?;
-        Ok(Self::new_npu(&registry.base_url, &model.id))
-    }
-
     /// Override the default max tokens ceiling.
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.default_max_tokens = n;
@@ -430,9 +410,13 @@ mod tests {
     #[tokio::test]
     async fn test_chat_ask_returns_response() {
         let url = require_integration_url!();
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let llm = selector.select_llm_models().into_iter().next()
+            .expect("No LLM model found in catalog");
         let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
+        let chat = LemonadeChatProvider::new(&url, &llm.model_id, Some(gpu));
 
         let response = chat
             .ask("Respond with exactly one word: pong")
@@ -447,9 +431,13 @@ mod tests {
     #[tokio::test]
     async fn test_chat_request_with_overrides() {
         let url = require_integration_url!();
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let llm = selector.select_llm_models().into_iter().next()
+            .expect("No LLM model found in catalog");
         let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::from_registry(&reg, Some(gpu)).unwrap();
+        let chat = LemonadeChatProvider::new(&url, &llm.model_id, Some(gpu));
 
         let req = ChatRequest::new(vec![ChatMessage::user("Count to three.")])
             .with_max_tokens(64)

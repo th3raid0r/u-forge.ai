@@ -205,8 +205,8 @@ mod tests {
     #[test]
     fn test_is_flm_model() {
         assert!(is_flm_model("embed-gemma-300m-FLM"));
-        assert!(is_flm_model("qwen3-8b-FLM"));
-        assert!(!is_flm_model("nomic-embed-text-v1-GGUF"));
+        assert!(is_flm_model("qwen3.5-4B-FLM"));
+        assert!(!is_flm_model("user.ggml-org/embeddinggemma-300M-GGUF"));
         assert!(!is_flm_model("bge-reranker-v2-m3-GGUF"));
     }
 
@@ -345,7 +345,7 @@ mod tests {
             ..Default::default()
         };
         let body = LoadRequest {
-            model_name: "nomic-embed-text-v2-moe-GGUF",
+            model_name: "user.ggml-org/embeddinggemma-300M-GGUF",
             ctx_size: opts.ctx_size,
             llamacpp_backend: opts.llamacpp_backend.as_deref(),
             llamacpp_args: opts.llamacpp_args.as_deref(),
@@ -371,22 +371,20 @@ mod tests {
         assert!(result.is_err(), "Expected error for unreachable server");
     }
 
-    /// Integration test: explicitly load `nomic-embed-text-v1-GGUF` with
+    /// Integration test: explicitly load `user.ggml-org/embeddinggemma-300M-GGUF` with
     /// `DEFAULT_EMBEDDING_CONTEXT_TOKENS` and verify the server accepts the request.
     ///
     /// Skips automatically when no Lemonade Server is reachable.
     #[tokio::test]
-    async fn test_load_nomic_embed_v1_default_ctx() {
+    async fn test_load_embeddinggemma_default_ctx() {
         let url = crate::test_helpers::require_integration_url!();
 
         let opts = ModelLoadOptions {
-            ctx_size: Some(crate::lemonade::effective_ctx_size(
-                "nomic-embed-text-v1-GGUF",
-            )),
+            ctx_size: Some(crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS),
             ..Default::default()
         };
 
-        let result = load_model(&url, "nomic-embed-text-v1-GGUF", &opts).await;
+        let result = load_model(&url, "user.ggml-org/embeddinggemma-300M-GGUF", &opts).await;
         assert!(
             result.is_ok(),
             "load_model failed: {:?}",

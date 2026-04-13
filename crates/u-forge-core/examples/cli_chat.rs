@@ -20,10 +20,11 @@
 //! See `AppConfig` / `ChatConfig` for the full list of knobs.
 //!
 //! REPL commands:
-//!   /quit     — exit
-//!   /clear    — reset conversation history
-//!   /context  — toggle showing retrieved knowledge graph context
-//!   /thinking — cycle reasoning effort: off → low → medium → high → off
+//!   /quit           — exit
+//!   /clear          — reset conversation history
+//!   /context        — toggle showing retrieved knowledge graph context
+//!   /thinking       — toggle extended thinking
+//!   /device [gpu|npu] — show or switch the active LLM device
 
 #[path = "common/mod.rs"]
 mod common;
@@ -35,16 +36,17 @@ use u_forge_core::{
     build_hq_embed_queue,
     config::AppConfig,
     embed_all_chunks,
-    hardware::{gpu::GpuDevice, npu::NpuDevice},
     ingest::EmbeddingTarget,
     lemonade::{
-        load_model, resolve_lemonade_url, GpuResourceManager, LemonadeHealth,
-        LemonadeModelRegistry, LemonadeRerankProvider,
+        provider_factory::{Capability, ProviderFactory},
+        selector::{ModelSelector, QualityTier},
+        resolve_lemonade_url, GpuResourceManager, LemonadeServerCatalog,
     },
     queue::InferenceQueueBuilder,
     rag::{build_rag_messages, format_search_context},
     search::{search_hybrid, HybridSearchConfig},
     setup_and_index, ChatDevice, ChatRequest, KnowledgeGraph, StreamToken,
+    HIGH_QUALITY_EMBEDDING_DIMENSIONS,
 };
 
 // ── Demo config (database overrides only) ────────────────────────────────────
@@ -105,78 +107,62 @@ async fn main() -> Result<()> {
     let url = lemonade_url.as_deref().unwrap();
     println!();
 
-    // ── Model registry ────────────────────────────────────────────────────────
+    // ── Catalog discovery + provider construction ─────────────────────────────
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("🔌 Lemonade — detecting capabilities");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let registry = match LemonadeModelRegistry::fetch(url).await {
-        Ok(r) => r,
+    let catalog = match LemonadeServerCatalog::discover(url).await {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("   ❌ Could not fetch model registry: {e}");
+            eprintln!("   ❌ Could not discover server catalog: {e}");
             eprintln!("   Is Lemonade Server running at {url}?");
             return Err(e);
         }
     };
 
-    // Desired LLM models — from config or hardcoded defaults.
-    const DEFAULT_GPU_LLM: &str = "Qwen3.5-9B-GGUF";
-    const DEFAULT_NPU_LLM: &str = "qwen3.5-9b-FLM";
+    let selector = ModelSelector::new(&catalog, &app_cfg.models, &app_cfg.embedding);
+
+    // Determine the desired LLM model IDs: config override → selector fallback.
+    // `select_llm_models` is used only to provide the fallback name; the actual
+    // SelectedModel is resolved via `model_by_id` so that config-specified
+    // models are used even when they are not in the preference list.
+    let llm_selections = selector.select_llm_models();
     let desired_gpu_llm: String = chat_cfg
         .gpu
         .model
         .clone()
-        .unwrap_or_else(|| DEFAULT_GPU_LLM.to_string());
+        .or_else(|| {
+            llm_selections
+                .iter()
+                .find(|s| s.recipe != "flm")
+                .map(|s| s.model_id.clone())
+        })
+        .unwrap_or_else(|| "Qwen3.5-9B-GGUF".to_string());
     let desired_npu_llm: String = chat_cfg
         .npu
         .model
         .clone()
-        .unwrap_or_else(|| DEFAULT_NPU_LLM.to_string());
+        .or_else(|| {
+            llm_selections
+                .iter()
+                .find(|s| s.recipe == "flm")
+                .map(|s| s.model_id.clone())
+        })
+        .unwrap_or_else(|| "qwen3.5-9b-FLM".to_string());
 
-    // Fetch health to see which models are actually running in memory right now.
-    // Falls back to an empty snapshot (all models considered not loaded) on failure.
-    let health = LemonadeHealth::fetch(url).await.unwrap_or_default();
+    // Resolve the exact SelectedModel for each slot from the live catalog.
+    // This bypasses preference-list filtering so config overrides are always
+    // honoured, even for models that are not in llm_model_preferences.
+    let gpu_llm_sel = selector.model_by_id(&desired_gpu_llm, QualityTier::NotApplicable);
+    let npu_llm_sel = selector.model_by_id(&desired_npu_llm, QualityTier::NotApplicable);
+    let npu_available = npu_llm_sel.is_some();
 
-    // Ensure the GPU LLM is loaded before the REPL starts (pre-warms first request).
-    if !health.is_model_loaded(&desired_gpu_llm) {
-        print!("   Loading   : {desired_gpu_llm}…");
-        std::io::stdout().flush()?;
-        match load_model(
-            url,
-            &desired_gpu_llm,
-            &app_cfg.models.load_options_for(&desired_gpu_llm),
-        )
-        .await
-        {
-            Ok(()) => println!(" ✅"),
-            Err(e) => println!(" ⚠️  {e}"),
-        }
-    }
     print_llm_line("GPU", &desired_gpu_llm, chat_cfg.gpu.model.is_none());
-
-    // Pre-load the NPU LLM only when an NPU embedding model is present in the
-    // registry — NpuDevice::from_registry requires one; without it the NPU
-    // path is skipped entirely.
-    let npu_available = registry.npu_embedding_model().is_some();
     if npu_available {
-        if !health.is_model_loaded(&desired_npu_llm) {
-            print!("   Loading   : {desired_npu_llm}…");
-            std::io::stdout().flush()?;
-            match load_model(
-                url,
-                &desired_npu_llm,
-                &app_cfg.models.load_options_for(&desired_npu_llm),
-            )
-            .await
-            {
-                Ok(()) => println!(" ✅"),
-                Err(e) => println!(" ⚠️  {e}"),
-            }
-        }
         print_llm_line("NPU", &desired_npu_llm, chat_cfg.npu.model.is_none());
     }
-
     println!(
         "   Active device: {}",
         match chat_cfg.preferred_device {
@@ -187,58 +173,86 @@ async fn main() -> Result<()> {
         }
     );
 
-    // ── Build InferenceQueue with LLM + embedding ─────────────────────────────
+    // ── Build InferenceQueue (embedding + reranker + LLM) ────────────────────
+    // cli_chat is text-only — STT and TTS are not loaded here.
 
-    let gpu = GpuResourceManager::new();
-    let mut builder = InferenceQueueBuilder::new().with_config(app_cfg.clone());
+    let gpu_mgr = Arc::new(GpuResourceManager::new());
     let mut embedding_available = false;
 
-    // NPU device: embedding + optional LLM (FLM models).
-    match NpuDevice::from_registry_with_config(&registry, &app_cfg.models).await {
-        Ok(npu) => {
-            let has_llm = npu.chat.is_some();
-            let has_embed = npu.has_embedding();
-            println!("   NPU device: embed={} llm={}", has_embed, has_llm);
-            if has_embed {
+    let embed_models = selector.select_embedding_models();
+    let reranker_sel = selector.select_reranker();
+
+    let mut providers = Vec::new();
+
+    // Embedding providers (standard-dim only; HQ handled separately below).
+    for sel in embed_models.iter().filter(|s| s.quality_tier == QualityTier::Standard) {
+        let weight = match sel.recipe.as_str() {
+            "flm" => app_cfg.embedding.npu_weight,
+            "llamacpp" => match sel.backend.as_deref() {
+                Some("rocm") | Some("vulkan") | Some("metal") => app_cfg.embedding.gpu_weight,
+                _ => app_cfg.embedding.cpu_weight,
+            },
+            _ => app_cfg.embedding.cpu_weight,
+        };
+        match ProviderFactory::build(sel, Capability::Embedding, url, weight, None).await {
+            Ok(p) => {
+                println!("   Embedding : ✅ {} (weight={})", p.name, p.weight);
                 embedding_available = true;
+                providers.push(p);
             }
-            builder = builder.with_npu_device(npu);
-        }
-        Err(e) => {
-            println!("   NPU device: unavailable ({e})");
+            Err(e) => println!("   Embedding : ⚠️  {} unavailable: {e}", sel.model_id),
         }
     }
 
-    // GPU device: STT + LLM + optional embedding (llamacpp models).
-    let gpu_device =
-        GpuDevice::from_registry_with_config(&registry, Arc::clone(&gpu), &app_cfg.models).await;
-    let has_gpu_llm = gpu_device.chat.is_some();
-    let has_gpu_embed = gpu_device.embedding.is_some();
-    println!("   GPU device: embed={} llm={}", has_gpu_embed, has_gpu_llm);
-    if has_gpu_embed {
-        embedding_available = true;
-    }
-    builder = builder.with_gpu_device(gpu_device);
-
-    // Reranker (optional — improves result quality when available).
-    match LemonadeRerankProvider::from_registry(&registry) {
-        Ok(r) => {
-            let load_opts = app_cfg.models.load_options_for(&r.model);
-            if let Err(e) = r.load(&load_opts).await {
-                eprintln!("   Reranker  : load failed ({e}), continuing without explicit ctx");
+    // Reranker
+    if let Some(ref r_sel) = reranker_sel {
+        match ProviderFactory::build(r_sel, Capability::Reranking, url, 100, None).await {
+            Ok(p) => {
+                println!("   Reranker  : ✅ {}", p.name);
+                providers.push(p);
             }
-            println!("   Reranker  : ✅ {}", r.model);
-            builder = builder.with_reranker(r);
+            Err(e) => println!("   Reranker  : ⚠️  unavailable: {e}"),
         }
-        Err(_) => {
-            println!("   Reranker  : not available (results ordered by RRF score)");
+    } else {
+        println!("   Reranker  : not available (results ordered by RRF score)");
+    }
+
+    // LLM providers — exactly the configured/desired models, one per slot.
+    for sel in gpu_llm_sel.iter().chain(npu_llm_sel.iter()) {
+        match ProviderFactory::build(sel, Capability::TextGeneration, url, 100, Some(Arc::clone(&gpu_mgr))).await {
+            Ok(p) => {
+                println!("   LLM       : ✅ {}", p.name);
+                providers.push(p);
+            }
+            Err(e) => println!("   LLM       : ⚠️  {} unavailable: {e}", sel.model_id),
         }
     }
 
-    let queue = builder.build();
+    let queue = InferenceQueueBuilder::new()
+        .with_providers(providers)
+        .with_config(app_cfg.clone())
+        .build();
 
-    // High-quality embedding queue (optional — only when hq embedding is enabled in config).
-    let hq_embed_queue = build_hq_embed_queue(&registry, &app_cfg).await;
+    // High-quality embedding queue (optional — only when HQ embedding is enabled).
+    // Derive the model name from embed_models before the queue consumes it.
+    let hq_model_name: Option<String> = embed_models
+        .iter()
+        .find(|s| s.quality_tier == QualityTier::High)
+        .map(|s| match &s.backend {
+            Some(b) => format!("{b}/{}", s.model_id),
+            None => format!("{}/{}", s.recipe, s.model_id),
+        });
+    let hq_embed_queue = build_hq_embed_queue(&catalog, &app_cfg).await;
+    match &hq_embed_queue {
+        Some(_) => println!(
+            "   HQ Embed  : ✅ {} ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)",
+            hq_model_name.as_deref().unwrap_or("unknown")
+        ),
+        None if app_cfg.embedding.high_quality_embedding => {
+            println!("   HQ Embed  : ⚠️  enabled in config but no compatible model found");
+        }
+        None => {}
+    }
 
     if !queue.has_text_generation() {
         eprintln!();
@@ -322,12 +336,15 @@ async fn main() -> Result<()> {
     if !queue.has_embedding() {
         println!("   ⚠️  FTS-only search (no embedding model)");
     }
-    println!("   Commands: /quit  /clear  /context  /thinking");
+    let device_hint = if npu_available { "/quit  /clear  /context  /thinking  /device [gpu|npu]" }
+                      else             { "/quit  /clear  /context  /thinking" };
+    println!("   Commands: {device_hint}");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     let mut history: Vec<u_forge_core::ChatMessage> = Vec::new();
     let mut show_context = false;
     let mut thinking_effort: Option<bool> = None;
+    let mut active_device = chat_cfg.preferred_device.clone();
     let stdin = std::io::stdin();
 
     loop {
@@ -384,6 +401,38 @@ async fn main() -> Result<()> {
                 );
                 continue;
             }
+            s if s == "/device" || s.starts_with("/device ") => {
+                let arg = input.strip_prefix("/device").unwrap_or("").trim();
+                match arg {
+                    "" => {
+                        // No argument: toggle if both available, otherwise show state.
+                        if npu_available {
+                            active_device = match active_device {
+                                ChatDevice::Npu => ChatDevice::Gpu,
+                                _ => ChatDevice::Npu,
+                            };
+                            let name = if active_device == ChatDevice::Npu { "npu" } else { "gpu" };
+                            println!("   Active device: {name}\n");
+                        } else {
+                            println!("   Active device: gpu (NPU not loaded)\n");
+                        }
+                    }
+                    "gpu" => {
+                        active_device = ChatDevice::Gpu;
+                        println!("   Active device: gpu\n");
+                    }
+                    "npu" => {
+                        if npu_available {
+                            active_device = ChatDevice::Npu;
+                            println!("   Active device: npu\n");
+                        } else {
+                            println!("   ⚠️  NPU LLM not loaded — staying on gpu\n");
+                        }
+                    }
+                    _ => println!("   Usage: /device [gpu|npu]\n"),
+                }
+                continue;
+            }
             _ => {}
         }
 
@@ -413,8 +462,11 @@ async fn main() -> Result<()> {
             &input,
         );
 
-        let device_cfg = chat_cfg.active_device_config();
-        let effective_model = match chat_cfg.preferred_device {
+        let device_cfg = match active_device {
+            ChatDevice::Npu => &chat_cfg.npu,
+            _ => &chat_cfg.gpu,
+        };
+        let effective_model = match active_device {
             ChatDevice::Npu => desired_npu_llm.as_str(),
             _ => desired_gpu_llm.as_str(),
         };
@@ -429,7 +481,7 @@ async fn main() -> Result<()> {
             request = request.with_thinking(true);
         }
 
-        print!("Assistant: ");
+        print!("{effective_model}: ");
         std::io::stdout().flush()?;
 
         let mut rx = match queue.generate_stream(request) {

@@ -53,20 +53,22 @@ mod common;
 use anyhow::Result;
 use std::sync::Arc;
 use u_forge_core::{
-    ai::embeddings::LemonadeProvider,
     build_hq_embed_queue,
-    config::AppConfig,
+    config::{AppConfig, EmbeddingDeviceConfig},
     embed_all_chunks,
-    hardware::npu::NpuDevice,
     ingest::EmbeddingTarget,
     lemonade::{
-        resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
+        catalog::CatalogModel,
+        provider_factory::{Capability, ProviderFactory, ProviderSlot},
+        selector::{ModelSelector, QualityTier, SelectedModel},
+        resolve_lemonade_url, GpuResourceManager, LemonadeRerankProvider,
+        LemonadeServerCatalog, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
     setup_and_index,
     types::ObjectMetadata,
-    EmbeddingProvider, KnowledgeGraph, ObjectBuilder,
+    KnowledgeGraph, ObjectBuilder,
     EMBEDDING_DIMENSIONS, HIGH_QUALITY_EMBEDDING_DIMENSIONS,
 };
 
@@ -220,10 +222,10 @@ async fn main() -> Result<()> {
     // Capture reachable providers for later sections; these are all Option so
     // the demo degrades gracefully when no server is present.
     let mut reranker: Option<LemonadeRerankProvider> = None;
-    // Multi-worker embedding queue: NPU + all compatible llamacpp models (768-dim).
+    // Multi-worker embedding queue: standard-dim models (768-dim by default).
     // Needed for query embedding in search demos.
     let mut embed_queue: Option<InferenceQueue> = None;
-    // High-quality embedding queue: Qwen3-Embedding-8B-GGUF (4096-dim).
+    // High-quality embedding queue: large-dim model (4096-dim when configured).
     // Needed for HQ query embedding if available.
     let mut hq_embed_queue: Option<InferenceQueue> = None;
 
@@ -232,7 +234,7 @@ async fn main() -> Result<()> {
         println!("🔌 Lemonade Server — capability detection");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-        // ── System info ───────────────────────────────────────────────────────
+        // ── System info (hardware display) ────────────────────────────────────
         match SystemInfo::fetch(url).await {
             Err(e) => {
                 println!("   ⚠️  Could not reach Lemonade Server: {e}");
@@ -245,15 +247,10 @@ async fn main() -> Result<()> {
                 println!("   OS        : {}", info.os_version);
                 println!();
 
-                // ── Device availability ───────────────────────────────────────
                 println!("🔧 Devices");
                 match &info.npu {
                     Some(d) if d.available => {
-                        let name = if d.name.is_empty() {
-                            "AMD NPU"
-                        } else {
-                            &d.name
-                        };
+                        let name = if d.name.is_empty() { "AMD NPU" } else { &d.name };
                         println!("   NPU  : ✅ {name} (family: {})", d.family);
                     }
                     Some(_) => println!("   NPU  : ❌ present but unavailable"),
@@ -261,11 +258,7 @@ async fn main() -> Result<()> {
                 }
                 match &info.igpu {
                     Some(d) if d.available => {
-                        let name = if d.name.is_empty() {
-                            "AMD iGPU"
-                        } else {
-                            &d.name
-                        };
+                        let name = if d.name.is_empty() { "AMD iGPU" } else { &d.name };
                         println!("   iGPU : ✅ {name} (family: {})", d.family);
                     }
                     Some(_) => println!("   iGPU : ❌ present but unavailable"),
@@ -273,262 +266,183 @@ async fn main() -> Result<()> {
                 }
                 println!();
 
-                // ── Derived capabilities ──────────────────────────────────────
-                let caps = info.lemonade_capabilities();
-                println!("🧠 Capabilities");
+                // ── Catalog discovery + capabilities ──────────────────────────
+                match LemonadeServerCatalog::discover(url).await {
+                    Err(e) => {
+                        println!("   ⚠️  Could not build server catalog: {e}\n");
+                        println!("      (continuing without AI features)\n");
+                    }
+                    Ok(catalog) => {
+                        println!("🧠 Capabilities");
+                        println!("   Installed backends:");
+                        println!("     FLM (NPU)          : {}", bool_icon(catalog.has_installed_backend("flm", "npu")));
+                        println!("     llamacpp (ROCm)    : {}", bool_icon(catalog.has_installed_backend("llamacpp", "rocm")));
+                        println!("     llamacpp (Vulkan)  : {}", bool_icon(catalog.has_installed_backend("llamacpp", "vulkan")));
+                        println!("     whispercpp (Vulkan): {}", bool_icon(catalog.has_installed_backend("whispercpp", "vulkan")));
+                        println!("     whispercpp (CPU)   : {}", bool_icon(catalog.has_installed_backend("whispercpp", "cpu")));
+                        println!("     Kokoro TTS (CPU)   : {}", bool_icon(catalog.has_installed_backend("kokoro", "cpu")));
+                        println!();
 
-                // Backends installed
-                println!("   Installed backends:");
-                println!(
-                    "     FLM (NPU)          : {}",
-                    bool_icon(caps.flm_npu_installed)
-                );
-                println!(
-                    "     llamacpp (ROCm)    : {}",
-                    bool_icon(caps.llamacpp_rocm_installed)
-                );
-                println!(
-                    "     llamacpp (Vulkan)  : {}",
-                    bool_icon(caps.llamacpp_vulkan_installed)
-                );
-                println!(
-                    "     whispercpp (Vulkan): {}",
-                    bool_icon(caps.whispercpp_vulkan_installed)
-                );
-                println!(
-                    "     whispercpp (CPU)   : {}",
-                    bool_icon(caps.whispercpp_cpu_installed)
-                );
-                println!(
-                    "     Kokoro TTS (CPU)   : {}",
-                    bool_icon(caps.kokoro_cpu_installed)
-                );
-                println!();
+                        println!("   Inference paths:");
+                        println!("     Embed (NPU)        : {}", capability_icon(catalog.has_npu() && catalog.has_installed_backend("flm", "npu")));
+                        println!("     LLM (NPU)          : {}", capability_icon(catalog.has_npu() && catalog.has_installed_backend("flm", "npu")));
+                        println!("     LLM (GPU)          : {}", capability_icon(catalog.has_gpu() && (catalog.has_installed_backend("llamacpp", "rocm") || catalog.has_installed_backend("llamacpp", "vulkan"))));
+                        println!("     Rerank (GPU/CPU)   : {}", capability_icon(catalog.has_installed_backend("llamacpp", "rocm") || catalog.has_installed_backend("llamacpp", "vulkan")));
+                        println!();
 
-                // Inference paths
-                println!("   Inference paths:");
-                println!(
-                    "     Embed (NPU)        : {}",
-                    capability_icon(caps.can_embed_npu)
-                );
-                println!(
-                    "     LLM (NPU)          : {}",
-                    capability_icon(caps.can_llm_npu)
-                );
-                println!(
-                    "     LLM (GPU)          : {}",
-                    capability_icon(caps.can_llm_gpu)
-                );
-                println!(
-                    "     Rerank (GPU/CPU)   : {}",
-                    capability_icon(caps.can_llm_gpu || caps.llamacpp_vulkan_installed)
-                );
-                // Audio paths omitted as requested
-                println!();
-
-                // ── Model registry ────────────────────────────────────────────
-                println!("📋 Model Registry");
-                match LemonadeModelRegistry::fetch(url).await {
-                    Err(e) => println!("   ⚠️  Could not fetch model list: {e}\n"),
-                    Ok(registry) => {
-                        if registry.models.is_empty() {
-                            println!("   (no models installed)\n");
+                        // ── Model catalog ─────────────────────────────────────
+                        println!("📋 Model Catalog");
+                        let downloaded: Vec<&CatalogModel> =
+                            catalog.models.iter().filter(|m| m.downloaded).collect();
+                        if downloaded.is_empty() {
+                            println!("   (no models downloaded)\n");
                         } else {
-                            // Group by role for a tidy display
-                            let all_roles = [
-                                ModelRole::NpuEmbedding,
-                                ModelRole::LlamacppEmbedding,
-                                ModelRole::NpuLlm,
-                                ModelRole::GpuLlm,
-                                ModelRole::Reranker,
-                                ModelRole::ImageGen,
-                                ModelRole::Other,
-                            ];
-
-                            for role in &all_roles {
-                                let models = registry.by_role(role);
-                                if models.is_empty() {
-                                    continue;
-                                }
-                                println!("   {} [{} model(s)]", role_label(role), models.len());
+                            for recipe in &["flm", "llamacpp", "whispercpp", "kokoro", "sd-cpp"] {
+                                let models: Vec<&&CatalogModel> = downloaded
+                                    .iter()
+                                    .filter(|m| m.recipe == *recipe)
+                                    .collect();
+                                if models.is_empty() { continue; }
+                                println!("   {} [{} downloaded]", recipe_label(recipe), models.len());
                                 for m in models {
-                                    let status = if m.downloaded.unwrap_or(false) {
-                                        "✅ downloaded"
-                                    } else {
-                                        "⬇️  not downloaded"
-                                    };
-                                    let suggested = if m.suggested.unwrap_or(false) {
-                                        " ★"
-                                    } else {
-                                        ""
-                                    };
-                                    println!(
-                                        "     • {}{} — {} | recipe: {}",
-                                        m.id, suggested, status, m.recipe
-                                    );
+                                    let labels_str: Vec<&str> =
+                                        m.labels.iter().map(String::as_str).collect();
+                                    let mut sorted = labels_str.clone();
+                                    sorted.sort();
+                                    println!("     • {} — labels: {}", m.id, sorted.join(", "));
                                 }
                             }
-                            println!();
-
-                            // Summarise which canonical models will be used
-                            let device_cfg = AppConfig::load_default();
-                            println!("   Active model selection:");
-                            print_model_choice("   Embed (NPU)  ", registry.npu_embedding_model());
-                            print_model_choice(
-                                "   Embed (llamacpp)",
-                                registry.llamacpp_embedding_model(),
-                            );
-                            print_model_choice(
-                                "   Embed (HQ)   ",
-                                registry.hq_embedding_model(
-                                    device_cfg.embedding.high_quality_embedding,
-                                ),
-                            );
-                            print_model_choice("   LLM (NPU)   ", registry.npu_llm_model());
-                            print_model_choice("   LLM (GPU)   ", registry.llm_model());
-                            print_model_choice("   Reranker     ", registry.reranker_model());
-                            println!();
-
-                            // Build a reranker for the demo section below
-                            match LemonadeRerankProvider::from_registry(&registry) {
-                                Ok(r) => {
-                                    let load_opts = device_cfg.models.load_options_for(&r.model);
-                                    if let Err(e) = r.load(&load_opts).await {
-                                        println!("   ⚠️  Reranker load failed ({e}), using server defaults");
-                                    }
-                                    println!("   ✅ Reranker ready: {}", r.model);
-                                    reranker = Some(r);
-                                }
-                                Err(e) => println!("   ⚠️  No reranker available: {e}"),
-                            }
-
-                            // Build a multi-worker embedding InferenceQueue with weighted dispatch.
-                            // device_cfg loaded above for model selection display.
-                            println!("   Device config:");
-                            println!(
-                                "     NPU embed: {} (weight={})",
-                                if device_cfg.embedding.npu_enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                },
-                                device_cfg.embedding.npu_weight
-                            );
-                            println!(
-                                "     GPU embed: {} (weight={})",
-                                if device_cfg.embedding.gpu_enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                },
-                                device_cfg.embedding.gpu_weight
-                            );
-                            println!(
-                                "     CPU embed: {} (weight={})",
-                                if device_cfg.embedding.cpu_enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                },
-                                device_cfg.embedding.cpu_weight
-                            );
-                            println!(
-                                "     HQ embed : {} ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)",
-                                if device_cfg.embedding.high_quality_embedding {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                }
-                            );
-
-                            println!("   Building embedding workers…");
-                            let mut eq_builder =
-                                InferenceQueueBuilder::new().with_config(device_cfg.clone());
-                            let mut worker_count = 0usize;
-
-                            // NPU worker (FLM embed-gemma-300m-FLM)
-                            // ctx_size capped to the model's actual max sequence length.
-                            let npu_load_opts =
-                                device_cfg.models.load_options_for("embed-gemma-300m-FLM");
-                            match NpuDevice::embedding_only(url, None, Some(&npu_load_opts)).await {
-                                Ok(npu) => {
-                                    let dims = npu.embedding.as_ref().and_then(|p| p.dimensions().ok()).unwrap_or(0);
-                                    if dims == EMBEDDING_DIMENSIONS {
-                                        println!("     ✅ NPU worker: {} ({dims}-dim)", npu.name);
-                                        eq_builder = eq_builder.with_npu_device(npu);
-                                        worker_count += 1;
-                                    } else {
-                                        println!(
-                                            "     ⚠️  NPU skipped: returns {dims}-dim, \
-                                             need {EMBEDDING_DIMENSIONS}-dim"
-                                        );
-                                    }
-                                }
-                                Err(e) => println!("     ⚠️  NPU embedding unavailable: {e}"),
-                            }
-
-                            // llamacpp worker — embedding-gemma GGUF variant (GPU or CPU).
-                            // Must be the same model family as the NPU embed-gemma-300m-FLM
-                            // so that all workers produce vectors in the same embedding
-                            // space.  Mixing model families (e.g. nomic + gemma) causes
-                            // meaningless distance scores.
-                            if let Some(model) = registry.llamacpp_embedding_model() {
-                                let model_id = model.id.clone();
-                                let cpu_load_opts = device_cfg.models.load_options_for(&model_id);
-                                match LemonadeProvider::new_with_load(
-                                    url,
-                                    &model_id,
-                                    &cpu_load_opts,
-                                )
-                                .await
-                                {
-                                    Err(e) => {
-                                        println!("     ⚠️  llamacpp({model_id}) unavailable: {e}")
-                                    }
-                                    Ok(provider) => {
-                                        let dims = provider.dimensions().unwrap_or(0);
-                                        if dims != EMBEDDING_DIMENSIONS {
-                                            println!(
-                                                "     ⚠️  llamacpp({model_id}) skipped: \
-                                                 {dims}-dim ≠ {EMBEDDING_DIMENSIONS}-dim"
-                                            );
-                                        } else {
-                                            println!(
-                                                "     ✅ llamacpp worker: \
-                                                 {model_id} ({dims}-dim)"
-                                            );
-                                            eq_builder = eq_builder.with_embedding_provider(
-                                                Arc::new(provider),
-                                                format!("llamacpp({model_id})"),
-                                            );
-                                            worker_count += 1;
-                                        }
-                                    }
-                                }
-                            } else {
-                                println!("     ⚠️  No llamacpp embedding model found in registry");
-                                println!("        Add embedding-gemma GGUF via Lemonade UI —");
-                                println!("        see README.md for instructions.");
-                            }
-
-                            if worker_count > 0 {
-                                println!(
-                                    "   ✅ {worker_count} embedding worker(s) ready \
-                                     ({EMBEDDING_DIMENSIONS}-dim, cosine)"
-                                );
-                                embed_queue = Some(eq_builder.build());
-                            } else {
-                                println!(
-                                    "   ⚠️  No compatible {EMBEDDING_DIMENSIONS}-dim \
-                                     embedding models found — semantic search disabled."
-                                );
-                            }
-
-                            // ── High-quality embedding worker (Qwen3-Embedding-8B-GGUF) ─
-                            hq_embed_queue =
-                                build_hq_embed_queue(&registry, &device_cfg).await;
                             println!();
                         }
+
+                        // ── Model selection summary ───────────────────────────
+                        let device_cfg = AppConfig::load_default();
+                        let selector = ModelSelector::new(&catalog, &device_cfg.models, &device_cfg.embedding);
+                        let embed_models = selector.select_embedding_models();
+                        let std_embeds: Vec<&SelectedModel> = embed_models
+                            .iter()
+                            .filter(|s| s.quality_tier == QualityTier::Standard)
+                            .collect();
+                        let hq_embeds: Vec<&SelectedModel> = embed_models
+                            .iter()
+                            .filter(|s| s.quality_tier == QualityTier::High)
+                            .collect();
+
+                        println!("   Active model selection:");
+                        print_selection_list("   Embed (standard)", &std_embeds);
+                        print_selection_list("   Embed (HQ)      ", &hq_embeds);
+                        match selector.select_reranker() {
+                            Some(r) => println!("   Reranker         : {} ({})", r.model_id, r.recipe),
+                            None => println!("   Reranker         : — (none available)"),
+                        }
+                        match selector.select_llm_models().first() {
+                            Some(l) => println!("   LLM              : {} ({})", l.model_id, l.recipe),
+                            None => println!("   LLM              : — (none available)"),
+                        }
+                        println!();
+
+                        // ── Build providers ───────────────────────────────────
+                        println!("   Device config:");
+                        println!(
+                            "     NPU embed: {} (weight={})",
+                            if device_cfg.embedding.npu_enabled { "enabled" } else { "disabled" },
+                            device_cfg.embedding.npu_weight
+                        );
+                        println!(
+                            "     GPU embed: {} (weight={})",
+                            if device_cfg.embedding.gpu_enabled { "enabled" } else { "disabled" },
+                            device_cfg.embedding.gpu_weight
+                        );
+                        println!(
+                            "     CPU embed: {} (weight={})",
+                            if device_cfg.embedding.cpu_enabled { "enabled" } else { "disabled" },
+                            device_cfg.embedding.cpu_weight
+                        );
+                        println!(
+                            "     HQ embed : {} ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)",
+                            if device_cfg.embedding.high_quality_embedding { "enabled" } else { "disabled" }
+                        );
+                        println!("   Building providers…");
+
+                        let gpu_mgr = Arc::new(GpuResourceManager::new());
+
+                        // Reranker
+                        if let Some(reranker_sel) = selector.select_reranker() {
+                            match ProviderFactory::build(
+                                &reranker_sel,
+                                Capability::Reranking,
+                                url,
+                                100,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(built) => {
+                                    if let ProviderSlot::Rerank(r) = built.provider {
+                                        println!("   ✅ Reranker ready: {}", r.model);
+                                        reranker = Some(r);
+                                    }
+                                }
+                                Err(e) => println!("   ⚠️  Reranker load failed: {e}"),
+                            }
+                        } else {
+                            println!("   Reranker  : not available");
+                        }
+
+                        // Standard embedding workers
+                        println!("   Building embedding workers…");
+                        let mut eq_builder = InferenceQueueBuilder::new().with_config(device_cfg.clone());
+                        let mut worker_count = 0usize;
+
+                        for sel in &std_embeds {
+                            let weight = embedding_weight(sel, &device_cfg.embedding);
+                            match ProviderFactory::build(
+                                sel,
+                                Capability::Embedding,
+                                url,
+                                weight,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(built) => {
+                                    let dims = if let ProviderSlot::Embedding(ref p) = built.provider {
+                                        p.dimensions().unwrap_or(0)
+                                    } else { 0 };
+                                    if dims != EMBEDDING_DIMENSIONS {
+                                        println!(
+                                            "     ⚠️  {} skipped: {dims}-dim ≠ {EMBEDDING_DIMENSIONS}-dim",
+                                            sel.model_id
+                                        );
+                                    } else {
+                                        println!("     ✅ embedding worker: {} ({dims}-dim)", built.name);
+                                        eq_builder = eq_builder.with_provider(built);
+                                        worker_count += 1;
+                                    }
+                                }
+                                Err(e) => println!("     ⚠️  {} unavailable: {e}", sel.model_id),
+                            }
+                        }
+
+                        if worker_count > 0 {
+                            println!(
+                                "   ✅ {worker_count} embedding worker(s) ready \
+                                 ({EMBEDDING_DIMENSIONS}-dim, cosine)"
+                            );
+                            embed_queue = Some(eq_builder.build());
+                        } else {
+                            println!(
+                                "   ⚠️  No compatible {EMBEDDING_DIMENSIONS}-dim \
+                                 embedding models found — semantic search disabled."
+                            );
+                        }
+
+                        // HQ embedding queue
+                        hq_embed_queue = build_hq_embed_queue(&catalog, &device_cfg).await;
+                        println!();
+
+                        // Suppress unused warning — gpu_mgr kept for future STT/LLM wiring
+                        let _ = gpu_mgr;
                     }
                 }
             }
@@ -1123,27 +1037,37 @@ fn capability_icon(available: bool) -> &'static str {
     }
 }
 
-/// Human-readable label for a [`ModelRole`].
-fn role_label(role: &ModelRole) -> &'static str {
-    match role {
-        ModelRole::NpuEmbedding => "Embedding (NPU / FLM)",
-        ModelRole::LlamacppEmbedding => "Embedding (GPU/CPU llamacpp)",
-        ModelRole::NpuStt => "Speech-to-Text (NPU / FLM)",
-        ModelRole::GpuStt => "Speech-to-Text (GPU / whispercpp)",
-        ModelRole::NpuLlm => "LLM (NPU / FLM)",
-        ModelRole::GpuLlm => "LLM (GPU / llamacpp)",
-        ModelRole::CpuTts => "Text-to-Speech (CPU / Kokoro)",
-        ModelRole::Reranker => "Reranker",
-        ModelRole::ImageGen => "Image Generation",
-        ModelRole::Other => "Other",
+/// Human-readable label for a recipe string.
+fn recipe_label(recipe: &str) -> &'static str {
+    match recipe {
+        "flm" => "FLM (NPU)",
+        "llamacpp" => "llamacpp (GPU/CPU)",
+        "whispercpp" => "whispercpp (STT)",
+        "kokoro" => "Kokoro (TTS)",
+        "sd-cpp" => "sd-cpp (Image)",
+        _ => "Other",
     }
 }
 
-/// Print which model the registry selects for a given slot, or a dash if none.
-fn print_model_choice(label: &str, model: Option<&u_forge_core::lemonade::LemonadeModelEntry>) {
-    match model {
-        Some(m) => println!("{}  : {} (recipe: {})", label, m.id, m.recipe),
-        None => println!("{}  : — (none available)", label),
+/// Print a list of selected models (e.g. embedding workers).
+fn print_selection_list(label: &str, models: &[&SelectedModel]) {
+    if models.is_empty() {
+        println!("{label:<20}: — (none available)");
+    } else {
+        let ids: Vec<&str> = models.iter().map(|s| s.model_id.as_str()).collect();
+        println!("{label:<20}: {}", ids.join(", "));
+    }
+}
+
+/// Compute dispatch weight for an embedding selection based on device config.
+fn embedding_weight(sel: &SelectedModel, cfg: &EmbeddingDeviceConfig) -> u32 {
+    match sel.recipe.as_str() {
+        "flm" => cfg.npu_weight,
+        "llamacpp" => match sel.backend.as_deref() {
+            Some("rocm") | Some("vulkan") | Some("metal") => cfg.gpu_weight,
+            _ => cfg.cpu_weight,
+        },
+        _ => cfg.cpu_weight,
     }
 }
 

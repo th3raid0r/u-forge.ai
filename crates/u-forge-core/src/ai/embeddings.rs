@@ -1,28 +1,15 @@
 //! Embedding trait definitions and provider types.
 //!
 //! The [`EmbeddingProvider`] trait and supporting types live here.
-//! Provider implementations ([`LemonadeProvider`]) and the
-//! [`EmbeddingManager`] convenience wrapper live in
-//! [`crate::lemonade::embedding`] and are re-exported below.
-//!
-//! # Quick start
-//!
-//! ```no_run
-//! # use u_forge_core::ai::embeddings::EmbeddingManager;
-//! // Auto: reads LEMONADE_URL env var, connects to Lemonade Server
-//! # async fn example() {
-//! let mgr = EmbeddingManager::try_new_auto(None, None).await.unwrap();
-//! let embedding = mgr.get_provider().embed("Hello, world!").await.unwrap();
-//! println!("dims: {}", embedding.len());
-//! # }
-//! ```
+//! The [`LemonadeProvider`] implementation lives in
+//! [`crate::lemonade::embedding`] and is re-exported below.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
-pub use crate::lemonade::embedding::{EmbeddingManager, LemonadeProvider};
+pub use crate::lemonade::embedding::LemonadeProvider;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider type identifiers
@@ -111,19 +98,6 @@ mod tests {
         assert_eq!(info.name, "embed-gemma-300m-FLM");
         assert_eq!(info.dimensions, 768);
         assert!(info.description.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_try_new_lemonade_unreachable() {
-        let result = EmbeddingManager::try_new_lemonade(
-            "http://127.0.0.1:19999/api/v1",
-            "embed-gemma-300m-FLM",
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "Expected connection error for unreachable server"
-        );
     }
 
     // ── Integration tests (require a running Lemonade Server) ─────────────────

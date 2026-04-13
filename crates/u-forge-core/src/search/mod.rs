@@ -817,6 +817,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
+    use crate::lemonade::{BuiltProvider, Capability, ProviderSlot};
     use crate::queue::InferenceQueueBuilder;
     use crate::types::ChunkType;
     use crate::{KnowledgeGraph, ObjectBuilder};
@@ -958,9 +959,13 @@ mod tests {
     }
 
     fn make_embed_queue() -> InferenceQueue {
-        InferenceQueueBuilder::new()
-            .with_embedding_provider(Arc::new(MockEmbeddingProvider), "mock-embed".to_string())
-            .build()
+        let built = BuiltProvider {
+            name: "mock-embed".to_string(),
+            capability: Capability::Embedding,
+            provider: ProviderSlot::Embedding(Arc::new(MockEmbeddingProvider)),
+            weight: 100,
+        };
+        InferenceQueueBuilder::new().with_provider(built).build()
     }
 
     fn make_queue_no_workers() -> InferenceQueue {

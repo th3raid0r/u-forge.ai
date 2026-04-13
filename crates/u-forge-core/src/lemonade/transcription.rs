@@ -1,14 +1,15 @@
-//! Lemonade-backed transcription provider and manager.
+//! Lemonade-backed transcription provider (no GPU lock).
 //!
 //! This module contains the [`LemonadeTranscriptionProvider`] implementation of
-//! [`TranscriptionProvider`] and the [`TranscriptionManager`] convenience wrapper.
-//! The trait definitions live in [`crate::ai::transcription`] and are
-//! dependency-free; this module handles all Lemonade-specific HTTP logic.
+//! [`TranscriptionProvider`].  The trait definitions live in
+//! [`crate::ai::transcription`] and are dependency-free; this module handles
+//! all Lemonade-specific HTTP logic.
+//!
+//! For GPU-locked STT with resource contention management, see
+//! [`LemonadeSttProvider`](super::stt::LemonadeSttProvider).
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use std::sync::Arc;
-use tracing::info;
 
 use crate::ai::transcription::{TranscriptionProvider, mime_for_filename};
 use super::client::LemonadeHttpClient;
@@ -101,80 +102,3 @@ impl TranscriptionProvider for LemonadeTranscriptionProvider {
     }
 }
 
-// ── TranscriptionManager ──────────────────────────────────────────────────────
-
-/// Owns a single [`TranscriptionProvider`] and hands out `Arc` references to it.
-///
-/// Construct via [`TranscriptionManager::try_new_auto`] for production use, or
-/// [`TranscriptionManager::new_lemonade`] when the URL is known.
-///
-/// # Example
-///
-/// ```no_run
-/// # use u_forge_core::ai::transcription::TranscriptionManager;
-/// # async fn run() -> anyhow::Result<()> {
-/// let mgr = TranscriptionManager::try_new_auto(None, None).await?;
-/// let provider = mgr.get_provider();       // Arc<dyn TranscriptionProvider>
-/// let wav = std::fs::read("session.wav")?;
-/// let text = provider.transcribe(wav, "session.wav").await?;
-/// # Ok(()) }
-/// ```
-pub struct TranscriptionManager {
-    provider: Arc<dyn TranscriptionProvider>,
-}
-
-impl std::fmt::Debug for TranscriptionManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TranscriptionManager")
-            .field("model", &self.provider.model_name())
-            .finish()
-    }
-}
-
-impl TranscriptionManager {
-    /// Create a manager backed directly by a Lemonade Server instance.
-    ///
-    /// Defaults to the NPU-optimised `whisper-v3-turbo-FLM` model when `model`
-    /// is `None`.
-    pub fn new_lemonade(base_url: &str, model: &str) -> Self {
-        info!(base_url, model, "TranscriptionManager: using Lemonade Server");
-        Self {
-            provider: Arc::new(LemonadeTranscriptionProvider::new(base_url, model)),
-        }
-    }
-
-    /// Auto-select a transcription provider from the environment.
-    ///
-    /// **Resolution order:**
-    /// 1. `lemonade_url` argument (if `Some`)
-    /// 2. `LEMONADE_URL` environment variable
-    /// 3. Hard error — there is no silent local fallback for transcription
-    ///
-    /// `model` defaults to `"whisper-v3-turbo-FLM"` when `None`.
-    pub async fn try_new_auto(lemonade_url: Option<&str>, model: Option<&str>) -> Result<Self> {
-        let url = crate::lemonade::resolve_provider_url(lemonade_url, "LEMONADE_URL", false)
-            .await
-            .ok_or_else(|| {
-                anyhow!(
-                    "No Lemonade Server URL configured. Set the LEMONADE_URL environment \
-                     variable or pass a URL explicitly:\n  \
-                     export LEMONADE_URL=http://localhost:13305/api/v1"
-                )
-            })?;
-
-        let whisper_model = model.unwrap_or("whisper-v3-turbo-FLM");
-        Ok(Self::new_lemonade(&url, whisper_model))
-    }
-
-    /// Wrap an arbitrary [`TranscriptionProvider`] implementation.
-    ///
-    /// Useful in tests where a mock provider is preferred over a live server.
-    pub fn from_provider(provider: Arc<dyn TranscriptionProvider>) -> Self {
-        Self { provider }
-    }
-
-    /// Return a clone of the inner provider, suitable for passing to async tasks.
-    pub fn get_provider(&self) -> Arc<dyn TranscriptionProvider> {
-        self.provider.clone()
-    }
-}

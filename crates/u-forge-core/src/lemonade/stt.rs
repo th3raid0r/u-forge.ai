@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use async_openai::{Client, config::OpenAIConfig};
 use async_openai::types::{InputSource};
 use async_openai::types::audio::{AudioInput, CreateTranscriptionRequestArgs};
@@ -14,7 +14,6 @@ use crate::ai::transcription::TranscriptionProvider;
 
 use super::client::make_lemonade_openai_client;
 use super::gpu_manager::GpuResourceManager;
-use super::registry::LemonadeModelRegistry;
 
 /// Transcription result returned by the Whisper endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -45,17 +44,6 @@ impl LemonadeSttProvider {
             model: model.to_string(),
             gpu,
         }
-    }
-
-    /// Construct using the STT model discovered in `registry`.
-    pub fn from_registry(
-        registry: &LemonadeModelRegistry,
-        gpu: Arc<GpuResourceManager>,
-    ) -> Result<Self> {
-        let model = registry
-            .stt_model()
-            .ok_or_else(|| anyhow!("No STT model found in the Lemonade registry"))?;
-        Ok(Self::new(&registry.base_url, &model.id, gpu))
     }
 
     /// Transcribe `audio_data` to text.

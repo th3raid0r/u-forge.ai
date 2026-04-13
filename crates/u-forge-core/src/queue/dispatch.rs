@@ -76,9 +76,9 @@ impl InferenceQueue {
     pub async fn embed(&self, text: impl Into<String>) -> Result<Vec<f32>> {
         if self.embedding_workers == 0 {
             return Err(anyhow!(
-                "InferenceQueue: no embedding-capable device is registered. \
-                 Add an NpuDevice with NpuDevice::new() or NpuDevice::embedding_only() \
-                 to the builder before calling embed()."
+                "InferenceQueue: no embedding-capable provider is registered. \
+                 Build an embedding provider with ProviderFactory::build() and register \
+                 it via InferenceQueueBuilder::with_provider() before calling embed()."
             ));
         }
 
@@ -140,9 +140,9 @@ impl InferenceQueue {
     ) -> Result<String> {
         if self.transcription_workers == 0 {
             return Err(anyhow!(
-                "InferenceQueue: no transcription-capable device is registered. \
-                 Add an NpuDevice::new() or GpuDevice::stt_only() to the builder \
-                 before calling transcribe()."
+                "InferenceQueue: no transcription-capable provider is registered. \
+                 Build a transcription provider with ProviderFactory::build() and register \
+                 it via InferenceQueueBuilder::with_provider() before calling transcribe()."
             ));
         }
 
@@ -221,9 +221,9 @@ impl InferenceQueue {
     pub async fn generate(&self, request: ChatRequest) -> Result<ChatCompletionResponse> {
         if self.llm_workers == 0 {
             return Err(anyhow!(
-                "InferenceQueue: no LLM-capable device is registered. \
-                 Add a GpuDevice with a chat model or an NpuDevice with an LLM model \
-                 to the builder before calling generate()."
+                "InferenceQueue: no LLM-capable provider is registered. \
+                 Build a TextGeneration provider with ProviderFactory::build() and register \
+                 it via InferenceQueueBuilder::with_provider() before calling generate()."
             ));
         }
 
@@ -408,7 +408,6 @@ mod tests {
 
     use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
     use crate::ai::transcription::TranscriptionProvider;
-    use crate::hardware::npu::NpuDevice;
     use crate::test_helpers::require_integration_url;
 
     use super::super::builder::InferenceQueueBuilder;
@@ -564,16 +563,8 @@ mod tests {
         // builder state directly.
         let builder = InferenceQueueBuilder::new();
         assert!(
-            builder.npu_devices.is_empty(),
-            "New builder should have no NPU devices"
-        );
-        assert!(
-            builder.gpu_devices.is_empty(),
-            "New builder should have no GPU devices"
-        );
-        assert!(
-            builder.cpu_devices.is_empty(),
-            "New builder should have no CPU devices"
+            builder.providers.is_empty(),
+            "New builder should have no providers registered"
         );
     }
 
@@ -873,42 +864,70 @@ mod tests {
     // ── Integration tests (require a running Lemonade Server) ─────────────────
 
     #[tokio::test]
-    async fn test_queue_embed_via_npu() {
+    async fn test_queue_embed_via_provider_factory() {
         let url = require_integration_url!();
 
-        let npu = NpuDevice::embedding_only(&url, None, None)
-            .await
-            .expect("NpuDevice construction failed");
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let embed_sel = selector
+            .select_embedding_models()
+            .into_iter()
+            .next()
+            .expect("No embedding model found in catalog");
+        let built = crate::lemonade::ProviderFactory::build(
+            &embed_sel,
+            crate::lemonade::Capability::Embedding,
+            &url,
+            100,
+            None,
+        )
+        .await
+        .expect("Failed to build embedding provider");
 
-        let queue = InferenceQueueBuilder::new().with_npu_device(npu).build();
+        let queue = InferenceQueueBuilder::new().with_provider(built).build();
 
         let vec = queue
             .embed("The foundation stood for a thousand years")
             .await;
-        assert!(vec.is_ok(), "embed() via NPU failed: {:?}", vec.err());
+        assert!(vec.is_ok(), "embed() failed: {:?}", vec.err());
         let vec = vec.unwrap();
         assert!(!vec.is_empty(), "Expected non-empty embedding");
         assert!(
-            vec.iter().all(|&x| x.is_finite()),
+            vec.iter().all(|&x: &f32| x.is_finite()),
             "Embedding contains non-finite values"
         );
     }
 
     #[tokio::test]
-    async fn test_queue_transcribe_via_npu() {
+    async fn test_queue_transcribe_via_provider_factory() {
         let url = require_integration_url!();
 
-        let npu = NpuDevice::new(&url, None, None, None)
-            .await
-            .expect("NpuDevice construction failed");
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let stt_selections = selector.select_stt_models();
+        if stt_selections.is_empty() {
+            eprintln!("SKIP: No STT model available in catalog");
+            return;
+        }
+        let built = crate::lemonade::ProviderFactory::build(
+            &stt_selections[0],
+            crate::lemonade::Capability::Transcription,
+            &url,
+            100,
+            None,
+        )
+        .await
+        .expect("Failed to build transcription provider");
 
-        let queue = InferenceQueueBuilder::new().with_npu_device(npu).build();
+        let queue = InferenceQueueBuilder::new().with_provider(built).build();
 
         let wav = make_test_silence_wav(1.0);
         let result = queue.transcribe(wav, "silence.wav").await;
         assert!(
             result.is_ok(),
-            "transcribe() via NPU failed: {:?}",
+            "transcribe() failed: {:?}",
             result.err()
         );
     }
@@ -917,16 +936,37 @@ mod tests {
     async fn test_queue_two_transcription_workers_compete() {
         let url = require_integration_url!();
 
-        let npu1 = NpuDevice::new(&url, None, None, None)
-            .await
-            .expect("NpuDevice 1 construction failed");
-        let npu2 = NpuDevice::new(&url, None, None, None)
-            .await
-            .expect("NpuDevice 2 construction failed");
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let stt_selections = selector.select_stt_models();
+        if stt_selections.is_empty() {
+            eprintln!("SKIP: No STT model available in catalog");
+            return;
+        }
+
+        let b1 = crate::lemonade::ProviderFactory::build(
+            &stt_selections[0],
+            crate::lemonade::Capability::Transcription,
+            &url,
+            100,
+            None,
+        )
+        .await
+        .expect("Failed to build provider 1");
+        let b2 = crate::lemonade::ProviderFactory::build(
+            &stt_selections[0],
+            crate::lemonade::Capability::Transcription,
+            &url,
+            100,
+            None,
+        )
+        .await
+        .expect("Failed to build provider 2");
 
         let queue = InferenceQueueBuilder::new()
-            .with_npu_device(npu1)
-            .with_npu_device(npu2)
+            .with_provider(b1)
+            .with_provider(b2)
             .build();
 
         assert_eq!(

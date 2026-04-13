@@ -49,8 +49,8 @@ export RUST_LOG=u_forge_core::graph::storage=debug,u_forge_core::ai::embeddings=
 
 ## Lemonade Server Configuration
 
-Lemonade Server provides embeddings (and future reranking / chat) via an
-OpenAI-compatible HTTP API.  u-forge.ai does **not** fall back to a local model if
+Lemonade Server provides all AI inference (embedding, reranking, chat, STT, TTS) via
+an OpenAI-compatible HTTP API. u-forge.ai does **not** fall back to a local model if
 Lemonade is unavailable — it returns a clear error with instructions.
 
 ```bash
@@ -59,7 +59,7 @@ sudo snap install lemonade-server
 
 # Pull required models
 lemonade-server pull embed-gemma-300m-FLM    # embeddings (NPU, 0.62 GB) — default embedding model
-lemonade-server pull whisper-v3-turbo-FLM    # transcription (NPU, 1.55 GB) — default transcription model
+lemonade-server pull whisper-v3-turbo-FLM    # transcription (NPU, 1.55 GB)
 lemonade-server pull bge-reranker-v2-m3      # reranking (GPU/CPU)
 
 # Start the server
@@ -68,38 +68,38 @@ lemonade-server serve
 # Verify health (also shows which models are currently loaded in RAM)
 curl http://localhost:13305/api/v1/health
 
-# Point u-forge.ai at it
+# Point u-forge.ai at it (optional — localhost:13305 is auto-discovered)
 export LEMONADE_URL="http://localhost:13305/api/v1"
 ```
 
-`EmbeddingManager::try_new_auto(None, None)` resolves the URL in this order:
-1. The `lemonade_url` argument (if `Some`)
-2. `LEMONADE_URL` environment variable
-3. Hard error — no silent fallback
+`lemonade::resolve_lemonade_url()` resolves the server URL in this order:
+1. `GET http://localhost:13305/api/v1/health` — probed with 2 s timeout
+2. `GET http://127.0.0.1:13305/api/v1/health` — explicit IPv4 loopback
+3. `LEMONADE_URL` environment variable — accepted as-is, no liveness check
 
-`TranscriptionManager::try_new_auto(None, None)` uses the **same** resolution order
-and is **synchronous** (no probe request at construction). The default transcription
-model is `whisper-v3-turbo-FLM`. Errors surface only when `transcribe()` is called.
+Returns `None` when no server is found. Setting `LEMONADE_URL` is optional when
+Lemonade Server runs on its default port.
 
 ### Lemonade API Endpoints in Use
 
-| Endpoint | Method | Provider |
+| Endpoint | Method | Provider / Purpose |
 |---|---|---|
-| `/api/v1/embeddings` | POST (JSON) | `LemonadeProvider` (`embeddings.rs`) |
-| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeTranscriptionProvider` (`embeddings.rs`) |
-| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeSttProvider` (`lemonade.rs`, GPU-managed) |
-| `/api/v1/audio/speech` | POST (JSON) | `LemonadeTtsProvider` (`lemonade.rs`) |
-| `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` (`lemonade.rs`) |
-| `/api/v1/reranking` | POST (JSON) | `LemonadeRerankProvider` (`lemonade.rs`) |
-| `/api/v1/models` | GET | `LemonadeModelRegistry` (`lemonade.rs`) |
-| `/api/v1/health` | GET | *(manual verification only)* |
+| `/api/v1/models` | GET | `LemonadeServerCatalog::discover()` — catalog discovery |
+| `/system-info` | GET | `LemonadeServerCatalog::discover()` — installed backends |
+| `/api/v1/health` | GET | `LemonadeServerCatalog::discover()` + manual verification |
+| `/api/v1/load` | POST | `load_model()` — load a model before inference |
+| `/api/v1/embeddings` | POST (JSON) | `LemonadeProvider` (`lemonade/embedding.rs`) |
+| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeTranscriptionProvider` (simple, no GPU lock) |
+| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeSttProvider` (GPU-managed) |
+| `/api/v1/audio/speech` | POST (JSON) | `LemonadeTtsProvider` (`lemonade/tts.rs`) |
+| `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` (`lemonade/chat.rs`) |
+| `/api/v1/reranking` | POST (JSON) | `LemonadeRerankProvider` (`lemonade/rerank.rs`) |
 
-> **Note on the two transcription providers:** `LemonadeTranscriptionProvider` in
-> `ai/embeddings.rs` is a simple standalone provider with no GPU resource management —
-> suitable for one-off use and testing. `LemonadeSttProvider` in `lemonade.rs`
-> integrates with `GpuResourceManager` to prevent contention when LLM inference is
-> running concurrently on the same GPU. Use `LemonadeSttProvider` (via
-> `LemonadeStack`) in production.
+> **Note on the two transcription providers:** `LemonadeTranscriptionProvider`
+> has no GPU resource management — suitable for NPU FLM whisper and standalone use.
+> `LemonadeSttProvider` integrates with `GpuResourceManager` to prevent contention
+> when LLM inference is running concurrently on the same GPU. Both are constructed
+> via `ProviderFactory::build` with `Capability::Transcription`.
 
 ## Database Location
 

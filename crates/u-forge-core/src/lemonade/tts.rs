@@ -6,7 +6,6 @@ use async_openai::types::audio::{CreateSpeechRequestArgs, SpeechModel, Voice};
 use serde::{Deserialize, Serialize};
 
 use super::client::make_lemonade_openai_client;
-use super::registry::LemonadeModelRegistry;
 
 /// Built-in voices supported by kokoro-v1.
 ///
@@ -82,14 +81,6 @@ impl LemonadeTtsProvider {
             model: model.to_string(),
             default_voice: KokoroVoice::default(),
         }
-    }
-
-    /// Construct using the TTS model discovered in `registry`.
-    pub fn from_registry(registry: &LemonadeModelRegistry) -> Result<Self> {
-        let model = registry
-            .tts_model()
-            .ok_or_else(|| anyhow::anyhow!("No TTS model found in the Lemonade registry"))?;
-        Ok(Self::new(&registry.base_url, &model.id))
     }
 
     /// Override the default voice.
@@ -170,8 +161,11 @@ mod tests {
     #[tokio::test]
     async fn test_tts_returns_audio_bytes() {
         let url = require_integration_url!();
-        let reg = LemonadeModelRegistry::fetch(&url).await.unwrap();
-        let tts = LemonadeTtsProvider::from_registry(&reg).unwrap();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let tts_sel = selector.select_tts().expect("No TTS model found in catalog");
+        let tts = LemonadeTtsProvider::new(&url, &tts_sel.model_id);
 
         let audio = tts.synthesize_default("Hello, adventurer!").await.unwrap();
         assert!(!audio.is_empty(), "TTS should return non-empty audio bytes");

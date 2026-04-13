@@ -1,16 +1,15 @@
-//! Lemonade-backed embedding provider and manager.
+//! Lemonade-backed embedding provider.
 //!
 //! This module contains the [`LemonadeProvider`] implementation of
-//! [`EmbeddingProvider`] and the [`EmbeddingManager`] convenience wrapper.
-//! The trait definitions live in [`crate::ai::embeddings`] and are
-//! dependency-free; this module handles all Lemonade-specific HTTP logic.
+//! [`EmbeddingProvider`].  The trait definitions live in
+//! [`crate::ai::embeddings`] and are dependency-free; this module handles
+//! all Lemonade-specific HTTP logic.
 
 use anyhow::{anyhow, Result};
 use async_openai::{Client, config::OpenAIConfig};
 use async_openai::types::embeddings::{CreateEmbeddingRequest, EmbeddingInput};
 use async_trait::async_trait;
-use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::ai::embeddings::{
     EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
@@ -172,7 +171,7 @@ impl EmbeddingProvider for LemonadeProvider {
     }
 
     fn max_tokens(&self) -> Result<usize> {
-        Ok(crate::lemonade::effective_ctx_size(&self.model))
+        Ok(crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS)
     }
 
     fn provider_type(&self) -> EmbeddingProviderType {
@@ -188,79 +187,3 @@ impl EmbeddingProvider for LemonadeProvider {
     }
 }
 
-// ── EmbeddingManager ──────────────────────────────────────────────────────────
-
-/// Owns a single [`EmbeddingProvider`] and hands out `Arc` references to it.
-///
-/// Construct via [`EmbeddingManager::try_new_auto`] for production use, or
-/// [`EmbeddingManager::try_new_lemonade`] when the URL is known.
-pub struct EmbeddingManager {
-    provider: Arc<dyn EmbeddingProvider>,
-}
-
-impl std::fmt::Debug for EmbeddingManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EmbeddingManager")
-            .field("provider_type", &self.provider.provider_type())
-            .field("dimensions", &self.provider.dimensions().ok())
-            .finish()
-    }
-}
-
-impl EmbeddingManager {
-    /// Connect directly to a Lemonade Server instance.
-    pub async fn try_new_lemonade(base_url: &str, model: &str) -> Result<Self> {
-        let provider = LemonadeProvider::new(base_url, model).await?;
-        info!(base_url, model, "EmbeddingManager: using Lemonade Server");
-        Ok(Self {
-            provider: Arc::new(provider),
-        })
-    }
-
-    /// Auto-select a provider from the environment.
-    ///
-    /// Resolution order:
-    /// 1. `lemonade_url` argument (if provided)
-    /// 2. `LEMONADE_URL` environment variable
-    /// 3. Localhost probe
-    /// 4. Hard error
-    pub async fn try_new_auto(lemonade_url: Option<&str>, model: Option<&str>) -> Result<Self> {
-        let resolved_url =
-            crate::lemonade::resolve_provider_url(lemonade_url, "LEMONADE_URL", true).await;
-
-        match resolved_url {
-            Some(url) => {
-                let lemonade_model = model.unwrap_or("embed-gemma-300m-FLM");
-                match Self::try_new_lemonade(&url, lemonade_model).await {
-                    Ok(mgr) => {
-                        info!(url, "Auto-selected Lemonade Server");
-                        Ok(mgr)
-                    }
-                    Err(e) => {
-                        warn!(url, error = %e, "Lemonade Server not available");
-                        Err(anyhow!(
-                            "Lemonade Server not available at {} ({}). \
-                             Ensure lemonade-server is running and the model is pulled:\n  \
-                             lemonade-server serve\n  \
-                             lemonade-server pull {}",
-                            url,
-                            e,
-                            lemonade_model
-                        ))
-                    }
-                }
-            }
-            None => Err(anyhow!(
-                "No Lemonade Server URL configured and none found on localhost. \
-                 Start lemonade-server or set the LEMONADE_URL environment variable:\n  \
-                 lemonade-server serve\n  \
-                 export LEMONADE_URL=http://localhost:13305/api/v1"
-            )),
-        }
-    }
-
-    /// Return a clone of the inner provider, suitable for passing to async tasks.
-    pub fn get_provider(&self) -> Arc<dyn EmbeddingProvider> {
-        self.provider.clone()
-    }
-}
