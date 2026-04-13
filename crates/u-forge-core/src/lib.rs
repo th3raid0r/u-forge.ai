@@ -87,7 +87,7 @@ use text::split_text;
 ///     .unwrap();
 /// ```
 // KnowledgeGraph is Send + Sync:
-//   - KnowledgeGraphStorage wraps rusqlite::Connection in Arc<Mutex<Connection>> (see graph/storage.rs)
+//   - KnowledgeGraphStorage wraps rusqlite::Connection in Arc<parking_lot::Mutex<Connection>> (see graph/storage.rs)
 //   - SchemaManager holds Arc<KnowledgeGraphStorage> + DashMap (both Send + Sync)
 // This means Arc<KnowledgeGraph> is a valid axum State<T> type for Phase 3.
 pub struct KnowledgeGraph {
@@ -307,6 +307,19 @@ impl KnowledgeGraph {
     /// All text chunks belonging to `object_id`.
     pub fn get_text_chunks(&self, object_id: ObjectId) -> Result<Vec<TextChunk>> {
         self.storage.get_chunks_for_node(object_id)
+    }
+
+    /// All chunks that have no 768-dim embedding in `chunks_vec` yet.
+    ///
+    /// Use this for incremental embedding passes: only process what's new
+    /// rather than re-embedding the entire graph on each call.
+    pub fn get_unembedded_chunks(&self) -> Result<Vec<TextChunk>> {
+        self.storage.get_unembedded_chunks()
+    }
+
+    /// All chunks that have no 4096-dim embedding in `chunks_vec_hq` yet.
+    pub fn get_unembedded_chunks_hq(&self) -> Result<Vec<TextChunk>> {
+        self.storage.get_unembedded_chunks_hq()
     }
 
     // ── Search ────────────────────────────────────────────────────────────────

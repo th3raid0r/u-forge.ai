@@ -20,7 +20,7 @@ impl KnowledgeGraphStorage {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(ChunkId, ObjectId, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.object_id, c.content
              FROM chunks c
@@ -76,7 +76,7 @@ impl KnowledgeGraphStorage {
             ));
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         // Resolve the chunk's integer rowid — vec0 uses rowid as its PK.
         let rowid: i64 = conn
@@ -130,7 +130,7 @@ impl KnowledgeGraphStorage {
             .flat_map(|f| f.to_le_bytes())
             .collect();
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.object_id, c.content, v.distance
              FROM chunks c
@@ -185,7 +185,7 @@ impl KnowledgeGraphStorage {
             ));
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         let rowid: i64 = conn
             .query_row(
@@ -225,7 +225,7 @@ impl KnowledgeGraphStorage {
             .flat_map(|f| f.to_le_bytes())
             .collect();
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.object_id, c.content, v.distance
              FROM chunks c

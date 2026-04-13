@@ -19,7 +19,7 @@ impl KnowledgeGraphStorage {
     /// `EdgeType` is stored via `as_str()` and read back as
     /// `EdgeType::Custom(s)`, which round-trips correctly for all variants.
     pub fn upsert_edge(&self, edge: Edge) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let meta_json =
             serde_json::to_string(&edge.metadata).context("Failed to serialise edge metadata")?;
         conn.execute(
@@ -45,7 +45,7 @@ impl KnowledgeGraphStorage {
     /// direction as stored; the caller should check both fields when the
     /// direction matters.
     pub fn get_edges(&self, node_id: ObjectId) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let id_str = node_id.hyphenated().to_string();
         let mut stmt = conn.prepare(
             "SELECT source_id, target_id, edge_type, weight, metadata, created_at
@@ -90,7 +90,7 @@ impl KnowledgeGraphStorage {
     /// snapshot — one `SELECT * FROM edges` is far cheaper than N per-node
     /// round-trips.
     pub fn get_all_edges(&self) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT source_id, target_id, edge_type, weight, metadata, created_at
              FROM edges",
@@ -132,7 +132,7 @@ impl KnowledgeGraphStorage {
     ///
     /// Results are deduplicated via `SELECT DISTINCT`.
     pub fn get_neighbors(&self, node_id: ObjectId) -> Result<Vec<ObjectId>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let id_str = node_id.hyphenated().to_string();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT

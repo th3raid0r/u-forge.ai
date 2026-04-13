@@ -8,15 +8,18 @@
 //! * `vec0` virtual table (`chunks_vec`) via sqlite-vec for ANN similarity search.
 //!
 //! # Thread safety
-//! `Connection` is wrapped in `Arc<Mutex<Connection>>` so `KnowledgeGraphStorage`
-//! is `Send + Sync` and can be placed behind an `Arc` in the facade layer.
+//! `Connection` is wrapped in `Arc<parking_lot::Mutex<Connection>>` so
+//! `KnowledgeGraphStorage` is `Send + Sync` and can be placed behind an `Arc`
+//! in the facade layer.  `parking_lot::Mutex` has no poisoning semantics, so
+//! lock guards are obtained without `.unwrap()`.
 
 use crate::schema::SchemaDefinition;
 use crate::types::{ChunkType, ObjectMetadata};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
-use std::sync::{Arc, Mutex, Once};
+use parking_lot::Mutex;
+use std::sync::{Arc, Once};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -162,8 +165,8 @@ pub(super) static SQLITE_VEC_INIT: Once = Once::new();
 
 /// SQLite-backed storage engine for the knowledge graph.
 ///
-/// Wraps a single `rusqlite::Connection` in `Arc<Mutex<…>>` so the struct is
-/// cheaply cloneable and safe to share across threads.
+/// Wraps a single `rusqlite::Connection` in `Arc<parking_lot::Mutex<…>>` so
+/// the struct is cheaply cloneable and safe to share across threads.
 pub struct KnowledgeGraphStorage {
     pub(super) conn: Arc<Mutex<Connection>>,
 }
@@ -297,7 +300,7 @@ impl KnowledgeGraphStorage {
     /// CASCADE`), all schemas, and explicitly clears the vector index tables
     /// (`chunks_vec` and `chunks_vec_hq`).
     pub fn clear_all(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute_batch(
             "DELETE FROM nodes;
              DELETE FROM schemas;
@@ -314,7 +317,7 @@ impl KnowledgeGraphStorage {
     /// All four queries use indexed `COUNT(*)` or `SUM(…)` — effectively O(1)
     /// regardless of graph size.
     pub fn get_stats(&self) -> Result<GraphStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         let node_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
@@ -353,7 +356,7 @@ impl KnowledgeGraphStorage {
 
     /// Retrieve a schema definition by name.  Returns `Ok(None)` if absent.
     pub fn get_schema(&self, name: &str) -> Result<Option<SchemaDefinition>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let result = conn
             .query_row(
                 "SELECT definition FROM schemas WHERE name = ?1",
@@ -375,7 +378,7 @@ impl KnowledgeGraphStorage {
 
     /// Persist a schema definition, inserting or replacing by name.
     pub fn save_schema(&self, schema: &SchemaDefinition) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let json = serde_json::to_string(schema)
             .context("Failed to serialise SchemaDefinition to JSON")?;
         conn.execute(
@@ -388,7 +391,7 @@ impl KnowledgeGraphStorage {
 
     /// Delete a schema by name.  No-ops silently if the name does not exist.
     pub fn delete_schema(&self, name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM schemas WHERE name = ?1", params![name])
             .context("Failed to delete schema")?;
         Ok(())
@@ -396,7 +399,7 @@ impl KnowledgeGraphStorage {
 
     /// Return the names of all stored schemas, sorted alphabetically.
     pub fn list_schemas(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn
             .prepare("SELECT name FROM schemas ORDER BY name")
             .context("Failed to prepare list_schemas statement")?;
