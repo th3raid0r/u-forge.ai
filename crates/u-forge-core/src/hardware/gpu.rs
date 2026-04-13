@@ -69,7 +69,42 @@ use crate::lemonade::{
     GpuResourceManager, LemonadeChatProvider, LemonadeModelRegistry, LemonadeSttProvider,
 };
 
+use crate::lemonade::ModelLoadOptions;
+
 use super::{DeviceCapability, DeviceWorker, HardwareBackend};
+
+// ── Shared helper ─────────────────────────────────────────────────────────────
+
+/// Construct a llamacpp embedding provider from the registry's
+/// `llamacpp_embedding_model`, optionally loading it first.
+///
+/// Returns `None` when no llamacpp embedding model is registered or the
+/// provider fails to connect.  Pushes [`DeviceCapability::Embedding`] into
+/// `capabilities` on success.
+async fn init_llamacpp_embedding(
+    registry: &LemonadeModelRegistry,
+    load_opts: Option<&ModelLoadOptions>,
+    capabilities: &mut Vec<DeviceCapability>,
+    device_label: &str,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    let model_entry = registry.llamacpp_embedding_model()?;
+    let model_id = model_entry.id.clone();
+    let result = match load_opts {
+        Some(opts) => LemonadeProvider::new_with_load(&registry.base_url, &model_id, opts).await,
+        None => LemonadeProvider::new(&registry.base_url, &model_id).await,
+    };
+    match result {
+        Ok(p) => {
+            capabilities.push(DeviceCapability::Embedding);
+            info!(model = %model_id, "{device_label}: embedding provider ready");
+            Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
+        }
+        Err(e) => {
+            tracing::warn!(model = %model_id, error = %e, "{device_label}: embedding model not reachable");
+            None
+        }
+    }
+}
 
 // ── GpuDevice ─────────────────────────────────────────────────────────────────
 
@@ -166,28 +201,16 @@ impl GpuDevice {
                 info!(model = %p.model, "GpuDevice: Chat/LLM provider ready");
             });
 
-        let embedding =
-            if let Some(model_entry) = registry.llamacpp_embedding_model() {
-                let model_id = model_entry.id.clone();
-                let load_opts = config.load_options_for(&model_id);
-                match LemonadeProvider::new_with_load(&registry.base_url, &model_id, &load_opts).await {
-                    Ok(p) => {
-                        capabilities.push(DeviceCapability::Embedding);
-                        info!(model = %model_id, "GpuDevice: embedding provider ready");
-                        Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            model = %model_id,
-                            error = %e,
-                            "GpuDevice: embedding model not reachable"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+        let load_opts_for_embed = registry
+            .llamacpp_embedding_model()
+            .map(|m| config.load_options_for(&m.id));
+        let embedding = init_llamacpp_embedding(
+            registry,
+            load_opts_for_embed.as_ref(),
+            &mut capabilities,
+            "GpuDevice",
+        )
+        .await;
 
         if capabilities.is_empty() {
             tracing::warn!(
@@ -229,26 +252,7 @@ impl GpuDevice {
 
         // Embedding via llamacpp (does not need the GpuResourceManager lock).
         let embedding =
-            if let Some(model_entry) = registry.llamacpp_embedding_model() {
-                let model_id = model_entry.id.clone();
-                match LemonadeProvider::new(&registry.base_url, &model_id).await {
-                    Ok(p) => {
-                        capabilities.push(DeviceCapability::Embedding);
-                        info!(model = %model_id, "GpuDevice: embedding provider ready");
-                        Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            model = %model_id,
-                            error = %e,
-                            "GpuDevice: embedding model not reachable"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            init_llamacpp_embedding(registry, None, &mut capabilities, "GpuDevice").await;
 
         if capabilities.is_empty() {
             tracing::warn!(

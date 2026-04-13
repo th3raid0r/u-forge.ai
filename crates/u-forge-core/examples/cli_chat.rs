@@ -25,44 +25,30 @@
 //!   /context  — toggle showing retrieved knowledge graph context
 //!   /thinking — cycle reasoning effort: off → low → medium → high → off
 
+#[path = "common/mod.rs"]
+mod common;
+
 use anyhow::Result;
-use std::env;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use u_forge_core::{
-    ai::embeddings::LemonadeProvider,
     config::AppConfig,
     hardware::{gpu::GpuDevice, npu::NpuDevice},
-    ingest::DataIngestion,
     lemonade::{
         load_model, resolve_lemonade_url, GpuResourceManager, LemonadeHealth,
         LemonadeModelRegistry, LemonadeRerankProvider,
     },
-    queue::{InferenceQueue, InferenceQueueBuilder},
+    queue::InferenceQueueBuilder,
     rag::{build_rag_messages, format_search_context},
     search::{search_hybrid, HybridSearchConfig},
-    ChatDevice, ChatRequest, ChunkType, EmbeddingProvider, KnowledgeGraph,
-    SchemaIngestion, StreamToken, HIGH_QUALITY_EMBEDDING_DIMENSIONS,
+    ChatDevice, ChatRequest, StreamToken,
 };
 
 // ── Demo config (database overrides only) ────────────────────────────────────
 
 #[derive(serde::Deserialize, Default)]
-struct DatabaseChatConfig {
-    path: Option<String>,
-    #[serde(default)]
-    clear: bool,
-}
-
-#[derive(serde::Deserialize, Default)]
 struct DemoConfig {
-    database: Option<DatabaseChatConfig>,
-}
-
-fn load_demo_config(path: &str) -> Result<DemoConfig> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Could not read config file '{path}': {e}"))?;
-    toml::from_str(&text).map_err(|e| anyhow::anyhow!("Could not parse config file '{path}': {e}"))
+    database: Option<common::DatabaseConfig>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -71,51 +57,16 @@ fn load_demo_config(path: &str) -> Result<DemoConfig> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let args: Vec<String> = env::args().collect();
+    let args = common::resolve_demo_args();
 
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage(&args[0]);
+    if args.help_requested {
+        print_usage();
         return Ok(());
     }
 
-    let data_file = args
-        .get(1)
-        .cloned()
-        .or_else(|| env::var("UFORGE_DATA_FILE").ok())
-        .unwrap_or_else(|| {
-            format!(
-                "{}/../../defaults/data/memory.json",
-                env!("CARGO_MANIFEST_DIR")
-            )
-        });
-
-    let schema_dir = args
-        .get(2)
-        .cloned()
-        .or_else(|| env::var("UFORGE_SCHEMA_DIR").ok())
-        .unwrap_or_else(|| format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR")));
-
-    let default_config_path = format!(
-        "{}/../../defaults/demo_config.toml",
-        env!("CARGO_MANIFEST_DIR")
-    );
-
-    let config_path = args
-        .windows(2)
-        .find(|w| w[0] == "--config")
-        .map(|w| w[1].clone())
-        .or_else(|| env::var("UFORGE_DEMO_CONFIG").ok())
-        .or_else(|| {
-            if std::path::Path::new(&default_config_path).exists() {
-                Some(default_config_path.clone())
-            } else {
-                None
-            }
-        });
-
-    let demo_cfg: DemoConfig = match config_path {
+    let demo_cfg: DemoConfig = match args.config_path {
         None => DemoConfig::default(),
-        Some(ref path) => match load_demo_config(path) {
+        Some(ref path) => match common::load_toml_config::<DemoConfig>(path) {
             Ok(c) => {
                 println!("   Config    : {path} (loaded)");
                 c
@@ -132,8 +83,8 @@ async fn main() -> Result<()> {
     let lemonade_url = resolve_lemonade_url().await;
 
     println!("🌟 u-forge.ai — RAG Chat Demo 🌟");
-    println!("   Data    : {data_file}");
-    println!("   Schemas : {schema_dir}");
+    println!("   Data    : {}", args.data_file);
+    println!("   Schemas : {}", args.schema_dir);
     match &lemonade_url {
         Some(url) => println!("   Lemonade: {url} (auto-discovered)"),
         None => {
@@ -284,36 +235,7 @@ async fn main() -> Result<()> {
     let queue = builder.build();
 
     // High-quality embedding queue (optional — only when hq embedding is enabled in config).
-    let mut hq_embed_queue: Option<InferenceQueue> = None;
-    if app_cfg.embedding.high_quality_embedding {
-        if let Some(hq_model) = registry.hq_embedding_model(true) {
-            let hq_model_id = hq_model.id.clone();
-            let hq_load_opts = app_cfg.models.load_options_for(&hq_model_id);
-            print!("   HQ embed  : loading {hq_model_id}…");
-            std::io::stdout().flush()?;
-            match LemonadeProvider::new_with_load(url, &hq_model_id, &hq_load_opts).await {
-                Err(e) => println!(" ⚠️  {e}"),
-                Ok(provider) => {
-                    let dims = provider.dimensions().unwrap_or(0);
-                    if dims != HIGH_QUALITY_EMBEDDING_DIMENSIONS {
-                        println!(" ⚠️  {dims}-dim ≠ {HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim, skipped");
-                    } else {
-                        println!(" ✅ ({dims}-dim)");
-                        hq_embed_queue = Some(
-                            InferenceQueueBuilder::new()
-                                .with_config(app_cfg.clone())
-                                .with_embedding_provider_weighted(
-                                    Arc::new(provider),
-                                    format!("hq({hq_model_id})"),
-                                    app_cfg.embedding.gpu_weight,
-                                )
-                                .build(),
-                        );
-                    }
-                }
-            }
-        }
-    }
+    let hq_embed_queue = common::build_hq_embed_queue(&registry, &app_cfg).await;
 
     if !queue.has_text_generation() {
         eprintln!();
@@ -344,118 +266,15 @@ async fn main() -> Result<()> {
         .unwrap_or(&default_db_path);
     let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
 
-    println!("   Opening knowledge graph at {db_path_str}…");
-    let graph = KnowledgeGraph::new(db_path_str)?;
+    let (graph, _fresh) = common::setup_knowledge_graph(
+        db_path_str,
+        clear_db,
+        &args.schema_dir,
+        &args.data_file,
+    )
+    .await?;
 
-    if clear_db {
-        println!("   Clearing existing data…");
-        graph.clear_all()?;
-    }
-
-    let pre_stats = graph.get_stats()?;
-    let data_already_loaded = pre_stats.node_count > 0;
-
-    if data_already_loaded && !clear_db {
-        println!(
-            "   ✅ Loaded from disk ({} nodes, {} chunks)\n",
-            pre_stats.node_count, pre_stats.chunk_count
-        );
-    } else {
-        // Load schemas.
-        println!("   Loading schemas from {schema_dir}…");
-        match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0")
-        {
-            Ok(schema_def) => {
-                let mgr = graph.get_schema_manager();
-                match mgr.save_schema(&schema_def).await {
-                    Ok(()) => println!(
-                        "   ✅ {} schema types loaded",
-                        schema_def.object_types.len()
-                    ),
-                    Err(e) => eprintln!("   ⚠️  Could not save schemas: {e}"),
-                }
-            }
-            Err(e) => eprintln!("   ⚠️  Could not load schemas from {schema_dir}: {e}"),
-        }
-
-        // Import data.
-        println!("   Importing data from {data_file}…");
-        let mut ingestion = DataIngestion::new(&graph);
-        if let Err(e) = ingestion.import_json_data(&data_file).await {
-            eprintln!("   ❌ Import failed: {e}");
-            return Err(e);
-        }
-        let stats = ingestion.get_stats();
-        println!(
-            "   ✅ {} objects, {} edges imported",
-            stats.objects_created, stats.relationships_created
-        );
-
-        // Index text chunks for FTS5.
-        println!("   Indexing text for full-text search…");
-        let all_objects = graph.get_all_objects()?;
-        let id_to_name: std::collections::HashMap<u_forge_core::types::ObjectId, String> =
-            all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
-        let mut indexed = 0usize;
-
-        for obj in &all_objects {
-            let edges = graph.get_relationships(obj.id).unwrap_or_default();
-            let edge_lines: Vec<String> = edges
-                .iter()
-                .filter_map(|e| {
-                    let from_name = id_to_name.get(&e.from)?;
-                    let to_name = id_to_name.get(&e.to)?;
-                    Some(format!(
-                        "{} {} {}",
-                        from_name,
-                        e.edge_type.as_str(),
-                        to_name
-                    ))
-                })
-                .collect();
-            let text = obj.flatten_for_embedding(&edge_lines);
-            indexed += graph
-                .add_text_chunk(obj.id, text, ChunkType::Imported)?
-                .len();
-        }
-        println!("   ✅ {indexed} text chunks indexed\n");
-    }
-
-    // Embed chunks if an embedding worker is available.
-    let post_stats = graph.get_stats()?;
-    let needs_embedding = post_stats.chunk_count > post_stats.embedded_count;
-
-    if queue.has_embedding() && needs_embedding {
-        println!("   Embedding chunks for semantic search…");
-        let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
-            let mut all = Vec::new();
-            for obj in &objs {
-                for chunk in graph.get_text_chunks(obj.id)? {
-                    all.push(chunk);
-                }
-            }
-            Ok(all)
-        })?;
-
-        let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
-        match queue.embed_many(texts).await {
-            Err(e) => eprintln!("   ⚠️  Embedding failed: {e}"),
-            Ok(vecs) => {
-                let mut stored = 0usize;
-                for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
-                    if graph.upsert_chunk_embedding(chunk.id, vec).is_ok() {
-                        stored += 1;
-                    }
-                }
-                println!("   ✅ {stored}/{} chunks embedded\n", chunks_to_embed.len());
-            }
-        }
-    } else if queue.has_embedding() && !needs_embedding {
-        println!(
-            "   ℹ️  Embedding skipped — all {} chunks already embedded.\n",
-            post_stats.chunk_count
-        );
-    }
+    common::embed_all_chunks(&graph, &queue).await?;
 
     // ── REPL ─────────────────────────────────────────────────────────────────
 
@@ -551,7 +370,8 @@ async fn main() -> Result<()> {
         }
 
         // Retrieve relevant context from the knowledge graph.
-        let results = search_hybrid(&graph, &queue, hq_embed_queue.as_ref(), &input, &search_config).await?;
+        let results =
+            search_hybrid(&graph, &queue, hq_embed_queue.as_ref(), &input, &search_config).await?;
         let ctx = format_search_context(&results);
 
         if show_context {
@@ -652,7 +472,8 @@ async fn main() -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn print_usage(prog: &str) {
+fn print_usage() {
+    let prog = std::env::args().next().unwrap_or_default();
     println!("Usage: {prog} [DATA_FILE] [SCHEMA_DIR] [--config <CONFIG_FILE>]");
     println!();
     println!("Interactive RAG chat demo backed by the Foundation universe knowledge graph.");
@@ -687,4 +508,3 @@ fn indent_block(text: &str, prefix: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-

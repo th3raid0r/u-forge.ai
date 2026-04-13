@@ -13,7 +13,7 @@ The project is a Cargo workspace. All source lives under `crates/`:
 | `u-forge-ui-egui` | bin | Skeleton | egui fallback app (see `feature_UI.md`) |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
-`defaults/` (schemas + sample data) stays at the workspace root. `cli_demo.rs` resolves it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
+`defaults/` (schemas + sample data) stays at the workspace root. Both example entry points and `examples/common/mod.rs` resolve it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
 
 ## Module Map (u-forge-core)
 
@@ -50,7 +50,9 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/schema/manager.rs` | Schema load/validate/cache | `SchemaManager`, `SchemaStats` |
 | `src/schema/ingestion.rs` | JSON schema file → internal | `SchemaIngestion` |
 | `src/ingest/data.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
-| `examples/cli_demo.rs` | Only runnable entry point (resolves `defaults/` via `CARGO_MANIFEST_DIR`) | — |
+| `examples/common/mod.rs` | Shared example helpers (config, args, KG setup, embedding) | `DatabaseConfig`, `DemoArgs`, `setup_knowledge_graph`, `build_hq_embed_queue`, `embed_all_chunks` |
+| `examples/cli_demo.rs` | Demo: hardware caps, FTS5, semantic, rerank, hybrid search (includes `common` via `#[path]`) | — |
+| `examples/cli_chat.rs` | Interactive RAG chat REPL (includes `common` via `#[path]`) | — |
 
 ---
 
@@ -297,6 +299,8 @@ provider (llamacpp-based, independent of GPU resource manager).
 Constructors: `GpuDevice::from_registry()`, `GpuDevice::new()`,
 `GpuDevice::stt_only()`, `GpuDevice::llm_only()`.
 
+Both `from_registry` and `from_registry_with_config` share a private `init_llamacpp_embedding()` helper that handles connection + capability registration.
+
 Builder: `with_embedding(base_url, model_id)` — adds an embedding provider asynchronously.
 
 Convenience methods: `has_embedding()` → bool.
@@ -313,6 +317,8 @@ Wraps `LemonadeTtsProvider` (Kokoro) and optionally an embedding provider
 
 Constructors: `CpuDevice::from_registry()`, `CpuDevice::new()`,
 `CpuDevice::new_with_voice()`, `CpuDevice::empty()`.
+
+Both `from_registry` and `from_registry_with_config` share a private `init_llamacpp_embedding()` helper that handles connection + capability registration.
 
 Builder: `with_embedding(base_url, model_id)` — adds an embedding provider asynchronously.
 

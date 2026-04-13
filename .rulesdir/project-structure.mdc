@@ -103,7 +103,9 @@ See [ARCHITECTURE.md](mdc:ARCHITECTURE.md) §Known Bugs for resolution details.
 - [env.sh](mdc:env.sh) — Optional. Sets `UFORGE_*` path variables. **No longer required for compilation**.
 - [dev.sh](mdc:dev.sh) — Development runner. Automatically sets `--test-threads=1` when `LEMONADE_URL` is present.
 - [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work. Contains current module map, SQLite schema, hardware architecture, inference queue design, resolved bugs.
-- [crates/u-forge-core/examples/cli_demo.rs](mdc:crates/u-forge-core/examples/cli_demo.rs) — The only runnable entry point. Resolves `defaults/` via `CARGO_MANIFEST_DIR`.
+- [crates/u-forge-core/examples/common/mod.rs](mdc:crates/u-forge-core/examples/common/mod.rs) — Shared helpers for both examples: config loading, arg parsing, KG setup + ingestion + FTS indexing, HQ embed queue construction, chunk embedding. Included via `#[path = "common/mod.rs"] mod common;`.
+- [crates/u-forge-core/examples/cli_demo.rs](mdc:crates/u-forge-core/examples/cli_demo.rs) — Demo entry point: hardware caps, FTS5, semantic, rerank, and hybrid search. Resolves `defaults/` via `CARGO_MANIFEST_DIR`.
+- [crates/u-forge-core/examples/cli_chat.rs](mdc:crates/u-forge-core/examples/cli_chat.rs) — Interactive RAG chat REPL. Resolves `defaults/` via `CARGO_MANIFEST_DIR`.
 - [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files (workspace root).
 - [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data (~220 nodes, ~312 edges).
 

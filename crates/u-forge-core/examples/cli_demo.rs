@@ -47,41 +47,30 @@
 //! limit = 3
 //! ```
 
+#[path = "common/mod.rs"]
+mod common;
+
 use anyhow::Result;
-use std::env;
 use std::sync::Arc;
 use u_forge_core::{
     ai::embeddings::LemonadeProvider,
     config::AppConfig,
     hardware::npu::NpuDevice,
-    ingest::DataIngestion,
     lemonade::{
         resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
     types::ObjectMetadata,
-    ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
+    EmbeddingProvider, KnowledgeGraph, ObjectBuilder,
     EMBEDDING_DIMENSIONS, HIGH_QUALITY_EMBEDDING_DIMENSIONS,
 };
 
 // ── Demo config ───────────────────────────────────────────────────────────────
 
-/// Optional per-section configuration loaded from a JSON file.
-/// Every field is optional; missing sections fall back to built-in defaults.
-#[derive(serde::Deserialize, Default)]
-struct DatabaseDemoConfig {
-    /// Path to the persistent database directory.  Relative paths are resolved
-    /// from the current working directory.  Defaults to `./demo_data/kg`.
-    path: Option<String>,
-    /// When `true`, clear all data from the database before loading.
-    #[serde(default)]
-    clear: bool,
-}
-
 #[derive(serde::Deserialize, Default)]
 struct DemoConfig {
-    database: Option<DatabaseDemoConfig>,
+    database: Option<common::DatabaseConfig>,
     fts: Option<FtsDemoConfig>,
     semantic: Option<SemanticDemoConfig>,
     rerank: Option<RerankDemoConfig>,
@@ -168,70 +157,27 @@ fn default_hq_semantic_boost() -> f32 {
     3.0
 }
 
-fn load_demo_config(path: &str) -> Result<DemoConfig> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Could not read config file '{path}': {e}"))?;
-    toml::from_str(&text).map_err(|e| anyhow::anyhow!("Could not parse config file '{path}': {e}"))
-}
-
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let args: Vec<String> = env::args().collect();
+    let args = common::resolve_demo_args();
 
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage(&args[0]);
+    if args.help_requested {
+        print_usage();
         return Ok(());
     }
 
-    let data_file = args
-        .get(1)
-        .cloned()
-        .or_else(|| env::var("UFORGE_DATA_FILE").ok())
-        .unwrap_or_else(|| {
-            format!(
-                "{}/../../defaults/data/memory.json",
-                env!("CARGO_MANIFEST_DIR")
-            )
-        });
-
-    let schema_dir = args
-        .get(2)
-        .cloned()
-        .or_else(|| env::var("UFORGE_SCHEMA_DIR").ok())
-        .unwrap_or_else(|| format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR")));
-
-    // Optional demo config: --config <path>, UFORGE_DEMO_CONFIG env var, or
-    // defaults/demo_config.toml next to the data file / schema dir.
-    let default_config_path = format!(
-        "{}/../../defaults/demo_config.toml",
-        env!("CARGO_MANIFEST_DIR")
-    );
-
-    let config_path = args
-        .windows(2)
-        .find(|w| w[0] == "--config")
-        .map(|w| w[1].clone())
-        .or_else(|| env::var("UFORGE_DEMO_CONFIG").ok())
-        .or_else(|| {
-            if std::path::Path::new(&default_config_path).exists() {
-                Some(default_config_path.clone())
-            } else {
-                None
-            }
-        });
-
-    let demo_cfg: DemoConfig = match config_path {
+    let demo_cfg: DemoConfig = match args.config_path {
         None => {
             eprintln!("❌ No demo config file found.");
             eprintln!("   Pass --config <path>, set UFORGE_DEMO_CONFIG, or place");
             eprintln!("   defaults/demo_config.toml relative to the project root.");
             return Err(anyhow::anyhow!("Demo config file required but not found"));
         }
-        Some(ref path) => match load_demo_config(path) {
+        Some(ref path) => match common::load_toml_config::<DemoConfig>(path) {
             Ok(c) => {
                 println!("   Config    : {path} (loaded)");
                 c
@@ -246,8 +192,8 @@ async fn main() -> Result<()> {
     let lemonade_url = resolve_lemonade_url().await;
 
     println!("🌟 u-forge.ai — Universe Forge 🌟");
-    println!("   Data      : {data_file}");
-    println!("   Schemas   : {schema_dir}");
+    println!("   Data      : {}", args.data_file);
+    println!("   Schemas   : {}", args.schema_dir);
     println!("   Storage   : SQLite (bundled, no system libs required)");
     match &lemonade_url {
         Some(url) => println!("   Lemonade  : {url} (auto-discovered)"),
@@ -263,6 +209,7 @@ async fn main() -> Result<()> {
     let db_path_str = db_cfg
         .and_then(|c| c.path.as_deref())
         .unwrap_or(&default_db_path);
+    let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
 
     // ── Lemonade capabilities & model discovery ───────────────────────────────
 
@@ -574,47 +521,8 @@ async fn main() -> Result<()> {
                             }
 
                             // ── High-quality embedding worker (Qwen3-Embedding-8B-GGUF) ─
-                            if let Some(hq_model) = registry
-                                .hq_embedding_model(device_cfg.embedding.high_quality_embedding)
-                            {
-                                let hq_model_id = hq_model.id.clone();
-                                let hq_load_opts = device_cfg.models.load_options_for(&hq_model_id);
-                                println!("   Building HQ embedding worker ({hq_model_id})…");
-                                match LemonadeProvider::new_with_load(
-                                    url,
-                                    &hq_model_id,
-                                    &hq_load_opts,
-                                )
-                                .await
-                                {
-                                    Err(e) => {
-                                        println!(
-                                            "     ⚠️  HQ embed({hq_model_id}) unavailable: {e}"
-                                        );
-                                    }
-                                    Ok(provider) => {
-                                        let dims = provider.dimensions().unwrap_or(0);
-                                        if dims != HIGH_QUALITY_EMBEDDING_DIMENSIONS {
-                                            println!(
-                                                "     ⚠️  HQ embed({hq_model_id}) skipped: \
-                                                 {dims}-dim ≠ {HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim"
-                                            );
-                                        } else {
-                                            println!(
-                                                "     ✅ HQ worker: {hq_model_id} ({dims}-dim)"
-                                            );
-                                            let hq_builder = InferenceQueueBuilder::new()
-                                                .with_config(device_cfg.clone())
-                                                .with_embedding_provider_weighted(
-                                                    Arc::new(provider),
-                                                    format!("hq({hq_model_id})"),
-                                                    device_cfg.embedding.gpu_weight,
-                                                );
-                                            hq_embed_queue = Some(hq_builder.build());
-                                        }
-                                    }
-                                }
-                            }
+                            hq_embed_queue =
+                                common::build_hq_embed_queue(&registry, &device_cfg).await;
                             println!();
                         }
                     }
@@ -629,176 +537,21 @@ async fn main() -> Result<()> {
     println!("🗄️  Knowledge Graph");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let db_path = std::path::PathBuf::from(db_path_str);
-    let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
-
-    println!("🗄️  Opening knowledge graph at {db_path_str}…");
-    let graph = KnowledgeGraph::new(&db_path)?;
-
-    if clear_db {
-        println!("    🗑️  Clearing existing data…");
-        graph.clear_all()?;
-        println!("    ✅ Cleared\n");
-    }
-
-    let pre_stats = graph.get_stats()?;
-    let data_already_loaded = pre_stats.node_count > 0;
-
-    if data_already_loaded && !clear_db {
-        println!(
-            "    ✅ Loaded from disk ({} nodes, {} chunks)\n",
-            pre_stats.node_count, pre_stats.chunk_count
-        );
-    } else {
-        println!("    ✅ Ready (empty)\n");
-
-        // ── Schemas ───────────────────────────────────────────────────────────
-
-        println!("📚 Loading schemas from {schema_dir}");
-        match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0")
-        {
-            Ok(schema_def) => {
-                let mgr = graph.get_schema_manager();
-                match mgr.save_schema(&schema_def).await {
-                    Ok(()) => {
-                        println!(
-                            "    ✅ Loaded {} object types:",
-                            schema_def.object_types.len()
-                        );
-                        let mut names: Vec<_> = schema_def.object_types.keys().collect();
-                        names.sort();
-                        for name in names {
-                            println!("       • {name}");
-                        }
-                    }
-                    Err(e) => eprintln!("    ⚠️  Could not save schemas: {e}"),
-                }
-            }
-            Err(e) => eprintln!("    ⚠️  Could not load schemas from {schema_dir}: {e}"),
-        }
-        println!();
-
-        // ── Data import ───────────────────────────────────────────────────────
-
-        println!("📄 Importing data from {data_file}");
-        let mut ingestion = DataIngestion::new(&graph);
-        if let Err(e) = ingestion.import_json_data(&data_file).await {
-            eprintln!("    ❌ Import failed: {e}");
-            return Err(e);
-        }
-
-        let stats = ingestion.get_stats();
-        println!("    ✅ Objects   : {}", stats.objects_created);
-        println!("    ✅ Edges     : {}", stats.relationships_created);
-        if stats.parse_errors > 0 {
-            println!("    ⚠️  Parse errors: {}", stats.parse_errors);
-        }
-        println!();
-
-        // ── Index text chunks for FTS5 ────────────────────────────────────────
-
-        println!("🔍 Indexing text for full-text search…");
-        let all_objects = graph.get_all_objects()?;
-        // Build a fast id→name lookup for edge label resolution.
-        let id_to_name: std::collections::HashMap<u_forge_core::types::ObjectId, String> =
-            all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
-        let mut indexed = 0usize;
-
-        for obj in &all_objects {
-            // Flatten the entire node (name, type, description, all properties, tags,
-            // and incident edges) into one chunk so FTS5 and semantic search both
-            // see the full node context including its relationships.
-            let edges = graph.get_relationships(obj.id).unwrap_or_default();
-            let edge_lines: Vec<String> = edges
-                .iter()
-                .filter_map(|e| {
-                    let from_name = id_to_name.get(&e.from)?;
-                    let to_name = id_to_name.get(&e.to)?;
-                    Some(format!(
-                        "{} {} {}",
-                        from_name,
-                        e.edge_type.as_str(),
-                        to_name
-                    ))
-                })
-                .collect();
-            let text = obj.flatten_for_embedding(&edge_lines);
-            indexed += graph
-                .add_text_chunk(obj.id, text, ChunkType::Imported)?
-                .len();
-        }
-
-        println!("    ✅ {indexed} text chunks indexed\n");
-    }
+    let (graph, _fresh) = common::setup_knowledge_graph(
+        db_path_str,
+        clear_db,
+        &args.schema_dir,
+        &args.data_file,
+    )
+    .await?;
 
     // ── Embed chunks for semantic (ANN) search ────────────────────────────────
 
     let post_load_stats = graph.get_stats()?;
-    let needs_embedding = post_load_stats.chunk_count > post_load_stats.embedded_count;
     let needs_hq_embedding = post_load_stats.chunk_count > post_load_stats.embedded_hq_count;
 
     if let Some(ref eq) = embed_queue {
-        if !needs_embedding {
-            println!(
-                "ℹ️  Embedding skipped — all {} chunks already embedded.\n",
-                post_load_stats.chunk_count
-            );
-        } else {
-            println!("🧮 Embedding chunks for semantic search (sqlite-vec)…");
-            println!("   Workers  : {}", eq.embedding_worker_count());
-
-            // Collect all chunks that need embeddings.
-            let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
-                let mut all = Vec::new();
-                for obj in &objs {
-                    for chunk in graph.get_text_chunks(obj.id)? {
-                        all.push(chunk);
-                    }
-                }
-                Ok(all)
-            })?;
-
-            let total = chunks_to_embed.len();
-            println!("   Chunks   : {total}");
-
-            // Fire all texts at once — embed_many() dispatches one job per chunk
-            // and each worker races to claim jobs, so all workers run concurrently.
-            let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
-
-            let t0 = std::time::Instant::now();
-            match eq.embed_many(texts).await {
-                Err(e) => {
-                    eprintln!("    ❌ embed_many failed: {e}");
-                }
-                Ok(vecs) => {
-                    let elapsed = t0.elapsed();
-                    let mut stored = 0usize;
-                    let mut skipped = 0usize;
-                    for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
-                        match graph.upsert_chunk_embedding(chunk.id, vec) {
-                            Ok(()) => stored += 1,
-                            Err(e) => {
-                                skipped += 1;
-                                eprintln!(
-                                    "    ⚠️  Could not store embedding for chunk {}: {e}",
-                                    chunk.id
-                                );
-                            }
-                        }
-                    }
-                    let rate = if elapsed.as_secs_f64() > 0.0 {
-                        stored as f64 / elapsed.as_secs_f64()
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "    ✅ {stored}/{total} embedded in {:.1}s ({rate:.0} chunks/s, \
-                     {skipped} skipped)\n",
-                        elapsed.as_secs_f64()
-                    );
-                }
-            }
-        } // end needs_embedding else
+        common::embed_all_chunks(&graph, eq).await?;
     } else if lemonade_url.is_some() {
         println!("ℹ️  Embedding skipped — no compatible embedding model available.\n");
     } else {
@@ -1454,7 +1207,8 @@ fn print_node_full(node: &ObjectMetadata, graph: &KnowledgeGraph, indent: &str) 
 
 // ── Usage ─────────────────────────────────────────────────────────────────────
 
-fn print_usage(prog: &str) {
+fn print_usage() {
+    let prog = std::env::args().next().unwrap_or_default();
     println!("u-forge.ai CLI Demo");
     println!();
     println!("Usage:");

@@ -249,6 +249,7 @@ u-forge.ai/
 │   │   │   ├── rag.rs              # RAG context formatting + message assembly
 │   │   │   └── search/             # Hybrid FTS5 + ANN + rerank search pipeline
 │   │   └── examples/
+│   │       ├── common/             # Shared helpers (config, args, KG setup, embedding)
 │   │       ├── cli_demo.rs         # Demo: hardware caps, FTS5, reranking
 │   │       └── cli_chat.rs         # Interactive RAG chat REPL
 │   ├── u-forge-graph-view/ # Graph view model + layout (skeleton — see feature_UI.md)
