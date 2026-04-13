@@ -3,10 +3,11 @@ pub mod embeddings;
 pub mod transcription;
 
 pub use embeddings::{
-    EmbeddingManager, EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
+    EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
     LemonadeProvider,
 };
 pub use transcription::{
-    LemonadeTranscriptionProvider, TranscriptionManager, TranscriptionProvider,
+    LemonadeTranscriptionProvider, TranscriptionProvider,
     mime_for_filename,
 };
+

@@ -13,9 +13,11 @@ cpu_weight = 10
 "Qwen3-Embedding-8B-GGUF"           = { ctx_size = 32768, batch_size = 2048, ubatch_size = 2048 }
 "bge-reranker-v2-m3-GGUF"          = { ctx_size = 8192, batch_size = 2048, ubatch_size = 2048 }
 "qwen3.5-9B-FLM"                   = { ctx_size = 32768 }
+"qwen3.5-4B-FLM"                   = { ctx_size = 32768 }
 "Qwen3.5-27B-GGUF"                 = { ctx_size = 262144, batch_size = 2048, ubatch_size = 2048 }
 "Qwen3.5-35B-A3B-GGUF"             = { ctx_size = 262144, batch_size = 2048, ubatch_size = 2048 }
 "Qwen3.5-122B-A10B-GGUF"           = { ctx_size = 262144, batch_size = 2048, ubatch_size = 2048 }
+"Gemma-4-26B-A4B-it-GGUF"          = { ctx_size = 262144, batch_size = 2048, ubatch_size = 2048 }
 
 [chat]
 preferred_device = "gpu"       # "auto" | "gpu" | "npu" | "cpu"
@@ -27,7 +29,7 @@ hq_semantic_boost = 3        # RRF weight multiplier for the 4096-dim HQ semanti
 
 [chat.gpu]
 #model = "Qwen3.5-27B-GGUF"
-model = "Qwen3.5-35B-A3B-GGUF"
+model = "Gemma-4-26B-A4B-it-GGUF"
 # model = "Qwen3.5-122B-A10B-GGUF"
 max_tokens = 262144
 temperature = 0.7

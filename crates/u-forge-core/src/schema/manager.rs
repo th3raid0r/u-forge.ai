@@ -219,12 +219,12 @@ impl SchemaManager {
     }
 
     /// List all available schemas
-    pub async fn list_schemas(&self) -> Result<Vec<String>> {
+    pub fn list_schemas(&self) -> Result<Vec<String>> {
         self.storage.list_schemas()
     }
 
     /// Delete a schema
-    pub async fn delete_schema(&self, name: &str) -> Result<()> {
+    pub fn delete_schema(&self, name: &str) -> Result<()> {
         self.storage.delete_schema(name)?;
         self.schema_cache.write().remove(name);
         Ok(())

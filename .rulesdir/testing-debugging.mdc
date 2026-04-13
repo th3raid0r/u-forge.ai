@@ -134,14 +134,13 @@ impl TranscriptionProvider for MockTranscriptionProvider {
 
 ### WAV test helper: `make_silence_wav`
 
-`make_silence_wav(duration_secs: f32) -> Vec<u8>` lives in the `embeddings` test
-module. It builds a valid mono 16-bit 16 kHz PCM WAV entirely in memory — no
-binary fixtures needed. Refer to the source for the implementation; copy the
+`make_silence_wav(duration_secs: f32) -> Vec<u8>` lives in the `ai::transcription::tests`
+module (`src/ai/transcription.rs`). It builds a valid mono 16-bit 16 kHz PCM WAV entirely
+in memory — no binary fixtures needed. Refer to the source for the implementation; copy the
 pattern when you need real audio bytes in a test.
 
-> **`TranscriptionManager::try_new_auto` is synchronous** — no probe at construction.
-> Errors surface only when `transcribe()` is called. `LEMONADE_URL` is required;
-> `resolve_lemonade_url()` is not called by `TranscriptionManager`.
+> **`LemonadeTranscriptionProvider::new` is synchronous** — no probe at construction.
+> Errors surface only when `transcribe()` is called. There is no `TranscriptionManager`.
 
 Transcription integration tests use the same `require_integration_url!()` macro
 as all other integration tests. See `src/test_helpers.rs` for the implementation.
@@ -157,15 +156,6 @@ behaviours to cover:
 - `delete_node` — verify `ON DELETE CASCADE` removes edges and chunks
 - `search_chunks_fts` — insert a chunk, then query by keyword
 - `query_subgraph` — verify BFS hop depth and edge deduplication
-
----
-
-## Known Bug Regression Tests
-
-All nine original bugs (BUG-1 through BUG-9) are resolved. Regression tests live
-in their respective modules — see `crates/u-forge-core/src/ingest/data.rs` for BUG-6/BUG-7 tests,
-`crates/u-forge-core/src/graph/storage.rs` for BUG-3/BUG-4/BUG-8, and `crates/u-forge-core/src/ai/embeddings.rs` for BUG-5. Do
-not re-introduce any of these patterns.
 
 ---
 
@@ -236,7 +226,7 @@ tracing::warn!(
 | `Lemonade Server not available` | Server not running or `LEMONADE_URL` not set | `lemonade-server serve` + `export LEMONADE_URL=http://localhost:13305/api/v1` |
 | Transcription returns immediate error | Model not pulled or server can't open audio | Run `lemonade-server pull whisper-v3-turbo-FLM`; verify audio bytes are non-empty and a valid WAV/MP3/OGG |
 | Transcription test passes but text is noise | Silence input hallucinations are normal | Use real speech audio for content assertions; only check `result.is_ok()` for silence |
-| `TranscriptionManager::try_new_auto` returns err without server | `LEMONADE_URL` not set | Set env var; construction is sync so the error is URL-resolution, not connectivity |
+| `LemonadeTranscriptionProvider::new` used but transcription fails | Server not reachable or model not pulled | Run `lemonade-server serve` + `lemonade-server pull whisper-v3-turbo-FLM`; errors surface on first `transcribe()` call |
 | FTS5 search returns nothing | Chunk not yet added for the object | Call `add_text_chunk` before `search_chunks_fts` |
 | `database is locked` | Two processes sharing the same `knowledge.db` | Ensure only one writer at a time |
 | Import creates 0 edges | Node names in edges don't match node names exactly | Check spelling; `resolve_node_id` does exact-match lookup |

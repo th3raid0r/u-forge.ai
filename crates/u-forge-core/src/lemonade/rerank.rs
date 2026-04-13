@@ -1,12 +1,11 @@
 //! Cross-encoder reranking via Lemonade Server.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use super::client::LemonadeHttpClient;
 use super::load::{load_model, ModelLoadOptions};
-use super::registry::LemonadeModelRegistry;
 
 /// A single ranked document returned by [`LemonadeRerankProvider::rerank`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,14 +38,6 @@ impl LemonadeRerankProvider {
             client: LemonadeHttpClient::new(base_url),
             model: model.to_string(),
         }
-    }
-
-    /// Construct using the reranker model discovered in `registry`.
-    pub fn from_registry(registry: &LemonadeModelRegistry) -> Result<Self> {
-        let model = registry
-            .reranker_model()
-            .ok_or_else(|| anyhow!("No reranker model found in the Lemonade registry"))?;
-        Ok(Self::new(&registry.base_url, &model.id))
     }
 
     /// Explicitly load this model via `POST /api/v1/load` with the given options.

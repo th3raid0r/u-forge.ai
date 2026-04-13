@@ -50,15 +50,7 @@ pub struct InferenceQueue {
     /// provider's internal GPU lock handles serialisation).
     pub(super) chat_providers: Arc<Vec<LemonadeChatProvider>>,
 
-    // Capability presence flags — avoids dynamic trait-object dispatch for
-    // the fast "no device registered" error path.
-    pub(super) has_embedding: bool,
-    pub(super) has_transcription: bool,
-    pub(super) has_tts: bool,
-    pub(super) has_text_generation: bool,
-    pub(super) has_reranking: bool,
-
-    // Worker counts per capability (informational).
+    // Worker counts per capability — presence is derived as `count > 0`.
     pub(super) embedding_workers: usize,
     pub(super) transcription_workers: usize,
     pub(super) tts_workers: usize,
@@ -82,11 +74,11 @@ impl InferenceQueue {
     /// - The underlying embedding provider returned an error.
     #[instrument(skip(self, text), fields(text_len))]
     pub async fn embed(&self, text: impl Into<String>) -> Result<Vec<f32>> {
-        if !self.has_embedding {
+        if self.embedding_workers == 0 {
             return Err(anyhow!(
-                "InferenceQueue: no embedding-capable device is registered. \
-                 Add an NpuDevice with NpuDevice::new() or NpuDevice::embedding_only() \
-                 to the builder before calling embed()."
+                "InferenceQueue: no embedding-capable provider is registered. \
+                 Build an embedding provider with ProviderFactory::build() and register \
+                 it via InferenceQueueBuilder::with_provider() before calling embed()."
             ));
         }
 
@@ -110,41 +102,17 @@ impl InferenceQueue {
     /// [`embed_batch`](crate::ai::embeddings::EmbeddingProvider::embed_batch) call
     /// because it can parallelise across multiple NPU contexts.
     pub async fn embed_many(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        if !self.has_embedding {
+        if self.embedding_workers == 0 {
             return Err(anyhow!(
                 "InferenceQueue: no embedding-capable device is registered"
             ));
         }
 
-        // Fire all jobs concurrently and collect results in input order.
-        // We use a JoinSet paired with an index so we can reassemble in order.
-        let mut set: tokio::task::JoinSet<(usize, Result<Vec<f32>>)> = tokio::task::JoinSet::new();
-
-        for (i, text) in texts.into_iter().enumerate() {
+        futures::future::try_join_all(texts.into_iter().map(|text| {
             let q = self.clone();
-            set.spawn(async move { (i, q.embed(text).await) });
-        }
-
-        let mut results: Vec<Option<Vec<f32>>> = Vec::new();
-        while let Some(join_result) = set.join_next().await {
-            let (i, embed_result) = join_result
-                .map_err(|e| anyhow!("InferenceQueue: embed_many task panicked: {e}"))?;
-            let vec = embed_result?;
-            // Grow the results vec if needed.
-            if i >= results.len() {
-                results.resize_with(i + 1, || None);
-            }
-            results[i] = Some(vec);
-        }
-
-        // Collect, turning any missing slots into errors (should never happen).
-        results
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| {
-                v.ok_or_else(|| anyhow!("InferenceQueue: embed_many missing result for index {i}"))
-            })
-            .collect()
+            async move { q.embed(text).await }
+        }))
+        .await
     }
 
     /// Submit an audio transcription request and await the result.
@@ -170,11 +138,11 @@ impl InferenceQueue {
         audio_bytes: Vec<u8>,
         filename: impl Into<String>,
     ) -> Result<String> {
-        if !self.has_transcription {
+        if self.transcription_workers == 0 {
             return Err(anyhow!(
-                "InferenceQueue: no transcription-capable device is registered. \
-                 Add an NpuDevice::new() or GpuDevice::stt_only() to the builder \
-                 before calling transcribe()."
+                "InferenceQueue: no transcription-capable provider is registered. \
+                 Build a transcription provider with ProviderFactory::build() and register \
+                 it via InferenceQueueBuilder::with_provider() before calling transcribe()."
             ));
         }
 
@@ -214,7 +182,7 @@ impl InferenceQueue {
         text: impl Into<String>,
         voice: Option<KokoroVoice>,
     ) -> Result<Vec<u8>> {
-        if !self.has_tts {
+        if self.tts_workers == 0 {
             return Err(anyhow!(
                 "InferenceQueue: no TTS-capable device is registered. \
                  Add a CpuDevice::new() to the builder before calling synthesize()."
@@ -251,11 +219,11 @@ impl InferenceQueue {
     /// - The underlying chat provider returned an error.
     #[instrument(skip(self, request), fields(model, n_messages))]
     pub async fn generate(&self, request: ChatRequest) -> Result<ChatCompletionResponse> {
-        if !self.has_text_generation {
+        if self.llm_workers == 0 {
             return Err(anyhow!(
-                "InferenceQueue: no LLM-capable device is registered. \
-                 Add a GpuDevice with a chat model or an NpuDevice with an LLM model \
-                 to the builder before calling generate()."
+                "InferenceQueue: no LLM-capable provider is registered. \
+                 Build a TextGeneration provider with ProviderFactory::build() and register \
+                 it via InferenceQueueBuilder::with_provider() before calling generate()."
             ));
         }
 
@@ -282,7 +250,7 @@ impl InferenceQueue {
     /// Returns an error immediately if no LLM-capable device is registered.
     /// Stream-level errors are sent as `Err(_)` items through the receiver.
     pub fn generate_stream(&self, request: ChatRequest) -> Result<mpsc::Receiver<Result<StreamToken>>> {
-        if !self.has_text_generation {
+        if self.llm_workers == 0 {
             return Err(anyhow!(
                 "InferenceQueue: no LLM-capable device is registered."
             ));
@@ -290,7 +258,7 @@ impl InferenceQueue {
         let provider = self
             .chat_providers
             .first()
-            .expect("has_text_generation is true but chat_providers is empty");
+            .expect("llm_workers > 0 but chat_providers is empty");
         Ok(provider.complete_stream(request))
     }
 
@@ -328,7 +296,7 @@ impl InferenceQueue {
         documents: Vec<String>,
         top_n: Option<usize>,
     ) -> Result<Vec<RerankDocument>> {
-        if !self.has_reranking {
+        if self.reranking_workers == 0 {
             return Err(anyhow!(
                 "InferenceQueue: no reranking-capable device is registered. \
                  Ensure a reranker model is available in the Lemonade registry \
@@ -369,27 +337,27 @@ impl InferenceQueue {
 
     /// Whether any embedding-capable worker is registered.
     pub fn has_embedding(&self) -> bool {
-        self.has_embedding
+        self.embedding_workers > 0
     }
 
     /// Whether any transcription-capable worker is registered.
     pub fn has_transcription(&self) -> bool {
-        self.has_transcription
+        self.transcription_workers > 0
     }
 
     /// Whether any TTS-capable worker is registered.
     pub fn has_tts(&self) -> bool {
-        self.has_tts
+        self.tts_workers > 0
     }
 
     /// Whether any LLM-capable worker is registered.
     pub fn has_text_generation(&self) -> bool {
-        self.has_text_generation
+        self.llm_workers > 0
     }
 
     /// Whether any reranking-capable worker is registered.
     pub fn has_reranking(&self) -> bool {
-        self.has_reranking
+        self.reranking_workers > 0
     }
 
     /// Number of background worker tasks registered for embedding.
@@ -421,11 +389,6 @@ impl InferenceQueue {
 impl std::fmt::Debug for InferenceQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InferenceQueue")
-            .field("has_embedding", &self.has_embedding)
-            .field("has_transcription", &self.has_transcription)
-            .field("has_tts", &self.has_tts)
-            .field("has_text_generation", &self.has_text_generation)
-            .field("has_reranking", &self.has_reranking)
             .field("embedding_workers", &self.embedding_workers)
             .field("transcription_workers", &self.transcription_workers)
             .field("tts_workers", &self.tts_workers)
@@ -445,7 +408,6 @@ mod tests {
 
     use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
     use crate::ai::transcription::TranscriptionProvider;
-    use crate::hardware::npu::NpuDevice;
     use crate::test_helpers::require_integration_url;
 
     use super::super::builder::InferenceQueueBuilder;
@@ -585,11 +547,6 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
-            has_embedding: true,
-            has_transcription: true,
-            has_tts: false,
-            has_text_generation: false,
-            has_reranking: false,
             embedding_workers: 1,
             transcription_workers: 2,
             tts_workers: 0,
@@ -606,16 +563,8 @@ mod tests {
         // builder state directly.
         let builder = InferenceQueueBuilder::new();
         assert!(
-            builder.npu_devices.is_empty(),
-            "New builder should have no NPU devices"
-        );
-        assert!(
-            builder.gpu_devices.is_empty(),
-            "New builder should have no GPU devices"
-        );
-        assert!(
-            builder.cpu_devices.is_empty(),
-            "New builder should have no CPU devices"
+            builder.providers.is_empty(),
+            "New builder should have no providers registered"
         );
     }
 
@@ -723,11 +672,6 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
-            has_embedding: false,
-            has_transcription: false,
-            has_tts: false,
-            has_text_generation: false,
-            has_reranking: false,
             embedding_workers: 0,
             transcription_workers: 0,
             tts_workers: 0,
@@ -752,11 +696,6 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
-            has_embedding: false,
-            has_transcription: false,
-            has_tts: false,
-            has_text_generation: false,
-            has_reranking: false,
             embedding_workers: 0,
             transcription_workers: 0,
             tts_workers: 0,
@@ -817,11 +756,6 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
-            has_embedding: true,
-            has_transcription: false,
-            has_tts: false,
-            has_text_generation: false,
-            has_reranking: false,
             embedding_workers: 1,
             transcription_workers: 0,
             tts_workers: 0,
@@ -866,11 +800,6 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
-            has_embedding: true,
-            has_transcription: true,
-            has_tts: false,
-            has_text_generation: false,
-            has_reranking: false,
             embedding_workers: 1,
             transcription_workers: 2,
             tts_workers: 0,
@@ -883,8 +812,8 @@ mod tests {
             "Debug must include struct name"
         );
         assert!(
-            debug.contains("has_embedding: true"),
-            "Debug must reflect embedding flag"
+            debug.contains("embedding_workers: 1"),
+            "Debug must show embedding worker count"
         );
         assert!(
             debug.contains("transcription_workers: 2"),
@@ -901,11 +830,6 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
-            has_embedding: true,
-            has_transcription: true,
-            has_tts: true,
-            has_text_generation: false,
-            has_reranking: false,
             embedding_workers: 1,
             transcription_workers: 2,
             tts_workers: 1,
@@ -926,11 +850,6 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
-            has_embedding: true,
-            has_transcription: false,
-            has_tts: true,
-            has_text_generation: false,
-            has_reranking: false,
             embedding_workers: 1,
             transcription_workers: 0,
             tts_workers: 1,
@@ -945,42 +864,70 @@ mod tests {
     // ── Integration tests (require a running Lemonade Server) ─────────────────
 
     #[tokio::test]
-    async fn test_queue_embed_via_npu() {
+    async fn test_queue_embed_via_provider_factory() {
         let url = require_integration_url!();
 
-        let npu = NpuDevice::embedding_only(&url, None, None)
-            .await
-            .expect("NpuDevice construction failed");
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let embed_sel = selector
+            .select_embedding_models()
+            .into_iter()
+            .next()
+            .expect("No embedding model found in catalog");
+        let built = crate::lemonade::ProviderFactory::build(
+            &embed_sel,
+            crate::lemonade::Capability::Embedding,
+            &url,
+            100,
+            None,
+        )
+        .await
+        .expect("Failed to build embedding provider");
 
-        let queue = InferenceQueueBuilder::new().with_npu_device(npu).build();
+        let queue = InferenceQueueBuilder::new().with_provider(built).build();
 
         let vec = queue
             .embed("The foundation stood for a thousand years")
             .await;
-        assert!(vec.is_ok(), "embed() via NPU failed: {:?}", vec.err());
+        assert!(vec.is_ok(), "embed() failed: {:?}", vec.err());
         let vec = vec.unwrap();
         assert!(!vec.is_empty(), "Expected non-empty embedding");
         assert!(
-            vec.iter().all(|&x| x.is_finite()),
+            vec.iter().all(|&x: &f32| x.is_finite()),
             "Embedding contains non-finite values"
         );
     }
 
     #[tokio::test]
-    async fn test_queue_transcribe_via_npu() {
+    async fn test_queue_transcribe_via_provider_factory() {
         let url = require_integration_url!();
 
-        let npu = NpuDevice::new(&url, None, None, None)
-            .await
-            .expect("NpuDevice construction failed");
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let stt_selections = selector.select_stt_models();
+        if stt_selections.is_empty() {
+            eprintln!("SKIP: No STT model available in catalog");
+            return;
+        }
+        let built = crate::lemonade::ProviderFactory::build(
+            &stt_selections[0],
+            crate::lemonade::Capability::Transcription,
+            &url,
+            100,
+            None,
+        )
+        .await
+        .expect("Failed to build transcription provider");
 
-        let queue = InferenceQueueBuilder::new().with_npu_device(npu).build();
+        let queue = InferenceQueueBuilder::new().with_provider(built).build();
 
         let wav = make_test_silence_wav(1.0);
         let result = queue.transcribe(wav, "silence.wav").await;
         assert!(
             result.is_ok(),
-            "transcribe() via NPU failed: {:?}",
+            "transcribe() failed: {:?}",
             result.err()
         );
     }
@@ -989,16 +936,37 @@ mod tests {
     async fn test_queue_two_transcription_workers_compete() {
         let url = require_integration_url!();
 
-        let npu1 = NpuDevice::new(&url, None, None, None)
-            .await
-            .expect("NpuDevice 1 construction failed");
-        let npu2 = NpuDevice::new(&url, None, None, None)
-            .await
-            .expect("NpuDevice 2 construction failed");
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let stt_selections = selector.select_stt_models();
+        if stt_selections.is_empty() {
+            eprintln!("SKIP: No STT model available in catalog");
+            return;
+        }
+
+        let b1 = crate::lemonade::ProviderFactory::build(
+            &stt_selections[0],
+            crate::lemonade::Capability::Transcription,
+            &url,
+            100,
+            None,
+        )
+        .await
+        .expect("Failed to build provider 1");
+        let b2 = crate::lemonade::ProviderFactory::build(
+            &stt_selections[0],
+            crate::lemonade::Capability::Transcription,
+            &url,
+            100,
+            None,
+        )
+        .await
+        .expect("Failed to build provider 2");
 
         let queue = InferenceQueueBuilder::new()
-            .with_npu_device(npu1)
-            .with_npu_device(npu2)
+            .with_provider(b1)
+            .with_provider(b2)
             .build();
 
         assert_eq!(

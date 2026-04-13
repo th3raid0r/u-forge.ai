@@ -17,13 +17,13 @@
 //!   caller                InferenceQueue           device workers (Tokio tasks)
 //!   ──────                ──────────────           ────────────────────────────
 //!
-//!   embed(text)  ───────► embed_queue  ──────────► NpuDevice  (embed-gemma-300m-FLM)
-//!                                      ──────────► llamacpp   (embeddinggemma-300M-GGUF)
+//!   embed(text)  ───────► embed_queue  ──────────► flm/embed-gemma-300m-FLM
+//!                                      ──────────► rocm/embeddinggemma-300M-GGUF
 //!
-//!   transcribe() ───────► transcribe_queue ──────► NpuDevice  (whisper-v3-turbo-FLM)
-//!                                         ──────► GpuDevice  (Whisper-Large-v3-Turbo)
+//!   transcribe() ───────► transcribe_queue ──────► flm/whisper-v3-turbo-FLM
+//!                                         ──────► whispercpp/Whisper-Large-v3-Turbo
 //!
-//!   synthesize() ───────► synthesize_queue ──────► CpuDevice  (kokoro-v1)
+//!   synthesize() ───────► synthesize_queue ──────► kokoro/kokoro-v1
 //! ```
 //!
 //! The race is natural: both transcription workers receive a `notify_one()` when
@@ -57,18 +57,11 @@
 //!
 //! ```no_run
 //! # use u_forge_core::queue::InferenceQueueBuilder;
-//! # use u_forge_core::hardware::npu::NpuDevice;
-//! # use u_forge_core::hardware::gpu::GpuDevice;
-//! # use u_forge_core::hardware::cpu::CpuDevice;
 //! # async fn run() -> anyhow::Result<()> {
-//! # let npu_device: NpuDevice = todo!();
-//! # let gpu_device: GpuDevice = todo!();
-//! # let cpu_device: CpuDevice = todo!();
+//! # let built_providers = vec![];
 //! # let wav_bytes: Vec<u8> = Vec::new();
 //! let queue = InferenceQueueBuilder::new()
-//!     .with_npu_device(npu_device)
-//!     .with_gpu_device(gpu_device)
-//!     .with_cpu_device(cpu_device)
+//!     .with_providers(built_providers)
 //!     .build();
 //!
 //! // Embeddings go to the NPU

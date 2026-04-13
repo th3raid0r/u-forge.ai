@@ -2,15 +2,18 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use async_openai::{Client, config::OpenAIConfig};
 use async_openai::types::{InputSource};
 use async_openai::types::audio::{AudioInput, CreateTranscriptionRequestArgs};
 use serde::{Deserialize, Serialize};
 
+use async_trait::async_trait;
+
+use crate::ai::transcription::TranscriptionProvider;
+
 use super::client::make_lemonade_openai_client;
 use super::gpu_manager::GpuResourceManager;
-use super::registry::LemonadeModelRegistry;
 
 /// Transcription result returned by the Whisper endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -41,17 +44,6 @@ impl LemonadeSttProvider {
             model: model.to_string(),
             gpu,
         }
-    }
-
-    /// Construct using the STT model discovered in `registry`.
-    pub fn from_registry(
-        registry: &LemonadeModelRegistry,
-        gpu: Arc<GpuResourceManager>,
-    ) -> Result<Self> {
-        let model = registry
-            .stt_model()
-            .ok_or_else(|| anyhow!("No STT model found in the Lemonade registry"))?;
-        Ok(Self::new(&registry.base_url, &model.id, gpu))
     }
 
     /// Transcribe `audio_data` to text.
@@ -110,5 +102,19 @@ impl LemonadeSttProvider {
 
         Ok(TranscriptionResult { text })
         // _guard is dropped here → GPU released, queued LLM requests are woken.
+    }
+}
+
+#[async_trait]
+impl TranscriptionProvider for LemonadeSttProvider {
+    /// Delegates to the inherent [`transcribe`](Self::transcribe) method and
+    /// maps the result to a plain `String`.
+    async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> anyhow::Result<String> {
+        // Inherent `transcribe` has priority over this trait method.
+        self.transcribe(audio_bytes, filename).await.map(|r| r.text)
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
     }
 }

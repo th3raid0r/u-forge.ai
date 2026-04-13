@@ -9,9 +9,9 @@
 //!   full-text search via FTS5).
 //! * [`SchemaManager`] — runtime schema registration and property validation.
 //!
-//! Embeddings are handled separately by [`EmbeddingManager`] / [`LemonadeProvider`] and
-//! are *not* coupled to the storage layer, making it straightforward to use the graph
-//! without a running Lemonade Server (e.g. in tests).
+//! Embeddings are handled separately by [`LemonadeProvider`] and are *not* coupled to the
+//! storage layer, making it straightforward to use the graph without a running Lemonade
+//! Server (e.g. in tests).  AI capabilities are opt-in via [`InferenceQueue`].
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -21,7 +21,6 @@ pub mod builder;
 pub mod config;
 pub mod error;
 pub mod graph;
-pub mod hardware;
 pub mod ingest;
 pub mod lemonade;
 pub mod queue;
@@ -34,7 +33,7 @@ pub mod types;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use ai::embeddings::{
-    EmbeddingManager, EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
+    EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
     LemonadeProvider,
 };
 pub use builder::ObjectBuilder;
@@ -46,9 +45,12 @@ pub use graph::{
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, StreamToken,
     GpuResourceManager, GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth,
-    LemonadeModelEntry, LemonadeModelRegistry, LemonadeStack, LemonadeSttProvider,
-    LemonadeTtsProvider, LlmGuard, LoadedModelEntry, ModelLoadOptions, ModelRole, SttGuard,
-    TranscriptionResult, load_model,
+    LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, LoadedModelEntry, ModelLoadOptions,
+    SttGuard, TranscriptionResult, load_model,
+};
+pub use ingest::{
+    build_hq_embed_queue, embed_all_chunks, setup_and_index, DataIngestion, EmbeddingResult,
+    EmbeddingTarget, IngestionStats, SetupResult,
 };
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
@@ -72,8 +74,8 @@ use text::split_text;
 ///
 /// Composes storage and schema management.  Embedding / vector search are
 /// intentionally *not* members of this struct — they are opt-in via
-/// [`EmbeddingManager`] so that the graph can be used synchronously in tests
-/// and CLI tooling without a running Lemonade Server.
+/// [`InferenceQueue`](queue::InferenceQueue) so that the graph can be used
+/// synchronously in tests and CLI tooling without a running Lemonade Server.
 ///
 /// # Example
 /// ```no_run
@@ -447,8 +449,8 @@ impl KnowledgeGraph {
     }
 
     /// Names of all schemas currently persisted.
-    pub async fn list_schemas(&self) -> Result<Vec<String>> {
-        self.schema_manager.list_schemas().await
+    pub fn list_schemas(&self) -> Result<Vec<String>> {
+        self.schema_manager.list_schemas()
     }
 }
 

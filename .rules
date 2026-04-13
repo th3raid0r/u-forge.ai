@@ -31,10 +31,12 @@ a non-standard location or port.
 ### 2. Check the live Lemonade API before making capability decisions
 
 Before assuming what models or hardware are available, **fetch the actual server
-state**. `SystemInfo::fetch(url)` and `LemonadeModelRegistry::fetch(url)` exist
-for exactly this reason — use them. The `cli_demo` pattern (fetch → inspect →
-degrade gracefully) is the canonical example. Do not hardcode model IDs, device
-presence, or capability flags without a live registry check to back them up.
+state**. `SystemInfo::fetch(url)` and `LemonadeServerCatalog::discover(url)` exist
+for exactly this reason — use them. From the catalog, build a `ModelSelector` to
+pick the best available models for each capability. The `cli_demo` pattern (fetch →
+select → build providers → degrade gracefully) is the canonical example. Do not
+hardcode model IDs, device presence, or capability flags without a live catalog
+check to back them up.
 
 ### 3. Prescriptive plans belong in feature or bug files — not in shared docs
 
@@ -75,9 +77,27 @@ navigational aids.
 ## Current Project State (snapshot)
 
 Working prototype. Multi-crate Cargo workspace under `crates/`. SQLite + FTS5 storage,
-sqlite-vec ANN search, `LemonadeProvider` embeddings, hardware abstraction, unified
-inference queue, `LemonadeRerankProvider`, hybrid search pipeline, bulk graph access
-(`get_all_edges`, `get_nodes_paginated`). No active bugs.
+sqlite-vec ANN search, catalog-driven provider selection, unified inference queue
+(`InferenceQueue`), hybrid search pipeline, bulk graph access (`get_all_edges`,
+`get_nodes_paginated`). Interactive RAG chat REPL (`cli_chat`). No active bugs.
+
+The core library has been fully refactored (hardware abstraction layer removed):
+- `hardware/` directory deleted — `NpuDevice`, `GpuDevice`, `CpuDevice`, `DeviceWorker`
+  trait, and `HardwareBackend` enum no longer exist.
+- `lemonade/device_factory.rs`, `lemonade/model_limits.rs`, `lemonade/registry.rs`,
+  `lemonade/stack.rs` deleted. `LemonadeModelRegistry`, `ModelRole`, `LemonadeStack`,
+  `EmbeddingManager`, and `TranscriptionManager` no longer exist.
+- Replaced by: `lemonade/catalog.rs` (`LemonadeServerCatalog`), `lemonade/selector.rs`
+  (`ModelSelector`, `SelectedModel`, `QualityTier`), `lemonade/duplicate_guard.rs`
+  (`DuplicateGuard`), `lemonade/provider_factory.rs` (`ProviderFactory`, `Capability`,
+  `BuiltProvider`).
+- `ai/embeddings.rs` and `ai/transcription.rs` are trait-only files; implementations
+  live in `lemonade/embedding.rs` and `lemonade/transcription.rs`.
+- `InferenceQueueBuilder` now wires providers via `.with_provider(BuiltProvider)` /
+  `.with_providers(Vec<BuiltProvider>)`. `ProviderFactory::build()` constructs them.
+- `AppConfig` now includes `[chat]` section with per-device model overrides
+  (`[chat.gpu]`, `[chat.npu]`). `ModelConfig.load_params` replaces the old
+  `context_limits: HashMap`.
 
 ---
 
@@ -115,10 +135,12 @@ anti-patterns, storage patterns, tracing instrumentation.
 → **`.rulesdir/rust-patterns.mdc`** (EmbeddingProvider / trait sections)
 → **`.rulesdir/development-workflow.mdc`** (provider addition workflow)
 
-New providers implement the relevant trait (`EmbeddingProvider`,
-`TranscriptionProvider`, or the `DeviceWorker` trait for hardware backends).
-For queue-dispatched work use `InferenceQueueBuilder`. Do NOT call provider HTTP
+New providers implement the relevant trait (`EmbeddingProvider` or
+`TranscriptionProvider`). For queue-dispatched work, build via `ProviderFactory` and
+register with `InferenceQueueBuilder::with_provider`. Do NOT call provider HTTP
 clients directly from business logic. Do NOT use `Mutex<T>` in async paths.
+There is no `DeviceWorker` trait — that abstraction was removed in the hardware
+refactor.
 
 ---
 

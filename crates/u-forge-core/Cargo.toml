@@ -50,6 +50,9 @@ async-openai = { version = "0.34", features = ["embedding", "audio"] }
 dashmap = "6.1"
 parking_lot = "0.12"
 
+# MIME type inference (audio file uploads)
+mime_guess = "2.0"
+
 # Regular expressions (schema property validation)
 regex = "1.10"
 

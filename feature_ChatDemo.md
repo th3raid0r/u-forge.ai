@@ -44,14 +44,14 @@ pub fn build_rag_messages(
 **File:** `crates/u-forge-core/examples/cli_chat.rs`
 
 Structure:
-1. **Args/config** — Reuse same data_file/schema_dir/config pattern as cli_demo
+1. **Args/config** — Uses `common::resolve_demo_args()` and `common::load_toml_config()` from `examples/common/mod.rs`
 2. **Lemonade discovery** — `resolve_lemonade_url()` → `LemonadeModelRegistry::fetch()` → `GpuResourceManager::new()`
 3. **Build full InferenceQueue** — Unlike cli_demo (embedding-only), wire up both embedding AND LLM workers:
    - `NpuDevice::from_registry(&registry)` — gets embedding + STT + LLM if available
    - `GpuDevice::from_registry(&registry, gpu)` — gets STT + LLM + embedding if available
    - `InferenceQueueBuilder::new().with_npu_device(npu).with_gpu_device(gpu).build()`
    - This gives a queue with `has_text_generation() == true` AND `has_embedding() == true`
-4. **KnowledgeGraph setup** — Open DB, load schemas, import data, index chunks, embed chunks (same as cli_demo)
+4. **KnowledgeGraph setup** — Uses `setup_and_index()` and `embed_all_chunks()` from `u_forge_core::ingest`
 5. **Capability gate** — If `!queue.has_text_generation()`, print helpful message and exit
 6. **REPL loop:**
    - Print `You: ` prompt, read line from stdin

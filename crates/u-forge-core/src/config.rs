@@ -145,6 +145,42 @@ pub struct ModelConfig {
     /// Keys are the exact model IDs reported by Lemonade Server.
     #[serde(default = "default_model_load_params")]
     pub load_params: HashMap<String, ModelLoadParams>,
+
+    /// Models considered "high quality" for embedding (e.g. 4096-dim Qwen3).
+    ///
+    /// Models listed here receive [`QualityTier::High`] from `ModelSelector`
+    /// and are routed to the separate HQ embedding queue/index.
+    #[serde(default = "default_hq_embedding_models")]
+    pub high_quality_embedding_models: Vec<String>,
+
+    /// Preferred llamacpp backend order.  First installed backend wins.
+    ///
+    /// Default: `["rocm", "vulkan", "cpu"]`.
+    #[serde(default = "default_llamacpp_backend_preference")]
+    pub llamacpp_backend_preference: Vec<String>,
+
+    /// Preference list for embedding models.  First downloaded match wins.
+    ///
+    /// When empty (user has not overridden), any downloaded model with the
+    /// `"embeddings"` label is eligible; the list only controls ordering.
+    #[serde(default = "default_embedding_model_preferences")]
+    pub embedding_model_preferences: Vec<String>,
+
+    /// Preference list for reranker models.
+    #[serde(default = "default_reranker_model_preferences")]
+    pub reranker_model_preferences: Vec<String>,
+
+    /// Preference list for STT models.
+    #[serde(default = "default_stt_model_preferences")]
+    pub stt_model_preferences: Vec<String>,
+
+    /// Preference list for LLM models.
+    #[serde(default = "default_llm_model_preferences")]
+    pub llm_model_preferences: Vec<String>,
+
+    /// Preference list for TTS models.
+    #[serde(default = "default_tts_model_preferences")]
+    pub tts_model_preferences: Vec<String>,
 }
 
 impl ModelConfig {
@@ -180,6 +216,13 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             load_params: default_model_load_params(),
+            high_quality_embedding_models: default_hq_embedding_models(),
+            llamacpp_backend_preference: default_llamacpp_backend_preference(),
+            embedding_model_preferences: default_embedding_model_preferences(),
+            reranker_model_preferences: default_reranker_model_preferences(),
+            stt_model_preferences: default_stt_model_preferences(),
+            llm_model_preferences: default_llm_model_preferences(),
+            tts_model_preferences: default_tts_model_preferences(),
         }
     }
 }
@@ -214,7 +257,7 @@ pub enum ChatDevice {
 /// provider default baked into [`LemonadeChatProvider`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatDeviceConfig {
-    /// Override the model id for this device (e.g. `"GLM-4.7-Flash-GGUF"`).
+    /// Override the model id for this device (e.g. `"Gemma-4-26B-A4B-it-GGUF"`).
     ///
     /// When `None`, the model is auto-selected from the Lemonade registry.
     pub model: Option<String>,
@@ -429,6 +472,47 @@ fn default_cpu_weight() -> u32 {
     10
 }
 
+fn default_hq_embedding_models() -> Vec<String> {
+    vec!["Qwen3-Embedding-8B-GGUF".to_string()]
+}
+
+fn default_llamacpp_backend_preference() -> Vec<String> {
+    vec![
+        "rocm".to_string(),
+        "vulkan".to_string(),
+        "cpu".to_string(),
+    ]
+}
+
+fn default_embedding_model_preferences() -> Vec<String> {
+    vec![
+        "embed-gemma-300m-FLM".to_string(),
+        "user.ggml-org/embeddinggemma-300M-GGUF".to_string(),
+    ]
+}
+
+fn default_reranker_model_preferences() -> Vec<String> {
+    vec!["bge-reranker-v2-m3-GGUF".to_string()]
+}
+
+fn default_stt_model_preferences() -> Vec<String> {
+    vec![
+        "whisper-v3-turbo-FLM".to_string(),
+        "Whisper-Large-v3-Turbo".to_string(),
+    ]
+}
+
+fn default_llm_model_preferences() -> Vec<String> {
+    vec![
+        "qwen3.5-4B-FLM".to_string(),
+        "Gemma-4-26B-A4B-it-GGUF".to_string(),
+    ]
+}
+
+fn default_tts_model_preferences() -> Vec<String> {
+    vec!["kokoro-v1".to_string()]
+}
+
 /// Built-in load parameters for known models.
 fn default_model_load_params() -> HashMap<String, ModelLoadParams> {
     fn ctx(ctx_size: usize) -> ModelLoadParams {
@@ -438,8 +522,6 @@ fn default_model_load_params() -> HashMap<String, ModelLoadParams> {
     m.insert("embed-gemma-300m-FLM".to_string(), ctx(2048));
     m.insert("embed-gemma-300M-GGUF".to_string(), ctx(2048));
     m.insert("user.ggml-org/embeddinggemma-300M-GGUF".to_string(), ctx(2048));
-    m.insert("nomic-embed-text-v2-moe-GGUF".to_string(), ctx(512));
-    m.insert("nomic-embed-text-v1-GGUF".to_string(), ctx(2048));
     m.insert("Qwen3-Embedding-8B-GGUF".to_string(), ctx(32768));
     m.insert("bge-reranker-v2-m3-GGUF".to_string(), ctx(8192));
     m
@@ -468,8 +550,7 @@ mod tests {
     fn test_default_model_load_params() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.models.ctx_size_for("embed-gemma-300m-FLM"), 2048);
-        assert_eq!(cfg.models.ctx_size_for("nomic-embed-text-v2-moe-GGUF"), 512);
-        assert_eq!(cfg.models.ctx_size_for("nomic-embed-text-v1-GGUF"), 2048);
+        assert_eq!(cfg.models.ctx_size_for("user.ggml-org/embeddinggemma-300M-GGUF"), 2048);
         assert_eq!(cfg.models.ctx_size_for("bge-reranker-v2-m3-GGUF"), 8192);
         assert_eq!(cfg.models.ctx_size_for("Qwen3-Embedding-8B-GGUF"), 32768);
         // Unknown model falls back to default

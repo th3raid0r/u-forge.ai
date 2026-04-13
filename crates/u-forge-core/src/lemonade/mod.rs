@@ -1,78 +1,78 @@
 //! Extended Lemonade Server integration.
 //!
-//! This module builds on the base [`LemonadeProvider`](crate::LemonadeProvider) to expose
-//! the full breadth of the hardware-aware Lemonade stack:
+//! This module exposes the full Lemonade AI stack:
 //!
-//! | Component                  | Hardware | Model                    |
-//! |----------------------------|----------|--------------------------|
-//! | [`LemonadeModelRegistry`]  | —        | Discovers all models     |
-//! | [`LemonadeTtsProvider`]    | CPU      | `kokoro-v1`              |
-//! | [`LemonadeSttProvider`]    | GPU      | `Whisper-Large-v3-Turbo` |
-//! | [`LemonadeChatProvider`]   | GPU      | `GLM-4.7-Flash-GGUF`     |
-//! | NPU embedding              | NPU      | `embed-gemma-300m-FLM`   |
+//! | Component                    | Hardware | Model                       |
+//! |------------------------------|----------|-----------------------------|
+//! | [`LemonadeServerCatalog`]    | —        | Discovers all models        |
+//! | [`ModelSelector`]            | —        | Selects models by capability|
+//! | [`ProviderFactory`]          | —        | Builds live providers       |
+//! | [`LemonadeTtsProvider`]      | CPU      | `kokoro-v1`                 |
+//! | [`LemonadeSttProvider`]      | GPU      | `Whisper-Large-v3-Turbo`    |
+//! | [`LemonadeChatProvider`]     | GPU/NPU  | llamacpp / FLM models       |
 //!
 //! # GPU Sharing Policy
 //!
 //! Both [`LemonadeSttProvider`] and [`LemonadeChatProvider`] share the same GPU and use
 //! a [`GpuResourceManager`] to enforce the following rules:
 //!
-//! * **STT invoked while LLM is active** → returns an error immediately.  STT is
-//!   latency-sensitive and must not be made to wait for a long inference run.
-//! * **LLM invoked while STT is active** → the future is suspended and resumes as soon as
-//!   the STT session completes.
+//! * **STT invoked while LLM is active** → returns an error immediately.
+//! * **LLM invoked while STT is active** → the future is suspended and resumes when STT completes.
 //! * **LLM invoked while another LLM is active** → same queuing behaviour.
 //!
-//! RAII guards ([`SttGuard`], [`LlmGuard`]) automatically release the GPU when dropped,
-//! so callers cannot forget to unlock the resource.
+//! RAII guards ([`SttGuard`], [`LlmGuard`]) automatically release the GPU when dropped.
 
+pub mod catalog;
 pub mod chat;
-pub(crate) mod client;
+pub mod duplicate_guard;
+pub mod embedding;
 pub mod gpu_manager;
 pub mod health;
 pub mod load;
-pub mod model_limits;
-pub mod registry;
+pub mod provider_factory;
 pub mod rerank;
+pub mod selector;
 pub mod stt;
-pub mod stack;
 pub mod system_info;
+pub mod transcription;
 pub mod tts;
+pub(crate) mod client;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
+pub use catalog::{CatalogModel, InstalledBackend, LemonadeServerCatalog, LoadedModel};
+pub use duplicate_guard::DuplicateGuard;
+pub use provider_factory::{BuiltProvider, Capability, ProviderFactory, ProviderSlot};
+pub use selector::{ModelSelector, QualityTier, SelectedModel};
 pub use chat::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest,
     ChatUsage, LemonadeChatProvider, StreamToken,
 };
 pub use client::{make_lemonade_openai_client, LemonadeHttpClient};
+pub use embedding::LemonadeProvider;
+pub use transcription::LemonadeTranscriptionProvider;
 pub use health::{LemonadeHealth, LoadedModelEntry};
 pub use gpu_manager::{GpuResourceManager, GpuWorkload, LlmGuard, SttGuard};
 pub use load::{load_model, ModelLoadOptions};
-pub use model_limits::effective_ctx_size;
-pub use registry::{LemonadeModelEntry, LemonadeModelRegistry, ModelRole};
 pub use rerank::{LemonadeRerankProvider, RerankDocument};
 pub use stt::{LemonadeSttProvider, TranscriptionResult};
-pub use stack::LemonadeStack;
-pub use system_info::{LemonadeCapabilities, RecipeBackendInfo, SystemDeviceInfo, SystemInfo};
+pub use system_info::{RecipeBackendInfo, SystemDeviceInfo, SystemInfo};
 pub use tts::{KokoroVoice, LemonadeTtsProvider};
 
 // ── URL resolution utilities ──────────────────────────────────────────────────
 
 /// Resolve a Lemonade Server URL for a specific provider.
 ///
-/// Shared helper for [`EmbeddingManager::try_new_auto`](crate::EmbeddingManager::try_new_auto) and
-/// [`TranscriptionManager::try_new_auto`](crate::transcription::TranscriptionManager::try_new_auto)
-/// to avoid duplicating the `arg → env var → [probe]` resolution pattern.
+/// Shared helper for provider auto-discovery to avoid duplicating the
+/// `arg → env var → [probe]` resolution pattern.
 ///
 /// # Parameters
 /// - `explicit`         — Caller-supplied URL (highest priority).
 /// - `env_var`          — Name of the environment variable to check next.
 /// - `probe_localhost`  — When `true`, falls back to probing localhost if
-///   neither `explicit` nor the env var are set.  Pass `false` for providers
-///   that should hard-error instead of probing (e.g. transcription).
+///   neither `explicit` nor the env var are set.
 ///
-/// Returns `None` when no URL could be found, indicating a hard error is
-/// appropriate for the caller.
+/// Returns `None` when no URL could be found.
 pub async fn resolve_provider_url(
     explicit: Option<&str>,
     env_var: &str,
@@ -92,15 +92,11 @@ pub async fn resolve_provider_url(
 
 /// Resolve a reachable Lemonade Server base URL.
 ///
-/// This is the canonical URL-discovery routine used both at application startup
-/// and in integration tests.  Resolution order:
+/// Resolution order:
 ///
-/// 1. `http://localhost:13305/api/v1` — probed via `GET /api/v1/health` with a
-///    2-second timeout.  This is the default Lemonade Server port.
-/// 2. `http://127.0.0.1:13305/api/v1` — same probe against the explicit IPv4
-///    loopback address, in case `localhost` resolves to `::1` on the host.
-/// 3. The `LEMONADE_URL` environment variable — accepted as-is with no liveness
-///    check, allowing non-standard or remote servers to be configured.
+/// 1. `http://localhost:13305/api/v1` — probed via `GET /api/v1/health`.
+/// 2. `http://127.0.0.1:13305/api/v1` — same probe against explicit IPv4 loopback.
+/// 3. The `LEMONADE_URL` environment variable — accepted as-is with no liveness check.
 ///
 /// Returns `None` when none of the above sources yield a reachable server.
 pub async fn resolve_lemonade_url() -> Option<String> {
@@ -121,6 +117,5 @@ pub async fn resolve_lemonade_url() -> Option<String> {
         }
     }
 
-    // Fall back to an explicitly configured URL (e.g. a remote dev server).
     std::env::var("LEMONADE_URL").ok()
 }

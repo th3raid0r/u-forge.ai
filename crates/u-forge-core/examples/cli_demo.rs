@@ -47,41 +47,36 @@
 //! limit = 3
 //! ```
 
+#[path = "common/mod.rs"]
+mod common;
+
 use anyhow::Result;
-use std::env;
 use std::sync::Arc;
 use u_forge_core::{
-    ai::embeddings::LemonadeProvider,
-    config::AppConfig,
-    hardware::npu::NpuDevice,
-    ingest::DataIngestion,
+    build_hq_embed_queue,
+    config::{AppConfig, EmbeddingDeviceConfig},
+    embed_all_chunks,
+    ingest::EmbeddingTarget,
     lemonade::{
-        resolve_lemonade_url, LemonadeModelRegistry, LemonadeRerankProvider, ModelRole, SystemInfo,
+        catalog::CatalogModel,
+        provider_factory::{Capability, ProviderFactory, ProviderSlot},
+        selector::{ModelSelector, QualityTier, SelectedModel},
+        resolve_lemonade_url, GpuResourceManager, LemonadeRerankProvider,
+        LemonadeServerCatalog, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     search::{search_hybrid, HybridSearchConfig},
+    setup_and_index,
     types::ObjectMetadata,
-    ChunkType, EmbeddingProvider, KnowledgeGraph, ObjectBuilder, SchemaIngestion,
+    KnowledgeGraph, ObjectBuilder,
     EMBEDDING_DIMENSIONS, HIGH_QUALITY_EMBEDDING_DIMENSIONS,
 };
 
 // ── Demo config ───────────────────────────────────────────────────────────────
 
-/// Optional per-section configuration loaded from a JSON file.
-/// Every field is optional; missing sections fall back to built-in defaults.
-#[derive(serde::Deserialize, Default)]
-struct DatabaseDemoConfig {
-    /// Path to the persistent database directory.  Relative paths are resolved
-    /// from the current working directory.  Defaults to `./demo_data/kg`.
-    path: Option<String>,
-    /// When `true`, clear all data from the database before loading.
-    #[serde(default)]
-    clear: bool,
-}
-
 #[derive(serde::Deserialize, Default)]
 struct DemoConfig {
-    database: Option<DatabaseDemoConfig>,
+    database: Option<common::DatabaseConfig>,
     fts: Option<FtsDemoConfig>,
     semantic: Option<SemanticDemoConfig>,
     rerank: Option<RerankDemoConfig>,
@@ -168,70 +163,27 @@ fn default_hq_semantic_boost() -> f32 {
     3.0
 }
 
-fn load_demo_config(path: &str) -> Result<DemoConfig> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Could not read config file '{path}': {e}"))?;
-    toml::from_str(&text).map_err(|e| anyhow::anyhow!("Could not parse config file '{path}': {e}"))
-}
-
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let args: Vec<String> = env::args().collect();
+    let args = common::resolve_demo_args();
 
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage(&args[0]);
+    if args.help_requested {
+        print_usage();
         return Ok(());
     }
 
-    let data_file = args
-        .get(1)
-        .cloned()
-        .or_else(|| env::var("UFORGE_DATA_FILE").ok())
-        .unwrap_or_else(|| {
-            format!(
-                "{}/../../defaults/data/memory.json",
-                env!("CARGO_MANIFEST_DIR")
-            )
-        });
-
-    let schema_dir = args
-        .get(2)
-        .cloned()
-        .or_else(|| env::var("UFORGE_SCHEMA_DIR").ok())
-        .unwrap_or_else(|| format!("{}/../../defaults/schemas", env!("CARGO_MANIFEST_DIR")));
-
-    // Optional demo config: --config <path>, UFORGE_DEMO_CONFIG env var, or
-    // defaults/demo_config.toml next to the data file / schema dir.
-    let default_config_path = format!(
-        "{}/../../defaults/demo_config.toml",
-        env!("CARGO_MANIFEST_DIR")
-    );
-
-    let config_path = args
-        .windows(2)
-        .find(|w| w[0] == "--config")
-        .map(|w| w[1].clone())
-        .or_else(|| env::var("UFORGE_DEMO_CONFIG").ok())
-        .or_else(|| {
-            if std::path::Path::new(&default_config_path).exists() {
-                Some(default_config_path.clone())
-            } else {
-                None
-            }
-        });
-
-    let demo_cfg: DemoConfig = match config_path {
+    let demo_cfg: DemoConfig = match args.config_path {
         None => {
             eprintln!("❌ No demo config file found.");
             eprintln!("   Pass --config <path>, set UFORGE_DEMO_CONFIG, or place");
             eprintln!("   defaults/demo_config.toml relative to the project root.");
             return Err(anyhow::anyhow!("Demo config file required but not found"));
         }
-        Some(ref path) => match load_demo_config(path) {
+        Some(ref path) => match common::load_toml_config::<DemoConfig>(path) {
             Ok(c) => {
                 println!("   Config    : {path} (loaded)");
                 c
@@ -246,8 +198,8 @@ async fn main() -> Result<()> {
     let lemonade_url = resolve_lemonade_url().await;
 
     println!("🌟 u-forge.ai — Universe Forge 🌟");
-    println!("   Data      : {data_file}");
-    println!("   Schemas   : {schema_dir}");
+    println!("   Data      : {}", args.data_file);
+    println!("   Schemas   : {}", args.schema_dir);
     println!("   Storage   : SQLite (bundled, no system libs required)");
     match &lemonade_url {
         Some(url) => println!("   Lemonade  : {url} (auto-discovered)"),
@@ -263,16 +215,17 @@ async fn main() -> Result<()> {
     let db_path_str = db_cfg
         .and_then(|c| c.path.as_deref())
         .unwrap_or(&default_db_path);
+    let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
 
     // ── Lemonade capabilities & model discovery ───────────────────────────────
 
     // Capture reachable providers for later sections; these are all Option so
     // the demo degrades gracefully when no server is present.
     let mut reranker: Option<LemonadeRerankProvider> = None;
-    // Multi-worker embedding queue: NPU + all compatible llamacpp models (768-dim).
+    // Multi-worker embedding queue: standard-dim models (768-dim by default).
     // Needed for query embedding in search demos.
     let mut embed_queue: Option<InferenceQueue> = None;
-    // High-quality embedding queue: Qwen3-Embedding-8B-GGUF (4096-dim).
+    // High-quality embedding queue: large-dim model (4096-dim when configured).
     // Needed for HQ query embedding if available.
     let mut hq_embed_queue: Option<InferenceQueue> = None;
 
@@ -281,7 +234,7 @@ async fn main() -> Result<()> {
         println!("🔌 Lemonade Server — capability detection");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-        // ── System info ───────────────────────────────────────────────────────
+        // ── System info (hardware display) ────────────────────────────────────
         match SystemInfo::fetch(url).await {
             Err(e) => {
                 println!("   ⚠️  Could not reach Lemonade Server: {e}");
@@ -294,15 +247,10 @@ async fn main() -> Result<()> {
                 println!("   OS        : {}", info.os_version);
                 println!();
 
-                // ── Device availability ───────────────────────────────────────
                 println!("🔧 Devices");
                 match &info.npu {
                     Some(d) if d.available => {
-                        let name = if d.name.is_empty() {
-                            "AMD NPU"
-                        } else {
-                            &d.name
-                        };
+                        let name = if d.name.is_empty() { "AMD NPU" } else { &d.name };
                         println!("   NPU  : ✅ {name} (family: {})", d.family);
                     }
                     Some(_) => println!("   NPU  : ❌ present but unavailable"),
@@ -310,11 +258,7 @@ async fn main() -> Result<()> {
                 }
                 match &info.igpu {
                     Some(d) if d.available => {
-                        let name = if d.name.is_empty() {
-                            "AMD iGPU"
-                        } else {
-                            &d.name
-                        };
+                        let name = if d.name.is_empty() { "AMD iGPU" } else { &d.name };
                         println!("   iGPU : ✅ {name} (family: {})", d.family);
                     }
                     Some(_) => println!("   iGPU : ❌ present but unavailable"),
@@ -322,301 +266,183 @@ async fn main() -> Result<()> {
                 }
                 println!();
 
-                // ── Derived capabilities ──────────────────────────────────────
-                let caps = info.lemonade_capabilities();
-                println!("🧠 Capabilities");
+                // ── Catalog discovery + capabilities ──────────────────────────
+                match LemonadeServerCatalog::discover(url).await {
+                    Err(e) => {
+                        println!("   ⚠️  Could not build server catalog: {e}\n");
+                        println!("      (continuing without AI features)\n");
+                    }
+                    Ok(catalog) => {
+                        println!("🧠 Capabilities");
+                        println!("   Installed backends:");
+                        println!("     FLM (NPU)          : {}", bool_icon(catalog.has_installed_backend("flm", "npu")));
+                        println!("     llamacpp (ROCm)    : {}", bool_icon(catalog.has_installed_backend("llamacpp", "rocm")));
+                        println!("     llamacpp (Vulkan)  : {}", bool_icon(catalog.has_installed_backend("llamacpp", "vulkan")));
+                        println!("     whispercpp (Vulkan): {}", bool_icon(catalog.has_installed_backend("whispercpp", "vulkan")));
+                        println!("     whispercpp (CPU)   : {}", bool_icon(catalog.has_installed_backend("whispercpp", "cpu")));
+                        println!("     Kokoro TTS (CPU)   : {}", bool_icon(catalog.has_installed_backend("kokoro", "cpu")));
+                        println!();
 
-                // Backends installed
-                println!("   Installed backends:");
-                println!(
-                    "     FLM (NPU)          : {}",
-                    bool_icon(caps.flm_npu_installed)
-                );
-                println!(
-                    "     llamacpp (ROCm)    : {}",
-                    bool_icon(caps.llamacpp_rocm_installed)
-                );
-                println!(
-                    "     llamacpp (Vulkan)  : {}",
-                    bool_icon(caps.llamacpp_vulkan_installed)
-                );
-                println!(
-                    "     whispercpp (Vulkan): {}",
-                    bool_icon(caps.whispercpp_vulkan_installed)
-                );
-                println!(
-                    "     whispercpp (CPU)   : {}",
-                    bool_icon(caps.whispercpp_cpu_installed)
-                );
-                println!(
-                    "     Kokoro TTS (CPU)   : {}",
-                    bool_icon(caps.kokoro_cpu_installed)
-                );
-                println!();
+                        println!("   Inference paths:");
+                        println!("     Embed (NPU)        : {}", capability_icon(catalog.has_npu() && catalog.has_installed_backend("flm", "npu")));
+                        println!("     LLM (NPU)          : {}", capability_icon(catalog.has_npu() && catalog.has_installed_backend("flm", "npu")));
+                        println!("     LLM (GPU)          : {}", capability_icon(catalog.has_gpu() && (catalog.has_installed_backend("llamacpp", "rocm") || catalog.has_installed_backend("llamacpp", "vulkan"))));
+                        println!("     Rerank (GPU/CPU)   : {}", capability_icon(catalog.has_installed_backend("llamacpp", "rocm") || catalog.has_installed_backend("llamacpp", "vulkan")));
+                        println!();
 
-                // Inference paths
-                println!("   Inference paths:");
-                println!(
-                    "     Embed (NPU)        : {}",
-                    capability_icon(caps.can_embed_npu)
-                );
-                println!(
-                    "     LLM (NPU)          : {}",
-                    capability_icon(caps.can_llm_npu)
-                );
-                println!(
-                    "     LLM (GPU)          : {}",
-                    capability_icon(caps.can_llm_gpu)
-                );
-                println!(
-                    "     Rerank (GPU/CPU)   : {}",
-                    capability_icon(caps.can_llm_gpu || caps.llamacpp_vulkan_installed)
-                );
-                // Audio paths omitted as requested
-                println!();
-
-                // ── Model registry ────────────────────────────────────────────
-                println!("📋 Model Registry");
-                match LemonadeModelRegistry::fetch(url).await {
-                    Err(e) => println!("   ⚠️  Could not fetch model list: {e}\n"),
-                    Ok(registry) => {
-                        if registry.models.is_empty() {
-                            println!("   (no models installed)\n");
+                        // ── Model catalog ─────────────────────────────────────
+                        println!("📋 Model Catalog");
+                        let downloaded: Vec<&CatalogModel> =
+                            catalog.models.iter().filter(|m| m.downloaded).collect();
+                        if downloaded.is_empty() {
+                            println!("   (no models downloaded)\n");
                         } else {
-                            // Group by role for a tidy display
-                            let all_roles = [
-                                ModelRole::NpuEmbedding,
-                                ModelRole::LlamacppEmbedding,
-                                ModelRole::NpuLlm,
-                                ModelRole::GpuLlm,
-                                ModelRole::Reranker,
-                                ModelRole::ImageGen,
-                                ModelRole::Other,
-                            ];
-
-                            for role in &all_roles {
-                                let models = registry.by_role(role);
-                                if models.is_empty() {
-                                    continue;
-                                }
-                                println!("   {} [{} model(s)]", role_label(role), models.len());
+                            for recipe in &["flm", "llamacpp", "whispercpp", "kokoro", "sd-cpp"] {
+                                let models: Vec<&&CatalogModel> = downloaded
+                                    .iter()
+                                    .filter(|m| m.recipe == *recipe)
+                                    .collect();
+                                if models.is_empty() { continue; }
+                                println!("   {} [{} downloaded]", recipe_label(recipe), models.len());
                                 for m in models {
-                                    let status = if m.downloaded.unwrap_or(false) {
-                                        "✅ downloaded"
-                                    } else {
-                                        "⬇️  not downloaded"
-                                    };
-                                    let suggested = if m.suggested.unwrap_or(false) {
-                                        " ★"
-                                    } else {
-                                        ""
-                                    };
-                                    println!(
-                                        "     • {}{} — {} | recipe: {}",
-                                        m.id, suggested, status, m.recipe
-                                    );
-                                }
-                            }
-                            println!();
-
-                            // Summarise which canonical models will be used
-                            let device_cfg = AppConfig::load_default();
-                            println!("   Active model selection:");
-                            print_model_choice("   Embed (NPU)  ", registry.npu_embedding_model());
-                            print_model_choice(
-                                "   Embed (llamacpp)",
-                                registry.llamacpp_embedding_model(),
-                            );
-                            print_model_choice(
-                                "   Embed (HQ)   ",
-                                registry.hq_embedding_model(
-                                    device_cfg.embedding.high_quality_embedding,
-                                ),
-                            );
-                            print_model_choice("   LLM (NPU)   ", registry.npu_llm_model());
-                            print_model_choice("   LLM (GPU)   ", registry.llm_model());
-                            print_model_choice("   Reranker     ", registry.reranker_model());
-                            println!();
-
-                            // Build a reranker for the demo section below
-                            match LemonadeRerankProvider::from_registry(&registry) {
-                                Ok(r) => {
-                                    let load_opts = device_cfg.models.load_options_for(&r.model);
-                                    if let Err(e) = r.load(&load_opts).await {
-                                        println!("   ⚠️  Reranker load failed ({e}), using server defaults");
-                                    }
-                                    println!("   ✅ Reranker ready: {}", r.model);
-                                    reranker = Some(r);
-                                }
-                                Err(e) => println!("   ⚠️  No reranker available: {e}"),
-                            }
-
-                            // Build a multi-worker embedding InferenceQueue with weighted dispatch.
-                            // device_cfg loaded above for model selection display.
-                            println!("   Device config:");
-                            println!(
-                                "     NPU embed: {} (weight={})",
-                                if device_cfg.embedding.npu_enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                },
-                                device_cfg.embedding.npu_weight
-                            );
-                            println!(
-                                "     GPU embed: {} (weight={})",
-                                if device_cfg.embedding.gpu_enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                },
-                                device_cfg.embedding.gpu_weight
-                            );
-                            println!(
-                                "     CPU embed: {} (weight={})",
-                                if device_cfg.embedding.cpu_enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                },
-                                device_cfg.embedding.cpu_weight
-                            );
-                            println!(
-                                "     HQ embed : {} ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)",
-                                if device_cfg.embedding.high_quality_embedding {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                }
-                            );
-
-                            println!("   Building embedding workers…");
-                            let mut eq_builder =
-                                InferenceQueueBuilder::new().with_config(device_cfg.clone());
-                            let mut worker_count = 0usize;
-
-                            // NPU worker (FLM embed-gemma-300m-FLM)
-                            // ctx_size capped to the model's actual max sequence length.
-                            let npu_load_opts =
-                                device_cfg.models.load_options_for("embed-gemma-300m-FLM");
-                            match NpuDevice::embedding_only(url, None, Some(&npu_load_opts)).await {
-                                Ok(npu) => {
-                                    let dims = npu.embedding.dimensions().unwrap_or(0);
-                                    if dims == EMBEDDING_DIMENSIONS {
-                                        println!("     ✅ NPU worker: {} ({dims}-dim)", npu.name);
-                                        eq_builder = eq_builder.with_npu_device(npu);
-                                        worker_count += 1;
-                                    } else {
-                                        println!(
-                                            "     ⚠️  NPU skipped: returns {dims}-dim, \
-                                             need {EMBEDDING_DIMENSIONS}-dim"
-                                        );
-                                    }
-                                }
-                                Err(e) => println!("     ⚠️  NPU embedding unavailable: {e}"),
-                            }
-
-                            // llamacpp worker — embedding-gemma GGUF variant (GPU or CPU).
-                            // Must be the same model family as the NPU embed-gemma-300m-FLM
-                            // so that all workers produce vectors in the same embedding
-                            // space.  Mixing model families (e.g. nomic + gemma) causes
-                            // meaningless distance scores.
-                            if let Some(model) = registry.llamacpp_embedding_model() {
-                                let model_id = model.id.clone();
-                                let cpu_load_opts = device_cfg.models.load_options_for(&model_id);
-                                match LemonadeProvider::new_with_load(
-                                    url,
-                                    &model_id,
-                                    &cpu_load_opts,
-                                )
-                                .await
-                                {
-                                    Err(e) => {
-                                        println!("     ⚠️  llamacpp({model_id}) unavailable: {e}")
-                                    }
-                                    Ok(provider) => {
-                                        let dims = provider.dimensions().unwrap_or(0);
-                                        if dims != EMBEDDING_DIMENSIONS {
-                                            println!(
-                                                "     ⚠️  llamacpp({model_id}) skipped: \
-                                                 {dims}-dim ≠ {EMBEDDING_DIMENSIONS}-dim"
-                                            );
-                                        } else {
-                                            println!(
-                                                "     ✅ llamacpp worker: \
-                                                 {model_id} ({dims}-dim)"
-                                            );
-                                            eq_builder = eq_builder.with_embedding_provider(
-                                                Arc::new(provider),
-                                                format!("llamacpp({model_id})"),
-                                            );
-                                            worker_count += 1;
-                                        }
-                                    }
-                                }
-                            } else {
-                                println!("     ⚠️  No llamacpp embedding model found in registry");
-                                println!("        Add embedding-gemma GGUF via Lemonade UI —");
-                                println!("        see README.md for instructions.");
-                            }
-
-                            if worker_count > 0 {
-                                println!(
-                                    "   ✅ {worker_count} embedding worker(s) ready \
-                                     ({EMBEDDING_DIMENSIONS}-dim, cosine)"
-                                );
-                                embed_queue = Some(eq_builder.build());
-                            } else {
-                                println!(
-                                    "   ⚠️  No compatible {EMBEDDING_DIMENSIONS}-dim \
-                                     embedding models found — semantic search disabled."
-                                );
-                            }
-
-                            // ── High-quality embedding worker (Qwen3-Embedding-8B-GGUF) ─
-                            if let Some(hq_model) = registry
-                                .hq_embedding_model(device_cfg.embedding.high_quality_embedding)
-                            {
-                                let hq_model_id = hq_model.id.clone();
-                                let hq_load_opts = device_cfg.models.load_options_for(&hq_model_id);
-                                println!("   Building HQ embedding worker ({hq_model_id})…");
-                                match LemonadeProvider::new_with_load(
-                                    url,
-                                    &hq_model_id,
-                                    &hq_load_opts,
-                                )
-                                .await
-                                {
-                                    Err(e) => {
-                                        println!(
-                                            "     ⚠️  HQ embed({hq_model_id}) unavailable: {e}"
-                                        );
-                                    }
-                                    Ok(provider) => {
-                                        let dims = provider.dimensions().unwrap_or(0);
-                                        if dims != HIGH_QUALITY_EMBEDDING_DIMENSIONS {
-                                            println!(
-                                                "     ⚠️  HQ embed({hq_model_id}) skipped: \
-                                                 {dims}-dim ≠ {HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim"
-                                            );
-                                        } else {
-                                            println!(
-                                                "     ✅ HQ worker: {hq_model_id} ({dims}-dim)"
-                                            );
-                                            let hq_builder = InferenceQueueBuilder::new()
-                                                .with_config(device_cfg.clone())
-                                                .with_embedding_provider_weighted(
-                                                    Arc::new(provider),
-                                                    format!("hq({hq_model_id})"),
-                                                    device_cfg.embedding.gpu_weight,
-                                                );
-                                            hq_embed_queue = Some(hq_builder.build());
-                                        }
-                                    }
+                                    let labels_str: Vec<&str> =
+                                        m.labels.iter().map(String::as_str).collect();
+                                    let mut sorted = labels_str.clone();
+                                    sorted.sort();
+                                    println!("     • {} — labels: {}", m.id, sorted.join(", "));
                                 }
                             }
                             println!();
                         }
+
+                        // ── Model selection summary ───────────────────────────
+                        let device_cfg = AppConfig::load_default();
+                        let selector = ModelSelector::new(&catalog, &device_cfg.models, &device_cfg.embedding);
+                        let embed_models = selector.select_embedding_models();
+                        let std_embeds: Vec<&SelectedModel> = embed_models
+                            .iter()
+                            .filter(|s| s.quality_tier == QualityTier::Standard)
+                            .collect();
+                        let hq_embeds: Vec<&SelectedModel> = embed_models
+                            .iter()
+                            .filter(|s| s.quality_tier == QualityTier::High)
+                            .collect();
+
+                        println!("   Active model selection:");
+                        print_selection_list("   Embed (standard)", &std_embeds);
+                        print_selection_list("   Embed (HQ)      ", &hq_embeds);
+                        match selector.select_reranker() {
+                            Some(r) => println!("   Reranker         : {} ({})", r.model_id, r.recipe),
+                            None => println!("   Reranker         : — (none available)"),
+                        }
+                        match selector.select_llm_models().first() {
+                            Some(l) => println!("   LLM              : {} ({})", l.model_id, l.recipe),
+                            None => println!("   LLM              : — (none available)"),
+                        }
+                        println!();
+
+                        // ── Build providers ───────────────────────────────────
+                        println!("   Device config:");
+                        println!(
+                            "     NPU embed: {} (weight={})",
+                            if device_cfg.embedding.npu_enabled { "enabled" } else { "disabled" },
+                            device_cfg.embedding.npu_weight
+                        );
+                        println!(
+                            "     GPU embed: {} (weight={})",
+                            if device_cfg.embedding.gpu_enabled { "enabled" } else { "disabled" },
+                            device_cfg.embedding.gpu_weight
+                        );
+                        println!(
+                            "     CPU embed: {} (weight={})",
+                            if device_cfg.embedding.cpu_enabled { "enabled" } else { "disabled" },
+                            device_cfg.embedding.cpu_weight
+                        );
+                        println!(
+                            "     HQ embed : {} ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)",
+                            if device_cfg.embedding.high_quality_embedding { "enabled" } else { "disabled" }
+                        );
+                        println!("   Building providers…");
+
+                        let gpu_mgr = Arc::new(GpuResourceManager::new());
+
+                        // Reranker
+                        if let Some(reranker_sel) = selector.select_reranker() {
+                            match ProviderFactory::build(
+                                &reranker_sel,
+                                Capability::Reranking,
+                                url,
+                                100,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(built) => {
+                                    if let ProviderSlot::Rerank(r) = built.provider {
+                                        println!("   ✅ Reranker ready: {}", r.model);
+                                        reranker = Some(r);
+                                    }
+                                }
+                                Err(e) => println!("   ⚠️  Reranker load failed: {e}"),
+                            }
+                        } else {
+                            println!("   Reranker  : not available");
+                        }
+
+                        // Standard embedding workers
+                        println!("   Building embedding workers…");
+                        let mut eq_builder = InferenceQueueBuilder::new().with_config(device_cfg.clone());
+                        let mut worker_count = 0usize;
+
+                        for sel in &std_embeds {
+                            let weight = embedding_weight(sel, &device_cfg.embedding);
+                            match ProviderFactory::build(
+                                sel,
+                                Capability::Embedding,
+                                url,
+                                weight,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(built) => {
+                                    let dims = if let ProviderSlot::Embedding(ref p) = built.provider {
+                                        p.dimensions().unwrap_or(0)
+                                    } else { 0 };
+                                    if dims != EMBEDDING_DIMENSIONS {
+                                        println!(
+                                            "     ⚠️  {} skipped: {dims}-dim ≠ {EMBEDDING_DIMENSIONS}-dim",
+                                            sel.model_id
+                                        );
+                                    } else {
+                                        println!("     ✅ embedding worker: {} ({dims}-dim)", built.name);
+                                        eq_builder = eq_builder.with_provider(built);
+                                        worker_count += 1;
+                                    }
+                                }
+                                Err(e) => println!("     ⚠️  {} unavailable: {e}", sel.model_id),
+                            }
+                        }
+
+                        if worker_count > 0 {
+                            println!(
+                                "   ✅ {worker_count} embedding worker(s) ready \
+                                 ({EMBEDDING_DIMENSIONS}-dim, cosine)"
+                            );
+                            embed_queue = Some(eq_builder.build());
+                        } else {
+                            println!(
+                                "   ⚠️  No compatible {EMBEDDING_DIMENSIONS}-dim \
+                                 embedding models found — semantic search disabled."
+                            );
+                        }
+
+                        // HQ embedding queue
+                        hq_embed_queue = build_hq_embed_queue(&catalog, &device_cfg).await;
+                        println!();
+
+                        // Suppress unused warning — gpu_mgr kept for future STT/LLM wiring
+                        let _ = gpu_mgr;
                     }
                 }
             }
@@ -629,176 +455,35 @@ async fn main() -> Result<()> {
     println!("🗄️  Knowledge Graph");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let db_path = std::path::PathBuf::from(db_path_str);
-    let clear_db = db_cfg.map(|c| c.clear).unwrap_or(false);
-
-    println!("🗄️  Opening knowledge graph at {db_path_str}…");
-    let graph = KnowledgeGraph::new(&db_path)?;
-
+    println!("   Opening knowledge graph at {db_path_str}…");
+    let graph = KnowledgeGraph::new(db_path_str)?;
     if clear_db {
-        println!("    🗑️  Clearing existing data…");
+        println!("   Clearing existing data…");
         graph.clear_all()?;
-        println!("    ✅ Cleared\n");
     }
-
-    let pre_stats = graph.get_stats()?;
-    let data_already_loaded = pre_stats.node_count > 0;
-
-    if data_already_loaded && !clear_db {
+    let setup_result = setup_and_index(&graph, &args.schema_dir, &args.data_file).await?;
+    if setup_result.fresh_import {
         println!(
-            "    ✅ Loaded from disk ({} nodes, {} chunks)\n",
-            pre_stats.node_count, pre_stats.chunk_count
+            "   ✅ {} objects, {} edges imported, {} chunks indexed\n",
+            setup_result.objects_created, setup_result.relationships_created, setup_result.chunks_indexed
         );
     } else {
-        println!("    ✅ Ready (empty)\n");
-
-        // ── Schemas ───────────────────────────────────────────────────────────
-
-        println!("📚 Loading schemas from {schema_dir}");
-        match SchemaIngestion::load_schemas_from_directory(&schema_dir, "imported_schemas", "1.0.0")
-        {
-            Ok(schema_def) => {
-                let mgr = graph.get_schema_manager();
-                match mgr.save_schema(&schema_def).await {
-                    Ok(()) => {
-                        println!(
-                            "    ✅ Loaded {} object types:",
-                            schema_def.object_types.len()
-                        );
-                        let mut names: Vec<_> = schema_def.object_types.keys().collect();
-                        names.sort();
-                        for name in names {
-                            println!("       • {name}");
-                        }
-                    }
-                    Err(e) => eprintln!("    ⚠️  Could not save schemas: {e}"),
-                }
-            }
-            Err(e) => eprintln!("    ⚠️  Could not load schemas from {schema_dir}: {e}"),
-        }
-        println!();
-
-        // ── Data import ───────────────────────────────────────────────────────
-
-        println!("📄 Importing data from {data_file}");
-        let mut ingestion = DataIngestion::new(&graph);
-        if let Err(e) = ingestion.import_json_data(&data_file).await {
-            eprintln!("    ❌ Import failed: {e}");
-            return Err(e);
-        }
-
-        let stats = ingestion.get_stats();
-        println!("    ✅ Objects   : {}", stats.objects_created);
-        println!("    ✅ Edges     : {}", stats.relationships_created);
-        if stats.parse_errors > 0 {
-            println!("    ⚠️  Parse errors: {}", stats.parse_errors);
-        }
-        println!();
-
-        // ── Index text chunks for FTS5 ────────────────────────────────────────
-
-        println!("🔍 Indexing text for full-text search…");
-        let all_objects = graph.get_all_objects()?;
-        // Build a fast id→name lookup for edge label resolution.
-        let id_to_name: std::collections::HashMap<u_forge_core::types::ObjectId, String> =
-            all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
-        let mut indexed = 0usize;
-
-        for obj in &all_objects {
-            // Flatten the entire node (name, type, description, all properties, tags,
-            // and incident edges) into one chunk so FTS5 and semantic search both
-            // see the full node context including its relationships.
-            let edges = graph.get_relationships(obj.id).unwrap_or_default();
-            let edge_lines: Vec<String> = edges
-                .iter()
-                .filter_map(|e| {
-                    let from_name = id_to_name.get(&e.from)?;
-                    let to_name = id_to_name.get(&e.to)?;
-                    Some(format!(
-                        "{} {} {}",
-                        from_name,
-                        e.edge_type.as_str(),
-                        to_name
-                    ))
-                })
-                .collect();
-            let text = obj.flatten_for_embedding(&edge_lines);
-            indexed += graph
-                .add_text_chunk(obj.id, text, ChunkType::Imported)?
-                .len();
-        }
-
-        println!("    ✅ {indexed} text chunks indexed\n");
+        let s = graph.get_stats()?;
+        println!(
+            "   ✅ Loaded from disk ({} nodes, {} chunks)\n",
+            s.node_count, s.chunk_count
+        );
     }
 
     // ── Embed chunks for semantic (ANN) search ────────────────────────────────
 
-    let post_load_stats = graph.get_stats()?;
-    let needs_embedding = post_load_stats.chunk_count > post_load_stats.embedded_count;
-    let needs_hq_embedding = post_load_stats.chunk_count > post_load_stats.embedded_hq_count;
-
     if let Some(ref eq) = embed_queue {
-        if !needs_embedding {
-            println!(
-                "ℹ️  Embedding skipped — all {} chunks already embedded.\n",
-                post_load_stats.chunk_count
-            );
-        } else {
-            println!("🧮 Embedding chunks for semantic search (sqlite-vec)…");
-            println!("   Workers  : {}", eq.embedding_worker_count());
-
-            // Collect all chunks that need embeddings.
-            let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
-                let mut all = Vec::new();
-                for obj in &objs {
-                    for chunk in graph.get_text_chunks(obj.id)? {
-                        all.push(chunk);
-                    }
-                }
-                Ok(all)
-            })?;
-
-            let total = chunks_to_embed.len();
-            println!("   Chunks   : {total}");
-
-            // Fire all texts at once — embed_many() dispatches one job per chunk
-            // and each worker races to claim jobs, so all workers run concurrently.
-            let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
-
-            let t0 = std::time::Instant::now();
-            match eq.embed_many(texts).await {
-                Err(e) => {
-                    eprintln!("    ❌ embed_many failed: {e}");
-                }
-                Ok(vecs) => {
-                    let elapsed = t0.elapsed();
-                    let mut stored = 0usize;
-                    let mut skipped = 0usize;
-                    for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
-                        match graph.upsert_chunk_embedding(chunk.id, vec) {
-                            Ok(()) => stored += 1,
-                            Err(e) => {
-                                skipped += 1;
-                                eprintln!(
-                                    "    ⚠️  Could not store embedding for chunk {}: {e}",
-                                    chunk.id
-                                );
-                            }
-                        }
-                    }
-                    let rate = if elapsed.as_secs_f64() > 0.0 {
-                        stored as f64 / elapsed.as_secs_f64()
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "    ✅ {stored}/{total} embedded in {:.1}s ({rate:.0} chunks/s, \
-                     {skipped} skipped)\n",
-                        elapsed.as_secs_f64()
-                    );
-                }
-            }
-        } // end needs_embedding else
+        let emb = embed_all_chunks(&graph, eq, EmbeddingTarget::Standard).await?;
+        if emb.total > 0 {
+            println!("   ✅ {}/{} chunks embedded\n", emb.stored, emb.total);
+        } else if eq.has_embedding() {
+            println!("   ℹ️  Embedding skipped — all chunks already embedded.\n");
+        }
     } else if lemonade_url.is_some() {
         println!("ℹ️  Embedding skipped — no compatible embedding model available.\n");
     } else {
@@ -808,64 +493,17 @@ async fn main() -> Result<()> {
     // ── HQ embed chunks (4096-dim) ───────────────────────────────────────────
 
     if let Some(ref hq_eq) = hq_embed_queue {
-        if !needs_hq_embedding {
+        println!("🧮 HQ embedding chunks ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)…");
+        println!("   Workers  : {}", hq_eq.embedding_worker_count());
+        let hq_emb = embed_all_chunks(&graph, hq_eq, EmbeddingTarget::HighQuality).await?;
+        if hq_emb.total > 0 {
             println!(
-                "ℹ️  HQ embedding skipped — all {} chunks already HQ embedded.\n",
-                post_load_stats.chunk_count
+                "   ✅ {}/{} HQ embedded ({} skipped)\n",
+                hq_emb.stored, hq_emb.total, hq_emb.skipped
             );
         } else {
-            println!("🧮 HQ embedding chunks ({HIGH_QUALITY_EMBEDDING_DIMENSIONS}-dim)…");
-            println!("   Workers  : {}", hq_eq.embedding_worker_count());
-
-            let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
-                let mut all = Vec::new();
-                for obj in &objs {
-                    for chunk in graph.get_text_chunks(obj.id)? {
-                        all.push(chunk);
-                    }
-                }
-                Ok(all)
-            })?;
-
-            let total = chunks_to_embed.len();
-            println!("   Chunks   : {total}");
-
-            let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
-
-            let t0 = std::time::Instant::now();
-            match hq_eq.embed_many(texts).await {
-                Err(e) => {
-                    eprintln!("    ❌ HQ embed_many failed: {e}");
-                }
-                Ok(vecs) => {
-                    let elapsed = t0.elapsed();
-                    let mut stored = 0usize;
-                    let mut skipped = 0usize;
-                    for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
-                        match graph.upsert_chunk_embedding_hq(chunk.id, vec) {
-                            Ok(()) => stored += 1,
-                            Err(e) => {
-                                skipped += 1;
-                                eprintln!(
-                                    "    ⚠️  Could not store HQ embedding for chunk {}: {e}",
-                                    chunk.id
-                                );
-                            }
-                        }
-                    }
-                    let rate = if elapsed.as_secs_f64() > 0.0 {
-                        stored as f64 / elapsed.as_secs_f64()
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "    ✅ {stored}/{total} HQ embedded in {:.1}s ({rate:.0} chunks/s, \
-                     {skipped} skipped)\n",
-                        elapsed.as_secs_f64()
-                    );
-                }
-            }
-        } // end needs_hq_embedding else
+            println!("   ℹ️  HQ embedding skipped — all chunks already HQ embedded.\n");
+        }
     }
 
     // ── Graph statistics ──────────────────────────────────────────────────────
@@ -1399,27 +1037,37 @@ fn capability_icon(available: bool) -> &'static str {
     }
 }
 
-/// Human-readable label for a [`ModelRole`].
-fn role_label(role: &ModelRole) -> &'static str {
-    match role {
-        ModelRole::NpuEmbedding => "Embedding (NPU / FLM)",
-        ModelRole::LlamacppEmbedding => "Embedding (GPU/CPU llamacpp)",
-        ModelRole::NpuStt => "Speech-to-Text (NPU / FLM)",
-        ModelRole::GpuStt => "Speech-to-Text (GPU / whispercpp)",
-        ModelRole::NpuLlm => "LLM (NPU / FLM)",
-        ModelRole::GpuLlm => "LLM (GPU / llamacpp)",
-        ModelRole::CpuTts => "Text-to-Speech (CPU / Kokoro)",
-        ModelRole::Reranker => "Reranker",
-        ModelRole::ImageGen => "Image Generation",
-        ModelRole::Other => "Other",
+/// Human-readable label for a recipe string.
+fn recipe_label(recipe: &str) -> &'static str {
+    match recipe {
+        "flm" => "FLM (NPU)",
+        "llamacpp" => "llamacpp (GPU/CPU)",
+        "whispercpp" => "whispercpp (STT)",
+        "kokoro" => "Kokoro (TTS)",
+        "sd-cpp" => "sd-cpp (Image)",
+        _ => "Other",
     }
 }
 
-/// Print which model the registry selects for a given slot, or a dash if none.
-fn print_model_choice(label: &str, model: Option<&u_forge_core::lemonade::LemonadeModelEntry>) {
-    match model {
-        Some(m) => println!("{}  : {} (recipe: {})", label, m.id, m.recipe),
-        None => println!("{}  : — (none available)", label),
+/// Print a list of selected models (e.g. embedding workers).
+fn print_selection_list(label: &str, models: &[&SelectedModel]) {
+    if models.is_empty() {
+        println!("{label:<20}: — (none available)");
+    } else {
+        let ids: Vec<&str> = models.iter().map(|s| s.model_id.as_str()).collect();
+        println!("{label:<20}: {}", ids.join(", "));
+    }
+}
+
+/// Compute dispatch weight for an embedding selection based on device config.
+fn embedding_weight(sel: &SelectedModel, cfg: &EmbeddingDeviceConfig) -> u32 {
+    match sel.recipe.as_str() {
+        "flm" => cfg.npu_weight,
+        "llamacpp" => match sel.backend.as_deref() {
+            Some("rocm") | Some("vulkan") | Some("metal") => cfg.gpu_weight,
+            _ => cfg.cpu_weight,
+        },
+        _ => cfg.cpu_weight,
     }
 }
 
@@ -1454,7 +1102,8 @@ fn print_node_full(node: &ObjectMetadata, graph: &KnowledgeGraph, indent: &str) 
 
 // ── Usage ─────────────────────────────────────────────────────────────────────
 
-fn print_usage(prog: &str) {
+fn print_usage() {
+    let prog = std::env::args().next().unwrap_or_default();
     println!("u-forge.ai CLI Demo");
     println!();
     println!("Usage:");

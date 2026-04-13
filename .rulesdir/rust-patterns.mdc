@@ -6,7 +6,23 @@ globs: crates/**/*.rs,crates/**/examples/*.rs
 
 ## Error Handling
 
-Use `anyhow::Result` for application-level errors throughout the codebase:
+Use `anyhow::Result` for application-level errors throughout the codebase.
+
+For typed error enums at system boundaries (e.g. HTTP handler responses), use
+`#[derive(thiserror::Error)]` instead of hand-writing `Display` and `From` impls.
+`thiserror = "2.0"` is already in `Cargo.toml`.
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    #[error("Not found: {0}")]
+    NotFound(String),
+    #[error("Internal error: {0}")]
+    Internal(#[from] anyhow::Error),  // generates From<anyhow::Error> + std::error::Error
+}
+```
+
+For internal fallible operations, keep using `anyhow`:
 
 ```rust
 use anyhow::{anyhow, Context, Result};
@@ -96,8 +112,7 @@ impl EmbeddingProvider for MyProvider {
 
 ## TranscriptionProvider
 
-A second provider trait lives in `crates/u-forge-core/src/ai/transcription.rs`, alongside the embedding module.
-It follows the same trait + manager pattern but targets audio-to-text.
+`TranscriptionProvider` trait lives in `crates/u-forge-core/src/ai/transcription.rs`:
 
 ```rust
 #[async_trait]
@@ -119,73 +134,16 @@ MIME type is inferred from the filename extension:
 
 ### LemonadeTranscriptionProvider
 
-Concrete implementation against `POST {base_url}/audio/transcriptions`:
+Concrete implementation against `POST {base_url}/audio/transcriptions`. Construction
+is synchronous — no probe at construction time.
 
-```rust
-// Construction is synchronous and cheap — no probe request is made.
-let provider = LemonadeTranscriptionProvider::new(
-    "http://localhost:13305/api/v1",
-    "whisper-v3-turbo-FLM",
-);
-
-let wav_bytes = std::fs::read("session.wav")?;
-let text = provider.transcribe(wav_bytes, "session.wav").await?;
-```
-
-**Key difference from `LemonadeSttProvider` in `lemonade.rs`:** this provider has
-no `GpuResourceManager` — it is intentionally simple and standalone. Use
-`LemonadeSttProvider` when you need the full GPU-managed `LemonadeStack` where LLM
+**Key difference from `LemonadeSttProvider`:** no `GpuResourceManager` — intentionally
+simple and standalone. `LemonadeSttProvider` (via `ProviderFactory`) is used when LLM
 inference and STT may contend for the same GPU.
 
-### TranscriptionManager
-
-Mirrors `EmbeddingManager`. Holds an `Arc<dyn TranscriptionProvider>`:
-
-```rust
-// Auto: reads LEMONADE_URL env var; defaults to "whisper-v3-turbo-FLM"
-// Note: try_new_auto is SYNCHRONOUS — no probe request needed at construction.
-let mgr = TranscriptionManager::try_new_auto(None, None)?;
-
-// Explicit URL and model
-let mgr = TranscriptionManager::new_lemonade(
-    "http://localhost:13305/api/v1",
-    "whisper-v3-turbo-FLM",
-);
-
-let provider = mgr.get_provider();  // Arc<dyn TranscriptionProvider>
-let text = provider.transcribe(wav_bytes, "recording.wav").await?;
-```
-
-`try_new_auto` resolution order:
-1. `lemonade_url` argument (if `Some`)
-2. `LEMONADE_URL` environment variable
-3. Hard error — no silent fallback
-
----
-
-## EmbeddingManager
-
-`EmbeddingManager` is decoupled from `KnowledgeGraph`. Construct it separately when
-embeddings are needed; do not expect the graph to own one.
-
-```rust
-// Auto: reads LEMONADE_URL env var; errors clearly if not set
-let mgr = EmbeddingManager::try_new_auto(None, None).await?;
-
-// Explicit URL
-let mgr = EmbeddingManager::try_new_lemonade(
-    "http://localhost:13305/api/v1",
-    "nomic-embed-text",
-).await?;
-
-let provider = mgr.get_provider();  // Arc<dyn EmbeddingProvider>
-let vec = provider.embed("Some text").await?;
-```
-
-`try_new_auto` resolution order (for embeddings):
-1. `lemonade_url` argument (if `Some`)
-2. `LEMONADE_URL` environment variable
-3. Hard error — there is **no** local fallback in this build
+There is no `TranscriptionManager`. Construct `LemonadeTranscriptionProvider` directly,
+or use `ProviderFactory::build` with `Capability::Transcription` to build a managed
+provider for the `InferenceQueue`.
 
 ---
 
