@@ -698,11 +698,348 @@ impl Render for GraphCanvas {
     }
 }
 
+// ── Node detail panel ─────────────────────────────────────────────────────────
+
+/// Height of the tab bar inside the detail panel.
+const DETAIL_TAB_H: f32 = 28.0;
+
+/// Read-only node detail panel rendered in the top 30% of the workspace.
+///
+/// Observes `SelectionModel` and updates whenever the selection changes.
+/// Shows the selected node's data as formatted JSON in a scrollable view.
+struct NodeDetailPanel {
+    selection: Entity<SelectionModel>,
+    snapshot: Arc<RwLock<GraphSnapshot>>,
+    /// Keeps the selection subscription alive.
+    _selection_sub: Subscription,
+}
+
+impl NodeDetailPanel {
+    fn new(
+        snapshot: Arc<RwLock<GraphSnapshot>>,
+        selection: Entity<SelectionModel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let sub = cx.observe(&selection, |_this, _sel, cx| {
+            cx.notify();
+        });
+        Self { selection, snapshot, _selection_sub: sub }
+    }
+}
+
+/// Target display column width for word-wrapping property values.
+const DISPLAY_COLS: usize = 72;
+
+/// Escape only the characters that are illegal inside a JSON string.
+/// Whitespace (newlines, tabs) is left for `word_wrap_str` to normalize.
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Split `s` into word-wrapped chunks.
+/// `first_avail` is the character budget for the first chunk;
+/// `cont_avail` is the budget for subsequent chunks.
+/// All whitespace sequences (including embedded newlines) are treated as
+/// word separators — the caller gets clean single-space-separated text.
+fn word_wrap_str(s: &str, first_avail: usize, cont_avail: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut avail = first_avail;
+
+    for word in s.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= avail {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            chunks.push(current);
+            current = word.to_string();
+            avail = cont_avail;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+/// Format a string-valued property as one or more display lines with word
+/// wrapping. Continuation lines are indented to align with the opening `"`.
+fn string_prop_lines(key: &str, value: &str, comma: &str) -> Vec<String> {
+    let key_part = format!("    \"{}\": \"", escape_json(key));
+    let cont_indent = " ".repeat(key_part.len());
+    let first_avail = DISPLAY_COLS.saturating_sub(key_part.len() + 1); // +1 for closing `"`
+    let cont_avail = DISPLAY_COLS.saturating_sub(cont_indent.len());
+
+    // Fast path: fits on one line.
+    let single = format!("{}{}\"{}",  key_part, escape_json(value), comma);
+    if single.len() <= DISPLAY_COLS {
+        return vec![single];
+    }
+
+    let chunks = word_wrap_str(value, first_avail, cont_avail);
+    let n = chunks.len();
+    let mut lines: Vec<String> = Vec::new();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let escaped = escape_json(&chunk);
+        let is_last = i == n - 1;
+        if i == 0 && is_last {
+            lines.push(format!("{}{}\"{}", key_part, escaped, comma));
+        } else if i == 0 {
+            lines.push(format!("{}{}", key_part, escaped));
+        } else if is_last {
+            lines.push(format!("{}{}\"{}",  cont_indent, escaped, comma));
+        } else {
+            lines.push(format!("{}{}", cont_indent, escaped));
+        }
+    }
+    lines
+}
+
+/// Format a non-string serde_json Value as a compact single-line string.
+fn json_value_to_display(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("\"{}\"", escape_json(s)),
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                return "[]".into();
+            }
+            let all_scalar = arr.iter().all(|item| {
+                matches!(
+                    item,
+                    serde_json::Value::String(_)
+                        | serde_json::Value::Number(_)
+                        | serde_json::Value::Bool(_)
+                )
+            });
+            if all_scalar {
+                let items: Vec<String> = arr.iter().map(json_value_to_display).collect();
+                format!("[{}]", items.join(", "))
+            } else {
+                v.to_string()
+            }
+        }
+        serde_json::Value::Object(_) => v.to_string(),
+    }
+}
+
+/// Render a `NodeView` as display lines resembling pretty-printed JSON.
+///
+/// `description` and `tags` live in dedicated DB columns (not inside the
+/// `properties` JSON blob), so we merge them in at display time.
+/// The panel shows: id, name, type, then a unified `properties` block with
+/// description first, followed by all schema properties, with tags last if
+/// not already present in the properties map.
+fn node_json_lines(node: &u_forge_graph_view::NodeView) -> Vec<String> {
+    // Collect the merged property entries in display order.
+    // Each entry is (key, display_lines_for_value).
+    let mut prop_lines: Vec<Vec<String>> = Vec::new();
+
+    // 1. description (from the dedicated column) — shown first if present.
+    if let Some(desc) = &node.description {
+        prop_lines.push(vec!["__desc_placeholder__".into(), desc.clone()]);
+    }
+
+    // 2. All entries from the properties JSON blob.
+    //    Skip any key named "description" or "tags" to avoid duplication
+    //    (the ingestion pipeline sometimes stores them in both places).
+    let props_has_tags = node
+        .properties
+        .as_object()
+        .map(|o| o.contains_key("tags"))
+        .unwrap_or(false);
+
+    if let Some(obj) = node.properties.as_object() {
+        for (key, val) in obj.iter() {
+            if key.eq_ignore_ascii_case("description") {
+                continue; // already shown from the dedicated column
+            }
+            if key.eq_ignore_ascii_case("tags") {
+                continue; // handled below
+            }
+            prop_lines.push(vec!["__prop__".into(), key.clone(), val.to_string()]);
+        }
+    }
+
+    // 3. tags — from properties if present, else fall back to the dedicated column.
+    if props_has_tags {
+        if let Some(v) = node.properties.as_object().and_then(|o| o.get("tags")) {
+            prop_lines.push(vec!["__tags_json__".into(), v.to_string()]);
+        }
+    } else if !node.tags.is_empty() {
+        let tag_list = node
+            .tags
+            .iter()
+            .map(|t| format!("\"{}\"", escape_json(t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        prop_lines.push(vec!["__tags_list__".into(), tag_list]);
+    }
+
+    // ── Render ────────────────────────────────────────────────────────────────
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("{".into());
+    lines.push(format!("  \"id\": \"{}\",", node.id));
+    lines.push(format!("  \"name\": \"{}\",", escape_json(&node.name)));
+    lines.push(format!("  \"type\": \"{}\",", escape_json(&node.object_type)));
+
+    if prop_lines.is_empty() {
+        lines.push("  \"properties\": {}".into());
+    } else {
+        lines.push("  \"properties\": {".into());
+        let total = prop_lines.len();
+        for (i, entry) in prop_lines.iter().enumerate() {
+            let comma = if i < total - 1 { "," } else { "" };
+            match entry[0].as_str() {
+                "__desc_placeholder__" => {
+                    lines.extend(string_prop_lines("description", &entry[1], comma));
+                }
+                "__prop__" => {
+                    let key = &entry[1];
+                    let val: serde_json::Value =
+                        serde_json::from_str(&entry[2]).unwrap_or(serde_json::Value::Null);
+                    match &val {
+                        serde_json::Value::String(s) => {
+                            lines.extend(string_prop_lines(key, s, comma));
+                        }
+                        _ => {
+                            lines.push(format!(
+                                "    \"{}\": {}{}",
+                                escape_json(key),
+                                json_value_to_display(&val),
+                                comma
+                            ));
+                        }
+                    }
+                }
+                "__tags_json__" => {
+                    let val: serde_json::Value =
+                        serde_json::from_str(&entry[1]).unwrap_or(serde_json::Value::Null);
+                    lines.push(format!(
+                        "    \"tags\": {}{}",
+                        json_value_to_display(&val),
+                        comma
+                    ));
+                }
+                "__tags_list__" => {
+                    lines.push(format!("    \"tags\": [{}]{}", entry[1], comma));
+                }
+                _ => {}
+            }
+        }
+        lines.push("  }".into());
+    }
+
+    lines.push("}".into());
+    lines
+}
+
+impl Render for NodeDetailPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected_idx = self.selection.read(cx).selected_node_idx;
+
+        let outer = div()
+            .id("node-detail-panel")
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(rgb(0x1e1e2e))
+            .border_b_1()
+            .border_color(rgb(0x313244));
+
+        if let Some(idx) = selected_idx {
+            let snap = self.snapshot.read();
+            if idx < snap.nodes.len() {
+                let lines = node_json_lines(&snap.nodes[idx]);
+                drop(snap);
+
+                // Tab bar — single "Overview" tab for now.
+                let tab_bar = div()
+                    .id("detail-tab-bar")
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .h(px(DETAIL_TAB_H))
+                    .bg(rgb(0x181825))
+                    .border_b_1()
+                    .border_color(rgb(0x313244))
+                    .child(
+                        div()
+                            .id("tab-overview")
+                            .flex()
+                            .items_center()
+                            .px_3()
+                            .h_full()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgba(0xcdd6f4ff))
+                            .border_b_2()
+                            .border_color(rgb(0x89b4fa))
+                            .child("Overview"),
+                    );
+
+                // Scrollable JSON content.
+                let mut scroll = div()
+                    .id("detail-scroll")
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .min_h_0()
+                    .p_3();
+                scroll.style().flex_grow = Some(1.0);
+                scroll.style().flex_shrink = Some(1.0);
+                scroll.style().flex_basis = Some(relative(0.).into());
+
+                for (i, line) in lines.into_iter().enumerate() {
+                    scroll = scroll.child(
+                        div()
+                            .id(("detail-line", i))
+                            .flex_none()
+                            .text_xs()
+                            .font_family(".SystemUIMonospacedFont")
+                            .text_color(rgba(0xcdd6f4ff))
+                            .child(line),
+                    );
+                }
+
+                outer.child(tab_bar).child(scroll)
+            } else {
+                drop(snap);
+                outer
+                    .items_center()
+                    .justify_center()
+                    .child(div().text_sm().text_color(rgba(0x6c7086ff)).child("—"))
+            }
+        } else {
+            outer
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgba(0x6c7086ff))
+                        .child("Select a node to view details"),
+                )
+        }
+    }
+}
+
 // ── Root app view ─────────────────────────────────────────────────────────────
 
 struct AppView {
     graph_canvas: Entity<GraphCanvas>,
     tree_panel: Entity<TreePanel>,
+    node_detail: Entity<NodeDetailPanel>,
     #[allow(dead_code)]
     selection: Entity<SelectionModel>,
     snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -720,9 +1057,13 @@ impl AppView {
             GraphCanvas::new(snapshot_arc.clone(), graph, selection.clone(), cx)
         });
         let tree_panel = cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
+        let node_detail = cx.new(|cx| {
+            NodeDetailPanel::new(snapshot_arc.clone(), selection.clone(), cx)
+        });
         Self {
             graph_canvas,
             tree_panel,
+            node_detail,
             selection,
             snapshot: snapshot_arc,
             file_menu_open: false,
@@ -848,19 +1189,14 @@ impl Render for AppView {
                 workspace.style().flex_shrink = Some(1.0);
                 workspace.style().flex_basis = Some(relative(0.).into());
 
-                // Editor placeholder pane — 3 parts out of 10 (30%).
+                // Node detail pane — 3 parts out of 10 (30%).
                 let mut editor = div()
                     .id("editor-pane")
                     .flex()
+                    .flex_col()
                     .w_full()
-                    .bg(rgb(0x1e1e2e))
-                    .border_b_1()
-                    .border_color(rgb(0x313244))
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgba(0x6c7086ff))
-                    .text_sm()
-                    .child("Editor pane — coming soon");
+                    .min_h_0()
+                    .child(self.node_detail.clone());
                 editor.style().flex_grow = Some(3.0);
                 editor.style().flex_shrink = Some(1.0);
                 editor.style().flex_basis = Some(relative(0.).into());

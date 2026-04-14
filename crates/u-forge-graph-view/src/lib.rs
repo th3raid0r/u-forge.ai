@@ -4,9 +4,11 @@
 // rendering. Both GPUI and egui UI frontends share this crate.
 
 mod layout;
+mod observable;
 mod snapshot;
 mod spatial;
 
 pub use layout::force_directed_layout;
+pub use observable::{GraphEvent, ObservableGraph};
 pub use snapshot::{build_snapshot, EdgeView, GraphSnapshot, LodLevel, NodeView};
 pub use spatial::NodeEntry;

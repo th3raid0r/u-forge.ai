@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use glam::Vec2;
 use rstar::RTree;
+use serde_json::Value as JsonValue;
 use u_forge_core::{KnowledgeGraph, ObjectId};
 
 use crate::layout::force_directed_layout;
@@ -28,6 +29,8 @@ pub struct NodeView {
     pub description: Option<String>,
     pub position: Vec2,
     pub tags: Vec<String>,
+    /// Additional schema-defined properties stored as JSON (e.g. abilities, affiliations).
+    pub properties: JsonValue,
 }
 
 /// An edge between two nodes, stored as indices into `GraphSnapshot::nodes`.
@@ -166,6 +169,7 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
             description: obj.description,
             position: Vec2::ZERO,
             tags: obj.tags,
+            properties: obj.properties,
         })
         .collect();
 
