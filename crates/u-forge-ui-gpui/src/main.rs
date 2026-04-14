@@ -13,7 +13,7 @@ use u_forge_core::{AppConfig, KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{build_snapshot, GraphSnapshot, LodLevel};
 use u_forge_ui_traits::{generate_draw_commands, DrawCommand, Viewport, NODE_RADIUS};
 
-actions!([SaveLayout, ToggleSidebar]);
+actions!([SaveLayout, ToggleSidebar, ToggleRightPanel]);
 
 /// Edges per batched PathBuilder.
 const EDGE_BATCH_SIZE: usize = 500;
@@ -29,8 +29,11 @@ const LEGEND_ENTRIES: &[(&str, u32)] = &[
     ("Other", 0xcdd6f4),
 ];
 
-/// Menu bar height in pixels.
+/// Menu bar / status bar height in pixels.
 const MENU_BAR_H: f32 = 28.0;
+
+/// Status bar height in pixels.
+const STATUS_BAR_H: f32 = 24.0;
 
 // ── Selection model ──────────────────────────────────────────────────────────
 
@@ -702,8 +705,11 @@ struct AppView {
     tree_panel: Entity<TreePanel>,
     #[allow(dead_code)]
     selection: Entity<SelectionModel>,
+    snapshot: Arc<RwLock<GraphSnapshot>>,
     file_menu_open: bool,
+    view_menu_open: bool,
     sidebar_open: bool,
+    right_panel_open: bool,
 }
 
 impl AppView {
@@ -713,13 +719,16 @@ impl AppView {
         let graph_canvas = cx.new(|cx| {
             GraphCanvas::new(snapshot_arc.clone(), graph, selection.clone(), cx)
         });
-        let tree_panel = cx.new(|_cx| TreePanel::new(snapshot_arc, selection.clone()));
+        let tree_panel = cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
         Self {
             graph_canvas,
             tree_panel,
             selection,
+            snapshot: snapshot_arc,
             file_menu_open: false,
+            view_menu_open: false,
             sidebar_open: false,
+            right_panel_open: false,
         }
     }
 
@@ -731,7 +740,15 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let file_menu_open = self.file_menu_open;
+        let view_menu_open = self.view_menu_open;
         let sidebar_open = self.sidebar_open;
+        let right_panel_open = self.right_panel_open;
+
+        // Read graph stats for the status bar.
+        let snap = self.snapshot.read();
+        let node_count = snap.nodes.len();
+        let edge_count = snap.edges.len();
+        drop(snap);
 
         div()
             .id("app-root")
@@ -739,12 +756,16 @@ impl Render for AppView {
             .flex_col()
             .size_full()
             .bg(rgb(0x1e1e2e))
-            // Handle SaveLayout action dispatched from the native menu or Ctrl+S.
+            // Handle actions dispatched from native menu or keybindings.
             .on_action(cx.listener(|this, _: &SaveLayout, _window, cx| {
                 this.do_save(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
                 this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleRightPanel, _window, cx| {
+                this.right_panel_open = !this.right_panel_open;
                 cx.notify();
             }))
             // ── Menu bar ──────────────────────────────────────────────────────
@@ -774,6 +795,7 @@ impl Render for AppView {
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                     this.file_menu_open = !this.file_menu_open;
+                                    this.view_menu_open = false;
                                     cx.notify();
                                 }),
                             )
@@ -793,17 +815,16 @@ impl Render for AppView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                    this.sidebar_open = !this.sidebar_open;
+                                    this.view_menu_open = !this.view_menu_open;
                                     this.file_menu_open = false;
                                     cx.notify();
                                 }),
                             )
-                            .child(if sidebar_open { "◀ Nodes" } else { "▶ Nodes" }),
+                            .child("View"),
                     ),
             )
             // ── Body: optional sidebar + main content ─────────────────────────
             .child({
-                // Horizontal flex container for sidebar + main workspace.
                 let mut body = div()
                     .id("body")
                     .flex()
@@ -813,7 +834,7 @@ impl Render for AppView {
                 body.style().flex_shrink = Some(1.0);
                 body.style().flex_basis = Some(relative(0.).into());
 
-                // Sidebar (when open)
+                // Left sidebar (tree panel)
                 if sidebar_open {
                     body = body.child(self.tree_panel.clone());
                 }
@@ -852,9 +873,128 @@ impl Render for AppView {
                 graph_pane.style().flex_shrink = Some(1.0);
                 graph_pane.style().flex_basis = Some(relative(0.).into());
 
-                body.child(workspace.child(editor).child(graph_pane))
+                body = body.child(workspace.child(editor).child(graph_pane));
+
+                // Right panel placeholder (chat)
+                if right_panel_open {
+                    body = body.child(
+                        div()
+                            .id("right-panel")
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .w(px(280.0))
+                            .h_full()
+                            .min_h_0()
+                            .bg(rgb(0x181825))
+                            .border_l_1()
+                            .border_color(rgb(0x313244))
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgba(0x6c7086ff))
+                            .text_sm()
+                            .child("Chat — coming soon"),
+                    );
+                }
+
+                body
             })
-            // ── File dropdown overlay (rendered on top via deferred) ───────────
+            // ── Status bar ────────────────────────────────────────────────────
+            .child(
+                div()
+                    .id("status-bar")
+                    .flex()
+                    .flex_none()
+                    .flex_row()
+                    .h(px(STATUS_BAR_H))
+                    .w_full()
+                    .bg(rgb(0x181825))
+                    .border_t_1()
+                    .border_color(rgb(0x313244))
+                    .items_center()
+                    .text_xs()
+                    // ── Left: panel toggle buttons ────────────────────────────
+                    .child(
+                        div()
+                            .id("status-left")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .flex_none()
+                            .gap(px(2.0))
+                            .px_1()
+                            .child(
+                                div()
+                                    .id("status-tree-btn")
+                                    .flex()
+                                    .items_center()
+                                    .px_2()
+                                    .h(px(STATUS_BAR_H - 4.0))
+                                    .cursor_pointer()
+                                    .text_color(if sidebar_open {
+                                        rgba(0xcdd6f4ff)
+                                    } else {
+                                        rgba(0x6c7086ff)
+                                    })
+                                    .when(sidebar_open, |el| el.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.sidebar_open = !this.sidebar_open;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("Tree"),
+                            ),
+                    )
+                    // ── Center: graph stats ───────────────────────────────────
+                    .child({
+                        let mut center = div()
+                            .id("status-center")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgba(0xa6adc8ff));
+                        center.style().flex_grow = Some(1.0);
+                        center.child(format!("{} nodes  ·  {} edges", node_count, edge_count))
+                    })
+                    // ── Right: chat toggle button ─────────────────────────────
+                    .child(
+                        div()
+                            .id("status-right")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .flex_none()
+                            .gap(px(2.0))
+                            .px_1()
+                            .child(
+                                div()
+                                    .id("status-chat-btn")
+                                    .flex()
+                                    .items_center()
+                                    .px_2()
+                                    .h(px(STATUS_BAR_H - 4.0))
+                                    .cursor_pointer()
+                                    .text_color(if right_panel_open {
+                                        rgba(0xcdd6f4ff)
+                                    } else {
+                                        rgba(0x6c7086ff)
+                                    })
+                                    .when(right_panel_open, |el| el.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.right_panel_open = !this.right_panel_open;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("Chat"),
+                            ),
+                    ),
+            )
+            // ── File dropdown overlay ─────────────────────────────────────────
             .when(file_menu_open, |root| {
                 root.child(deferred(
                     anchored()
@@ -863,7 +1003,7 @@ impl Render for AppView {
                         .child(
                             div()
                                 .id("file-dropdown")
-                                .w(px(140.0))
+                                .w(px(180.0))
                                 .bg(rgb(0x313244))
                                 .border_1()
                                 .border_color(rgb(0x45475a))
@@ -885,7 +1025,76 @@ impl Render for AppView {
                                                 cx.notify();
                                             }),
                                         )
-                                        .child("Save"),
+                                        .child("Save                Ctrl+S"),
+                                ),
+                        ),
+                ))
+            })
+            // ── View dropdown overlay ─────────────────────────────────────────
+            .when(view_menu_open, |root| {
+                // Position horizontally after the "File" button (~30px wide + padding).
+                root.child(deferred(
+                    anchored()
+                        .position(point(px(32.0), px(MENU_BAR_H)))
+                        .anchor(Corner::TopLeft)
+                        .child(
+                            div()
+                                .id("view-dropdown")
+                                .w(px(200.0))
+                                .bg(rgb(0x313244))
+                                .border_1()
+                                .border_color(rgb(0x45475a))
+                                // Left Panel toggle
+                                .child(
+                                    div()
+                                        .id("toggle-left-item")
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.sidebar_open = !this.sidebar_open;
+                                                this.view_menu_open = false;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if sidebar_open {
+                                            "  Left Panel       Ctrl+B"
+                                        } else {
+                                            "    Left Panel       Ctrl+B"
+                                        }),
+                                )
+                                // Right Panel toggle
+                                .child(
+                                    div()
+                                        .id("toggle-right-item")
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.right_panel_open = !this.right_panel_open;
+                                                this.view_menu_open = false;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if right_panel_open {
+                                            "  Right Panel      Ctrl+J"
+                                        } else {
+                                            "    Right Panel      Ctrl+J"
+                                        }),
                                 ),
                         ),
                 ))
@@ -939,6 +1148,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("ctrl-s", SaveLayout, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
+            KeyBinding::new("ctrl-j", ToggleRightPanel, None),
         ]);
 
         // Register native application menu (macOS menu bar; no-op on Linux).
@@ -949,7 +1159,10 @@ fn main() {
             },
             Menu {
                 name: "View".into(),
-                items: vec![MenuItem::action("Toggle Sidebar", ToggleSidebar)],
+                items: vec![
+                    MenuItem::action("Toggle Left Panel", ToggleSidebar),
+                    MenuItem::action("Toggle Right Panel", ToggleRightPanel),
+                ],
             },
         ]);
 

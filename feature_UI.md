@@ -158,12 +158,11 @@ The view model produces `Vec<DrawCommand>` from a `GraphSnapshot` + `Viewport`. 
 
 ### App shell (`AppView`)
 
-`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SelectionModel>`, and boolean toggles. It renders:
-- **Menu bar** (28 px, `flex_none`): "File" button (dropdown: Save / Ctrl+S via `SaveLayout` action) and "Nodes ▶/◀" button that dispatches `ToggleSidebar`. Both actions are registered with `cx.set_menus()` and `cx.bind_keys()`. Ctrl+B also toggles the sidebar.
-- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional `TreePanel` (220 px, `flex_none`) on the left + main workspace.
+`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SelectionModel>`, the shared `Arc<RwLock<GraphSnapshot>>`, and boolean toggles (`sidebar_open`, `right_panel_open`, `file_menu_open`, `view_menu_open`). It renders:
+- **Menu bar** (28 px, `flex_none`): "File" button (dropdown: Save / Ctrl+S) and "View" button (dropdown: checkable Left Panel / Ctrl+B, checkable Right Panel / Ctrl+J). Both dropdowns rendered with `deferred(anchored(...))`.
+- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional `TreePanel` (220 px, `flex_none`) on the left + main workspace + optional right panel (280 px, `flex_none`) for chat (placeholder).
 - **Workspace** (`flex_col`, `flex_grow`): 30/70 vertical split — editor placeholder (top) + `GraphCanvas` (bottom).
-
-The File dropdown is rendered with `deferred(anchored(...))` so it paints on top of all other content.
+- **Status bar** (24 px, `flex_none`, bottom): left section has panel toggle buttons (Tree, more coming), center shows graph stats (node/edge count from snapshot), right has a Chat toggle button. All toggle buttons highlight when their panel is open.
 
 ### Selection model (`SelectionModel`)
 
@@ -227,9 +226,10 @@ The GPUI canvas saves positions **on every node drag completion** (mouse-up afte
 5. ✅ **Position persistence + node dragging** — `node_positions` table, `save_layout()`/`load_layout()`, drag-to-reposition nodes in the canvas, autosave on drag-end, persistent DB.
 6. ✅ **App shell** — `AppView` root view wrapping `GraphCanvas`. Menu bar (File > Save, Ctrl+S, `SaveLayout` action). 30/70 flex-grow workspace split: editor placeholder (top) + graph canvas (bottom). Canvas coordinate fix: `bounds.origin` offset applied to all paint positions; mouse events subtract `bounds.origin` before `screen_to_world`. `overflow_hidden()` clips paint to pane bounds.
 7. ✅ **Tree view nav + shared selection** — `SelectionModel` entity shared between `TreePanel` and `GraphCanvas`. Tree panel lists nodes by type (collapsed by default, collapsible groups, alphabetical sort). Selecting a node in the tree highlights it in the graph and pans the camera to it. Canvas clicks update the tree highlight. `suppress_pan` flag prevents the canvas from panning when it originated the selection. Sidebar toggled via Ctrl+B or "Nodes" menu bar button. GPUI layout fix: `overflow_hidden()` on body + `min_h_0()` on flex children enables true scroll containment.
-8. **`ObservableGraph`** — event-driven incremental updates.
-9. **Node detail panel** — click handler → detail view with node data.
-10. **Search** — text input → highlight matching nodes.
+8. ✅ **Status bar + View menu** — Status bar (24 px) at bottom: left panel-toggle buttons (Tree), centered graph stats (node/edge count), right Chat toggle. View menu dropdown with checkable Left Panel (Ctrl+B) and Right Panel (Ctrl+J) items. Right panel placeholder (280 px, "Chat — coming soon"). `ToggleRightPanel` action registered.
+9. **`ObservableGraph`** — event-driven incremental updates.
+10. **Node detail panel** — click handler → detail view with node data.
+11. **Search** — text input → highlight matching nodes.
 
 ---
 
