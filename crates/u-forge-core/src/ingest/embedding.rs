@@ -76,15 +76,10 @@ pub async fn embed_all_chunks(
 
     info!(target = ?target, "Embedding chunks");
 
-    let chunks_to_embed = graph.get_all_objects().and_then(|objs| {
-        let mut all = Vec::new();
-        for obj in &objs {
-            for chunk in graph.get_text_chunks(obj.id)? {
-                all.push(chunk);
-            }
-        }
-        Ok(all)
-    })?;
+    let chunks_to_embed = match target {
+        EmbeddingTarget::Standard => graph.get_unembedded_chunks()?,
+        EmbeddingTarget::HighQuality => graph.get_unembedded_chunks_hq()?,
+    };
 
     let total = chunks_to_embed.len();
     let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
@@ -150,12 +145,15 @@ pub async fn build_hq_embed_queue(
     let hq_model_id = hq_model.model_id.clone();
     info!(model = %hq_model_id, "Loading HQ embedding model");
 
+    let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
+
     let built: BuiltProvider = match ProviderFactory::build(
         &hq_model,
         Capability::Embedding,
         &catalog.base_url,
         app_cfg.embedding.gpu_weight,
         None,
+        &already_loaded,
     )
     .await
     {
@@ -187,4 +185,141 @@ pub async fn build_hq_embed_queue(
             .with_provider(built)
             .build(),
     )
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+
+    use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
+    use crate::lemonade::{BuiltProvider, Capability, ProviderSlot};
+    use crate::queue::InferenceQueueBuilder;
+    use crate::types::ChunkType;
+    use crate::{KnowledgeGraph, ObjectBuilder};
+
+    use super::*;
+
+    // ── Mock embedding provider ───────────────────────────────────────────────
+
+    struct MockEmbeddingProvider;
+
+    #[async_trait]
+    impl EmbeddingProvider for MockEmbeddingProvider {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let seed = text.len() as f32 + text.chars().next().unwrap_or('a') as u32 as f32;
+            Ok((0..768)
+                .map(|i| ((seed + i as f32) % 1000.0) / 1000.0)
+                .collect())
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut out = Vec::new();
+            for t in &texts {
+                out.push(self.embed(t).await?);
+            }
+            Ok(out)
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(768)
+        }
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
+    fn make_embed_queue() -> crate::queue::InferenceQueue {
+        let built = BuiltProvider {
+            name: "mock-embed".to_string(),
+            capability: Capability::Embedding,
+            provider: ProviderSlot::Embedding(Arc::new(MockEmbeddingProvider)),
+            weight: 100,
+        };
+        InferenceQueueBuilder::new().with_provider(built).build()
+    }
+
+    fn make_graph() -> (KnowledgeGraph, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let graph = KnowledgeGraph::new(tmp.path()).unwrap();
+        (graph, tmp)
+    }
+
+    /// Verify that `embed_all_chunks` is incremental: after an initial full
+    /// embedding pass, only newly added chunks are embedded on the next call.
+    #[tokio::test]
+    async fn test_embed_all_chunks_is_incremental() {
+        let (graph, _tmp) = make_graph();
+        let queue = make_embed_queue();
+
+        // Add 10 objects, each with one text chunk.
+        for i in 0..10 {
+            let oid = ObjectBuilder::character(format!("Character {i}"))
+                .add_to_graph(&graph)
+                .unwrap();
+            graph
+                .add_text_chunk(
+                    oid,
+                    format!("Description for character number {i}."),
+                    ChunkType::Description,
+                )
+                .unwrap();
+        }
+
+        let stats = graph.get_stats().unwrap();
+        assert_eq!(stats.chunk_count, 10, "Expected 10 chunks after initial inserts");
+        assert_eq!(stats.embedded_count, 0, "No chunks embedded yet");
+
+        // First pass: embed all 10.
+        let result = embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 10);
+        assert_eq!(result.stored, 10);
+        assert_eq!(result.skipped, 0);
+
+        let stats = graph.get_stats().unwrap();
+        assert_eq!(stats.embedded_count, 10, "All 10 chunks should now be embedded");
+
+        // Add 2 more objects with chunks.
+        for i in 10..12 {
+            let oid = ObjectBuilder::character(format!("Character {i}"))
+                .add_to_graph(&graph)
+                .unwrap();
+            graph
+                .add_text_chunk(
+                    oid,
+                    format!("Description for character number {i}."),
+                    ChunkType::Description,
+                )
+                .unwrap();
+        }
+
+        let stats = graph.get_stats().unwrap();
+        assert_eq!(stats.chunk_count, 12);
+        assert_eq!(stats.embedded_count, 10, "The 2 new chunks should be unembedded");
+
+        // Second pass: only the 2 new chunks should be processed.
+        let result = embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 2, "Only 2 unembedded chunks should be processed");
+        assert_eq!(result.stored, 2);
+        assert_eq!(result.skipped, 0);
+
+        let stats = graph.get_stats().unwrap();
+        assert_eq!(stats.embedded_count, 12, "All 12 chunks should now be embedded");
+    }
 }

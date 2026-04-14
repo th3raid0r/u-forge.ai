@@ -39,7 +39,7 @@ use u_forge_core::{
     ingest::EmbeddingTarget,
     lemonade::{
         provider_factory::{Capability, ProviderFactory},
-        selector::{ModelSelector, QualityTier},
+        selector::{ModelSelector, QualityTier, SelectedModel},
         resolve_lemonade_url, GpuResourceManager, LemonadeServerCatalog,
     },
     queue::InferenceQueueBuilder,
@@ -177,14 +177,28 @@ async fn main() -> Result<()> {
     // cli_chat is text-only — STT and TTS are not loaded here.
 
     let gpu_mgr = Arc::new(GpuResourceManager::new());
-    let mut embedding_available = false;
 
     let embed_models = selector.select_embedding_models();
     let reranker_sel = selector.select_reranker();
 
-    let mut providers = Vec::new();
+    // Collect the model IDs already running on the server so load_model can
+    // skip the round-trip for those.
+    let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
 
-    // Embedding providers (standard-dim only; HQ handled separately below).
+    if reranker_sel.is_none() {
+        println!("   Reranker  : not available (results ordered by RRF score)");
+    }
+
+    // Collect all build specs, then launch them in parallel.
+    struct BuildSpec {
+        sel: SelectedModel,
+        capability: Capability,
+        weight: u32,
+        gpu_mgr: Option<Arc<GpuResourceManager>>,
+    }
+
+    let mut specs: Vec<BuildSpec> = Vec::new();
+
     for sel in embed_models.iter().filter(|s| s.quality_tier == QualityTier::Standard) {
         let weight = match sel.recipe.as_str() {
             "flm" => app_cfg.embedding.npu_weight,
@@ -194,37 +208,49 @@ async fn main() -> Result<()> {
             },
             _ => app_cfg.embedding.cpu_weight,
         };
-        match ProviderFactory::build(sel, Capability::Embedding, url, weight, None).await {
-            Ok(p) => {
-                println!("   Embedding : ✅ {} (weight={})", p.name, p.weight);
-                embedding_available = true;
-                providers.push(p);
-            }
-            Err(e) => println!("   Embedding : ⚠️  {} unavailable: {e}", sel.model_id),
-        }
+        specs.push(BuildSpec { sel: sel.clone(), capability: Capability::Embedding, weight, gpu_mgr: None });
     }
-
-    // Reranker
-    if let Some(ref r_sel) = reranker_sel {
-        match ProviderFactory::build(r_sel, Capability::Reranking, url, 100, None).await {
-            Ok(p) => {
-                println!("   Reranker  : ✅ {}", p.name);
-                providers.push(p);
-            }
-            Err(e) => println!("   Reranker  : ⚠️  unavailable: {e}"),
-        }
-    } else {
-        println!("   Reranker  : not available (results ordered by RRF score)");
+    if let Some(r_sel) = reranker_sel {
+        specs.push(BuildSpec { sel: r_sel, capability: Capability::Reranking, weight: 100, gpu_mgr: None });
     }
-
-    // LLM providers — exactly the configured/desired models, one per slot.
     for sel in gpu_llm_sel.iter().chain(npu_llm_sel.iter()) {
-        match ProviderFactory::build(sel, Capability::TextGeneration, url, 100, Some(Arc::clone(&gpu_mgr))).await {
+        specs.push(BuildSpec { sel: sel.clone(), capability: Capability::TextGeneration, weight: 100, gpu_mgr: Some(Arc::clone(&gpu_mgr)) });
+    }
+
+    let url_owned = url.to_string();
+    let build_futs = specs.iter().map(|s| {
+        let sel = s.sel.clone();
+        let cap = s.capability;
+        let weight = s.weight;
+        let gpu = s.gpu_mgr.clone();
+        let base_url = url_owned.clone();
+        let loaded = already_loaded.clone();
+        async move { ProviderFactory::build(&sel, cap, &base_url, weight, gpu, &loaded).await }
+    });
+    let build_results = futures::future::join_all(build_futs).await;
+
+    let mut providers = Vec::new();
+    let mut embedding_available = false;
+
+    for (spec, result) in specs.iter().zip(build_results) {
+        match result {
             Ok(p) => {
-                println!("   LLM       : ✅ {}", p.name);
+                match spec.capability {
+                    Capability::Embedding => {
+                        println!("   Embedding : ✅ {} (weight={})", p.name, p.weight);
+                        embedding_available = true;
+                    }
+                    Capability::Reranking => println!("   Reranker  : ✅ {}", p.name),
+                    Capability::TextGeneration => println!("   LLM       : ✅ {}", p.name),
+                    _ => {}
+                }
                 providers.push(p);
             }
-            Err(e) => println!("   LLM       : ⚠️  {} unavailable: {e}", sel.model_id),
+            Err(e) => match spec.capability {
+                Capability::Reranking => println!("   Reranker  : ⚠️  unavailable: {e}"),
+                Capability::Embedding => println!("   Embedding : ⚠️  {} unavailable: {e}", spec.sel.model_id),
+                _ => println!("   LLM       : ⚠️  {} unavailable: {e}", spec.sel.model_id),
+            },
         }
     }
 

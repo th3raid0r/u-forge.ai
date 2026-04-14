@@ -52,7 +52,7 @@ fn test_basic_graph_operations() {
     let rels = graph.get_relationships(gandalf_id).unwrap();
     assert_eq!(rels.len(), 1);
     assert_eq!(rels[0].to, frodo_id);
-    assert_eq!(rels[0].edge_type, EdgeType::from_str("knows"));
+    assert_eq!(rels[0].edge_type, EdgeType::new("knows"));
 
     // Neighbours
     let neighbours = graph.get_neighbors(gandalf_id).unwrap();
@@ -121,7 +121,7 @@ fn test_weighted_relationships() {
     let rels = graph.get_relationships(sauron_id).unwrap();
     assert_eq!(rels.len(), 1);
     assert!((rels[0].weight - 0.9).abs() < 1e-6);
-    assert_eq!(rels[0].edge_type, EdgeType::from_str("enemy_of"));
+    assert_eq!(rels[0].edge_type, EdgeType::new("enemy_of"));
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn test_add_text_chunk_long_content_stored_as_multiple_chunks() {
         .unwrap();
 
     // Generate content that is 3× the character limit so it must split into ≥3 chunks.
-    let max_chars = MAX_CHUNK_TOKENS * 4;
+    let max_chars = MAX_CHUNK_TOKENS * 3;
     let word_repeats = (max_chars * 3 / 5) + 1; // "word " is 5 chars
     let long_content = "word ".repeat(word_repeats);
     let chunk_ids = graph

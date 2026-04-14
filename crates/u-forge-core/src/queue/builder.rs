@@ -168,7 +168,7 @@ impl InferenceQueueBuilder {
                     tts_workers += 1;
                     debug!(name = %name, "Spawning TTS worker");
                     tokio::spawn(async move {
-                        run_tts_worker(q, tts, name).await;
+                        run_tts_worker(q, *tts, name).await;
                     });
                 }
                 (Capability::Reranking, ProviderSlot::Rerank(reranker)) => {

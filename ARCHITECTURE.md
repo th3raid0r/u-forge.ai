@@ -210,7 +210,7 @@ that fires `AFTER DELETE ON chunks`.
   per node) is gone. Edge direction is now implicit in `source_id`/`target_id`.
 - `bincode` has been removed; all serialization is JSON via `serde_json`.
 - **Vector indexes live** — Both `chunks_vec` (768-dim) and `chunks_vec_hq` (4096-dim) are sqlite-vec `vec0` virtual tables supporting cosine distance. `upsert_chunk_embedding()` and `upsert_chunk_embedding_hq()` populate them respectively. `search_chunks_ann()` returns results ordered by ascending cosine distance. High-quality (HQ) embeddings are optional and only built when Qwen3-Embedding-8B-GGUF or similar is available and enabled.
-- **Chunk size enforcement** — `add_text_chunk` splits content at word boundaries into ≤350-token pieces (`MAX_CHUNK_TOKENS`) before storage. Guards against the llamacpp 512-token batch limit. Uses the same `len/4` heuristic as `estimate_token_count`.
+- **Chunk size enforcement** — `add_text_chunk` splits content at word boundaries into ≤350-token pieces (`MAX_CHUNK_TOKENS`) before storage. Guards against the llamacpp 512-token batch limit. Uses the same `len.div_ceil(3)` heuristic as `estimate_token_count` (≈ 3 chars/token — conservative for dense prose, producing ≈ 1 500 characters per chunk).
 
 ---
 
@@ -221,12 +221,11 @@ Unchanged from the previous architecture. Key types:
 - `ObjectMetadata`: `object_type: String` + `serde_json::Value` properties blob.
   Dynamic schema, no compile-time type enforcement.
   `flatten_for_embedding(edge_lines: &[String]) -> String` accepts incident edge strings (formatted as `"{from_name} {edge_type} {to_name}"`) so relationship context is included in the embedding input. Pass `&[]` when no edges are needed.
-- `EdgeType`: primarily `Custom(String)`. The four legacy variants (`Contains`,
-  `OwnedBy`, `LocatedIn`, `MemberOf`) remain `#[deprecated]` for backward compat.
-- `TextChunk`: content + estimated token count (`text.len() / 4`). Types:
+- `EdgeType`: transparent newtype `struct EdgeType(pub String)`. Construct with `EdgeType::new(s)`; read back with `.as_str()`. No enum variants.
+- `TextChunk`: content + estimated token count (`text.len().div_ceil(3)`). Types:
   `Description`, `SessionNote`, `AiGenerated`, `UserNote`, `Imported`.
 - `QueryResult`: aggregates objects + edges + chunks with a token budget system.
-- `ChunkId`, `ObjectId`: newtype wrappers around `String` (UUID).
+- `ChunkId`, `ObjectId`: newtype structs wrapping `Uuid` (`#[serde(transparent)]`). Compile-time type safety — the compiler rejects passing a `ChunkId` where an `ObjectId` is expected. Construct with `::new_v4()`; parse from string with `::parse_str(s)`.
 
 ---
 
@@ -723,7 +722,7 @@ before failing, allowing edges to reference nodes from prior import sessions.
 - **Schema system** — flexible JSON schemas with validation. External `.schema.json`
   files allow evolution without code changes.
 - **`ObjectBuilder` fluent API** — ergonomic for constructing `ObjectMetadata`.
-- **`EdgeType::Custom(String)`** — correct over rigid enums.
+- **`EdgeType` as transparent newtype** — a plain `struct EdgeType(pub String)` with `::new()` / `.as_str()` is simpler and more correct than a single-variant enum. Relationship labels are open-ended strings in TTRPG worldbuilding; an enum adds friction without safety.
 - **`EmbeddingQueue`** — well-architected async queue (needs integration, but solid).
 - **JSONL + schema.json format** — sensible for local-first tooling.
 - **Tests everywhere** — unit tests in every module using `TempDir` for isolation.

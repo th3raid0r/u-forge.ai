@@ -47,11 +47,14 @@ impl LemonadeRerankProvider {
     /// explicit load the server may use a very small default context window
     /// (e.g. 512 tokens) that causes truncation on longer document passages.
     ///
+    /// Pass `already_loaded` (from the server catalog) to skip the round-trip
+    /// when the model is already running.
+    ///
     /// # Errors
     ///
     /// Returns an error if the server is unreachable or rejects the load request.
-    pub async fn load(&self, opts: &ModelLoadOptions) -> Result<()> {
-        load_model(&self.client.base_url, &self.model, opts).await
+    pub async fn load(&self, opts: &ModelLoadOptions, already_loaded: &[String]) -> Result<()> {
+        load_model(&self.client.base_url, &self.model, opts, already_loaded).await
     }
 
     /// Rerank `documents` by relevance to `query`.

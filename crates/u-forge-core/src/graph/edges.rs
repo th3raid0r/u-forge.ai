@@ -3,7 +3,7 @@
 use super::storage::*;
 use anyhow::{Context, Result};
 use rusqlite::params;
-use uuid::Uuid;
+use tracing::debug;
 
 use crate::types::{Edge, EdgeType, ObjectId};
 use std::collections::HashMap;
@@ -16,10 +16,10 @@ impl KnowledgeGraphStorage {
     /// constraint ensures a logical edge is stored at most once; re-inserting
     /// the same (source, target, type) triplet updates `weight` and `metadata`.
     ///
-    /// `EdgeType` is stored via `as_str()` and read back as
-    /// `EdgeType::Custom(s)`, which round-trips correctly for all variants.
+    /// `EdgeType` is stored via `as_str()` and read back via `EdgeType::new(s)`,
+    /// which round-trips correctly.
     pub fn upsert_edge(&self, edge: Edge) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let meta_json =
             serde_json::to_string(&edge.metadata).context("Failed to serialise edge metadata")?;
         conn.execute(
@@ -45,7 +45,7 @@ impl KnowledgeGraphStorage {
     /// direction as stored; the caller should check both fields when the
     /// direction matters.
     pub fn get_edges(&self, node_id: ObjectId) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let id_str = node_id.hyphenated().to_string();
         let mut stmt = conn.prepare(
             "SELECT source_id, target_id, edge_type, weight, metadata, created_at
@@ -66,14 +66,19 @@ impl KnowledgeGraphStorage {
         let mut edges = Vec::new();
         for row in rows {
             let (src_s, tgt_s, et_s, weight, meta_s, ca_s) = row?;
-            let metadata: HashMap<String, String> =
-                serde_json::from_str(&meta_s).unwrap_or_default();
+            let metadata: HashMap<String, String> = match serde_json::from_str(&meta_s) {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!("Edge metadata JSON parse failed (using empty): {e}");
+                    HashMap::new()
+                }
+            };
             edges.push(Edge {
-                from: Uuid::parse_str(&src_s)
+                from: ObjectId::parse_str(&src_s)
                     .with_context(|| format!("Invalid source UUID in edges table: '{src_s}'"))?,
-                to: Uuid::parse_str(&tgt_s)
+                to: ObjectId::parse_str(&tgt_s)
                     .with_context(|| format!("Invalid target UUID in edges table: '{tgt_s}'"))?,
-                edge_type: EdgeType::Custom(et_s),
+                edge_type: EdgeType::new(et_s),
                 weight: weight as f32,
                 metadata,
                 created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
@@ -90,7 +95,7 @@ impl KnowledgeGraphStorage {
     /// snapshot — one `SELECT * FROM edges` is far cheaper than N per-node
     /// round-trips.
     pub fn get_all_edges(&self) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT source_id, target_id, edge_type, weight, metadata, created_at
              FROM edges",
@@ -109,14 +114,19 @@ impl KnowledgeGraphStorage {
         let mut edges = Vec::new();
         for row in rows {
             let (src_s, tgt_s, et_s, weight, meta_s, ca_s) = row?;
-            let metadata: HashMap<String, String> =
-                serde_json::from_str(&meta_s).unwrap_or_default();
+            let metadata: HashMap<String, String> = match serde_json::from_str(&meta_s) {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!("Edge metadata JSON parse failed (using empty): {e}");
+                    HashMap::new()
+                }
+            };
             edges.push(Edge {
-                from: Uuid::parse_str(&src_s)
+                from: ObjectId::parse_str(&src_s)
                     .with_context(|| format!("Invalid source UUID in edges table: '{src_s}'"))?,
-                to: Uuid::parse_str(&tgt_s)
+                to: ObjectId::parse_str(&tgt_s)
                     .with_context(|| format!("Invalid target UUID in edges table: '{tgt_s}'"))?,
-                edge_type: EdgeType::Custom(et_s),
+                edge_type: EdgeType::new(et_s),
                 weight: weight as f32,
                 metadata,
                 created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
@@ -132,7 +142,7 @@ impl KnowledgeGraphStorage {
     ///
     /// Results are deduplicated via `SELECT DISTINCT`.
     pub fn get_neighbors(&self, node_id: ObjectId) -> Result<Vec<ObjectId>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let id_str = node_id.hyphenated().to_string();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT
@@ -146,7 +156,7 @@ impl KnowledgeGraphStorage {
         for row in rows {
             let uuid_str = row?;
             neighbors.push(
-                Uuid::parse_str(&uuid_str)
+                ObjectId::parse_str(&uuid_str)
                     .with_context(|| format!("Invalid neighbor UUID: '{uuid_str}'"))?,
             );
         }

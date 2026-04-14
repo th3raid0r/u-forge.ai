@@ -1,64 +1,79 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// Re-export Uuid for easier access throughout the crate
-pub use uuid::Uuid as ForgeUuid;
+use uuid::Uuid as ForgeUuid;
 
-/// Core object types in the TTRPG knowledge graph
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ObjectType {
-    Character,
-    Location,
-    Faction,
-    Item,
-    Event,
-    Session,
-    CustomType(String),
-}
+/// Unique identifier for graph objects (nodes).
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ObjectId(pub ForgeUuid);
 
-impl ObjectType {
-    pub fn as_str(&self) -> &str {
-        match self {
-            ObjectType::Character => "character",
-            ObjectType::Location => "location",
-            ObjectType::Faction => "faction",
-            ObjectType::Item => "item",
-            ObjectType::Event => "event",
-            ObjectType::Session => "session",
-            ObjectType::CustomType(name) => name,
-        }
+impl ObjectId {
+    pub fn new_v4() -> Self {
+        Self(ForgeUuid::new_v4())
+    }
+
+    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+        ForgeUuid::parse_str(s).map(Self)
+    }
+
+    /// Return the inner UUID formatted with hyphens (e.g. for SQL params).
+    pub fn hyphenated(&self) -> uuid::fmt::Hyphenated {
+        self.0.hyphenated()
     }
 }
 
-/// Unique identifier for graph objects
-pub type ObjectId = ForgeUuid;
-
-/// Unique identifier for text chunks
-pub type ChunkId = ForgeUuid;
-
-/// Edge relationship types - primarily string-based for schema flexibility
-#[allow(deprecated)] // suppress warnings from #[derive]-generated code matching deprecated variants
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum EdgeType {
-    /// Custom relationship type (primary variant)
-    Custom(String),
+impl std::fmt::Display for ObjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
+
+/// Unique identifier for text chunks.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChunkId(pub ForgeUuid);
+
+impl ChunkId {
+    pub fn new_v4() -> Self {
+        Self(ForgeUuid::new_v4())
+    }
+
+    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+        ForgeUuid::parse_str(s).map(Self)
+    }
+
+    /// Return the inner UUID formatted with hyphens (e.g. for SQL params).
+    pub fn hyphenated(&self) -> uuid::fmt::Hyphenated {
+        self.0.hyphenated()
+    }
+}
+
+impl std::fmt::Display for ChunkId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Edge relationship type — a plain string label (e.g. `"led_by"`, `"located_in"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct EdgeType(pub String);
 
 impl EdgeType {
+    /// Construct an `EdgeType` from any string-like value.
+    pub fn new(edge_type: impl Into<String>) -> Self {
+        Self(edge_type.into())
+    }
+
     pub fn as_str(&self) -> &str {
-        match self {
-            EdgeType::Custom(name) => name,
-        }
+        &self.0
     }
+}
 
-    /// Create an EdgeType from a string (preferred method)
-    pub fn from_string(edge_type: String) -> Self {
-        EdgeType::Custom(edge_type)
-    }
-
-    /// Create an EdgeType from a string slice
-    pub fn from_str(edge_type: &str) -> Self {
-        EdgeType::Custom(edge_type.to_string())
+impl std::fmt::Display for EdgeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -114,7 +129,7 @@ impl ObjectMetadata {
     pub fn new(object_type: String, name: String) -> Self {
         let now = chrono::Utc::now();
         Self {
-            id: ForgeUuid::new_v4(),
+            id: ObjectId::new_v4(),
             object_type,
             schema_name: None,
             name,
@@ -124,11 +139,6 @@ impl ObjectMetadata {
             tags: Vec::new(),
             properties: serde_json::Value::Object(serde_json::Map::new()),
         }
-    }
-
-    /// Create a new object with legacy ObjectType enum (for backward compatibility)
-    pub fn new_with_type(object_type: ObjectType, name: String) -> Self {
-        Self::new(object_type.as_str().to_string(), name)
     }
 
     pub fn with_description(mut self, description: String) -> Self {
@@ -277,7 +287,7 @@ pub enum ChunkType {
 impl TextChunk {
     pub fn new(object_id: ObjectId, content: String, chunk_type: ChunkType) -> Self {
         Self {
-            id: ForgeUuid::new_v4(),
+            id: ChunkId::new_v4(),
             object_id,
             token_count: estimate_token_count(&content),
             content,
@@ -287,10 +297,15 @@ impl TextChunk {
     }
 }
 
-/// Simple token count estimation (rough approximation)
+/// Conservative token count estimation.
+///
+/// Uses ~3 characters per token, which is closer to the actual ratio for
+/// dense English prose (character backstories, location descriptions, lore
+/// entries). This intentionally overestimates slightly to avoid exceeding LLM
+/// context windows when assembling RAG context. The same ratio is used by
+/// `split_text()` in `text.rs`.
 fn estimate_token_count(text: &str) -> usize {
-    // Very rough estimation: ~4 characters per token on average
-    (text.len() / 4).max(1)
+    text.len().div_ceil(3).max(1)
 }
 
 /// Query result for graph traversal and search
@@ -377,23 +392,17 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_compatibility() {
-        let obj = ObjectMetadata::new_with_type(ObjectType::Character, "Frodo".to_string());
-        assert_eq!(obj.object_type, "character");
-    }
-
-    #[test]
     fn test_edge_creation() {
-        let id1 = ForgeUuid::new_v4();
-        let id2 = ForgeUuid::new_v4();
+        let id1 = ObjectId::new_v4();
+        let id2 = ObjectId::new_v4();
 
-        let edge = Edge::new(id1, id2, EdgeType::from_str("knows"))
+        let edge = Edge::new(id1, id2, EdgeType::new("knows"))
             .with_weight(0.8)
             .with_metadata("context".to_string(), "fellowship".to_string());
 
         assert_eq!(edge.from, id1);
         assert_eq!(edge.to, id2);
-        assert_eq!(edge.edge_type, EdgeType::from_str("knows"));
+        assert_eq!(edge.edge_type, EdgeType::new("knows"));
         assert_eq!(edge.weight, 0.8);
         assert_eq!(
             edge.metadata.get("context"),
@@ -403,16 +412,16 @@ mod tests {
 
     #[test]
     fn test_edge_type_from_string() {
-        let edge_type = EdgeType::from_string("led_by".to_string());
+        let edge_type = EdgeType::new("led_by");
         assert_eq!(edge_type.as_str(), "led_by");
 
-        let edge_type2 = EdgeType::from_str("governs");
+        let edge_type2 = EdgeType::new("governs");
         assert_eq!(edge_type2.as_str(), "governs");
     }
 
     #[test]
     fn test_text_chunk_creation() {
-        let obj_id = ForgeUuid::new_v4();
+        let obj_id = ObjectId::new_v4();
         let content = "This is a test description with some content.".to_string();
 
         let chunk = TextChunk::new(obj_id, content.clone(), ChunkType::Description);
@@ -425,7 +434,7 @@ mod tests {
     #[test]
     fn test_query_result_token_budget() {
         let mut result = QueryResult::new();
-        let obj_id = ForgeUuid::new_v4();
+        let obj_id = ObjectId::new_v4();
 
         let chunk1 = TextChunk::new(obj_id, "Short text".to_string(), ChunkType::Description);
         let chunk2 = TextChunk::new(

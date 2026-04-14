@@ -59,7 +59,7 @@ The project is a Cargo workspace. All crates live under `crates/`:
 **Standard on [Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
 - Model discovery: `GET /api/v1/models`, `GET /system-info`, `GET /health` — `LemonadeServerCatalog::discover(url)` fetches all three concurrently.
 - Model selection: `ModelSelector::new(catalog, config)` — picks best downloaded model per capability/device slot, deduplicates to one provider per slot.
-- Provider construction: `ProviderFactory::build(sel, capability, url, queue_depth, gpu_mgr)` — builds live providers from `SelectedModel`.
+- Provider construction: `ProviderFactory::build(sel, capability, url, queue_depth, gpu_mgr, already_loaded)` — builds live providers from `SelectedModel`. Pass `catalog.loaded` IDs as `already_loaded` to skip the `/load` round-trip for models that are already running; pass `&[]` to always send the load request.
 - Embeddings: `POST /api/v1/embeddings` — `LemonadeProvider` in `lemonade/embedding.rs`; re-exported via `ai::embeddings`.
 - Transcription: `POST /api/v1/audio/transcriptions` — `LemonadeTranscriptionProvider` (simple, no GPU lock) or `LemonadeSttProvider` (GPU-managed, shares `GpuResourceManager`).
 - Reranking: `POST /api/v1/reranking` — `LemonadeRerankProvider`; wired into `InferenceQueue` via `rerank_queue`.

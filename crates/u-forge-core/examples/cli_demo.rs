@@ -51,7 +51,6 @@
 mod common;
 
 use anyhow::Result;
-use std::sync::Arc;
 use u_forge_core::{
     build_hq_embed_queue,
     config::{AppConfig, EmbeddingDeviceConfig},
@@ -61,7 +60,7 @@ use u_forge_core::{
         catalog::CatalogModel,
         provider_factory::{Capability, ProviderFactory, ProviderSlot},
         selector::{ModelSelector, QualityTier, SelectedModel},
-        resolve_lemonade_url, GpuResourceManager, LemonadeRerankProvider,
+        resolve_lemonade_url, LemonadeRerankProvider,
         LemonadeServerCatalog, SystemInfo,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
@@ -364,47 +363,76 @@ async fn main() -> Result<()> {
                         );
                         println!("   Building providers…");
 
-                        let gpu_mgr = Arc::new(GpuResourceManager::new());
+                        // Collect model IDs already running so load_model can skip them.
+                        let already_loaded: Vec<String> =
+                            catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
 
-                        // Reranker
-                        if let Some(reranker_sel) = selector.select_reranker() {
-                            match ProviderFactory::build(
-                                &reranker_sel,
-                                Capability::Reranking,
-                                url,
-                                100,
-                                None,
-                            )
-                            .await
-                            {
-                                Ok(built) => {
-                                    if let ProviderSlot::Rerank(r) = built.provider {
-                                        println!("   ✅ Reranker ready: {}", r.model);
-                                        reranker = Some(r);
-                                    }
+                        // ── Parallel build: reranker + all standard embedding workers ──
+
+                        struct EmbedSpec {
+                            sel: SelectedModel,
+                            weight: u32,
+                        }
+                        let embed_specs: Vec<EmbedSpec> = std_embeds
+                            .iter()
+                            .map(|sel| EmbedSpec {
+                                sel: (*sel).clone(),
+                                weight: embedding_weight(sel, &device_cfg.embedding),
+                            })
+                            .collect();
+                        let reranker_spec = selector.select_reranker();
+
+                        let url_owned = url.to_string();
+
+                        // Reranker future
+                        let reranker_fut = {
+                            let url = url_owned.clone();
+                            let loaded = already_loaded.clone();
+                            let spec = reranker_spec.clone();
+                            async move {
+                                if let Some(sel) = spec {
+                                    Some(ProviderFactory::build(&sel, Capability::Reranking, &url, 100, None, &loaded).await)
+                                } else {
+                                    None
                                 }
-                                Err(e) => println!("   ⚠️  Reranker load failed: {e}"),
                             }
-                        } else {
-                            println!("   Reranker  : not available");
+                        };
+
+                        // Embedding futures
+                        let embed_futs: Vec<_> = embed_specs.iter().map(|s| {
+                            let sel = s.sel.clone();
+                            let weight = s.weight;
+                            let url = url_owned.clone();
+                            let loaded = already_loaded.clone();
+                            async move {
+                                ProviderFactory::build(&sel, Capability::Embedding, &url, weight, None, &loaded).await
+                            }
+                        }).collect();
+
+                        let (reranker_result, embed_results) = tokio::join!(
+                            reranker_fut,
+                            futures::future::join_all(embed_futs),
+                        );
+
+                        // Process reranker result
+                        match reranker_result {
+                            None => println!("   Reranker  : not available"),
+                            Some(Ok(built)) => {
+                                if let ProviderSlot::Rerank(r) = built.provider {
+                                    println!("   ✅ Reranker ready: {}", r.model);
+                                    reranker = Some(r);
+                                }
+                            }
+                            Some(Err(e)) => println!("   ⚠️  Reranker load failed: {e}"),
                         }
 
-                        // Standard embedding workers
-                        println!("   Building embedding workers…");
+                        // Process embedding results
+                        println!("   Embedding workers:");
                         let mut eq_builder = InferenceQueueBuilder::new().with_config(device_cfg.clone());
                         let mut worker_count = 0usize;
 
-                        for sel in &std_embeds {
-                            let weight = embedding_weight(sel, &device_cfg.embedding);
-                            match ProviderFactory::build(
-                                sel,
-                                Capability::Embedding,
-                                url,
-                                weight,
-                                None,
-                            )
-                            .await
-                            {
+                        for (spec, result) in embed_specs.iter().zip(embed_results) {
+                            match result {
                                 Ok(built) => {
                                     let dims = if let ProviderSlot::Embedding(ref p) = built.provider {
                                         p.dimensions().unwrap_or(0)
@@ -412,15 +440,15 @@ async fn main() -> Result<()> {
                                     if dims != EMBEDDING_DIMENSIONS {
                                         println!(
                                             "     ⚠️  {} skipped: {dims}-dim ≠ {EMBEDDING_DIMENSIONS}-dim",
-                                            sel.model_id
+                                            spec.sel.model_id
                                         );
                                     } else {
-                                        println!("     ✅ embedding worker: {} ({dims}-dim)", built.name);
+                                        println!("     ✅ {} ({dims}-dim)", built.name);
                                         eq_builder = eq_builder.with_provider(built);
                                         worker_count += 1;
                                     }
                                 }
-                                Err(e) => println!("     ⚠️  {} unavailable: {e}", sel.model_id),
+                                Err(e) => println!("     ⚠️  {} unavailable: {e}", spec.sel.model_id),
                             }
                         }
 
@@ -440,9 +468,6 @@ async fn main() -> Result<()> {
                         // HQ embedding queue
                         hq_embed_queue = build_hq_embed_queue(&catalog, &device_cfg).await;
                         println!();
-
-                        // Suppress unused warning — gpu_mgr kept for future STT/LLM wiring
-                        let _ = gpu_mgr;
                     }
                 }
             }

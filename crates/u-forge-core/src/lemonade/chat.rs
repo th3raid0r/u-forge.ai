@@ -335,8 +335,7 @@ impl LemonadeChatProvider {
                 line_buf.push_str(&String::from_utf8_lossy(&bytes));
 
                 // Process all complete lines in the buffer.
-                loop {
-                    let Some(nl) = line_buf.find('\n') else { break };
+                while let Some(nl) = line_buf.find('\n') {
                     let line = line_buf[..nl].trim_end_matches('\r').to_string();
                     line_buf.drain(..=nl);
 

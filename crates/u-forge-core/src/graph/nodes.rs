@@ -15,7 +15,7 @@ impl KnowledgeGraphStorage {
     /// `edges` and `chunks` tables and wipe out every relationship and text
     /// chunk every time a node property changes.
     pub fn upsert_node(&self, metadata: ObjectMetadata) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO nodes
                  (id, object_type, schema_name, name, description,
@@ -47,7 +47,7 @@ impl KnowledgeGraphStorage {
 
     /// Retrieve a node by its UUID.  Returns `Ok(None)` when the ID is unknown.
     pub fn get_node(&self, id: ObjectId) -> Result<Option<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let result = conn
             .query_row(
                 "SELECT id, object_type, schema_name, name, description,
@@ -82,7 +82,7 @@ impl KnowledgeGraphStorage {
 
     /// Return every node stored in the graph.
     pub fn get_all_objects(&self) -> Result<Vec<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, object_type, schema_name, name, description,
                     tags, properties, created_at, updated_at
@@ -116,7 +116,7 @@ impl KnowledgeGraphStorage {
     ///
     /// Uses the composite index `idx_nodes_name (object_type, name)`.
     pub fn find_nodes_by_name(&self, object_type: &str, name: &str) -> Result<Vec<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, object_type, schema_name, name, description,
                     tags, properties, created_at, updated_at
@@ -152,7 +152,7 @@ impl KnowledgeGraphStorage {
     /// Backed by `idx_nodes_name_only`.  Intended as a cross-type lookup
     /// fallback (e.g. BUG-7 cross-session edge resolution).
     pub fn find_nodes_by_name_only(&self, name: &str) -> Result<Vec<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, object_type, schema_name, name, description,
                     tags, properties, created_at, updated_at
@@ -192,7 +192,7 @@ impl KnowledgeGraphStorage {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<ObjectMetadata>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, object_type, schema_name, name, description,
                     tags, properties, created_at, updated_at
@@ -232,7 +232,7 @@ impl KnowledgeGraphStorage {
     /// `ON DELETE CASCADE` on `edges` and `chunks` handles all dependent rows
     /// automatically — no manual cleanup is required.
     pub fn delete_node(&self, id: ObjectId) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM nodes WHERE id = ?1",
             params![id.hyphenated().to_string()],

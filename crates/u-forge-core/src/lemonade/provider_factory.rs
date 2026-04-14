@@ -63,7 +63,7 @@ pub enum ProviderSlot {
     Embedding(Arc<dyn EmbeddingProvider>),
     Transcription(Arc<dyn TranscriptionProvider>),
     Chat(LemonadeChatProvider),
-    Tts(LemonadeTtsProvider),
+    Tts(Box<LemonadeTtsProvider>),
     Rerank(LemonadeRerankProvider),
 }
 
@@ -96,12 +96,15 @@ impl ProviderFactory {
     /// [`BuiltProvider`].
     ///
     /// # Parameters
-    /// - `selected`    — Model descriptor from [`ModelSelector`].
-    /// - `capability`  — Which inference capability to wire up.
-    /// - `base_url`    — Lemonade Server API base URL (e.g. `http://localhost:13305/api/v1`).
-    /// - `weight`      — Dispatch weight (relevant only for `Embedding` workers).
-    /// - `gpu_manager` — Shared GPU lock; attach when the model will share GPU memory
-    ///                   with STT or LLM workloads.
+    /// - `selected`       — Model descriptor from [`ModelSelector`].
+    /// - `capability`     — Which inference capability to wire up.
+    /// - `base_url`       — Lemonade Server API base URL (e.g. `http://localhost:13305/api/v1`).
+    /// - `weight`         — Dispatch weight (relevant only for `Embedding` workers).
+    /// - `gpu_manager`    — Shared GPU lock; attach when the model will share GPU memory
+    ///   with STT or LLM workloads.
+    /// - `already_loaded` — Model IDs currently loaded on the server (from the catalog's
+    ///   `loaded` field).  The load round-trip is skipped for any model whose ID appears
+    ///   here.  Pass `&[]` to always send the load request.
     ///
     /// # Errors
     ///
@@ -115,16 +118,17 @@ impl ProviderFactory {
         base_url: &str,
         weight: u32,
         gpu_manager: Option<Arc<GpuResourceManager>>,
+        already_loaded: &[String],
     ) -> Result<BuiltProvider> {
         let model_id = &selected.model_id;
         let load_opts = Self::merge_backend(&selected.load_opts, selected.backend.as_deref());
         let name = Self::provider_name(selected);
 
         let provider = match capability {
-            Capability::Embedding => Self::build_embedding(base_url, model_id, &load_opts, &name).await?,
-            Capability::Reranking => Self::build_reranker(base_url, model_id, &load_opts, &name).await?,
-            Capability::Transcription => Self::build_stt(base_url, model_id, &load_opts, &selected.recipe, gpu_manager, &name).await?,
-            Capability::TextGeneration => Self::build_llm(base_url, model_id, &load_opts, selected, gpu_manager, &name).await?,
+            Capability::Embedding => Self::build_embedding(base_url, model_id, &load_opts, already_loaded, &name).await?,
+            Capability::Reranking => Self::build_reranker(base_url, model_id, &load_opts, already_loaded, &name).await?,
+            Capability::Transcription => Self::build_stt(base_url, model_id, &load_opts, &selected.recipe, gpu_manager, already_loaded, &name).await?,
+            Capability::TextGeneration => Self::build_llm(base_url, model_id, &load_opts, selected, gpu_manager, already_loaded, &name).await?,
             Capability::TextToSpeech => Self::build_tts(base_url, model_id, &name),
         };
 
@@ -137,9 +141,10 @@ impl ProviderFactory {
         base_url: &str,
         model_id: &str,
         load_opts: &ModelLoadOptions,
+        already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
-        let provider = LemonadeProvider::new_with_load(base_url, model_id, load_opts).await?;
+        let provider = LemonadeProvider::new_with_load(base_url, model_id, load_opts, already_loaded).await?;
         info!(model = model_id, name, dimensions = ?provider.dimensions(), "Embedding provider built");
         Ok(ProviderSlot::Embedding(Arc::new(provider)))
     }
@@ -148,10 +153,11 @@ impl ProviderFactory {
         base_url: &str,
         model_id: &str,
         load_opts: &ModelLoadOptions,
+        already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
         let provider = LemonadeRerankProvider::new(base_url, model_id);
-        provider.load(load_opts).await?;
+        provider.load(load_opts, already_loaded).await?;
         info!(model = model_id, name, "Reranker provider built");
         Ok(ProviderSlot::Rerank(provider))
     }
@@ -162,9 +168,10 @@ impl ProviderFactory {
         load_opts: &ModelLoadOptions,
         recipe: &str,
         gpu_manager: Option<Arc<GpuResourceManager>>,
+        already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
-        load_model(base_url, model_id, load_opts).await?;
+        load_model(base_url, model_id, load_opts, already_loaded).await?;
 
         // whispercpp with a GPU manager → GPU-locked STT (enforces sharing policy).
         // flm (NPU) or whispercpp without a GPU manager → simple provider, no lock.
@@ -191,9 +198,10 @@ impl ProviderFactory {
         load_opts: &ModelLoadOptions,
         selected: &SelectedModel,
         gpu_manager: Option<Arc<GpuResourceManager>>,
+        already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
-        load_model(base_url, model_id, load_opts).await?;
+        load_model(base_url, model_id, load_opts, already_loaded).await?;
 
         let gpu = if Self::backend_uses_gpu(selected) { gpu_manager } else { None };
         let provider = LemonadeChatProvider::new(base_url, model_id, gpu);
@@ -204,7 +212,7 @@ impl ProviderFactory {
     fn build_tts(base_url: &str, model_id: &str, name: &str) -> ProviderSlot {
         let provider = LemonadeTtsProvider::new(base_url, model_id);
         info!(model = model_id, name, "TTS provider built");
-        ProviderSlot::Tts(provider)
+        ProviderSlot::Tts(Box::new(provider))
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -397,7 +405,7 @@ mod tests {
             quality_tier: QualityTier::Standard,
         };
 
-        let built = ProviderFactory::build(&selected, Capability::Embedding, &url, 100, None)
+        let built = ProviderFactory::build(&selected, Capability::Embedding, &url, 100, None, &[])
             .await
             .expect("build embedding provider");
 

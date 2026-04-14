@@ -63,8 +63,13 @@ use super::jobs::{EmbedJob, WorkQueue};
 struct WeightedWorkerSlot {
     queue: Arc<WorkQueue<EmbedJob>>,
     weight: u32,
+    /// Human-readable device name (e.g. "NPU", "GPU").  Retained for future
+    /// diagnostic output — e.g. logging which worker is idle or overloaded.
     #[allow(dead_code)]
     name: String,
+    /// Idle flag shared with the worker task.  Retained for future work-stealing
+    /// enhancements — e.g. preferring to steal *to* idle workers rather than
+    /// relying purely on EWMA cost comparison.
     #[allow(dead_code)]
     idle: Arc<AtomicBool>,
     /// EWMA job duration in microseconds.  `0` = no completed job yet.
@@ -165,12 +170,6 @@ impl WeightedEmbedDispatcher {
     pub(super) fn pending(&self) -> usize {
         self.workers.iter().map(|w| w.queue.pending()).sum()
     }
-
-    /// Number of registered worker slots.
-    #[allow(dead_code)]
-    pub(super) fn worker_count(&self) -> usize {
-        self.workers.len()
-    }
 }
 
 /// Predicted time (μs) until a newly dispatched job would complete.
@@ -212,14 +211,12 @@ mod tests {
     fn test_empty_dispatcher_pending_is_zero() {
         let d = WeightedEmbedDispatcher::new();
         assert_eq!(d.pending(), 0);
-        assert_eq!(d.worker_count(), 0);
     }
 
     #[test]
     fn test_add_worker_returns_queue_idle_and_ewma() {
         let mut d = WeightedEmbedDispatcher::new();
         let (_q, idle, ewma) = d.add_worker(100, "NPU");
-        assert_eq!(d.worker_count(), 1);
         assert!(!idle.load(Ordering::Relaxed));
         assert_eq!(ewma.load(Ordering::Relaxed), 0);
     }

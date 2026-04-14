@@ -10,9 +10,10 @@ use super::client::make_lemonade_openai_client;
 /// Built-in voices supported by kokoro-v1.
 ///
 /// Pass [`KokoroVoice::Custom`] to use any voice string the server accepts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum KokoroVoice {
     /// American English female (default, high quality).
+    #[default]
     AfSky,
     /// American English female, warmer tone.
     AfHeart,
@@ -41,12 +42,6 @@ impl KokoroVoice {
 
     fn to_oa_voice(&self) -> Voice {
         Voice::Other(self.as_str().to_string())
-    }
-}
-
-impl Default for KokoroVoice {
-    fn default() -> Self {
-        KokoroVoice::AfSky
     }
 }
 

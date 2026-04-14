@@ -451,7 +451,7 @@ pub async fn search_hybrid(
             let _ = writeln!(buf, "  FTS[{rank}] chunk={} obj={} content={snippet:?}…",
                 chunk_id.hyphenated(), obj_id.hyphenated());
         }
-        info!("{buf}");
+        debug!("{buf}");
     }
 
     // ── Diagnostic: Stage 2+3 (Semantic ANN) results ────────────────────────
@@ -463,7 +463,7 @@ pub async fn search_hybrid(
             let _ = writeln!(buf, "  SEM[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
                 chunk_id.hyphenated(), obj_id.hyphenated());
         }
-        info!("{buf}");
+        debug!("{buf}");
     }
 
     // ── Diagnostic: Stage 2b+3b (HQ Semantic ANN) results ───────────────────
@@ -475,7 +475,7 @@ pub async fn search_hybrid(
             let _ = writeln!(buf, "  HQ[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
                 chunk_id.hyphenated(), obj_id.hyphenated());
         }
-        info!("{buf}");
+        debug!("{buf}");
     }
 
     // ── Stage 4: Reciprocal Rank Fusion merge (chunk level) ───────────────────
@@ -541,7 +541,7 @@ pub async fn search_hybrid(
             let _ = writeln!(buf, "  RRF chunk={chunk_key} obj={} score={:.6} fts_rank={:?} sem_dist={:?}",
                 cm.object_id_str, cm.rrf_score, cm.fts_rank, cm.semantic_distance);
         }
-        info!("{buf}");
+        debug!("{buf}");
     }
 
     // ── Stage 5: Node-level aggregation ───────────────────────────────────────
@@ -583,7 +583,7 @@ pub async fn search_hybrid(
             let _ = writeln!(buf, "  NODE obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
                 acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance, acc.best_hq_semantic_distance);
         }
-        info!("{buf}");
+        debug!("{buf}");
     }
 
     // Sort nodes by descending aggregated score and cap at config.limit.
@@ -614,7 +614,7 @@ pub async fn search_hybrid(
             let _ = writeln!(buf, "  KEPT obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
                 acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance, acc.best_hq_semantic_distance);
         }
-        info!("{buf}");
+        debug!("{buf}");
     }
 
     // ── Stage 6: Node hydration ───────────────────────────────────────────────
@@ -696,7 +696,7 @@ pub async fn search_hybrid(
                 r.node.name, r.node.object_type, r.score,
                 r.sources.fts_rank, r.sources.semantic_distance);
         }
-        info!("{buf}");
+        debug!("{buf}");
     }
 
     // ── Stage 7: Optional reranking ───────────────────────────────────────────
@@ -748,7 +748,7 @@ pub async fn search_hybrid(
                 let snippet: String = doc.chars().take(120).collect();
                 let _ = writeln!(buf, "  RERANK_IN[{i}] ({} chars) {snippet:?}…", doc.len());
             }
-            info!("{buf}");
+            debug!("{buf}");
         }
 
         match queue.rerank(query, documents, Some(results.len())).await {
@@ -786,7 +786,7 @@ pub async fn search_hybrid(
                             r.score, r.sources.rerank_score,
                             r.sources.fts_rank, r.sources.semantic_distance);
                     }
-                    info!("{buf}");
+                    debug!("{buf}");
                 }
 
                 debug!("Returning {} reranked node results", results.len());
@@ -801,8 +801,8 @@ pub async fn search_hybrid(
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn parse_uuid(s: &str, label: &str) -> Result<uuid::Uuid> {
-    uuid::Uuid::parse_str(s)
+fn parse_uuid(s: &str, label: &str) -> Result<ObjectId> {
+    ObjectId::parse_str(s)
         .map_err(|e| anyhow::anyhow!("Invalid {label} UUID '{s}' in hybrid search result: {e}"))
 }
 
