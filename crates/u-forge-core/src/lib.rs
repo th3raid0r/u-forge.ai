@@ -65,6 +65,7 @@ pub use types::*;
 // ── Facade ────────────────────────────────────────────────────────────────────
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -406,6 +407,23 @@ impl KnowledgeGraph {
     /// Counts of nodes, edges, chunks, and total tokens.  O(1) via SQL aggregates.
     pub fn get_stats(&self) -> Result<GraphStats> {
         self.storage.get_stats()
+    }
+
+    // ── Layout persistence ────────────────────────────────────────────────────
+
+    /// Persist canvas positions for the graph-view UI.
+    ///
+    /// `positions` is a slice of `(node_id, x, y)` triples.  Each call is an
+    /// upsert — existing rows are updated in place.
+    pub fn save_layout(&self, positions: &[(ObjectId, f32, f32)]) -> Result<()> {
+        self.storage.save_layout(positions)
+    }
+
+    /// Load all previously saved canvas positions as an `ObjectId → (x, y)` map.
+    ///
+    /// Returns an empty map when no positions have been saved yet.
+    pub fn load_layout(&self) -> Result<HashMap<ObjectId, (f32, f32)>> {
+        self.storage.load_layout()
     }
 
     // ── Schema ────────────────────────────────────────────────────────────────

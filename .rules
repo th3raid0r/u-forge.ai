@@ -83,9 +83,10 @@ sqlite-vec ANN search, catalog-driven provider selection, unified inference queu
 canvas renders real graph data with pan/zoom and LOD. No active bugs.
 
 UI crates in progress (see `feature_UI.md`):
-- `u-forge-graph-view` — `GraphSnapshot` + `build_snapshot()`, force-directed layout (grid-cell bucketed O(N) repulsion), R-tree spatial index, viewport culling.
+- `u-forge-graph-view` — `GraphSnapshot` + `build_snapshot()`, force-directed layout (grid-cell bucketed O(N) repulsion), R-tree spatial index, viewport culling, `rebuild_spatial_index()`.
 - `u-forge-ui-traits` — `DrawCommand` / `Viewport` / `generate_draw_commands()` rendering pipeline (culling, LOD, type-color). Framework-agnostic.
-- `u-forge-ui-gpui` — GPUI 0.2.2 canvas app: loads `memory.json`, builds snapshot, renders with pan/zoom/LOD. Run: `cargo run -p u-forge-ui-gpui`.
+- `u-forge-ui-gpui` — GPUI 0.2.2 canvas app: persistent DB at `./data/graph-view/`, pan/zoom/LOD, click-to-select, drag-to-reposition nodes (node drag vs. canvas pan disambiguated by hit-test on mouse-down), positions autosaved to `node_positions` table on each drag-end. Run: `cargo run -p u-forge-ui-gpui`.
+- `u-forge-core` — `node_positions` table added to SQLite schema; `KnowledgeGraph::save_layout()` / `load_layout()` persist and restore canvas positions. `build_snapshot()` applies saved positions after force-directed layout, so new nodes get computed positions and known nodes restore their last user-placed position.
 
 Recent quality improvements:
 - `load_model()` now accepts `already_loaded: &[String]` — if the model ID is in the slice the HTTP round-trip to `/api/v1/load` is skipped entirely. Callers extract these IDs from `catalog.loaded` (already fetched by `LemonadeServerCatalog::discover`). `ProviderFactory::build` threads this parameter through all capability branches. Both CLI demos extract the loaded-model list from the catalog and fire all provider builds concurrently via `futures::future::join_all` / `tokio::join!`, eliminating sequential load waits on warm servers.

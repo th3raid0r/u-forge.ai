@@ -10,7 +10,6 @@ The project is a Cargo workspace. All source lives under `crates/`:
 | `u-forge-graph-view` | lib | In Progress | Graph view model + layout engine (see `feature_UI.md`) |
 | `u-forge-ui-traits` | lib | In Progress | Framework-agnostic rendering contracts (see `feature_UI.md`) |
 | `u-forge-ui-gpui` | bin | In Progress | GPUI native app — pan/zoom canvas, LOD rendering (see `feature_UI.md`) |
-| `u-forge-ui-egui` | bin | Skeleton | egui fallback — only if GPUI spike fails (spike passed; unlikely needed) |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
 `defaults/` (schemas + sample data) stays at the workspace root. Both example entry points and `examples/common/mod.rs` resolve it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
@@ -87,7 +86,7 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 |---|---|---|
 | `src/lib.rs` | All rendering contracts + `generate_draw_commands()` | `DrawCommand`, `Viewport`, `GraphRenderer`, `generate_draw_commands()` |
 
-`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment (Catppuccin Mocha palette keyed on `object_type`) → `DrawCommand` list. Backends (`u-forge-ui-gpui`, `u-forge-ui-egui`) consume this list — they never touch `GraphSnapshot` directly.
+`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment (Catppuccin Mocha palette keyed on `object_type`) → `DrawCommand` list. `u-forge-ui-gpui` consumes this list — it never touches `GraphSnapshot` directly.
 
 ## Module Map (u-forge-ui-gpui)
 
@@ -217,6 +216,17 @@ embeddings to coexist. Populated only when a high-quality embedding model (e.g.
 Qwen3-Embedding-8B-GGUF) is available in Lemonade Server and enabled in config
 (`embedding.high_quality_embedding: true`). Kept clean by a `chunks_vec_hq_ad` trigger
 that fires `AFTER DELETE ON chunks`.
+
+**`node_positions`** — canvas layout positions written by the graph-view UI.
+```
+node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE
+x       REAL
+y       REAL
+layout_version INTEGER DEFAULT 1
+```
+Populated via `KnowledgeGraph::save_layout()` after each node drag in the GPUI canvas.
+Read on startup by `build_snapshot()` to restore the last user-arranged layout.
+`ON DELETE CASCADE` keeps the table clean when nodes are removed.
 
 ### Indexes
 

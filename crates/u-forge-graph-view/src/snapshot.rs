@@ -60,6 +60,24 @@ impl GraphSnapshot {
             .collect()
     }
 
+    /// Rebuild the R-tree spatial index from the current node positions.
+    ///
+    /// Call this after mutating any `NodeView::position` values (e.g. after a
+    /// drag operation) so that subsequent viewport culling and hit-testing
+    /// reflect the new positions.
+    pub fn rebuild_spatial_index(&mut self) {
+        let entries: Vec<NodeEntry> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| NodeEntry {
+                index: i,
+                position: [n.position.x, n.position.y],
+            })
+            .collect();
+        self.spatial_index = RTree::bulk_load(entries);
+    }
+
     /// Return the index of the node closest to `world_pos` within `max_dist` world units,
     /// or `None` if no node is within range.
     pub fn node_at_position(&self, world_pos: Vec2, max_dist: f32) -> Option<usize> {
@@ -93,14 +111,18 @@ impl GraphSnapshot {
 
 /// Build a `GraphSnapshot` from a `KnowledgeGraph`.
 ///
-/// 1. Fetches all objects and edges
+/// 1. Fetches all objects, edges, and any previously saved canvas positions
 /// 2. Builds an ObjectId → index map
 /// 3. Converts edges to index-based EdgeViews
-/// 4. Runs force-directed layout to assign positions
-/// 5. Builds the R-tree spatial index
+/// 4. Runs force-directed layout to assign positions for all nodes
+/// 5. Overwrites positions with saved values where available
+/// 6. Builds the R-tree spatial index
 pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
     let objects = graph.get_all_objects()?;
     let raw_edges = graph.get_all_edges()?;
+
+    // Load any previously saved UI positions (empty map on first run)
+    let saved_positions = graph.load_layout().unwrap_or_default();
 
     // Build ObjectId → usize index map
     let id_to_idx: HashMap<ObjectId, usize> = objects
@@ -109,7 +131,7 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         .map(|(i, obj)| (obj.id, i))
         .collect();
 
-    // Convert to NodeViews (positions will be set by layout)
+    // Convert to NodeViews (positions will be set below)
     let mut nodes: Vec<NodeView> = objects
         .into_iter()
         .map(|obj| NodeView {
@@ -137,8 +159,17 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         })
         .collect();
 
-    // Run layout to assign positions
+    // Run layout so every node gets a valid initial position.
+    // Nodes with saved positions will have those overwritten in the next step,
+    // but new nodes (not yet in node_positions) keep the layout-computed value.
     force_directed_layout(&mut nodes, &edges);
+
+    // Apply saved positions, overriding the layout result for known nodes.
+    for node in &mut nodes {
+        if let Some(&(x, y)) = saved_positions.get(&node.id) {
+            node.position = Vec2::new(x, y);
+        }
+    }
 
     // Build R-tree spatial index from final positions
     let entries: Vec<NodeEntry> = nodes

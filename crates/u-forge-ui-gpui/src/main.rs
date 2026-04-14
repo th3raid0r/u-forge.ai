@@ -7,6 +7,8 @@ use gpui::{
     Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, TextRun, Window, WindowBounds,
     WindowOptions,
 };
+use parking_lot::RwLock;
+use u_forge_core::{KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{build_snapshot, GraphSnapshot, LodLevel};
 use u_forge_ui_traits::{generate_draw_commands, DrawCommand, Viewport, NODE_RADIUS};
 
@@ -25,11 +27,15 @@ const LEGEND_ENTRIES: &[(&str, u32)] = &[
 ];
 
 struct GraphCanvas {
-    snapshot: Arc<GraphSnapshot>,
+    snapshot: Arc<RwLock<GraphSnapshot>>,
+    graph: Arc<KnowledgeGraph>,
     /// Camera center in world space.
     camera: Vec2,
     zoom: f32,
-    dragging: bool,
+    /// True when the user is panning the canvas (drag on empty space).
+    panning: bool,
+    /// Index into `snapshot.nodes` of the node being dragged, if any.
+    dragging_node: Option<usize>,
     last_mouse: Point<Pixels>,
     /// Screen position where the last mouse-down occurred (for click vs. drag detection).
     mouse_down_pos: Point<Pixels>,
@@ -38,12 +44,14 @@ struct GraphCanvas {
 }
 
 impl GraphCanvas {
-    fn new(snapshot: GraphSnapshot) -> Self {
+    fn new(snapshot: GraphSnapshot, graph: Arc<KnowledgeGraph>) -> Self {
         Self {
-            snapshot: Arc::new(snapshot),
+            snapshot: Arc::new(RwLock::new(snapshot)),
+            graph,
             camera: Vec2::ZERO,
             zoom: 1.0,
-            dragging: false,
+            panning: false,
+            dragging_node: None,
             last_mouse: point(px(0.0), px(0.0)),
             mouse_down_pos: point(px(0.0), px(0.0)),
             selected_node_idx: None,
@@ -55,6 +63,20 @@ impl GraphCanvas {
             center: self.camera,
             size: canvas_size,
             zoom: self.zoom,
+        }
+    }
+
+    /// Persist all current node positions to the database.
+    fn save_layout(&self) {
+        let snap = self.snapshot.read();
+        let positions: Vec<(ObjectId, f32, f32)> = snap
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.position.x, n.position.y))
+            .collect();
+        drop(snap);
+        if let Err(e) = self.graph.save_layout(&positions) {
+            eprintln!("Warning: failed to save layout: {e}");
         }
     }
 }
@@ -84,18 +106,47 @@ impl Render for GraphCanvas {
             .bg(rgb(0x1e1e2e))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
-                    this.dragging = true;
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.last_mouse = event.position;
                     this.mouse_down_pos = event.position;
+
+                    // Hit-test: if the click lands on a node, start a node drag.
+                    // Otherwise start a canvas pan.
+                    let vp = window.viewport_size();
+                    let canvas_size = Vec2::new(f32::from(vp.width), f32::from(vp.height));
+                    let screen_pos = Vec2::new(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                    );
+                    let world_pos = this.viewport(canvas_size).screen_to_world(screen_pos);
+                    let hit_radius = NODE_RADIUS * 1.5 / this.zoom;
+
+                    if let Some(idx) = this.snapshot.read().node_at_position(world_pos, hit_radius) {
+                        this.dragging_node = Some(idx);
+                        cx.notify();
+                    } else {
+                        this.panning = true;
+                    }
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.dragging = false;
+                    let was_dragging_node = this.dragging_node.is_some();
 
-                    // Distinguish a click (≤5 px movement) from a drag.
+                    if was_dragging_node {
+                        // Rebuild the spatial index so hit-testing is accurate after the move.
+                        this.snapshot.write().rebuild_spatial_index();
+                        // Persist positions after each node drag.
+                        this.save_layout();
+                        this.dragging_node = None;
+                        cx.notify();
+                        return;
+                    }
+
+                    this.panning = false;
+
+                    // Distinguish a click (≤5 px movement) from a pan drag.
                     let dx =
                         (f32::from(event.position.x) - f32::from(this.mouse_down_pos.x)).abs();
                     let dy =
@@ -109,13 +160,11 @@ impl Render for GraphCanvas {
                             f32::from(event.position.y),
                         );
                         let world_pos = this.viewport(canvas_size).screen_to_world(screen_pos);
-                        // Hit radius scales inversely with zoom so that the click target
-                        // always matches the visible node size.
                         let max_dist = NODE_RADIUS * 2.0 / this.zoom;
-                        if let Some(idx) = this.snapshot.node_at_position(world_pos, max_dist) {
+                        if let Some(idx) = this.snapshot.read().node_at_position(world_pos, max_dist) {
                             this.selected_node_idx =
                                 if this.selected_node_idx == Some(idx) {
-                                    None // clicking same node deselects
+                                    None
                                 } else {
                                     Some(idx)
                                 };
@@ -128,11 +177,20 @@ impl Render for GraphCanvas {
             )
             .on_mouse_move(cx.listener(
                 |this, event: &MouseMoveEvent, _window, cx| {
-                    if this.dragging {
-                        let delta = event.position - this.last_mouse;
+                    let delta = event.position - this.last_mouse;
+                    this.last_mouse = event.position;
+
+                    if let Some(node_idx) = this.dragging_node {
+                        // Move the dragged node by the mouse delta in world space.
+                        let world_delta = Vec2::new(
+                            f32::from(delta.x) / this.zoom,
+                            f32::from(delta.y) / this.zoom,
+                        );
+                        this.snapshot.write().nodes[node_idx].position += world_delta;
+                        cx.notify();
+                    } else if this.panning {
                         this.camera.x -= f32::from(delta.x) / this.zoom;
                         this.camera.y -= f32::from(delta.y) / this.zoom;
-                        this.last_mouse = event.position;
                         cx.notify();
                     }
                 },
@@ -178,9 +236,11 @@ impl Render for GraphCanvas {
                             zoom,
                         };
 
+                        let snap = snapshot.read();
                         let commands =
-                            generate_draw_commands(&snapshot, &viewport, selected_node_idx);
+                            generate_draw_commands(&snap, &viewport, selected_node_idx);
                         let lod = viewport.lod_level();
+                        drop(snap);
 
                         // ── Edges (batched paths) ────────────────────────────────────
                         let edge_commands: Vec<&DrawCommand> = commands
@@ -236,11 +296,8 @@ impl Render for GraphCanvas {
                                 if use_dots {
                                     window.paint_quad(fill(node_bounds, rgb(col)));
                                 } else {
-                                    // Squircle: corner_radius ≈ 60 % of the radius gives
-                                    // the characteristic rounded-square look.
                                     let sq_radii = r * 0.6;
 
-                                    // Selection ring — a white squircle drawn behind the node.
                                     if *selected {
                                         let hr = r * 1.45;
                                         let ring_bounds = Bounds::new(
@@ -261,8 +318,6 @@ impl Render for GraphCanvas {
                         }
 
                         // ── Node labels (inside squircles) ───────────────────────────
-                        // Text is centered on the node's screen position.
-                        // Clone the Arc so we can call shape_line without borrowing `window`.
                         let text_system = window.text_system().clone();
                         let sys_font: Font = font(".SystemUIFont");
                         for cmd in &commands {
@@ -293,7 +348,6 @@ impl Render for GraphCanvas {
                                     None,
                                 );
                                 let line_height = font_size * 1.2;
-                                // Center the text on `position`.
                                 let tx = position.x - f32::from(shaped.width) / 2.0;
                                 let ty = position.y - f32::from(line_height) / 2.0;
                                 let _ = shaped.paint(
@@ -316,7 +370,6 @@ impl Render for GraphCanvas {
                             let lx = canvas_size.x - legend_w - pad;
                             let ly = canvas_size.y - legend_h - pad;
 
-                            // Semi-transparent background
                             window.paint_quad(fill(
                                 Bounds::new(
                                     point(px(lx), px(ly)),
@@ -332,7 +385,6 @@ impl Render for GraphCanvas {
                                 let row_y = ly + pad + i as f32 * entry_h;
                                 let center_y = row_y + entry_h / 2.0;
 
-                                // Color swatch (small squircle)
                                 window.paint_quad(
                                     fill(
                                         Bounds::new(
@@ -347,7 +399,6 @@ impl Render for GraphCanvas {
                                     .corner_radii(px(3.0)),
                                 );
 
-                                // Label
                                 let run = TextRun {
                                     len: label.len(),
                                     font: sys_font.clone(),
@@ -380,31 +431,43 @@ impl Render for GraphCanvas {
 }
 
 fn main() {
-    // Load graph data before starting GPUI (blocking)
-    let snapshot = {
+    // Use a persistent data directory so node positions survive across restarts.
+    let data_dir = std::path::PathBuf::from("./data/graph-view");
+
+    let (snapshot, graph) = {
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         rt.block_on(async {
-            let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
-            let graph =
-                u_forge_core::KnowledgeGraph::new(tmp.path()).expect("failed to create graph");
+            let graph = Arc::new(
+                KnowledgeGraph::new(&data_dir).expect("failed to open knowledge graph"),
+            );
 
-            let data_file = std::path::Path::new("defaults/data/memory.json");
-            if data_file.exists() {
-                let mut ingestion = u_forge_core::DataIngestion::new(&graph);
-                ingestion
-                    .import_json_data(data_file)
-                    .await
-                    .expect("failed to import data");
-                let stats = graph.get_stats().expect("failed to get stats");
+            // Only import memory.json on the first run (when the graph is empty).
+            let stats = graph.get_stats().expect("failed to get stats");
+            if stats.node_count == 0 {
+                let data_file = std::path::Path::new("defaults/data/memory.json");
+                if data_file.exists() {
+                    let mut ingestion = u_forge_core::DataIngestion::new(&graph);
+                    ingestion
+                        .import_json_data(data_file)
+                        .await
+                        .expect("failed to import data");
+                    let stats = graph.get_stats().expect("failed to get stats");
+                    eprintln!(
+                        "Imported {} nodes, {} edges from memory.json",
+                        stats.node_count, stats.edge_count
+                    );
+                } else {
+                    eprintln!("Warning: defaults/data/memory.json not found, using empty graph");
+                }
+            } else {
                 eprintln!(
-                    "Loaded {} nodes, {} edges from memory.json",
+                    "Loaded existing graph: {} nodes, {} edges",
                     stats.node_count, stats.edge_count
                 );
-            } else {
-                eprintln!("Warning: defaults/data/memory.json not found, using empty graph");
             }
 
-            build_snapshot(&graph).expect("failed to build snapshot")
+            let snapshot = build_snapshot(&graph).expect("failed to build snapshot");
+            (snapshot, graph)
         })
     };
 
@@ -415,7 +478,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| GraphCanvas::new(snapshot)),
+            |_, cx| cx.new(|_| GraphCanvas::new(snapshot, graph)),
         )
         .unwrap();
     });
