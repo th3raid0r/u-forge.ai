@@ -4,32 +4,6 @@ use std::collections::HashMap;
 // Re-export Uuid for easier access throughout the crate
 pub use uuid::Uuid as ForgeUuid;
 
-/// Core object types in the TTRPG knowledge graph
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ObjectType {
-    Character,
-    Location,
-    Faction,
-    Item,
-    Event,
-    Session,
-    CustomType(String),
-}
-
-impl ObjectType {
-    pub fn as_str(&self) -> &str {
-        match self {
-            ObjectType::Character => "character",
-            ObjectType::Location => "location",
-            ObjectType::Faction => "faction",
-            ObjectType::Item => "item",
-            ObjectType::Event => "event",
-            ObjectType::Session => "session",
-            ObjectType::CustomType(name) => name,
-        }
-    }
-}
-
 /// Unique identifier for graph objects
 pub type ObjectId = ForgeUuid;
 
@@ -124,11 +98,6 @@ impl ObjectMetadata {
             tags: Vec::new(),
             properties: serde_json::Value::Object(serde_json::Map::new()),
         }
-    }
-
-    /// Create a new object with legacy ObjectType enum (for backward compatibility)
-    pub fn new_with_type(object_type: ObjectType, name: String) -> Self {
-        Self::new(object_type.as_str().to_string(), name)
     }
 
     pub fn with_description(mut self, description: String) -> Self {
@@ -374,12 +343,6 @@ mod tests {
 
         assert_eq!(obj.get_json_property("level").unwrap().as_u64(), Some(3));
         assert!(obj.get_json_property("damage").unwrap().is_object());
-    }
-
-    #[test]
-    fn test_backward_compatibility() {
-        let obj = ObjectMetadata::new_with_type(ObjectType::Character, "Frodo".to_string());
-        assert_eq!(obj.object_type, "character");
     }
 
     #[test]

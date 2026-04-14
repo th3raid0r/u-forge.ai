@@ -84,7 +84,7 @@ while background indexing writes to it.
 
 ## P2 — Clean Up `ObjectType` Enum
 
-**Status:** ⏳
+**Status:** ✅
 
 `types.rs` defines `ObjectType` (Character, Location, Faction, Item, Event,
 Session, CustomType), but `ObjectMetadata.object_type` is `String`.
@@ -110,7 +110,7 @@ maintenance burden without clear benefit.
 
 ## P2 — `#[allow(dead_code)]` Audit
 
-**Status:** ⏳
+**Status:** ✅
 
 Three `#[allow(dead_code)]` annotations exist in `queue/weighted.rs`:
 

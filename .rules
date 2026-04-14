@@ -85,6 +85,8 @@ Recent quality improvements:
 - `embed_all_chunks` is now incremental — uses `get_unembedded_chunks` / `get_unembedded_chunks_hq` (LEFT JOIN on `chunks_vec`) instead of re-scanning all objects.
 - Hybrid search diagnostic blocks demoted from `info!` to `debug!` — no more log spam in production; `RUST_LOG=u_forge_core::search=debug` reveals full pipeline state.
 - `KnowledgeGraphStorage` now uses `parking_lot::Mutex` — all 24 `.lock().unwrap()` calls removed.
+- `ObjectType` enum deleted from `types.rs` — it was dead code; `ObjectMetadata.object_type` is `String` throughout, and `ObjectBuilder` already embeds correct string literals.
+- `WeightedEmbedDispatcher::worker_count()` removed — `InferenceQueue` exposes `embedding_worker_count()` for callers. `WeightedWorkerSlot::name` and `idle` fields annotated with intent comments (retained for future diagnostics).
 
 The core library has been fully refactored (hardware abstraction layer removed):
 - `hardware/` directory deleted — `NpuDevice`, `GpuDevice`, `CpuDevice`, `DeviceWorker`
