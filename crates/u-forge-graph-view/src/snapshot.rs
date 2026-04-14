@@ -98,6 +98,31 @@ impl GraphSnapshot {
         .map(|(idx, _)| idx)
     }
 
+    /// Return the index of the closest node whose AABB (centered on the node,
+    /// half-extent `half_size` in each axis) contains `world_pos`.
+    ///
+    /// Prefer this over [`node_at_position`] for hit-testing squircle nodes —
+    /// the rectangular test matches the visual footprint of a rounded square.
+    pub fn node_at_point_aabb(&self, world_pos: Vec2, half_size: f32) -> Option<usize> {
+        self.nodes_in_viewport(
+            world_pos - Vec2::splat(half_size),
+            world_pos + Vec2::splat(half_size),
+        )
+        .into_iter()
+        .filter_map(|idx| {
+            let delta = (self.nodes[idx].position - world_pos).abs();
+            if delta.x <= half_size && delta.y <= half_size {
+                // Use L∞ distance so the closest node in AABB sense is preferred.
+                let dist = delta.x.max(delta.y);
+                Some((idx, dist))
+            } else {
+                None
+            }
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx)
+    }
+
     /// Return indices of edges where at least one endpoint is visible.
     pub fn edges_in_viewport(&self, visible_nodes: &[bool]) -> Vec<usize> {
         self.edges

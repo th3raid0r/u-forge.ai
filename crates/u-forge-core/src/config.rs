@@ -368,6 +368,36 @@ impl Default for ChatConfig {
 
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
+// ── StorageConfig ─────────────────────────────────────────────────────────────
+
+/// Storage / persistence settings.
+///
+/// Corresponds to the `[storage]` section of `u-forge.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Path to the SQLite database directory.
+    ///
+    /// Defaults to `./data/db/` relative to the working directory.
+    #[serde(default = "StorageConfig::default_db_path")]
+    pub db_path: PathBuf,
+}
+
+impl StorageConfig {
+    fn default_db_path() -> PathBuf {
+        PathBuf::from("./data/db")
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            db_path: Self::default_db_path(),
+        }
+    }
+}
+
+// ── AppConfig ─────────────────────────────────────────────────────────────────
+
 /// Top-level application configuration.
 ///
 /// Loaded from `u-forge.toml` by [`AppConfig::load_default`].
@@ -385,6 +415,10 @@ pub struct AppConfig {
     /// Global chat / RAG settings.
     #[serde(default)]
     pub chat: ChatConfig,
+
+    /// Storage / persistence settings.
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 impl AppConfig {

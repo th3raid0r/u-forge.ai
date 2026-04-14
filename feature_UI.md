@@ -170,7 +170,7 @@ Node canvas positions are stored in the `node_positions` SQLite table (see `ARCH
 
 `build_snapshot()` in `u-forge-graph-view` always runs force-directed layout first (so new nodes get valid initial positions), then overwrites with saved positions for any node that has a stored entry. This means the layout pass is never fully skipped, but its result is overridden for known nodes — giving correct placement for mixed new+existing graphs.
 
-The GPUI canvas saves positions **on every node drag completion** (mouse-up after a node move) rather than only on window close. The app uses a persistent database at `./data/graph-view/` so positions survive restarts. Import from `memory.json` runs only on first launch (when the graph is empty).
+The GPUI canvas saves positions **on every node drag completion** (mouse-up after a node move) rather than only on window close. The database path defaults to `./data/db/` and is configurable via the `[storage] db_path` key in `u-forge.toml`. Import from `memory.json` runs only on first launch (when the graph is empty).
 
 `GraphSnapshot::rebuild_spatial_index()` rebuilds the R-tree from current `nodes[].position` values; called after each drag so hit-testing stays accurate.
 

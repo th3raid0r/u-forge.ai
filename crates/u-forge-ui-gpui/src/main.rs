@@ -8,7 +8,7 @@ use gpui::{
     WindowOptions,
 };
 use parking_lot::RwLock;
-use u_forge_core::{KnowledgeGraph, ObjectId};
+use u_forge_core::{AppConfig, KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{build_snapshot, GraphSnapshot, LodLevel};
 use u_forge_ui_traits::{generate_draw_commands, DrawCommand, Viewport, NODE_RADIUS};
 
@@ -37,8 +37,6 @@ struct GraphCanvas {
     /// Index into `snapshot.nodes` of the node being dragged, if any.
     dragging_node: Option<usize>,
     last_mouse: Point<Pixels>,
-    /// Screen position where the last mouse-down occurred (for click vs. drag detection).
-    mouse_down_pos: Point<Pixels>,
     /// Index into `snapshot.nodes` of the currently selected node.
     selected_node_idx: Option<usize>,
 }
@@ -53,7 +51,6 @@ impl GraphCanvas {
             panning: false,
             dragging_node: None,
             last_mouse: point(px(0.0), px(0.0)),
-            mouse_down_pos: point(px(0.0), px(0.0)),
             selected_node_idx: None,
         }
     }
@@ -108,128 +105,91 @@ impl Render for GraphCanvas {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.last_mouse = event.position;
-                    this.mouse_down_pos = event.position;
 
-                    // Hit-test: if the click lands on a node, start a node drag.
+                    // Hit-test: if the click lands on a node, select it and start a node drag.
                     // Otherwise start a canvas pan.
                     let vp = window.viewport_size();
                     let canvas_size = Vec2::new(f32::from(vp.width), f32::from(vp.height));
-                    let screen_pos = Vec2::new(
-                        f32::from(event.position.x),
-                        f32::from(event.position.y),
-                    );
+                    let screen_pos =
+                        Vec2::new(f32::from(event.position.x), f32::from(event.position.y));
                     let world_pos = this.viewport(canvas_size).screen_to_world(screen_pos);
-                    let hit_radius = NODE_RADIUS * 1.5 / this.zoom;
+                    // World-space half-extent matching the squircle visual footprint.
+                    // No zoom division — scales naturally with the node's on-screen size.
+                    let half_size = NODE_RADIUS * 1.5;
 
-                    if let Some(idx) = this.snapshot.read().node_at_position(world_pos, hit_radius) {
+                    if let Some(idx) = this.snapshot.read().node_at_point_aabb(world_pos, half_size)
+                    {
+                        this.selected_node_idx = Some(idx);
                         this.dragging_node = Some(idx);
                         cx.notify();
                     } else {
+                        this.selected_node_idx = None;
                         this.panning = true;
                     }
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    let was_dragging_node = this.dragging_node.is_some();
-
-                    if was_dragging_node {
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    if this.dragging_node.is_some() {
                         // Rebuild the spatial index so hit-testing is accurate after the move.
                         this.snapshot.write().rebuild_spatial_index();
                         // Persist positions after each node drag.
                         this.save_layout();
                         this.dragging_node = None;
                         cx.notify();
-                        return;
-                    }
-
-                    this.panning = false;
-
-                    // Distinguish a click (≤5 px movement) from a pan drag.
-                    let dx =
-                        (f32::from(event.position.x) - f32::from(this.mouse_down_pos.x)).abs();
-                    let dy =
-                        (f32::from(event.position.y) - f32::from(this.mouse_down_pos.y)).abs();
-                    if dx < 5.0 && dy < 5.0 {
-                        let vp = window.viewport_size();
-                        let canvas_size =
-                            Vec2::new(f32::from(vp.width), f32::from(vp.height));
-                        let screen_pos = Vec2::new(
-                            f32::from(event.position.x),
-                            f32::from(event.position.y),
-                        );
-                        let world_pos = this.viewport(canvas_size).screen_to_world(screen_pos);
-                        let max_dist = NODE_RADIUS * 2.0 / this.zoom;
-                        if let Some(idx) = this.snapshot.read().node_at_position(world_pos, max_dist) {
-                            this.selected_node_idx =
-                                if this.selected_node_idx == Some(idx) {
-                                    None
-                                } else {
-                                    Some(idx)
-                                };
-                        } else {
-                            this.selected_node_idx = None;
-                        }
-                        cx.notify();
+                    } else {
+                        this.panning = false;
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(
-                |this, event: &MouseMoveEvent, _window, cx| {
-                    let delta = event.position - this.last_mouse;
-                    this.last_mouse = event.position;
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                let delta = event.position - this.last_mouse;
+                this.last_mouse = event.position;
 
-                    if let Some(node_idx) = this.dragging_node {
-                        // Move the dragged node by the mouse delta in world space.
-                        let world_delta = Vec2::new(
-                            f32::from(delta.x) / this.zoom,
-                            f32::from(delta.y) / this.zoom,
-                        );
-                        this.snapshot.write().nodes[node_idx].position += world_delta;
-                        cx.notify();
-                    } else if this.panning {
-                        this.camera.x -= f32::from(delta.x) / this.zoom;
-                        this.camera.y -= f32::from(delta.y) / this.zoom;
-                        cx.notify();
-                    }
-                },
-            ))
-            .on_scroll_wheel(cx.listener(
-                |this, event: &ScrollWheelEvent, _window, cx| {
-                    let factor = match event.delta {
-                        ScrollDelta::Pixels(delta) => 1.0 + f32::from(delta.y) * 0.002,
-                        ScrollDelta::Lines(delta) => 1.0 + delta.y * 0.1,
-                    };
-                    let mouse_screen = Vec2::new(
-                        f32::from(event.position.x),
-                        f32::from(event.position.y),
+                if let Some(node_idx) = this.dragging_node {
+                    // Move the dragged node by the mouse delta in world space.
+                    let world_delta = Vec2::new(
+                        f32::from(delta.x) / this.zoom,
+                        f32::from(delta.y) / this.zoom,
                     );
-                    let canvas_size = Vec2::new(1200.0, 800.0);
-                    let vp = this.viewport(canvas_size);
-                    let world_under_mouse = vp.screen_to_world(mouse_screen);
-
-                    this.zoom = (this.zoom * factor).clamp(0.05, 20.0);
-
-                    let new_vp = this.viewport(canvas_size);
-                    let new_screen = new_vp.world_to_screen(world_under_mouse);
-                    let screen_delta = mouse_screen - new_screen;
-                    this.camera.x -= screen_delta.x / this.zoom;
-                    this.camera.y -= screen_delta.y / this.zoom;
-
+                    this.snapshot.write().nodes[node_idx].position += world_delta;
                     cx.notify();
-                },
-            ))
+                } else if this.panning {
+                    this.camera.x -= f32::from(delta.x) / this.zoom;
+                    this.camera.y -= f32::from(delta.y) / this.zoom;
+                    cx.notify();
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                let factor = match event.delta {
+                    ScrollDelta::Pixels(delta) => 1.0 + f32::from(delta.y) * 0.002,
+                    ScrollDelta::Lines(delta) => 1.0 + delta.y * 0.1,
+                };
+                let mouse_screen =
+                    Vec2::new(f32::from(event.position.x), f32::from(event.position.y));
+                let canvas_size = Vec2::new(1200.0, 800.0);
+                let vp = this.viewport(canvas_size);
+                let world_under_mouse = vp.screen_to_world(mouse_screen);
+
+                this.zoom = (this.zoom * factor).clamp(0.05, 20.0);
+
+                let new_vp = this.viewport(canvas_size);
+                let new_screen = new_vp.world_to_screen(world_under_mouse);
+                let screen_delta = mouse_screen - new_screen;
+                this.camera.x -= screen_delta.x / this.zoom;
+                this.camera.y -= screen_delta.y / this.zoom;
+
+                cx.notify();
+            }))
             .child(
                 canvas(
                     |_bounds, _window, _cx| {},
                     move |bounds, (), window, cx| {
                         window.paint_quad(fill(bounds, rgb(0x1e1e2e)));
 
-                        let canvas_size = Vec2::new(
-                            f32::from(bounds.size.width),
-                            f32::from(bounds.size.height),
-                        );
+                        let canvas_size =
+                            Vec2::new(f32::from(bounds.size.width), f32::from(bounds.size.height));
                         let viewport = Viewport {
                             center: camera,
                             size: canvas_size,
@@ -237,8 +197,7 @@ impl Render for GraphCanvas {
                         };
 
                         let snap = snapshot.read();
-                        let commands =
-                            generate_draw_commands(&snap, &viewport, selected_node_idx);
+                        let commands = generate_draw_commands(&snap, &viewport, selected_node_idx);
                         let lod = viewport.lod_level();
                         drop(snap);
 
@@ -285,12 +244,14 @@ impl Render for GraphCanvas {
                                 selected,
                             } = cmd
                             {
-                                let r = if use_dots { px(3.0) } else { px(*radius * zoom) };
+                                let r = if use_dots {
+                                    px(3.0)
+                                } else {
+                                    px(*radius * zoom)
+                                };
                                 let c = point(px(center.x), px(center.y));
-                                let node_bounds = Bounds::new(
-                                    point(c.x - r, c.y - r),
-                                    size(r * 2.0, r * 2.0),
-                                );
+                                let node_bounds =
+                                    Bounds::new(point(c.x - r, c.y - r), size(r * 2.0, r * 2.0));
                                 let col = color_to_rgb(*color);
 
                                 if use_dots {
@@ -305,8 +266,7 @@ impl Render for GraphCanvas {
                                             size(hr * 2.0, hr * 2.0),
                                         );
                                         window.paint_quad(
-                                            fill(ring_bounds, rgb(0xffffff))
-                                                .corner_radii(hr * 0.6),
+                                            fill(ring_bounds, rgb(0xffffff)).corner_radii(hr * 0.6),
                                         );
                                     }
 
@@ -350,12 +310,8 @@ impl Render for GraphCanvas {
                                 let line_height = font_size * 1.2;
                                 let tx = position.x - f32::from(shaped.width) / 2.0;
                                 let ty = position.y - f32::from(line_height) / 2.0;
-                                let _ = shaped.paint(
-                                    point(px(tx), px(ty)),
-                                    line_height,
-                                    window,
-                                    cx,
-                                );
+                                let _ =
+                                    shaped.paint(point(px(tx), px(ty)), line_height, window, cx);
                             }
                         }
 
@@ -365,8 +321,7 @@ impl Render for GraphCanvas {
                             let swatch = 12.0_f32;
                             let pad = 8.0_f32;
                             let legend_w = 155.0_f32;
-                            let legend_h =
-                                LEGEND_ENTRIES.len() as f32 * entry_h + pad * 2.0;
+                            let legend_h = LEGEND_ENTRIES.len() as f32 * entry_h + pad * 2.0;
                             let lx = canvas_size.x - legend_w - pad;
                             let ly = canvas_size.y - legend_h - pad;
 
@@ -388,10 +343,7 @@ impl Render for GraphCanvas {
                                 window.paint_quad(
                                     fill(
                                         Bounds::new(
-                                            point(
-                                                px(lx + pad),
-                                                px(center_y - swatch / 2.0),
-                                            ),
+                                            point(px(lx + pad), px(center_y - swatch / 2.0)),
                                             size(px(swatch), px(swatch)),
                                         ),
                                         rgb(*color_hex),
@@ -415,12 +367,8 @@ impl Render for GraphCanvas {
                                 );
                                 let text_x = lx + pad + swatch + 6.0;
                                 let text_y = center_y - f32::from(line_h) / 2.0;
-                                let _ = shaped.paint(
-                                    point(px(text_x), px(text_y)),
-                                    line_h,
-                                    window,
-                                    cx,
-                                );
+                                let _ =
+                                    shaped.paint(point(px(text_x), px(text_y)), line_h, window, cx);
                             }
                         }
                     },
@@ -431,15 +379,14 @@ impl Render for GraphCanvas {
 }
 
 fn main() {
-    // Use a persistent data directory so node positions survive across restarts.
-    let data_dir = std::path::PathBuf::from("./data/graph-view");
+    let cfg = AppConfig::load_default();
+    let data_dir = cfg.storage.db_path;
 
     let (snapshot, graph) = {
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         rt.block_on(async {
-            let graph = Arc::new(
-                KnowledgeGraph::new(&data_dir).expect("failed to open knowledge graph"),
-            );
+            let graph =
+                Arc::new(KnowledgeGraph::new(&data_dir).expect("failed to open knowledge graph"));
 
             // Only import memory.json on the first run (when the graph is empty).
             let stats = graph.get_stats().expect("failed to get stats");

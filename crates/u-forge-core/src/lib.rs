@@ -37,7 +37,7 @@ pub use ai::embeddings::{
     LemonadeProvider,
 };
 pub use builder::ObjectBuilder;
-pub use config::{AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, EmbeddingDeviceConfig, ModelConfig, ModelLoadParams};
+pub use config::{AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, EmbeddingDeviceConfig, ModelConfig, ModelLoadParams, StorageConfig};
 pub use graph::{
     GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
     HIGH_QUALITY_EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS,
