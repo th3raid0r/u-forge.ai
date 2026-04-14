@@ -3,7 +3,6 @@
 use super::storage::{self, *};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::params;
-use uuid::Uuid;
 
 use crate::types::{ChunkId, ObjectId};
 
@@ -43,9 +42,9 @@ impl KnowledgeGraphStorage {
         for row in rows {
             let (chunk_id_s, obj_id_s, content) = row?;
             results.push((
-                Uuid::parse_str(&chunk_id_s)
+                ChunkId::parse_str(&chunk_id_s)
                     .with_context(|| format!("Invalid chunk UUID in FTS result: '{chunk_id_s}'"))?,
-                Uuid::parse_str(&obj_id_s)
+                ObjectId::parse_str(&obj_id_s)
                     .with_context(|| format!("Invalid object UUID in FTS result: '{obj_id_s}'"))?,
                 content,
             ));
@@ -157,10 +156,10 @@ impl KnowledgeGraphStorage {
         for row in rows {
             let (chunk_id_s, obj_id_s, content, distance) = row?;
             results.push((
-                Uuid::parse_str(&chunk_id_s).with_context(|| {
+                ChunkId::parse_str(&chunk_id_s).with_context(|| {
                     format!("Invalid chunk UUID in semantic result: '{chunk_id_s}'")
                 })?,
-                Uuid::parse_str(&obj_id_s).with_context(|| {
+                ObjectId::parse_str(&obj_id_s).with_context(|| {
                     format!("Invalid object UUID in semantic result: '{obj_id_s}'")
                 })?,
                 content,
@@ -252,10 +251,10 @@ impl KnowledgeGraphStorage {
         for row in rows {
             let (chunk_id_s, obj_id_s, content, distance) = row?;
             results.push((
-                Uuid::parse_str(&chunk_id_s).with_context(|| {
+                ChunkId::parse_str(&chunk_id_s).with_context(|| {
                     format!("Invalid chunk UUID in HQ semantic result: '{chunk_id_s}'")
                 })?,
-                Uuid::parse_str(&obj_id_s).with_context(|| {
+                ObjectId::parse_str(&obj_id_s).with_context(|| {
                     format!("Invalid object UUID in HQ semantic result: '{obj_id_s}'")
                 })?,
                 content,

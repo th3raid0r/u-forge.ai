@@ -5,9 +5,9 @@
 //!   1. Create `notified` future — registers a permit listener BEFORE the
 //!      deque is checked.
 //!   2. Try to pop a job.
-//!   3a. If a job is found: drop the `notified` future, process the job.
-//!   3b. If no job: `.await` the `notified` future. Wakes immediately if
-//!      `notify_one()` was called between steps 1 and 3b.
+//!   3. If a job is found: drop the `notified` future, process the job.
+//!      If no job: `.await` the `notified` future. Wakes immediately if
+//!      `notify_one()` was called between steps 1 and 3.
 //!
 //! This is the canonical race-free pattern from the Tokio `Notify` docs.
 

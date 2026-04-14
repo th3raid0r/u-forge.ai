@@ -38,7 +38,11 @@ impl LemonadeHttpClient {
     /// Trailing slashes are stripped from `base_url` automatically.
     pub fn new(base_url: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }

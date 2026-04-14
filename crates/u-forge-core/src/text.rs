@@ -5,13 +5,13 @@ use crate::graph::MAX_CHUNK_TOKENS;
 /// Split `text` into pieces of at most [`MAX_CHUNK_TOKENS`] tokens, breaking
 /// only at whitespace boundaries.
 ///
-/// Uses the same `len / 4` heuristic as [`estimate_token_count`] so that the
+/// Uses the same `len / 3` heuristic as [`estimate_token_count`] so that the
 /// token budget is always consistent with what is stored in [`TextChunk::token_count`].
 ///
 /// [`estimate_token_count`]: crate::types
 pub(crate) fn split_text(text: &str) -> Vec<String> {
-    // 4 chars per token mirrors estimate_token_count in types.rs.
-    let max_chars = MAX_CHUNK_TOKENS * 4;
+    // 3 chars per token mirrors estimate_token_count in types.rs.
+    let max_chars = MAX_CHUNK_TOKENS * 3;
 
     if text.len() <= max_chars {
         let trimmed = text.trim().to_string();
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn test_split_text_exact_boundary_is_not_split() {
-        let max_chars = MAX_CHUNK_TOKENS * 4;
+        let max_chars = MAX_CHUNK_TOKENS * 3;
         let content = "a".repeat(max_chars);
         let pieces = split_text(&content);
         assert_eq!(pieces.len(), 1);
@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn test_split_text_long_content_splits_on_word_boundary() {
-        let max_chars = MAX_CHUNK_TOKENS * 4;
+        let max_chars = MAX_CHUNK_TOKENS * 3;
         // Build content that is 3× the character limit so it must split into ≥2 pieces.
         let word = "x".repeat(399);
         let repeats = (max_chars * 3 / (word.len() + 1)) + 1;
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_split_text_hard_cut_when_no_whitespace() {
-        let max_chars = MAX_CHUNK_TOKENS * 4;
+        let max_chars = MAX_CHUNK_TOKENS * 3;
         let content = "z".repeat(max_chars * 2 + 1);
         let pieces = split_text(&content);
         assert!(pieces.len() >= 2, "must hard-cut oversized no-whitespace content");

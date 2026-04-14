@@ -63,7 +63,7 @@ pub enum ProviderSlot {
     Embedding(Arc<dyn EmbeddingProvider>),
     Transcription(Arc<dyn TranscriptionProvider>),
     Chat(LemonadeChatProvider),
-    Tts(LemonadeTtsProvider),
+    Tts(Box<LemonadeTtsProvider>),
     Rerank(LemonadeRerankProvider),
 }
 
@@ -101,7 +101,7 @@ impl ProviderFactory {
     /// - `base_url`    — Lemonade Server API base URL (e.g. `http://localhost:13305/api/v1`).
     /// - `weight`      — Dispatch weight (relevant only for `Embedding` workers).
     /// - `gpu_manager` — Shared GPU lock; attach when the model will share GPU memory
-    ///                   with STT or LLM workloads.
+    ///   with STT or LLM workloads.
     ///
     /// # Errors
     ///
@@ -204,7 +204,7 @@ impl ProviderFactory {
     fn build_tts(base_url: &str, model_id: &str, name: &str) -> ProviderSlot {
         let provider = LemonadeTtsProvider::new(base_url, model_id);
         info!(model = model_id, name, "TTS provider built");
-        ProviderSlot::Tts(provider)
+        ProviderSlot::Tts(Box::new(provider))
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

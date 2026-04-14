@@ -242,7 +242,11 @@ impl LemonadeServerCatalog {
         base_url: &str,
     ) -> Result<(Vec<InstalledBackend>, String, f64)> {
         let url = format!("{base_url}/system-info");
-        let raw: serde_json::Value = reqwest::Client::new()
+        let raw: serde_json::Value = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_default()
             .get(&url)
             .send()
             .await

@@ -51,7 +51,11 @@ pub struct SystemInfo {
 impl SystemInfo {
     /// Fetch system info from `GET {base_url}/system-info`.
     pub async fn fetch(base_url: &str) -> Result<Self> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_default();
         let base = base_url.trim_end_matches('/');
         let url = format!("{base}/system-info");
 

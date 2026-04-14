@@ -154,7 +154,7 @@ impl KnowledgeGraph {
     /// Create a relationship using a plain string edge type.
     pub fn connect_objects_str(&self, from: ObjectId, to: ObjectId, edge_type: &str) -> Result<()> {
         self.storage
-            .upsert_edge(Edge::new(from, to, EdgeType::from_str(edge_type)))
+            .upsert_edge(Edge::new(from, to, EdgeType::new(edge_type)))
     }
 
     /// Create a weighted relationship.
@@ -178,7 +178,7 @@ impl KnowledgeGraph {
         weight: f32,
     ) -> Result<()> {
         self.storage
-            .upsert_edge(Edge::new(from, to, EdgeType::from_str(edge_type)).with_weight(weight))
+            .upsert_edge(Edge::new(from, to, EdgeType::new(edge_type)).with_weight(weight))
     }
 
     /// All edges incident to `id` (both outgoing and incoming).
@@ -243,7 +243,7 @@ impl KnowledgeGraph {
     /// automatically via the `chunks_ai` trigger.  Returns the [`ChunkId`] of
     /// every piece created, in order.  The vast majority of calls produce a
     /// single-element `Vec`; splitting only occurs when `content` exceeds
-    /// `MAX_CHUNK_TOKENS` (currently 500 tokens ≈ 2 000 characters).
+    /// `MAX_CHUNK_TOKENS` (currently 500 tokens ≈ 1 500 characters).
     pub fn add_text_chunk(
         &self,
         object_id: ObjectId,

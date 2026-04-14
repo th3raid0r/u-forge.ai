@@ -14,14 +14,14 @@
 //! lock guards are obtained without `.unwrap()`.
 
 use crate::schema::SchemaDefinition;
-use crate::types::{ChunkType, ObjectMetadata};
+use crate::types::{ChunkType, ObjectId, ObjectMetadata};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use parking_lot::Mutex;
 use std::sync::{Arc, Once};
 use tracing::warn;
-use uuid::Uuid;
+
 
 // ─── SQL schema ───────────────────────────────────────────────────────────────
 
@@ -221,6 +221,7 @@ pub(super) fn str_to_chunk_type(s: &str) -> ChunkType {
 /// Build an `ObjectMetadata` from the nine column values returned by every
 /// `SELECT … FROM nodes` query.  Centralising this avoids repeating
 /// fallible parsing logic across multiple methods.
+#[allow(clippy::too_many_arguments)] // mirrors the fixed 9-column SELECT schema
 pub(super) fn row_to_metadata(
     id_str: String,
     object_type: String,
@@ -233,7 +234,7 @@ pub(super) fn row_to_metadata(
     updated_at_str: String,
 ) -> Result<ObjectMetadata> {
     Ok(ObjectMetadata {
-        id: Uuid::parse_str(&id_str)
+        id: ObjectId::parse_str(&id_str)
             .with_context(|| format!("Invalid UUID in nodes table: '{id_str}'"))?,
         object_type,
         schema_name,
@@ -274,7 +275,14 @@ impl KnowledgeGraphStorage {
         SQLITE_VEC_INIT.call_once(|| unsafe {
             use rusqlite::ffi::sqlite3_auto_extension;
             use sqlite_vec::sqlite3_vec_init;
-            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+            sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut i8,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> i32,
+            >(sqlite3_vec_init as *const ())));
         });
 
         let db_file = db_path.join("knowledge.db");
@@ -418,7 +426,7 @@ impl KnowledgeGraphStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChunkType, Edge, EdgeType, ObjectId, TextChunk};
+    use crate::types::{ChunkId, ChunkType, Edge, EdgeType, ObjectId, TextChunk};
     use std::collections::HashSet;
     use tempfile::TempDir;
 
@@ -470,7 +478,7 @@ mod tests {
             .is_empty());
 
         // Unknown ID returns None.
-        assert!(storage.get_node(Uuid::new_v4()).unwrap().is_none());
+        assert!(storage.get_node(ObjectId::new_v4()).unwrap().is_none());
 
         // Upsert should update without dropping the node.
         let mut updated = got.clone();
@@ -495,7 +503,7 @@ mod tests {
         storage.upsert_node(gandalf.clone()).unwrap();
         storage.upsert_node(frodo.clone()).unwrap();
 
-        let edge = Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows"));
+        let edge = Edge::new(gandalf.id, frodo.id, EdgeType::new("knows"));
         storage.upsert_edge(edge).unwrap();
 
         // Outgoing from Gandalf.
@@ -521,7 +529,7 @@ mod tests {
         assert_eq!(f_neighbours[0], gandalf.id);
 
         // Re-inserting the same triplet should not create a duplicate.
-        let edge2 = Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows"));
+        let edge2 = Edge::new(gandalf.id, frodo.id, EdgeType::new("knows"));
         storage.upsert_edge(edge2).unwrap();
         assert_eq!(storage.get_edges(gandalf.id).unwrap().len(), 1);
 
@@ -544,7 +552,7 @@ mod tests {
         storage.upsert_node(frodo.clone()).unwrap();
 
         storage
-            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows")))
+            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::new("knows")))
             .unwrap();
 
         let chunk = TextChunk::new(
@@ -574,7 +582,7 @@ mod tests {
         assert!(storage.get_node(frodo.id).unwrap().is_some());
 
         // Deleting a non-existent node is a no-op.
-        storage.delete_node(Uuid::new_v4()).unwrap();
+        storage.delete_node(ObjectId::new_v4()).unwrap();
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────────
@@ -595,7 +603,7 @@ mod tests {
         storage.upsert_node(gandalf.clone()).unwrap();
         storage.upsert_node(frodo.clone()).unwrap();
         storage
-            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows")))
+            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::new("knows")))
             .unwrap();
 
         let chunk = TextChunk::new(
@@ -728,10 +736,10 @@ mod tests {
         storage.upsert_node(sam.clone()).unwrap();
 
         storage
-            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::from_str("knows")))
+            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::new("knows")))
             .unwrap();
         storage
-            .upsert_edge(Edge::new(frodo.id, sam.id, EdgeType::from_str("ally_of")))
+            .upsert_edge(Edge::new(frodo.id, sam.id, EdgeType::new("ally_of")))
             .unwrap();
 
         // Add text chunks to verify they are collected.
@@ -1019,7 +1027,7 @@ mod tests {
     fn test_upsert_embedding_nonexistent_chunk_errors() {
         let (storage, _dir) = create_test_storage();
 
-        let phantom_id = Uuid::new_v4();
+        let phantom_id = ChunkId::new_v4();
         let embedding = one_hot(0, EMBEDDING_DIMENSIONS);
         let err = storage
             .upsert_chunk_embedding(phantom_id, &embedding)
@@ -1081,20 +1089,20 @@ mod tests {
 
         // Insert edges across multiple nodes.
         storage
-            .upsert_edge(Edge::new(id_a, id_b, EdgeType::Custom("knows".to_string())))
+            .upsert_edge(Edge::new(id_a, id_b, EdgeType::new("knows")))
             .unwrap();
         storage
             .upsert_edge(Edge::new(
                 id_b,
                 id_c,
-                EdgeType::Custom("trusts".to_string()),
+                EdgeType::new("trusts"),
             ))
             .unwrap();
         storage
             .upsert_edge(Edge::new(
                 id_a,
                 id_c,
-                EdgeType::Custom("opposes".to_string()),
+                EdgeType::new("opposes"),
             ))
             .unwrap();
 

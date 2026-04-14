@@ -135,7 +135,7 @@ conn.execute(
 - `tags: Vec<String>` → `serde_json::to_string`
 - `properties: serde_json::Value` → `serde_json::to_string`
 - Datetimes → RFC 3339 `TEXT`
-- `EdgeType` → `edge_type.as_str()` on write; `EdgeType::Custom(s)` on read
+- `EdgeType` → `edge_type.as_str()` on write; `EdgeType::new(s)` on read
 
 `KnowledgeGraph::new(db_path)` takes **one argument** (the directory path). The
 SQLite file is created at `<db_path>/knowledge.db`.

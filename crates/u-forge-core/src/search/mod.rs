@@ -801,8 +801,8 @@ pub async fn search_hybrid(
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn parse_uuid(s: &str, label: &str) -> Result<uuid::Uuid> {
-    uuid::Uuid::parse_str(s)
+fn parse_uuid(s: &str, label: &str) -> Result<ObjectId> {
+    ObjectId::parse_str(s)
         .map_err(|e| anyhow::anyhow!("Invalid {label} UUID '{s}' in hybrid search result: {e}"))
 }
 

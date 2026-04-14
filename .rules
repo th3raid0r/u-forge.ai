@@ -87,6 +87,11 @@ Recent quality improvements:
 - `KnowledgeGraphStorage` now uses `parking_lot::Mutex` — all 24 `.lock().unwrap()` calls removed.
 - `ObjectType` enum deleted from `types.rs` — it was dead code; `ObjectMetadata.object_type` is `String` throughout, and `ObjectBuilder` already embeds correct string literals.
 - `WeightedEmbedDispatcher::worker_count()` removed — `InferenceQueue` exposes `embedding_worker_count()` for callers. `WeightedWorkerSlot::name` and `idle` fields annotated with intent comments (retained for future diagnostics).
+- HTTP timeouts added to all Lemonade HTTP clients — `LemonadeHttpClient::new()` sets 30s request / 5s connect; lightweight discovery clients (`system_info`, `catalog`) use 5s / 2s. Prevents indefinite blocking when Lemonade Server hangs.
+- Token estimation changed from `len / 4` to `len.div_ceil(3)` — conservative 3-char/token ratio better matches dense TTRPG prose. `split_text()` in `text.rs` uses the same ratio (`MAX_CHUNK_TOKENS * 3` chars per chunk).
+- `EdgeType` collapsed from single-variant enum (`Custom(String)`) to transparent newtype struct. Use `EdgeType::new(s)` everywhere — `Custom(s)` no longer exists.
+- `ObjectId` and `ChunkId` promoted from type aliases to newtype structs (`#[serde(transparent)]`). The compiler now rejects passing a `ChunkId` where an `ObjectId` is expected. Construct with `::new_v4()`; parse with `::parse_str(s)`.
+- 9 clippy warnings resolved: `while let` loop, boxed large enum variant (`ProviderSlot::Tts`), `#[derive(Default)]` on `KokoroVoice`, transmute type annotation for sqlite-vec FFI, doc formatting. Edge metadata JSON parse failures now emit `debug!()` instead of silently swallowing errors.
 
 The core library has been fully refactored (hardware abstraction layer removed):
 - `hardware/` directory deleted — `NpuDevice`, `GpuDevice`, `CpuDevice`, `DeviceWorker`

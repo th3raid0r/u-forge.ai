@@ -3,9 +3,8 @@
 use super::storage::*;
 use anyhow::{Context, Result};
 use rusqlite::params;
-use uuid::Uuid;
 
-use crate::types::{ObjectId, TextChunk};
+use crate::types::{ChunkId, ObjectId, TextChunk};
 
 impl KnowledgeGraphStorage {
     /// Insert or update a text chunk.
@@ -68,9 +67,9 @@ impl KnowledgeGraphStorage {
         for row in rows {
             let (id_s, obj_s, ct_s, content, token_count, ca_s) = row?;
             chunks.push(TextChunk {
-                id: Uuid::parse_str(&id_s)
+                id: ChunkId::parse_str(&id_s)
                     .with_context(|| format!("Invalid chunk UUID: '{id_s}'"))?,
-                object_id: Uuid::parse_str(&obj_s)
+                object_id: ObjectId::parse_str(&obj_s)
                     .with_context(|| format!("Invalid object UUID in chunk: '{obj_s}'"))?,
                 chunk_type: str_to_chunk_type(&ct_s),
                 content,
@@ -106,9 +105,9 @@ impl KnowledgeGraphStorage {
         for row in rows {
             let (id_s, obj_s, ct_s, content, token_count, ca_s) = row?;
             chunks.push(TextChunk {
-                id: Uuid::parse_str(&id_s)
+                id: ChunkId::parse_str(&id_s)
                     .with_context(|| format!("Invalid chunk UUID: '{id_s}'"))?,
-                object_id: Uuid::parse_str(&obj_s)
+                object_id: ObjectId::parse_str(&obj_s)
                     .with_context(|| format!("Invalid object UUID in chunk: '{obj_s}'"))?,
                 chunk_type: str_to_chunk_type(&ct_s),
                 content,
@@ -145,9 +144,9 @@ impl KnowledgeGraphStorage {
         for row in rows {
             let (id_s, obj_s, ct_s, content, token_count, ca_s) = row?;
             chunks.push(TextChunk {
-                id: Uuid::parse_str(&id_s)
+                id: ChunkId::parse_str(&id_s)
                     .with_context(|| format!("Invalid chunk UUID: '{id_s}'"))?,
-                object_id: Uuid::parse_str(&obj_s)
+                object_id: ObjectId::parse_str(&obj_s)
                     .with_context(|| format!("Invalid object UUID in chunk: '{obj_s}'"))?,
                 chunk_type: str_to_chunk_type(&ct_s),
                 content,
