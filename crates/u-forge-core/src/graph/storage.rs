@@ -102,6 +102,16 @@ CREATE TRIGGER IF NOT EXISTS chunks_vec_ad AFTER DELETE ON chunks BEGIN
     DELETE FROM chunks_vec WHERE rowid = old.rowid;
 END;
 
+-- ── UI layout positions ────────────────────────────────────────────────────────
+-- Persists node canvas positions from the graph view UI.
+-- ON DELETE CASCADE keeps this table clean when nodes are removed.
+CREATE TABLE IF NOT EXISTS node_positions (
+    node_id        TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    x              REAL NOT NULL,
+    y              REAL NOT NULL,
+    layout_version INTEGER NOT NULL DEFAULT 1
+);
+
 -- ── High-quality ANN vector search (sqlite-vec) ─────────────────────────────
 -- 4096-dim index for high-quality embedding models (e.g. Qwen3-Embedding-8B-GGUF).
 -- Populated only when high_quality_embedding is enabled in config.

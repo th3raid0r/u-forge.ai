@@ -7,7 +7,7 @@
 
 ## Goal
 
-A native GPU-accelerated UI for exploring and editing knowledge graphs. Primary framework is **GPUI** (Zed editor). The codebase must support swapping UI frameworks, so all rendering logic is isolated behind a framework-agnostic view model crate that neither GPUI nor egui depend on.
+A native GPU-accelerated UI for exploring and editing knowledge graphs. Built on **GPUI** (Zed editor). All rendering logic is isolated behind a framework-agnostic view model crate so it has zero UI framework dependencies.
 
 Target scale: **~3,000–10,000 nodes, ~20,000 edges** (a mature TTRPG campaign plus a full system reference like D&D 5E PHB + DMG + MM + expansions).
 
@@ -17,8 +17,7 @@ Target scale: **~3,000–10,000 nodes, ~20,000 edges** (a mature TTRPG campaign 
 
 - `crates/u-forge-graph-view/` — view model, layout engine, spatial indexing. **Zero UI framework dependencies.**
 - `crates/u-forge-ui-traits/` — rendering contracts shared across UI implementations (see [UI Traits](#ui-traits-u-forge-ui-traits) section)
-- `crates/u-forge-ui-gpui/` — GPUI prototype (primary)
-- `crates/u-forge-ui-egui/` — egui fallback (only if GPUI feasibility spike fails)
+- `crates/u-forge-ui-gpui/` — GPUI app (primary)
 
 ---
 
@@ -117,7 +116,7 @@ Use grid-cell bucketing for repulsion (O(N) per step, not O(N²)). Divide the bo
 
 ## UI Traits (`u-forge-ui-traits`)
 
-Defines the rendering contract that both GPUI and egui backends implement. This crate depends only on `glam` and `u-forge-graph-view` types — no UI framework dependencies.
+Defines the rendering contract for the GPUI backend. This crate depends only on `glam` and `u-forge-graph-view` types — no UI framework dependencies.
 
 ```rust
 /// A positioned, styled primitive that the UI framework draws.
@@ -157,36 +156,38 @@ The view model produces `Vec<DrawCommand>` from a `GraphSnapshot` + `Viewport`. 
 
 **GPUI version:** Using `gpui = "0.2.2"` from crates.io (blade-graphics backend). The current `main` branch of the Zed repo has restructured into `gpui_platform`/`gpui_linux`/`gpui_wgpu` sub-crates with a different entry point (`gpui_platform::application()` instead of `Application::new()`). Stay on 0.2.2 until there is a clear need to upgrade — the crates.io release is stable enough for our purposes. Do not switch to a git dependency without a targeted API compatibility pass.
 
-### Feasibility spike (do this first)
+### App shell (`AppView`)
 
-Before building the full app: render 5,000 randomly-positioned circles with pan and zoom using `gpui::canvas`. Confirm > 60fps on the target hardware. **Failure criteria:** if the spike cannot achieve 60fps with 5,000 circles after reasonable optimization (batching, viewport culling), switch to the egui fallback for the canvas. GPUI can still be used for panels and chrome in that case.
+`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>` and a `file_menu_open: bool` toggle. It renders:
+- **Menu bar** (28 px, `flex_none`): a "File" button that toggles an inline dropdown. The dropdown's single item dispatches `SaveLayout`. The `SaveLayout` action is also reachable via Ctrl+S and registered with `cx.set_menus()` for native menu support on macOS.
+- **Workspace** (remaining height, `flex_col`): a 30/70 flex-grow split. Top 30% is the editor placeholder; bottom 70% hosts `Entity<GraphCanvas>`.
+
+The File dropdown is rendered with `deferred(anchored(...))` so it paints on top of all other content.
 
 ### Canvas architecture
 
-The graph canvas is a single `gpui::canvas` element. Its paint closure reads the snapshot (non-blocking read lock), calls `nodes_in_viewport`, determines LOD from zoom level, then draws edges then nodes. World-to-screen transform: `screen = (world_pos - pan) * zoom + canvas_center`.
+`GraphCanvas` is a child `Entity<V>` rendered inside `AppView`. It renders a `div#graph-root` (with `overflow_hidden()`) containing a single `gpui::canvas` element.
+
+**Coordinate system.** GPUI's `window.paint_*` calls take _window_ coordinates, but `generate_draw_commands` produces _canvas-local_ coordinates (origin at the canvas element's top-left). When the canvas no longer fills the full window (e.g., sits below a menu bar and editor pane), all paint positions must be offset by `bounds.origin`. `GraphCanvas` stores `canvas_bounds: Arc<RwLock<Bounds<Pixels>>>`, updated at the top of each paint closure. Mouse event handlers read this to subtract `bounds.origin` before calling `screen_to_world`.
+
+**Clipping.** `overflow_hidden()` on `div#graph-root` installs a GPUI `content_mask` that clips all descendant paint ops to the pane's layout bounds. Without this, nodes near the viewport edge paint into adjacent panes.
+
+World-to-screen transform (canvas-local): `screen = (world_pos - pan) * zoom + canvas_size * 0.5`.
+Window-space position: `window_pos = screen + bounds.origin`.
 
 All `KnowledgeGraph` access happens on `cx.background_executor()` — never on the GPUI main thread, since `Mutex<Connection>` blocks.
 
 ---
 
-## egui Fallback (`u-forge-ui-egui`)
-
-Only implement if the GPUI spike fails. Same `GraphSnapshot`, same layout engine. Replace `gpui::canvas` with an `egui::Painter` inside `egui::CentralPanel`. The draw call structure is identical: edges first, then nodes, applying the same world-to-screen transform via the shared `Viewport` type.
-
----
-
 ## Graph Position Persistence
 
-Once a prototype is validated, add a `node_positions` table to SQLite (in `u-forge-core`) with `ON DELETE CASCADE` on `node_id`. Expose `save_layout()` and `load_layout()` on the `KnowledgeGraph` facade. Update `build_snapshot()` in `u-forge-graph-view` to use saved positions when available, skipping the layout pass if all nodes have stored positions.
+Node canvas positions are stored in the `node_positions` SQLite table (see `ARCHITECTURE.md` for schema). `KnowledgeGraph::save_layout(&[(ObjectId, f32, f32)])` upserts positions; `KnowledgeGraph::load_layout()` returns an `ObjectId → (x, y)` map. Both are implemented in `u-forge-core/src/graph/positions.rs`.
 
-```sql
-CREATE TABLE IF NOT EXISTS node_positions (
-    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
-    x       REAL NOT NULL,
-    y       REAL NOT NULL,
-    layout_version INTEGER NOT NULL DEFAULT 1
-);
-```
+`build_snapshot()` in `u-forge-graph-view` always runs force-directed layout first (so new nodes get valid initial positions), then overwrites with saved positions for any node that has a stored entry. This means the layout pass is never fully skipped, but its result is overridden for known nodes — giving correct placement for mixed new+existing graphs.
+
+The GPUI canvas saves positions **on every node drag completion** (mouse-up after a node move) rather than only on window close. The database path defaults to `./data/db/` and is configurable via the `[storage] db_path` key in `u-forge.toml`. Import from `memory.json` runs only on first launch (when the graph is empty).
+
+`GraphSnapshot::rebuild_spatial_index()` rebuilds the R-tree from current `nodes[].position` values; called after each drag so hit-testing stays accurate.
 
 ---
 
@@ -196,10 +197,11 @@ CREATE TABLE IF NOT EXISTS node_positions (
 2. ✅ **`u-forge-graph-view`** — `GraphSnapshot`, `build_snapshot()`, R-tree culling, force-directed layout. 5 passing tests.
 3. ✅ **`u-forge-ui-traits`** — `DrawCommand`, `Viewport`, `generate_draw_commands()`. 2 passing tests.
 4. ✅ **Wire GPUI prototype** — renders `memory.json` (220 nodes, 312 edges) with pan, zoom, LOD, type-colored nodes.
-5. **`ObservableGraph`** — event-driven incremental updates.
-6. **Node detail panel** — click handler → detail view with node data.
-7. **Search** — text input → highlight matching nodes.
-8. **Position persistence** — `node_positions` table + `save_layout()`/`load_layout()`.
+5. ✅ **Position persistence + node dragging** — `node_positions` table, `save_layout()`/`load_layout()`, drag-to-reposition nodes in the canvas, autosave on drag-end, persistent DB.
+6. ✅ **App shell** — `AppView` root view wrapping `GraphCanvas`. Menu bar (File > Save, Ctrl+S, `SaveLayout` action). 30/70 flex-grow workspace split: editor placeholder (top) + graph canvas (bottom). Canvas coordinate fix: `bounds.origin` offset applied to all paint positions; mouse events subtract `bounds.origin` before `screen_to_world`. `overflow_hidden()` clips paint to pane bounds.
+7. **`ObservableGraph`** — event-driven incremental updates.
+8. **Node detail panel** — click handler → detail view with node data.
+9. **Search** — text input → highlight matching nodes.
 
 ---
 

@@ -60,6 +60,69 @@ impl GraphSnapshot {
             .collect()
     }
 
+    /// Rebuild the R-tree spatial index from the current node positions.
+    ///
+    /// Call this after mutating any `NodeView::position` values (e.g. after a
+    /// drag operation) so that subsequent viewport culling and hit-testing
+    /// reflect the new positions.
+    pub fn rebuild_spatial_index(&mut self) {
+        let entries: Vec<NodeEntry> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| NodeEntry {
+                index: i,
+                position: [n.position.x, n.position.y],
+            })
+            .collect();
+        self.spatial_index = RTree::bulk_load(entries);
+    }
+
+    /// Return the index of the node closest to `world_pos` within `max_dist` world units,
+    /// or `None` if no node is within range.
+    pub fn node_at_position(&self, world_pos: Vec2, max_dist: f32) -> Option<usize> {
+        self.nodes_in_viewport(
+            world_pos - Vec2::splat(max_dist),
+            world_pos + Vec2::splat(max_dist),
+        )
+        .into_iter()
+        .filter_map(|idx| {
+            let dist = (self.nodes[idx].position - world_pos).length();
+            if dist <= max_dist {
+                Some((idx, dist))
+            } else {
+                None
+            }
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx)
+    }
+
+    /// Return the index of the closest node whose AABB (centered on the node,
+    /// half-extent `half_size` in each axis) contains `world_pos`.
+    ///
+    /// Prefer this over [`node_at_position`] for hit-testing squircle nodes —
+    /// the rectangular test matches the visual footprint of a rounded square.
+    pub fn node_at_point_aabb(&self, world_pos: Vec2, half_size: f32) -> Option<usize> {
+        self.nodes_in_viewport(
+            world_pos - Vec2::splat(half_size),
+            world_pos + Vec2::splat(half_size),
+        )
+        .into_iter()
+        .filter_map(|idx| {
+            let delta = (self.nodes[idx].position - world_pos).abs();
+            if delta.x <= half_size && delta.y <= half_size {
+                // Use L∞ distance so the closest node in AABB sense is preferred.
+                let dist = delta.x.max(delta.y);
+                Some((idx, dist))
+            } else {
+                None
+            }
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx)
+    }
+
     /// Return indices of edges where at least one endpoint is visible.
     pub fn edges_in_viewport(&self, visible_nodes: &[bool]) -> Vec<usize> {
         self.edges
@@ -73,14 +136,18 @@ impl GraphSnapshot {
 
 /// Build a `GraphSnapshot` from a `KnowledgeGraph`.
 ///
-/// 1. Fetches all objects and edges
+/// 1. Fetches all objects, edges, and any previously saved canvas positions
 /// 2. Builds an ObjectId → index map
 /// 3. Converts edges to index-based EdgeViews
-/// 4. Runs force-directed layout to assign positions
-/// 5. Builds the R-tree spatial index
+/// 4. Runs force-directed layout to assign positions for all nodes
+/// 5. Overwrites positions with saved values where available
+/// 6. Builds the R-tree spatial index
 pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
     let objects = graph.get_all_objects()?;
     let raw_edges = graph.get_all_edges()?;
+
+    // Load any previously saved UI positions (empty map on first run)
+    let saved_positions = graph.load_layout().unwrap_or_default();
 
     // Build ObjectId → usize index map
     let id_to_idx: HashMap<ObjectId, usize> = objects
@@ -89,7 +156,7 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         .map(|(i, obj)| (obj.id, i))
         .collect();
 
-    // Convert to NodeViews (positions will be set by layout)
+    // Convert to NodeViews (positions will be set below)
     let mut nodes: Vec<NodeView> = objects
         .into_iter()
         .map(|obj| NodeView {
@@ -117,8 +184,17 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         })
         .collect();
 
-    // Run layout to assign positions
+    // Run layout so every node gets a valid initial position.
+    // Nodes with saved positions will have those overwritten in the next step,
+    // but new nodes (not yet in node_positions) keep the layout-computed value.
     force_directed_layout(&mut nodes, &edges);
+
+    // Apply saved positions, overriding the layout result for known nodes.
+    for node in &mut nodes {
+        if let Some(&(x, y)) = saved_positions.get(&node.id) {
+            node.position = Vec2::new(x, y);
+        }
+    }
 
     // Build R-tree spatial index from final positions
     let entries: Vec<NodeEntry> = nodes

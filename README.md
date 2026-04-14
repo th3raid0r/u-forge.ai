@@ -251,10 +251,9 @@ u-forge.ai/
 │   │       ├── common/             # Shared helpers (config, args, KG setup, embedding)
 │   │       ├── cli_demo.rs         # Demo: hardware caps, FTS5, reranking
 │   │       └── cli_chat.rs         # Interactive RAG chat REPL
-│   ├── u-forge-graph-view/ # Graph view model + layout (skeleton — see feature_UI.md)
-│   ├── u-forge-ui-traits/  # Framework-agnostic rendering contracts (skeleton — see feature_UI.md)
-│   ├── u-forge-ui-gpui/    # GPUI native app (skeleton — see feature_UI.md)
-│   ├── u-forge-ui-egui/    # egui fallback app (skeleton — see feature_UI.md)
+│   ├── u-forge-graph-view/ # Graph view model + layout (see feature_UI.md)
+│   ├── u-forge-ui-traits/  # Framework-agnostic rendering contracts (see feature_UI.md)
+│   ├── u-forge-ui-gpui/    # GPUI native app (see feature_UI.md)
 │   └── u-forge-ts-runtime/ # Embedded deno_core TypeScript sandbox (skeleton — see feature_TS-Agent-Sandbox.md)
 ├── defaults/
 │   ├── data/memory.json    # Foundation universe JSONL (~220 nodes, ~312 edges)

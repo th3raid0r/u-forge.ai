@@ -6296,20 +6296,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "u-forge-ui-egui"
-version = "0.1.0"
-dependencies = [
- "u-forge-core",
- "u-forge-graph-view",
- "u-forge-ui-traits",
-]
-
-[[package]]
 name = "u-forge-ui-gpui"
 version = "0.1.0"
 dependencies = [
  "glam",
  "gpui",
+ "parking_lot",
  "tempfile",
  "tokio",
  "u-forge-core",
