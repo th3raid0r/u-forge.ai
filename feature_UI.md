@@ -158,11 +158,38 @@ The view model produces `Vec<DrawCommand>` from a `GraphSnapshot` + `Viewport`. 
 
 ### App shell (`AppView`)
 
-`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>` and a `file_menu_open: bool` toggle. It renders:
-- **Menu bar** (28 px, `flex_none`): a "File" button that toggles an inline dropdown. The dropdown's single item dispatches `SaveLayout`. The `SaveLayout` action is also reachable via Ctrl+S and registered with `cx.set_menus()` for native menu support on macOS.
-- **Workspace** (remaining height, `flex_col`): a 30/70 flex-grow split. Top 30% is the editor placeholder; bottom 70% hosts `Entity<GraphCanvas>`.
+`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SelectionModel>`, and boolean toggles. It renders:
+- **Menu bar** (28 px, `flex_none`): "File" button (dropdown: Save / Ctrl+S via `SaveLayout` action) and "Nodes ▶/◀" button that dispatches `ToggleSidebar`. Both actions are registered with `cx.set_menus()` and `cx.bind_keys()`. Ctrl+B also toggles the sidebar.
+- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional `TreePanel` (220 px, `flex_none`) on the left + main workspace.
+- **Workspace** (`flex_col`, `flex_grow`): 30/70 vertical split — editor placeholder (top) + `GraphCanvas` (bottom).
 
 The File dropdown is rendered with `deferred(anchored(...))` so it paints on top of all other content.
+
+### Selection model (`SelectionModel`)
+
+A shared GPUI entity that both `TreePanel` and `GraphCanvas` observe. Holds `selected_node_idx: Option<usize>` and `selected_node_id: Option<ObjectId>`. Key API:
+- `select_by_idx(idx, cx)` — called from canvas clicks; keeps both fields in sync.
+- `select_by_id(id, cx)` — called from tree panel clicks; looks up the index via snapshot scan.
+- `clear(cx)` — deselects.
+
+Both panels observe the entity via `cx.observe(&selection, callback)`. Observers fire whenever `SelectionModel` calls `cx.notify()`. `GraphCanvas` pans the camera to the selected node when the selection originates externally (tree panel). A `suppress_pan: bool` flag prevents the canvas from panning to a node it just selected itself.
+
+### Tree panel (`TreePanel`)
+
+A 220 px sidebar listing all nodes grouped by `object_type`. Rendered as a two-div structure:
+1. Fixed 28 px "NODES" header (`flex_none`).
+2. `overflow_y_scroll()` + `flex_grow` content area containing collapsible type groups and node entries.
+
+Nodes are sorted case-insensitively within each group; groups are sorted by type name. All groups start **collapsed** by default — the `collapsed` set is pre-populated with all type names at construction. Clicking a type header toggles its group. Clicking a node entry updates `SelectionModel`.
+
+### GPUI layout constraints (hard-won lessons)
+
+These patterns are required for scroll areas to work correctly inside a flex layout:
+
+- **`overflow_hidden()` on the body container** — without this, flex children that render more content than their computed size will grow the parent rather than clip. Apply to any container that must not exceed its allocated bounds.
+- **`min_h_0()` on flex children with scrollable content** — flex items have `min-height: auto` by default, which prevents them from shrinking below their content height. `min_h_0()` overrides this so the item can shrink to its flex-allocated size and let the inner `overflow_y_scroll()` div take over.
+- **Separate shell div from scroll area div** — the outer div (`flex_col`, `flex_none` width, `min_h_0()`) provides the fixed size; an inner div (`overflow_y_scroll()`, `flex_grow`) holds the scrollable content. Combining these on a single div causes layout issues.
+- **`flex_none` on the sidebar** — the tree panel must not participate in flex stretching; only the workspace should grow.
 
 ### Canvas architecture
 
@@ -199,9 +226,10 @@ The GPUI canvas saves positions **on every node drag completion** (mouse-up afte
 4. ✅ **Wire GPUI prototype** — renders `memory.json` (220 nodes, 312 edges) with pan, zoom, LOD, type-colored nodes.
 5. ✅ **Position persistence + node dragging** — `node_positions` table, `save_layout()`/`load_layout()`, drag-to-reposition nodes in the canvas, autosave on drag-end, persistent DB.
 6. ✅ **App shell** — `AppView` root view wrapping `GraphCanvas`. Menu bar (File > Save, Ctrl+S, `SaveLayout` action). 30/70 flex-grow workspace split: editor placeholder (top) + graph canvas (bottom). Canvas coordinate fix: `bounds.origin` offset applied to all paint positions; mouse events subtract `bounds.origin` before `screen_to_world`. `overflow_hidden()` clips paint to pane bounds.
-7. **`ObservableGraph`** — event-driven incremental updates.
-8. **Node detail panel** — click handler → detail view with node data.
-9. **Search** — text input → highlight matching nodes.
+7. ✅ **Tree view nav + shared selection** — `SelectionModel` entity shared between `TreePanel` and `GraphCanvas`. Tree panel lists nodes by type (collapsed by default, collapsible groups, alphabetical sort). Selecting a node in the tree highlights it in the graph and pans the camera to it. Canvas clicks update the tree highlight. `suppress_pan` flag prevents the canvas from panning when it originated the selection. Sidebar toggled via Ctrl+B or "Nodes" menu bar button. GPUI layout fix: `overflow_hidden()` on body + `min_h_0()` on flex children enables true scroll containment.
+8. **`ObservableGraph`** — event-driven incremental updates.
+9. **Node detail panel** — click handler → detail view with node data.
+10. **Search** — text input → highlight matching nodes.
 
 ---
 

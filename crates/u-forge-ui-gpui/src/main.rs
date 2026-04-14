@@ -5,15 +5,15 @@ use gpui::{
     anchored, canvas, deferred, div, fill, font, point, prelude::*, px, rgb, rgba, size, App,
     Application, Bounds, Context, Corner, Entity, Font, Hsla, KeyBinding, Menu, MenuItem,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, TextRun, Window, WindowBounds, WindowOptions,
-    actions, relative,
+    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, TextRun, Window, WindowBounds,
+    WindowOptions, actions, relative,
 };
 use parking_lot::RwLock;
 use u_forge_core::{AppConfig, KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{build_snapshot, GraphSnapshot, LodLevel};
 use u_forge_ui_traits::{generate_draw_commands, DrawCommand, Viewport, NODE_RADIUS};
 
-actions!([SaveLayout]);
+actions!([SaveLayout, ToggleSidebar]);
 
 /// Edges per batched PathBuilder.
 const EDGE_BATCH_SIZE: usize = 500;
@@ -32,11 +32,272 @@ const LEGEND_ENTRIES: &[(&str, u32)] = &[
 /// Menu bar height in pixels.
 const MENU_BAR_H: f32 = 28.0;
 
+// ── Selection model ──────────────────────────────────────────────────────────
+
+/// Shared selection state observed by both TreePanel and GraphCanvas.
+/// When either side changes the selection, it calls `cx.notify()` so
+/// observers re-render.
+struct SelectionModel {
+    /// Index into `GraphSnapshot::nodes` of the currently selected node.
+    selected_node_idx: Option<usize>,
+    /// ObjectId of the currently selected node (kept in sync with idx).
+    selected_node_id: Option<ObjectId>,
+    /// The shared snapshot — both panels read from this.
+    snapshot: Arc<RwLock<GraphSnapshot>>,
+}
+
+impl SelectionModel {
+    fn new(snapshot: Arc<RwLock<GraphSnapshot>>) -> Self {
+        Self {
+            selected_node_idx: None,
+            selected_node_id: None,
+            snapshot,
+        }
+    }
+
+    /// Select a node by its snapshot index. Called from graph canvas clicks.
+    fn select_by_idx(&mut self, idx: Option<usize>, cx: &mut Context<Self>) {
+        self.selected_node_idx = idx;
+        self.selected_node_id = idx.map(|i| self.snapshot.read().nodes[i].id);
+        cx.notify();
+    }
+
+    /// Select a node by ObjectId. Called from tree panel clicks.
+    /// Returns the node index if found.
+    fn select_by_id(&mut self, id: Option<ObjectId>, cx: &mut Context<Self>) -> Option<usize> {
+        if let Some(id) = id {
+            let snap = self.snapshot.read();
+            let idx = snap.nodes.iter().position(|n| n.id == id);
+            drop(snap);
+            self.selected_node_idx = idx;
+            self.selected_node_id = Some(id);
+            cx.notify();
+            idx
+        } else {
+            self.selected_node_idx = None;
+            self.selected_node_id = None;
+            cx.notify();
+            None
+        }
+    }
+
+    fn clear(&mut self, cx: &mut Context<Self>) {
+        self.selected_node_idx = None;
+        self.selected_node_id = None;
+        cx.notify();
+    }
+}
+
+// ── Tree panel ──────────────────────────────────────────────────────────────
+
+/// A group of nodes sharing the same object_type, for the tree panel.
+struct TypeGroup {
+    type_name: String,
+    /// (index into snapshot.nodes, display name)
+    entries: Vec<(usize, String, ObjectId)>,
+}
+
+/// Sidebar tree view listing all nodes grouped by type, alphabetically.
+struct TreePanel {
+    selection: Entity<SelectionModel>,
+    /// Pre-sorted groups, rebuilt when the snapshot changes.
+    groups: Vec<TypeGroup>,
+    /// Which type groups are collapsed (by type_name).
+    collapsed: std::collections::HashSet<String>,
+}
+
+impl TreePanel {
+    fn new(
+        snapshot: Arc<RwLock<GraphSnapshot>>,
+        selection: Entity<SelectionModel>,
+    ) -> Self {
+        let groups = Self::build_groups(&snapshot.read());
+        // Start with all groups collapsed so the tree fits on screen.
+        let collapsed: std::collections::HashSet<String> =
+            groups.iter().map(|g| g.type_name.clone()).collect();
+        Self {
+            selection,
+            groups,
+            collapsed,
+        }
+    }
+
+    fn build_groups(snap: &GraphSnapshot) -> Vec<TypeGroup> {
+        use std::collections::BTreeMap;
+        let mut by_type: BTreeMap<String, Vec<(usize, String, ObjectId)>> = BTreeMap::new();
+        for (idx, node) in snap.nodes.iter().enumerate() {
+            by_type
+                .entry(node.object_type.clone())
+                .or_default()
+                .push((idx, node.name.clone(), node.id));
+        }
+        let mut groups: Vec<TypeGroup> = by_type
+            .into_iter()
+            .map(|(type_name, mut entries)| {
+                entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                TypeGroup { type_name, entries }
+            })
+            .collect();
+        // BTreeMap already sorts keys, but let's be explicit about case-insensitive sort.
+        groups.sort_by(|a, b| a.type_name.to_lowercase().cmp(&b.type_name.to_lowercase()));
+        groups
+    }
+}
+
+/// Color for a type header in the tree panel, matching the node palette.
+fn tree_type_color(object_type: &str) -> u32 {
+    match object_type {
+        "npc" | "character" => 0x89b4fa,
+        "location" => 0xa6e3a1,
+        "faction" => 0xf9e2af,
+        "quest" => 0xf38ba8,
+        "item" | "transportation" => 0xcba6f7,
+        "currency" => 0x94e2d5,
+        _ => 0xcdd6f4,
+    }
+}
+
+/// Width of the sidebar in pixels.
+const SIDEBAR_W: f32 = 220.0;
+
+impl Render for TreePanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected_id = self.selection.read(cx).selected_node_id;
+
+        // Outer shell: fixed width, fills parent height, does not grow vertically.
+        let mut panel = div()
+            .id("tree-panel")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(SIDEBAR_W))
+            .h_full()
+            .min_h_0()
+            .bg(rgb(0x181825))
+            .border_r_1()
+            .border_color(rgb(0x313244));
+
+        // Fixed header
+        panel = panel.child(
+            div()
+                .id("tree-header")
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px_3()
+                .flex_none()
+                .border_b_1()
+                .border_color(rgb(0x313244))
+                .text_color(rgba(0xcdd6f4ff))
+                .text_xs()
+                .child("NODES"),
+        );
+
+        // Scrollable content area that fills remaining height.
+        let mut scroll_area = div()
+            .id("tree-scroll")
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .min_h_0();
+        scroll_area.style().flex_grow = Some(1.0);
+        scroll_area.style().flex_shrink = Some(1.0);
+        scroll_area.style().flex_basis = Some(relative(0.).into());
+
+        // Groups
+        for (group_idx, group) in self.groups.iter().enumerate() {
+            let type_name = group.type_name.clone();
+            let is_collapsed = self.collapsed.contains(&type_name);
+            let type_color = tree_type_color(&type_name);
+            let count = group.entries.len();
+            let collapse_label = format!(
+                "{} {} ({})",
+                if is_collapsed { "▸" } else { "▾" },
+                type_name,
+                count
+            );
+            let type_name_for_click = type_name.clone();
+
+            // Type group header
+            scroll_area = scroll_area.child(
+                div()
+                    .id(("type-group", group_idx))
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .px_2()
+                    .flex_none()
+                    .text_color(rgb(type_color))
+                    .text_xs()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                            if this.collapsed.contains(&type_name_for_click) {
+                                this.collapsed.remove(&type_name_for_click);
+                            } else {
+                                this.collapsed.insert(type_name_for_click.clone());
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(collapse_label),
+            );
+
+            // Node entries (if not collapsed)
+            if !is_collapsed {
+                for (entry_idx, (_node_idx, name, node_id)) in group.entries.iter().enumerate() {
+                    let is_selected = selected_id == Some(*node_id);
+                    let node_id = *node_id;
+                    let display_name = if name.len() > 26 {
+                        let mut s: String = name.chars().take(25).collect();
+                        s.push('…');
+                        s
+                    } else {
+                        name.clone()
+                    };
+
+                    scroll_area = scroll_area.child(
+                        div()
+                            .id(("node-entry", group_idx * 10000 + entry_idx))
+                            .flex()
+                            .items_center()
+                            .h(px(22.0))
+                            .pl(px(20.0))
+                            .pr(px(4.0))
+                            .flex_none()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(if is_selected {
+                                rgba(0xffffffff)
+                            } else {
+                                rgba(0xa6adc8ff)
+                            })
+                            .when(is_selected, |el| el.bg(rgba(0x45475aaa)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                    this.selection.update(cx, |sel, cx| {
+                                        sel.select_by_id(Some(node_id), cx);
+                                    });
+                                }),
+                            )
+                            .child(display_name),
+                    );
+                }
+            }
+        }
+
+        panel.child(scroll_area)
+    }
+}
+
 // ── Graph canvas ─────────────────────────────────────────────────────────────
 
 struct GraphCanvas {
     snapshot: Arc<RwLock<GraphSnapshot>>,
     graph: Arc<KnowledgeGraph>,
+    selection: Entity<SelectionModel>,
     /// Camera center in world space.
     camera: Vec2,
     zoom: f32,
@@ -45,25 +306,46 @@ struct GraphCanvas {
     /// Index into `snapshot.nodes` of the node being dragged, if any.
     dragging_node: Option<usize>,
     last_mouse: Point<Pixels>,
-    /// Index into `snapshot.nodes` of the currently selected node.
-    selected_node_idx: Option<usize>,
     /// Canvas bounds in window coordinates, updated each paint frame.
     /// Used to convert window-space mouse positions to canvas-local coordinates.
     canvas_bounds: Arc<RwLock<Bounds<Pixels>>>,
+    /// When true, the next selection-model observe callback skips panning
+    /// (because the selection originated from a canvas click, not the tree).
+    suppress_pan: bool,
+    /// Subscription to selection model changes (kept alive).
+    _selection_sub: Subscription,
 }
 
 impl GraphCanvas {
-    fn new(snapshot: GraphSnapshot, graph: Arc<KnowledgeGraph>) -> Self {
+    fn new(
+        snapshot: Arc<RwLock<GraphSnapshot>>,
+        graph: Arc<KnowledgeGraph>,
+        selection: Entity<SelectionModel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // When the selection model changes, repaint and pan to the new selection
+        // (unless the change originated from a canvas click — suppress_pan flag).
+        let sel_sub = cx.observe(&selection, |this: &mut GraphCanvas, sel, cx| {
+            if this.suppress_pan {
+                this.suppress_pan = false;
+            } else if let Some(idx) = sel.read(cx).selected_node_idx {
+                let pos = this.snapshot.read().nodes[idx].position;
+                this.camera = pos;
+            }
+            cx.notify();
+        });
         Self {
-            snapshot: Arc::new(RwLock::new(snapshot)),
+            snapshot,
             graph,
+            selection,
             camera: Vec2::ZERO,
             zoom: 1.0,
             panning: false,
             dragging_node: None,
             last_mouse: point(px(0.0), px(0.0)),
-            selected_node_idx: None,
             canvas_bounds: Arc::new(RwLock::new(Bounds::default())),
+            suppress_pan: false,
+            _selection_sub: sel_sub,
         }
     }
 
@@ -118,7 +400,7 @@ impl Render for GraphCanvas {
         let zoom = self.zoom;
         let camera = self.camera;
         let snapshot = self.snapshot.clone();
-        let selected_node_idx = self.selected_node_idx;
+        let selected_node_idx = self.selection.read(cx).selected_node_idx;
         let canvas_bounds_arc = self.canvas_bounds.clone();
 
         div()
@@ -142,11 +424,15 @@ impl Render for GraphCanvas {
 
                     if let Some(idx) = this.snapshot.read().node_at_point_aabb(world_pos, half_size)
                     {
-                        this.selected_node_idx = Some(idx);
+                        // Selection originated from the canvas — don't pan.
+                        this.suppress_pan = true;
+                        this.selection.update(cx, |sel, cx| {
+                            sel.select_by_idx(Some(idx), cx);
+                        });
                         this.dragging_node = Some(idx);
-                        cx.notify();
                     } else {
-                        this.selected_node_idx = None;
+                        this.suppress_pan = true;
+                        this.selection.update(cx, |sel, cx| sel.clear(cx));
                         this.panning = true;
                     }
                 }),
@@ -413,15 +699,27 @@ impl Render for GraphCanvas {
 
 struct AppView {
     graph_canvas: Entity<GraphCanvas>,
+    tree_panel: Entity<TreePanel>,
+    #[allow(dead_code)]
+    selection: Entity<SelectionModel>,
     file_menu_open: bool,
+    sidebar_open: bool,
 }
 
 impl AppView {
     fn new(snapshot: GraphSnapshot, graph: Arc<KnowledgeGraph>, cx: &mut Context<Self>) -> Self {
-        let graph_canvas = cx.new(|_cx| GraphCanvas::new(snapshot, graph));
+        let snapshot_arc = Arc::new(RwLock::new(snapshot));
+        let selection = cx.new(|_cx| SelectionModel::new(snapshot_arc.clone()));
+        let graph_canvas = cx.new(|cx| {
+            GraphCanvas::new(snapshot_arc.clone(), graph, selection.clone(), cx)
+        });
+        let tree_panel = cx.new(|_cx| TreePanel::new(snapshot_arc, selection.clone()));
         Self {
             graph_canvas,
+            tree_panel,
+            selection,
             file_menu_open: false,
+            sidebar_open: false,
         }
     }
 
@@ -433,6 +731,7 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let file_menu_open = self.file_menu_open;
+        let sidebar_open = self.sidebar_open;
 
         div()
             .id("app-root")
@@ -443,6 +742,10 @@ impl Render for AppView {
             // Handle SaveLayout action dispatched from the native menu or Ctrl+S.
             .on_action(cx.listener(|this, _: &SaveLayout, _window, cx| {
                 this.do_save(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
             }))
             // ── Menu bar ──────────────────────────────────────────────────────
             .child(
@@ -466,6 +769,7 @@ impl Render for AppView {
                             .px_3()
                             .text_color(rgba(0xcdd6f4ff))
                             .text_sm()
+                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -474,15 +778,51 @@ impl Render for AppView {
                                 }),
                             )
                             .child("File"),
+                    )
+                    .child(
+                        // "View" menu button
+                        div()
+                            .id("view-btn")
+                            .flex()
+                            .items_center()
+                            .h_full()
+                            .px_3()
+                            .text_color(rgba(0xcdd6f4ff))
+                            .text_sm()
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.sidebar_open = !this.sidebar_open;
+                                    this.file_menu_open = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(if sidebar_open { "◀ Nodes" } else { "▶ Nodes" }),
                     ),
             )
-            // ── Workspace (editor 30% + graph 70%) ────────────────────────────
+            // ── Body: optional sidebar + main content ─────────────────────────
             .child({
-                let mut workspace = div()
+                // Horizontal flex container for sidebar + main workspace.
+                let mut body = div()
+                    .id("body")
                     .flex()
-                    .flex_col()
-                    .w_full();
-                // Give the workspace container flex-grow:1 so it fills the space below the menu bar.
+                    .flex_row()
+                    .overflow_hidden();
+                body.style().flex_grow = Some(1.0);
+                body.style().flex_shrink = Some(1.0);
+                body.style().flex_basis = Some(relative(0.).into());
+
+                // Sidebar (when open)
+                if sidebar_open {
+                    body = body.child(self.tree_panel.clone());
+                }
+
+                // Main workspace: editor 30% + graph 70% (vertical split)
+                let mut workspace = div()
+                    .id("workspace")
+                    .flex()
+                    .flex_col();
                 workspace.style().flex_grow = Some(1.0);
                 workspace.style().flex_shrink = Some(1.0);
                 workspace.style().flex_basis = Some(relative(0.).into());
@@ -512,7 +852,7 @@ impl Render for AppView {
                 graph_pane.style().flex_shrink = Some(1.0);
                 graph_pane.style().flex_basis = Some(relative(0.).into());
 
-                workspace.child(editor).child(graph_pane)
+                body.child(workspace.child(editor).child(graph_pane))
             })
             // ── File dropdown overlay (rendered on top via deferred) ───────────
             .when(file_menu_open, |root| {
@@ -536,6 +876,7 @@ impl Render for AppView {
                                         .px_3()
                                         .text_color(rgba(0xcdd6f4ff))
                                         .text_sm()
+                                        .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -594,14 +935,23 @@ fn main() {
     };
 
     Application::new().run(|cx: &mut App| {
-        // Register Ctrl+S / Cmd+S keybinding for Save.
-        cx.bind_keys([KeyBinding::new("ctrl-s", SaveLayout, None)]);
+        // Register keybindings.
+        cx.bind_keys([
+            KeyBinding::new("ctrl-s", SaveLayout, None),
+            KeyBinding::new("ctrl-b", ToggleSidebar, None),
+        ]);
 
         // Register native application menu (macOS menu bar; no-op on Linux).
-        cx.set_menus(vec![Menu {
-            name: "File".into(),
-            items: vec![MenuItem::action("Save", SaveLayout)],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "File".into(),
+                items: vec![MenuItem::action("Save", SaveLayout)],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![MenuItem::action("Toggle Sidebar", ToggleSidebar)],
+            },
+        ]);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
