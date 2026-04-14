@@ -60,6 +60,26 @@ impl GraphSnapshot {
             .collect()
     }
 
+    /// Return the index of the node closest to `world_pos` within `max_dist` world units,
+    /// or `None` if no node is within range.
+    pub fn node_at_position(&self, world_pos: Vec2, max_dist: f32) -> Option<usize> {
+        self.nodes_in_viewport(
+            world_pos - Vec2::splat(max_dist),
+            world_pos + Vec2::splat(max_dist),
+        )
+        .into_iter()
+        .filter_map(|idx| {
+            let dist = (self.nodes[idx].position - world_pos).length();
+            if dist <= max_dist {
+                Some((idx, dist))
+            } else {
+                None
+            }
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx)
+    }
+
     /// Return indices of edges where at least one endpoint is visible.
     pub fn edges_in_viewport(&self, visible_nodes: &[bool]) -> Vec<usize> {
         self.edges

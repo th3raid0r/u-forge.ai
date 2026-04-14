@@ -14,6 +14,8 @@ pub enum DrawCommand {
         center: Vec2,
         radius: f32,
         color: [u8; 4],
+        /// Whether this node is the currently selected node.
+        selected: bool,
     },
     Line {
         from: Vec2,
@@ -92,17 +94,23 @@ fn type_color(object_type: &str) -> [u8; 4] {
 }
 
 const EDGE_COLOR: [u8; 4] = [88, 91, 112, 200]; // surface2 with alpha
-const NODE_RADIUS: f32 = 10.0;
+/// Node radius in world units. Exported so the GPUI renderer can compute hit-test distances.
+pub const NODE_RADIUS: f32 = 10.0;
 const DOT_RADIUS: f32 = 3.0;
 const EDGE_WIDTH: f32 = 1.0;
-const LABEL_SIZE: f32 = 12.0;
 
 /// Produce draw commands from a graph snapshot and viewport.
+///
+/// - `selected_idx`: index into `snapshot.nodes` of the currently selected node, if any.
 ///
 /// This is the main rendering pipeline — it handles viewport culling,
 /// LOD selection, and command generation. The result is consumed by
 /// whichever UI framework implements `GraphRenderer`.
-pub fn generate_draw_commands(snapshot: &GraphSnapshot, viewport: &Viewport) -> Vec<DrawCommand> {
+pub fn generate_draw_commands(
+    snapshot: &GraphSnapshot,
+    viewport: &Viewport,
+    selected_idx: Option<usize>,
+) -> Vec<DrawCommand> {
     let (world_min, world_max) = viewport.world_rect();
     let lod = viewport.lod_level();
 
@@ -136,44 +144,64 @@ pub fn generate_draw_commands(snapshot: &GraphSnapshot, viewport: &Viewport) -> 
         }
     }
 
-    // Nodes
+    // Nodes — squircle shape is handled by the renderer; here we emit circle primitives.
     let radius = if lod == LodLevel::Dot { DOT_RADIUS } else { NODE_RADIUS };
+    // Screen radius used to gate text visibility.
+    let screen_radius = NODE_RADIUS * viewport.zoom;
+
     for &idx in &visible_indices {
         let node = &snapshot.nodes[idx];
         let screen_pos = viewport.world_to_screen(node.position);
-        let color = type_color(&node.object_type);
+        let is_selected = selected_idx == Some(idx);
+        let base_color = type_color(&node.object_type);
+        let color = if is_selected {
+            brighten(base_color, 1.45)
+        } else {
+            base_color
+        };
 
         commands.push(DrawCommand::Circle {
             center: screen_pos,
             radius,
             color,
+            selected: is_selected,
         });
 
-        // Labels at Label and Full LOD
-        if lod == LodLevel::Label || lod == LodLevel::Full {
+        // Node label — rendered inside the squircle when the node is large enough on screen.
+        if lod != LodLevel::Dot && screen_radius > 10.0 {
+            // Font size proportional to node screen size, clamped to a readable range.
+            let font_size = (screen_radius * 0.75).clamp(7.0, 12.0);
+            // Approximate max chars that fit horizontally inside the squircle.
+            let max_chars = ((screen_radius * 2.0 * 0.8) / (font_size * 0.55)) as usize;
+            let max_chars = max_chars.max(2);
+            let display_name = if node.name.chars().count() > max_chars {
+                let mut s: String = node.name.chars().take(max_chars.saturating_sub(1)).collect();
+                s.push('…');
+                s
+            } else {
+                node.name.clone()
+            };
             commands.push(DrawCommand::Text {
-                position: screen_pos + Vec2::new(radius + 4.0, -LABEL_SIZE * 0.5),
-                content: node.name.clone(),
-                size: LABEL_SIZE,
-                color: [205, 214, 244, 255],
+                // Center position — the renderer centers the text here.
+                position: screen_pos,
+                content: display_name,
+                size: font_size,
+                // Dark text for contrast against the pastel node fills.
+                color: [10, 8, 20, 220],
             });
-        }
-
-        // Type subtitle at Full LOD
-        if lod == LodLevel::Full {
-            if let Some(desc) = &node.description {
-                let truncated: String = desc.chars().take(60).collect();
-                commands.push(DrawCommand::Text {
-                    position: screen_pos + Vec2::new(radius + 4.0, LABEL_SIZE * 0.5 + 2.0),
-                    content: truncated,
-                    size: LABEL_SIZE * 0.8,
-                    color: [166, 173, 200, 200],
-                });
-            }
         }
     }
 
     commands
+}
+
+fn brighten(color: [u8; 4], factor: f32) -> [u8; 4] {
+    [
+        (color[0] as f32 * factor).min(255.0) as u8,
+        (color[1] as f32 * factor).min(255.0) as u8,
+        (color[2] as f32 * factor).min(255.0) as u8,
+        color[3],
+    ]
 }
 
 #[cfg(test)]
