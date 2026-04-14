@@ -79,7 +79,13 @@ navigational aids.
 Working prototype. Multi-crate Cargo workspace under `crates/`. SQLite + FTS5 storage,
 sqlite-vec ANN search, catalog-driven provider selection, unified inference queue
 (`InferenceQueue`), hybrid search pipeline, bulk graph access (`get_all_edges`,
-`get_nodes_paginated`). Interactive RAG chat REPL (`cli_chat`). No active bugs.
+`get_nodes_paginated`). Interactive RAG chat REPL (`cli_chat`). Native GPUI graph
+canvas renders real graph data with pan/zoom and LOD. No active bugs.
+
+UI crates in progress (see `feature_UI.md`):
+- `u-forge-graph-view` — `GraphSnapshot` + `build_snapshot()`, force-directed layout (grid-cell bucketed O(N) repulsion), R-tree spatial index, viewport culling.
+- `u-forge-ui-traits` — `DrawCommand` / `Viewport` / `generate_draw_commands()` rendering pipeline (culling, LOD, type-color). Framework-agnostic.
+- `u-forge-ui-gpui` — GPUI 0.2.2 canvas app: loads `memory.json`, builds snapshot, renders with pan/zoom/LOD. Run: `cargo run -p u-forge-ui-gpui`.
 
 Recent quality improvements:
 - `load_model()` now accepts `already_loaded: &[String]` — if the model ID is in the slice the HTTP round-trip to `/api/v1/load` is skipped entirely. Callers extract these IDs from `catalog.loaded` (already fetched by `LemonadeServerCatalog::discover`). `ProviderFactory::build` threads this parameter through all capability branches. Both CLI demos extract the loaded-model list from the catalog and fire all provider builds concurrently via `futures::future::join_all` / `tokio::join!`, eliminating sequential load waits on warm servers.

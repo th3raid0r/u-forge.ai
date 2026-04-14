@@ -7,10 +7,10 @@ The project is a Cargo workspace. All source lives under `crates/`:
 | Crate | Kind | Status | Purpose |
 |-------|------|--------|---------|
 | `u-forge-core` | lib | Complete | All current source — storage, AI, hardware, queue, search, schema, ingest |
-| `u-forge-graph-view` | lib | Skeleton | Graph view model + layout (see `feature_UI.md`) |
-| `u-forge-ui-traits` | lib | Skeleton | Framework-agnostic rendering contracts (see `feature_UI.md`) |
-| `u-forge-ui-gpui` | bin | Skeleton | GPUI native app (see `feature_UI.md`) |
-| `u-forge-ui-egui` | bin | Skeleton | egui fallback app (see `feature_UI.md`) |
+| `u-forge-graph-view` | lib | In Progress | Graph view model + layout engine (see `feature_UI.md`) |
+| `u-forge-ui-traits` | lib | In Progress | Framework-agnostic rendering contracts (see `feature_UI.md`) |
+| `u-forge-ui-gpui` | bin | In Progress | GPUI native app — pan/zoom canvas, LOD rendering (see `feature_UI.md`) |
+| `u-forge-ui-egui` | bin | Skeleton | egui fallback — only if GPUI spike fails (spike passed; unlikely needed) |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
 `defaults/` (schemas + sample data) stays at the workspace root. Both example entry points and `examples/common/mod.rs` resolve it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
@@ -61,6 +61,43 @@ All paths below are relative to `crates/u-forge-core/`.
 | `examples/common/mod.rs` | Demo-specific helpers (config, CLI args) | `DatabaseConfig`, `DemoArgs`, `resolve_demo_args()`, `load_toml_config()` |
 | `examples/cli_demo.rs` | Demo: hardware caps, FTS5, semantic, rerank, hybrid search (includes `common` via `#[path]`) | — |
 | `examples/cli_chat.rs` | Interactive RAG chat REPL (includes `common` via `#[path]`) | — |
+
+## Module Map (u-forge-graph-view)
+
+All paths below are relative to `crates/u-forge-graph-view/`.
+
+| File | Role | Key Types |
+|---|---|---|
+| `src/lib.rs` | Crate re-exports | — |
+| `src/snapshot.rs` | Graph snapshot construction and viewport culling | `GraphSnapshot`, `NodeView`, `EdgeView`, `LodLevel`, `build_snapshot()` |
+| `src/layout.rs` | Force-directed layout with grid-cell bucketed repulsion | `force_directed_layout()` |
+| `src/spatial.rs` | R-tree spatial index entry | `NodeEntry` |
+
+`GraphSnapshot` holds `nodes: Vec<NodeView>`, `edges: Vec<EdgeView>` (index-based, not `ObjectId`-based), and an `RTree<NodeEntry>`. The `build_snapshot(graph)` function calls `get_all_objects()` + `get_all_edges()`, assigns positions via force-directed layout, then builds the R-tree. After construction the snapshot is immutable from the UI thread's perspective; hold it behind `Arc<RwLock<GraphSnapshot>>`.
+
+Viewport culling: `nodes_in_viewport(min, max)` queries the R-tree; `edges_in_viewport(visible_nodes)` filters by endpoint visibility. Both are O(log N + k) where k is the result count.
+
+`LodLevel` enum: `Dot` (below zoom 0.25), `Label` (zoom 0.25–0.6), `Full` (zoom ≥ 0.6).
+
+## Module Map (u-forge-ui-traits)
+
+All paths below are relative to `crates/u-forge-ui-traits/`.
+
+| File | Role | Key Types |
+|---|---|---|
+| `src/lib.rs` | All rendering contracts + `generate_draw_commands()` | `DrawCommand`, `Viewport`, `GraphRenderer`, `generate_draw_commands()` |
+
+`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment (Catppuccin Mocha palette keyed on `object_type`) → `DrawCommand` list. Backends (`u-forge-ui-gpui`, `u-forge-ui-egui`) consume this list — they never touch `GraphSnapshot` directly.
+
+## Module Map (u-forge-ui-gpui)
+
+| File | Role |
+|---|---|
+| `src/main.rs` | Application entry point: loads `defaults/data/memory.json` via `DataIngestion`, builds `GraphSnapshot`, opens a GPUI window with `GraphCanvas` |
+
+`GraphCanvas` owns `Arc<GraphSnapshot>`, camera world-space `Vec2`, and zoom. `Render::render()` clones camera state into a `canvas()` closure, calls `generate_draw_commands()`, then maps `DrawCommand::Line` values to batched `PathBuilder` paths (500 edges per path) and `DrawCommand::Circle` to `paint_quad()` with `corner_radii`. Run with `cargo run -p u-forge-ui-gpui` from the workspace root.
+
+**GPUI version:** `0.2.2` from crates.io (blade-graphics backend). Do not upgrade without a targeted API compatibility check — GPUI has no semver guarantees.
 
 ---
 

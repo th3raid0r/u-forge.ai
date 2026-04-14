@@ -1,7 +1,7 @@
 # Feature: High-Performance Native UI
 
-## Status: Not started
-## Prerequisites: `feature_refactor-for-extensibility.md` complete (workspace split + `get_all_edges()`)
+## Status: In Progress
+## Prerequisites: `feature_refactor-for-extensibility.md` complete ✓ (workspace split + `get_all_edges()`)
 
 ---
 
@@ -155,7 +155,7 @@ The view model produces `Vec<DrawCommand>` from a `GraphSnapshot` + `Viewport`. 
 
 ## GPUI Prototype (`u-forge-ui-gpui`)
 
-**GPUI API instability warning:** GPUI is Zed's internal UI framework and does not follow semver. Pin to a specific git revision in `Cargo.toml` (e.g., `gpui = { git = "https://github.com/zed-industries/zed", rev = "..." }`). Expect API breakage on updates.
+**GPUI version:** Using `gpui = "0.2.2"` from crates.io (blade-graphics backend). The current `main` branch of the Zed repo has restructured into `gpui_platform`/`gpui_linux`/`gpui_wgpu` sub-crates with a different entry point (`gpui_platform::application()` instead of `Application::new()`). Stay on 0.2.2 until there is a clear need to upgrade — the crates.io release is stable enough for our purposes. Do not switch to a git dependency without a targeted API compatibility pass.
 
 ### Feasibility spike (do this first)
 
@@ -192,10 +192,10 @@ CREATE TABLE IF NOT EXISTS node_positions (
 
 ## Implementation order
 
-1. **GPUI feasibility spike** — 5k circles + pan/zoom in `u-forge-ui-gpui`. Go/no-go decision.
-2. **`u-forge-graph-view`** — `GraphSnapshot`, `build_snapshot()`, R-tree culling, force-directed layout. Test with `memory.json` data.
-3. **`u-forge-ui-traits`** — `DrawCommand`, `Viewport`, `GraphRenderer` trait.
-4. **Wire GPUI (or egui) prototype** — render `memory.json` graph with pan, zoom, LOD.
+1. ✅ **GPUI feasibility spike** — 5k circles + 8k edges with pan/zoom in `u-forge-ui-gpui`. **Go decision.** Batched edge paths (500/batch) + LOD culling keep it responsive. GPUI 0.2.2 (crates.io).
+2. ✅ **`u-forge-graph-view`** — `GraphSnapshot`, `build_snapshot()`, R-tree culling, force-directed layout. 5 passing tests.
+3. ✅ **`u-forge-ui-traits`** — `DrawCommand`, `Viewport`, `generate_draw_commands()`. 2 passing tests.
+4. ✅ **Wire GPUI prototype** — renders `memory.json` (220 nodes, 312 edges) with pan, zoom, LOD, type-colored nodes.
 5. **`ObservableGraph`** — event-driven incremental updates.
 6. **Node detail panel** — click handler → detail view with node data.
 7. **Search** — text input → highlight matching nodes.
