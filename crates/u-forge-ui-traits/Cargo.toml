@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 glam = "0.29"
+u-forge-graph-view = { path = "../u-forge-graph-view" }

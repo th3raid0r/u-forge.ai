@@ -19,10 +19,10 @@ The project is a Cargo workspace. All crates live under `crates/`:
 | Crate | Kind | Status | Purpose |
 |-------|------|--------|---------|
 | `u-forge-core` | lib | Complete | All current source (storage, AI, hardware, queue, search, schema, ingest) |
-| `u-forge-graph-view` | lib | Skeleton | Graph view model + layout (see `feature_UI.md`) |
-| `u-forge-ui-traits` | lib | Skeleton | Framework-agnostic rendering contracts (see `feature_UI.md`) |
-| `u-forge-ui-gpui` | bin | Skeleton | GPUI native app (see `feature_UI.md`) |
-| `u-forge-ui-egui` | bin | Skeleton | egui fallback app (see `feature_UI.md`) |
+| `u-forge-graph-view` | lib | In Progress | Graph view model + layout engine (see `feature_UI.md`) |
+| `u-forge-ui-traits` | lib | In Progress | Framework-agnostic rendering contracts (see `feature_UI.md`) |
+| `u-forge-ui-gpui` | bin | In Progress | GPUI native app — pan/zoom canvas, LOD rendering (see `feature_UI.md`) |
+| `u-forge-ui-egui` | bin | Skeleton | egui fallback — only if GPUI spike fails (spike passed; unlikely needed) |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
 `defaults/` (schemas + sample data) lives at the **workspace root**, not inside any crate. `cli_demo.rs` resolves it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
@@ -116,6 +116,10 @@ export LEMONADE_URL=http://localhost:13305/api/v1
 - [crates/u-forge-core/examples/cli_chat.rs](mdc:crates/u-forge-core/examples/cli_chat.rs) — Interactive RAG chat REPL. Resolves `defaults/` via `CARGO_MANIFEST_DIR`.
 - [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files (workspace root).
 - [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data (~220 nodes, ~312 edges).
+- [crates/u-forge-graph-view/src/snapshot.rs](mdc:crates/u-forge-graph-view/src/snapshot.rs) — `GraphSnapshot`, `NodeView`, `EdgeView`, `LodLevel`, `build_snapshot()`.
+- [crates/u-forge-graph-view/src/layout.rs](mdc:crates/u-forge-graph-view/src/layout.rs) — Force-directed layout with grid-cell bucketed O(N) repulsion.
+- [crates/u-forge-ui-traits/src/lib.rs](mdc:crates/u-forge-ui-traits/src/lib.rs) — `DrawCommand`, `Viewport`, `generate_draw_commands()` rendering pipeline.
+- [crates/u-forge-ui-gpui/src/main.rs](mdc:crates/u-forge-ui-gpui/src/main.rs) — GPUI application: data load → snapshot → canvas render loop.
 
 ## Module Map (u-forge-core)
 
