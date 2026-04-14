@@ -9,6 +9,15 @@ const EDGE_COUNT: usize = 8_000;
 const NODE_RADIUS: f32 = 8.0;
 const WORLD_SIZE: f32 = 4000.0;
 
+/// Edges per batched PathBuilder. Balances tessellation cost vs draw call count.
+const EDGE_BATCH_SIZE: usize = 500;
+
+/// Zoom threshold below which edges are hidden (too zoomed out to be useful).
+const EDGE_ZOOM_THRESHOLD: f32 = 0.15;
+
+/// Zoom threshold below which nodes shrink to 2px dots (no rounded corners).
+const DOT_ZOOM_THRESHOLD: f32 = 0.25;
+
 struct GraphCanvas {
     /// (x, y, color) tuples in world space
     nodes: Vec<(f32, f32, u32)>,
@@ -141,40 +150,70 @@ impl Render for GraphCanvas {
                             })
                             .collect();
 
-                        // Draw edges first (behind nodes)
-                        let edge_color = rgb(0x585b70);
-                        for &(src, tgt) in &edges {
-                            let (sx, sy) = screen_pos[src];
-                            let (tx, ty) = screen_pos[tgt];
-
-                            // Rough viewport test: skip if both endpoints are outside
-                            let src_visible = sx >= view_min_x && sx <= view_max_x
-                                && sy >= view_min_y && sy <= view_max_y;
-                            let tgt_visible = tx >= view_min_x && tx <= view_max_x
-                                && ty >= view_min_y && ty <= view_max_y;
-                            if !src_visible && !tgt_visible {
-                                continue;
-                            }
-
+                        // Draw edges — batched into chunked paths for performance.
+                        // Skip entirely when zoomed out past threshold (LOD: Dot level).
+                        if zoom >= EDGE_ZOOM_THRESHOLD {
+                            let edge_color = rgb(0x585b70);
                             let mut builder = PathBuilder::stroke(px(1.0));
-                            builder.move_to(point(sx, sy));
-                            builder.line_to(point(tx, ty));
-                            if let Ok(path) = builder.build() {
-                                window.paint_path(path, edge_color);
+                            let mut count_in_batch = 0;
+
+                            for &(src, tgt) in &edges {
+                                let (sx, sy) = screen_pos[src];
+                                let (tx, ty) = screen_pos[tgt];
+
+                                // Skip if both endpoints are outside viewport
+                                let src_visible = sx >= view_min_x && sx <= view_max_x
+                                    && sy >= view_min_y && sy <= view_max_y;
+                                let tgt_visible = tx >= view_min_x && tx <= view_max_x
+                                    && ty >= view_min_y && ty <= view_max_y;
+                                if !src_visible && !tgt_visible {
+                                    continue;
+                                }
+
+                                builder.move_to(point(sx, sy));
+                                builder.line_to(point(tx, ty));
+                                count_in_batch += 1;
+
+                                if count_in_batch >= EDGE_BATCH_SIZE {
+                                    if let Ok(path) = builder.build() {
+                                        window.paint_path(path, edge_color);
+                                    }
+                                    builder = PathBuilder::stroke(px(1.0));
+                                    count_in_batch = 0;
+                                }
+                            }
+                            // Flush remaining edges
+                            if count_in_batch > 0 {
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, edge_color);
+                                }
                             }
                         }
 
-                        // Draw nodes
+                        // Draw nodes — at very low zoom, use tiny squares instead of
+                        // rounded quads (skips corner radius GPU cost).
+                        let use_dots = zoom < DOT_ZOOM_THRESHOLD;
+                        let dot_size = px(3.0);
+                        let dot_half = px(1.5);
+
                         for (i, &(_, _, color)) in nodes.iter().enumerate() {
                             let (sx, sy) = screen_pos[i];
                             if sx < view_min_x || sx > view_max_x || sy < view_min_y || sy > view_max_y {
                                 continue;
                             }
-                            let node_bounds = Bounds::new(
-                                point(sx - r, sy - r),
-                                size(diameter, diameter),
-                            );
-                            window.paint_quad(fill(node_bounds, rgb(color)).corner_radii(r));
+                            if use_dots {
+                                let dot_bounds = Bounds::new(
+                                    point(sx - dot_half, sy - dot_half),
+                                    size(dot_size, dot_size),
+                                );
+                                window.paint_quad(fill(dot_bounds, rgb(color)));
+                            } else {
+                                let node_bounds = Bounds::new(
+                                    point(sx - r, sy - r),
+                                    size(diameter, diameter),
+                                );
+                                window.paint_quad(fill(node_bounds, rgb(color)).corner_radii(r));
+                            }
                         }
                     },
                 )
