@@ -156,9 +156,24 @@ The view model produces `Vec<DrawCommand>` from a `GraphSnapshot` + `Viewport`. 
 
 **GPUI version:** Using `gpui = "0.2.2"` from crates.io (blade-graphics backend). The current `main` branch of the Zed repo has restructured into `gpui_platform`/`gpui_linux`/`gpui_wgpu` sub-crates with a different entry point (`gpui_platform::application()` instead of `Application::new()`). Stay on 0.2.2 until there is a clear need to upgrade — the crates.io release is stable enough for our purposes. Do not switch to a git dependency without a targeted API compatibility pass.
 
+### App shell (`AppView`)
+
+`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>` and a `file_menu_open: bool` toggle. It renders:
+- **Menu bar** (28 px, `flex_none`): a "File" button that toggles an inline dropdown. The dropdown's single item dispatches `SaveLayout`. The `SaveLayout` action is also reachable via Ctrl+S and registered with `cx.set_menus()` for native menu support on macOS.
+- **Workspace** (remaining height, `flex_col`): a 30/70 flex-grow split. Top 30% is the editor placeholder; bottom 70% hosts `Entity<GraphCanvas>`.
+
+The File dropdown is rendered with `deferred(anchored(...))` so it paints on top of all other content.
+
 ### Canvas architecture
 
-The graph canvas is a single `gpui::canvas` element. Its paint closure reads the snapshot (non-blocking read lock), calls `nodes_in_viewport`, determines LOD from zoom level, then draws edges then nodes. World-to-screen transform: `screen = (world_pos - pan) * zoom + canvas_center`.
+`GraphCanvas` is a child `Entity<V>` rendered inside `AppView`. It renders a `div#graph-root` (with `overflow_hidden()`) containing a single `gpui::canvas` element.
+
+**Coordinate system.** GPUI's `window.paint_*` calls take _window_ coordinates, but `generate_draw_commands` produces _canvas-local_ coordinates (origin at the canvas element's top-left). When the canvas no longer fills the full window (e.g., sits below a menu bar and editor pane), all paint positions must be offset by `bounds.origin`. `GraphCanvas` stores `canvas_bounds: Arc<RwLock<Bounds<Pixels>>>`, updated at the top of each paint closure. Mouse event handlers read this to subtract `bounds.origin` before calling `screen_to_world`.
+
+**Clipping.** `overflow_hidden()` on `div#graph-root` installs a GPUI `content_mask` that clips all descendant paint ops to the pane's layout bounds. Without this, nodes near the viewport edge paint into adjacent panes.
+
+World-to-screen transform (canvas-local): `screen = (world_pos - pan) * zoom + canvas_size * 0.5`.
+Window-space position: `window_pos = screen + bounds.origin`.
 
 All `KnowledgeGraph` access happens on `cx.background_executor()` — never on the GPUI main thread, since `Mutex<Connection>` blocks.
 
@@ -183,9 +198,10 @@ The GPUI canvas saves positions **on every node drag completion** (mouse-up afte
 3. ✅ **`u-forge-ui-traits`** — `DrawCommand`, `Viewport`, `generate_draw_commands()`. 2 passing tests.
 4. ✅ **Wire GPUI prototype** — renders `memory.json` (220 nodes, 312 edges) with pan, zoom, LOD, type-colored nodes.
 5. ✅ **Position persistence + node dragging** — `node_positions` table, `save_layout()`/`load_layout()`, drag-to-reposition nodes in the canvas, autosave on drag-end, persistent DB.
-6. **`ObservableGraph`** — event-driven incremental updates.
-7. **Node detail panel** — click handler → detail view with node data.
-8. **Search** — text input → highlight matching nodes.
+6. ✅ **App shell** — `AppView` root view wrapping `GraphCanvas`. Menu bar (File > Save, Ctrl+S, `SaveLayout` action). 30/70 flex-grow workspace split: editor placeholder (top) + graph canvas (bottom). Canvas coordinate fix: `bounds.origin` offset applied to all paint positions; mouse events subtract `bounds.origin` before `screen_to_world`. `overflow_hidden()` clips paint to pane bounds.
+7. **`ObservableGraph`** — event-driven incremental updates.
+8. **Node detail panel** — click handler → detail view with node data.
+9. **Search** — text input → highlight matching nodes.
 
 ---
 

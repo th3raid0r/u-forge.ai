@@ -2,15 +2,18 @@ use std::sync::Arc;
 
 use glam::Vec2;
 use gpui::{
-    canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size, App, Application, Bounds,
-    Context, Font, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
-    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, TextRun, Window, WindowBounds,
-    WindowOptions,
+    anchored, canvas, deferred, div, fill, font, point, prelude::*, px, rgb, rgba, size, App,
+    Application, Bounds, Context, Corner, Entity, Font, Hsla, KeyBinding, Menu, MenuItem,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    ScrollDelta, ScrollWheelEvent, SharedString, TextRun, Window, WindowBounds, WindowOptions,
+    actions, relative,
 };
 use parking_lot::RwLock;
 use u_forge_core::{AppConfig, KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{build_snapshot, GraphSnapshot, LodLevel};
 use u_forge_ui_traits::{generate_draw_commands, DrawCommand, Viewport, NODE_RADIUS};
+
+actions!([SaveLayout]);
 
 /// Edges per batched PathBuilder.
 const EDGE_BATCH_SIZE: usize = 500;
@@ -26,6 +29,11 @@ const LEGEND_ENTRIES: &[(&str, u32)] = &[
     ("Other", 0xcdd6f4),
 ];
 
+/// Menu bar height in pixels.
+const MENU_BAR_H: f32 = 28.0;
+
+// ── Graph canvas ─────────────────────────────────────────────────────────────
+
 struct GraphCanvas {
     snapshot: Arc<RwLock<GraphSnapshot>>,
     graph: Arc<KnowledgeGraph>,
@@ -39,6 +47,9 @@ struct GraphCanvas {
     last_mouse: Point<Pixels>,
     /// Index into `snapshot.nodes` of the currently selected node.
     selected_node_idx: Option<usize>,
+    /// Canvas bounds in window coordinates, updated each paint frame.
+    /// Used to convert window-space mouse positions to canvas-local coordinates.
+    canvas_bounds: Arc<RwLock<Bounds<Pixels>>>,
 }
 
 impl GraphCanvas {
@@ -52,6 +63,7 @@ impl GraphCanvas {
             dragging_node: None,
             last_mouse: point(px(0.0), px(0.0)),
             selected_node_idx: None,
+            canvas_bounds: Arc::new(RwLock::new(Bounds::default())),
         }
     }
 
@@ -61,6 +73,15 @@ impl GraphCanvas {
             size: canvas_size,
             zoom: self.zoom,
         }
+    }
+
+    /// Returns (canvas_size, canvas_origin) from the last paint frame.
+    fn canvas_metrics(&self) -> (Vec2, Vec2) {
+        let b = *self.canvas_bounds.read();
+        (
+            Vec2::new(f32::from(b.size.width), f32::from(b.size.height)),
+            Vec2::new(f32::from(b.origin.x), f32::from(b.origin.y)),
+        )
     }
 
     /// Persist all current node positions to the database.
@@ -74,6 +95,8 @@ impl GraphCanvas {
         drop(snap);
         if let Err(e) = self.graph.save_layout(&positions) {
             eprintln!("Warning: failed to save layout: {e}");
+        } else {
+            eprintln!("Layout saved.");
         }
     }
 }
@@ -96,25 +119,25 @@ impl Render for GraphCanvas {
         let camera = self.camera;
         let snapshot = self.snapshot.clone();
         let selected_node_idx = self.selected_node_idx;
+        let canvas_bounds_arc = self.canvas_bounds.clone();
 
         div()
             .id("graph-root")
             .size_full()
+            .overflow_hidden()
             .bg(rgb(0x1e1e2e))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
                     this.last_mouse = event.position;
 
-                    // Hit-test: if the click lands on a node, select it and start a node drag.
-                    // Otherwise start a canvas pan.
-                    let vp = window.viewport_size();
-                    let canvas_size = Vec2::new(f32::from(vp.width), f32::from(vp.height));
-                    let screen_pos =
-                        Vec2::new(f32::from(event.position.x), f32::from(event.position.y));
+                    let (canvas_size, origin) = this.canvas_metrics();
+                    // Convert window-space position to canvas-local.
+                    let screen_pos = Vec2::new(
+                        f32::from(event.position.x) - origin.x,
+                        f32::from(event.position.y) - origin.y,
+                    );
                     let world_pos = this.viewport(canvas_size).screen_to_world(screen_pos);
-                    // World-space half-extent matching the squircle visual footprint.
-                    // No zoom division — scales naturally with the node's on-screen size.
                     let half_size = NODE_RADIUS * 1.5;
 
                     if let Some(idx) = this.snapshot.read().node_at_point_aabb(world_pos, half_size)
@@ -132,9 +155,7 @@ impl Render for GraphCanvas {
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
                     if this.dragging_node.is_some() {
-                        // Rebuild the spatial index so hit-testing is accurate after the move.
                         this.snapshot.write().rebuild_spatial_index();
-                        // Persist positions after each node drag.
                         this.save_layout();
                         this.dragging_node = None;
                         cx.notify();
@@ -148,7 +169,6 @@ impl Render for GraphCanvas {
                 this.last_mouse = event.position;
 
                 if let Some(node_idx) = this.dragging_node {
-                    // Move the dragged node by the mouse delta in world space.
                     let world_delta = Vec2::new(
                         f32::from(delta.x) / this.zoom,
                         f32::from(delta.y) / this.zoom,
@@ -166,9 +186,12 @@ impl Render for GraphCanvas {
                     ScrollDelta::Pixels(delta) => 1.0 + f32::from(delta.y) * 0.002,
                     ScrollDelta::Lines(delta) => 1.0 + delta.y * 0.1,
                 };
-                let mouse_screen =
-                    Vec2::new(f32::from(event.position.x), f32::from(event.position.y));
-                let canvas_size = Vec2::new(1200.0, 800.0);
+                let (canvas_size, origin) = this.canvas_metrics();
+                // Convert window-space position to canvas-local.
+                let mouse_screen = Vec2::new(
+                    f32::from(event.position.x) - origin.x,
+                    f32::from(event.position.y) - origin.y,
+                );
                 let vp = this.viewport(canvas_size);
                 let world_under_mouse = vp.screen_to_world(mouse_screen);
 
@@ -186,10 +209,17 @@ impl Render for GraphCanvas {
                 canvas(
                     |_bounds, _window, _cx| {},
                     move |bounds, (), window, cx| {
+                        // Record bounds so event handlers can convert window → canvas coords.
+                        *canvas_bounds_arc.write() = bounds;
+
                         window.paint_quad(fill(bounds, rgb(0x1e1e2e)));
 
                         let canvas_size =
                             Vec2::new(f32::from(bounds.size.width), f32::from(bounds.size.height));
+                        // Offset added to every canvas-local position to get window coordinates.
+                        let ox = f32::from(bounds.origin.x);
+                        let oy = f32::from(bounds.origin.y);
+
                         let viewport = Viewport {
                             center: camera,
                             size: canvas_size,
@@ -214,8 +244,8 @@ impl Render for GraphCanvas {
 
                             for cmd in &edge_commands {
                                 if let DrawCommand::Line { from, to, .. } = cmd {
-                                    builder.move_to(point(px(from.x), px(from.y)));
-                                    builder.line_to(point(px(to.x), px(to.y)));
+                                    builder.move_to(point(px(from.x + ox), px(from.y + oy)));
+                                    builder.line_to(point(px(to.x + ox), px(to.y + oy)));
                                     count += 1;
 
                                     if count >= EDGE_BATCH_SIZE {
@@ -249,7 +279,7 @@ impl Render for GraphCanvas {
                                 } else {
                                     px(*radius * zoom)
                                 };
-                                let c = point(px(center.x), px(center.y));
+                                let c = point(px(center.x + ox), px(center.y + oy));
                                 let node_bounds =
                                     Bounds::new(point(c.x - r, c.y - r), size(r * 2.0, r * 2.0));
                                 let col = color_to_rgb(*color);
@@ -308,22 +338,23 @@ impl Render for GraphCanvas {
                                     None,
                                 );
                                 let line_height = font_size * 1.2;
-                                let tx = position.x - f32::from(shaped.width) / 2.0;
-                                let ty = position.y - f32::from(line_height) / 2.0;
+                                let tx = position.x + ox - f32::from(shaped.width) / 2.0;
+                                let ty = position.y + oy - f32::from(line_height) / 2.0;
                                 let _ =
                                     shaped.paint(point(px(tx), px(ty)), line_height, window, cx);
                             }
                         }
 
-                        // ── Color legend (bottom-right corner) ──────────────────────
+                        // ── Color legend (bottom-right of canvas pane) ───────────────
                         {
                             let entry_h = 20.0_f32;
                             let swatch = 12.0_f32;
                             let pad = 8.0_f32;
                             let legend_w = 155.0_f32;
                             let legend_h = LEGEND_ENTRIES.len() as f32 * entry_h + pad * 2.0;
-                            let lx = canvas_size.x - legend_w - pad;
-                            let ly = canvas_size.y - legend_h - pad;
+                            // Canvas-local bottom-right, then shifted to window coords.
+                            let lx = canvas_size.x - legend_w - pad + ox;
+                            let ly = canvas_size.y - legend_h - pad + oy;
 
                             window.paint_quad(fill(
                                 Bounds::new(
@@ -378,6 +409,151 @@ impl Render for GraphCanvas {
     }
 }
 
+// ── Root app view ─────────────────────────────────────────────────────────────
+
+struct AppView {
+    graph_canvas: Entity<GraphCanvas>,
+    file_menu_open: bool,
+}
+
+impl AppView {
+    fn new(snapshot: GraphSnapshot, graph: Arc<KnowledgeGraph>, cx: &mut Context<Self>) -> Self {
+        let graph_canvas = cx.new(|_cx| GraphCanvas::new(snapshot, graph));
+        Self {
+            graph_canvas,
+            file_menu_open: false,
+        }
+    }
+
+    fn do_save(&self, cx: &Context<Self>) {
+        self.graph_canvas.read(cx).save_layout();
+    }
+}
+
+impl Render for AppView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let file_menu_open = self.file_menu_open;
+
+        div()
+            .id("app-root")
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(0x1e1e2e))
+            // Handle SaveLayout action dispatched from the native menu or Ctrl+S.
+            .on_action(cx.listener(|this, _: &SaveLayout, _window, cx| {
+                this.do_save(cx);
+            }))
+            // ── Menu bar ──────────────────────────────────────────────────────
+            .child(
+                div()
+                    .id("menu-bar")
+                    .flex()
+                    .flex_none()
+                    .h(px(MENU_BAR_H))
+                    .w_full()
+                    .bg(rgb(0x181825))
+                    .border_b_1()
+                    .border_color(rgb(0x313244))
+                    .items_center()
+                    .child(
+                        // "File" menu button
+                        div()
+                            .id("file-btn")
+                            .flex()
+                            .items_center()
+                            .h_full()
+                            .px_3()
+                            .text_color(rgba(0xcdd6f4ff))
+                            .text_sm()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.file_menu_open = !this.file_menu_open;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("File"),
+                    ),
+            )
+            // ── Workspace (editor 30% + graph 70%) ────────────────────────────
+            .child({
+                let mut workspace = div()
+                    .flex()
+                    .flex_col()
+                    .w_full();
+                // Give the workspace container flex-grow:1 so it fills the space below the menu bar.
+                workspace.style().flex_grow = Some(1.0);
+                workspace.style().flex_shrink = Some(1.0);
+                workspace.style().flex_basis = Some(relative(0.).into());
+
+                // Editor placeholder pane — 3 parts out of 10 (30%).
+                let mut editor = div()
+                    .id("editor-pane")
+                    .flex()
+                    .w_full()
+                    .bg(rgb(0x1e1e2e))
+                    .border_b_1()
+                    .border_color(rgb(0x313244))
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgba(0x6c7086ff))
+                    .text_sm()
+                    .child("Editor pane — coming soon");
+                editor.style().flex_grow = Some(3.0);
+                editor.style().flex_shrink = Some(1.0);
+                editor.style().flex_basis = Some(relative(0.).into());
+
+                // Graph canvas pane — 7 parts out of 10 (70%).
+                let mut graph_pane = div()
+                    .w_full()
+                    .child(self.graph_canvas.clone());
+                graph_pane.style().flex_grow = Some(7.0);
+                graph_pane.style().flex_shrink = Some(1.0);
+                graph_pane.style().flex_basis = Some(relative(0.).into());
+
+                workspace.child(editor).child(graph_pane)
+            })
+            // ── File dropdown overlay (rendered on top via deferred) ───────────
+            .when(file_menu_open, |root| {
+                root.child(deferred(
+                    anchored()
+                        .position(point(px(0.0), px(MENU_BAR_H)))
+                        .anchor(Corner::TopLeft)
+                        .child(
+                            div()
+                                .id("file-dropdown")
+                                .w(px(140.0))
+                                .bg(rgb(0x313244))
+                                .border_1()
+                                .border_color(rgb(0x45475a))
+                                .child(
+                                    div()
+                                        .id("save-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_sm()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.do_save(cx);
+                                                this.file_menu_open = false;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child("Save"),
+                                ),
+                        ),
+                ))
+            })
+    }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 fn main() {
     let cfg = AppConfig::load_default();
     let data_dir = cfg.storage.db_path;
@@ -388,7 +564,6 @@ fn main() {
             let graph =
                 Arc::new(KnowledgeGraph::new(&data_dir).expect("failed to open knowledge graph"));
 
-            // Only import memory.json on the first run (when the graph is empty).
             let stats = graph.get_stats().expect("failed to get stats");
             if stats.node_count == 0 {
                 let data_file = std::path::Path::new("defaults/data/memory.json");
@@ -419,13 +594,22 @@ fn main() {
     };
 
     Application::new().run(|cx: &mut App| {
+        // Register Ctrl+S / Cmd+S keybinding for Save.
+        cx.bind_keys([KeyBinding::new("ctrl-s", SaveLayout, None)]);
+
+        // Register native application menu (macOS menu bar; no-op on Linux).
+        cx.set_menus(vec![Menu {
+            name: "File".into(),
+            items: vec![MenuItem::action("Save", SaveLayout)],
+        }]);
+
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| GraphCanvas::new(snapshot, graph)),
+            |_, cx| cx.new(|cx| AppView::new(snapshot, graph, cx)),
         )
         .unwrap();
     });
