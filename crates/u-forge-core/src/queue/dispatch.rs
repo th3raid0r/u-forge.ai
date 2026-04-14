@@ -875,12 +875,14 @@ mod tests {
             .into_iter()
             .next()
             .expect("No embedding model found in catalog");
+        let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
         let built = crate::lemonade::ProviderFactory::build(
             &embed_sel,
             crate::lemonade::Capability::Embedding,
             &url,
             100,
             None,
+            &already_loaded,
         )
         .await
         .expect("Failed to build embedding provider");
@@ -911,12 +913,14 @@ mod tests {
             eprintln!("SKIP: No STT model available in catalog");
             return;
         }
+        let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
         let built = crate::lemonade::ProviderFactory::build(
             &stt_selections[0],
             crate::lemonade::Capability::Transcription,
             &url,
             100,
             None,
+            &already_loaded,
         )
         .await
         .expect("Failed to build transcription provider");
@@ -945,12 +949,14 @@ mod tests {
             return;
         }
 
+        let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
         let b1 = crate::lemonade::ProviderFactory::build(
             &stt_selections[0],
             crate::lemonade::Capability::Transcription,
             &url,
             100,
             None,
+            &already_loaded,
         )
         .await
         .expect("Failed to build provider 1");
@@ -960,6 +966,7 @@ mod tests {
             &url,
             100,
             None,
+            &already_loaded,
         )
         .await
         .expect("Failed to build provider 2");

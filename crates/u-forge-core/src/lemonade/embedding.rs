@@ -94,12 +94,16 @@ impl LemonadeProvider {
 
     /// Explicitly load `model` via `POST /api/v1/load` with the given options,
     /// then connect and probe embedding dimensions.
+    ///
+    /// Pass `already_loaded` (from the server catalog) to skip the round-trip
+    /// when the model is already running.
     pub async fn new_with_load(
         base_url: &str,
         model: &str,
         load_opts: &crate::lemonade::ModelLoadOptions,
+        already_loaded: &[String],
     ) -> Result<Self> {
-        crate::lemonade::load_model(base_url, model, load_opts)
+        crate::lemonade::load_model(base_url, model, load_opts, already_loaded)
             .await
             .map_err(|e| {
                 anyhow!(

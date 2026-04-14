@@ -15,7 +15,7 @@
 //!     ctx_size: Some(4096),
 //!     ..Default::default()
 //! };
-//! load_model("http://localhost:13305/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF", &opts).await?;
+//! load_model("http://localhost:13305/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF", &opts, &[]).await?;
 //! # Ok(()) }
 //! ```
 
@@ -151,14 +151,26 @@ struct LoadRequest<'a> {
 /// Explicitly load `model_name` into Lemonade Server with the given options.
 ///
 /// Blocks until the server confirms the model is loaded (or returns an error).
-/// Safe to call even if the model is already loaded — the server treats
-/// repeated load calls as a no-op or a reconfiguration.
+///
+/// Pass the currently-loaded model IDs from the server catalog as
+/// `already_loaded` to skip the round-trip when the model is already running.
+/// Pass an empty slice to always send the load request.
 ///
 /// # Errors
 ///
 /// Returns an error if the server is unreachable, returns a non-2xx status, or
 /// the `model_name` is not registered in the server's model registry.
-pub async fn load_model(base_url: &str, model_name: &str, opts: &ModelLoadOptions) -> Result<()> {
+pub async fn load_model(
+    base_url: &str,
+    model_name: &str,
+    opts: &ModelLoadOptions,
+    already_loaded: &[String],
+) -> Result<()> {
+    if already_loaded.iter().any(|id| id == model_name) {
+        tracing::debug!(model = model_name, "Model already loaded — skipping load call");
+        return Ok(());
+    }
+
     let client = LemonadeHttpClient::new(base_url);
 
     // FLM (NPU) models do not use llama-server and will reject llamacpp params.
@@ -366,6 +378,7 @@ mod tests {
             "http://127.0.0.1:19999/api/v1",
             "embed-gemma-300m-FLM",
             &opts,
+            &[],
         )
         .await;
         assert!(result.is_err(), "Expected error for unreachable server");
@@ -384,7 +397,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = load_model(&url, "user.ggml-org/embeddinggemma-300M-GGUF", &opts).await;
+        let result = load_model(&url, "user.ggml-org/embeddinggemma-300M-GGUF", &opts, &[]).await;
         assert!(
             result.is_ok(),
             "load_model failed: {:?}",

@@ -82,6 +82,7 @@ sqlite-vec ANN search, catalog-driven provider selection, unified inference queu
 `get_nodes_paginated`). Interactive RAG chat REPL (`cli_chat`). No active bugs.
 
 Recent quality improvements:
+- `load_model()` now accepts `already_loaded: &[String]` — if the model ID is in the slice the HTTP round-trip to `/api/v1/load` is skipped entirely. Callers extract these IDs from `catalog.loaded` (already fetched by `LemonadeServerCatalog::discover`). `ProviderFactory::build` threads this parameter through all capability branches. Both CLI demos extract the loaded-model list from the catalog and fire all provider builds concurrently via `futures::future::join_all` / `tokio::join!`, eliminating sequential load waits on warm servers.
 - `embed_all_chunks` is now incremental — uses `get_unembedded_chunks` / `get_unembedded_chunks_hq` (LEFT JOIN on `chunks_vec`) instead of re-scanning all objects.
 - Hybrid search diagnostic blocks demoted from `info!` to `debug!` — no more log spam in production; `RUST_LOG=u_forge_core::search=debug` reveals full pipeline state.
 - `KnowledgeGraphStorage` now uses `parking_lot::Mutex` — all 24 `.lock().unwrap()` calls removed.

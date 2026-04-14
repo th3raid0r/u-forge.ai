@@ -145,12 +145,15 @@ pub async fn build_hq_embed_queue(
     let hq_model_id = hq_model.model_id.clone();
     info!(model = %hq_model_id, "Loading HQ embedding model");
 
+    let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
+
     let built: BuiltProvider = match ProviderFactory::build(
         &hq_model,
         Capability::Embedding,
         &catalog.base_url,
         app_cfg.embedding.gpu_weight,
         None,
+        &already_loaded,
     )
     .await
     {

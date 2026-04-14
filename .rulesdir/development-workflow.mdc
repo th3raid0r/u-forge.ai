@@ -190,17 +190,20 @@ there is no silent local fallback.
 let url = lemonade::resolve_lemonade_url().await
     .ok_or_else(|| anyhow!("No Lemonade Server found"))?;
 let catalog = LemonadeServerCatalog::discover(&url).await?;
-let selector = ModelSelector::new(catalog, config.models.clone());
+let selector = ModelSelector::new(&catalog, &config.models, &config.embedding);
 
-// Construct embedding providers
+// Extract currently-loaded model IDs — load_model skips the round-trip for these.
+let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
+
+// Construct embedding providers (run all in parallel with futures::future::join_all)
 for sel in selector.select_embedding_models() {
-    let p = ProviderFactory::build(&sel, Capability::Embedding, &url, 10, None).await?;
+    let p = ProviderFactory::build(&sel, Capability::Embedding, &url, 10, None, &already_loaded).await?;
     // register with InferenceQueueBuilder
 }
 
 // For STT/LLM that share the GPU, pass the shared gpu_mgr
 let gpu_mgr = Arc::new(GpuResourceManager::new());
-let p = ProviderFactory::build(&llm_sel, Capability::TextGeneration, &url, 100, Some(Arc::clone(&gpu_mgr))).await?;
+let p = ProviderFactory::build(&llm_sel, Capability::TextGeneration, &url, 100, Some(Arc::clone(&gpu_mgr)), &already_loaded).await?;
 ```
 
 ---
