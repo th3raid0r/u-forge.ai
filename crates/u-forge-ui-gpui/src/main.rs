@@ -1,85 +1,56 @@
+use std::sync::Arc;
+
+use glam::Vec2;
 use gpui::{
     canvas, div, fill, point, prelude::*, px, rgb, size, App, Application, Bounds, Context,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
     ScrollDelta, ScrollWheelEvent, Window, WindowBounds, WindowOptions,
 };
+use u_forge_graph_view::{build_snapshot, GraphSnapshot, LodLevel};
+use u_forge_ui_traits::{generate_draw_commands, DrawCommand, Viewport};
 
-const NODE_COUNT: usize = 5_000;
-const EDGE_COUNT: usize = 8_000;
-const NODE_RADIUS: f32 = 8.0;
-const WORLD_SIZE: f32 = 4000.0;
-
-/// Edges per batched PathBuilder. Balances tessellation cost vs draw call count.
+/// Edges per batched PathBuilder.
 const EDGE_BATCH_SIZE: usize = 500;
 
-/// Zoom threshold below which edges are hidden (too zoomed out to be useful).
-const EDGE_ZOOM_THRESHOLD: f32 = 0.15;
-
-/// Zoom threshold below which nodes shrink to 2px dots (no rounded corners).
-const DOT_ZOOM_THRESHOLD: f32 = 0.25;
-
 struct GraphCanvas {
-    /// (x, y, color) tuples in world space
-    nodes: Vec<(f32, f32, u32)>,
-    /// (source_idx, target_idx) pairs
-    edges: Vec<(usize, usize)>,
-    pan: Point<Pixels>,
+    snapshot: Arc<GraphSnapshot>,
+    /// Camera center in world space
+    camera: Vec2,
     zoom: f32,
     dragging: bool,
     last_mouse: Point<Pixels>,
 }
 
 impl GraphCanvas {
-    fn new() -> Self {
-        let mut seed: u64 = 42;
-        let mut rng = || -> f32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((seed >> 33) as f32) / (u32::MAX as f32 / 2.0)
-        };
-
-        let palette = [
-            0x89b4fa, 0xa6e3a1, 0xf9e2af, 0xf38ba8,
-            0xcba6f7, 0x94e2d5, 0xfab387, 0xf5c2e7,
-        ];
-
-        let nodes: Vec<(f32, f32, u32)> = (0..NODE_COUNT)
-            .map(|i| {
-                let x = rng() * WORLD_SIZE - WORLD_SIZE / 2.0;
-                let y = rng() * WORLD_SIZE - WORLD_SIZE / 2.0;
-                (x, y, palette[i % palette.len()])
-            })
-            .collect();
-
-        // Generate edges connecting nearby-ish nodes (deterministic)
-        let mut edges = Vec::with_capacity(EDGE_COUNT);
-        let mut edge_seed: u64 = 123;
-        for _ in 0..EDGE_COUNT {
-            edge_seed = edge_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let a = (edge_seed >> 33) as usize % NODE_COUNT;
-            edge_seed = edge_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let b = (edge_seed >> 33) as usize % NODE_COUNT;
-            if a != b {
-                edges.push((a, b));
-            }
-        }
-
+    fn new(snapshot: GraphSnapshot) -> Self {
         Self {
-            nodes,
-            edges,
-            pan: point(px(0.0), px(0.0)),
+            snapshot: Arc::new(snapshot),
+            camera: Vec2::ZERO,
             zoom: 1.0,
             dragging: false,
             last_mouse: point(px(0.0), px(0.0)),
         }
     }
+
+    fn viewport(&self, canvas_size: Vec2) -> Viewport {
+        Viewport {
+            center: self.camera,
+            size: canvas_size,
+            zoom: self.zoom,
+        }
+    }
+}
+
+/// Convert DrawCommand color [u8;4] → gpui rgb u32
+fn color_to_rgb(c: [u8; 4]) -> u32 {
+    ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
 }
 
 impl Render for GraphCanvas {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let zoom = self.zoom;
-        let pan = self.pan;
-        let nodes = self.nodes.clone();
-        let edges = self.edges.clone();
+        let camera = self.camera;
+        let snapshot = self.snapshot.clone();
 
         div()
             .id("graph-root")
@@ -102,8 +73,9 @@ impl Render for GraphCanvas {
                 |this, event: &MouseMoveEvent, _window, cx| {
                     if this.dragging {
                         let delta = event.position - this.last_mouse;
-                        this.pan.x += delta.x;
-                        this.pan.y += delta.y;
+                        // Pan moves camera in the opposite direction of mouse drag
+                        this.camera.x -= f32::from(delta.x) / this.zoom;
+                        this.camera.y -= f32::from(delta.y) / this.zoom;
                         this.last_mouse = event.position;
                         cx.notify();
                     }
@@ -115,12 +87,24 @@ impl Render for GraphCanvas {
                         ScrollDelta::Pixels(delta) => 1.0 + f32::from(delta.y) * 0.002,
                         ScrollDelta::Lines(delta) => 1.0 + delta.y * 0.1,
                     };
-                    let mouse = event.position;
-                    let old_zoom = this.zoom;
+                    // Zoom toward mouse position
+                    let mouse_screen = Vec2::new(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                    );
+                    let canvas_size = Vec2::new(1200.0, 800.0); // approximate
+                    let vp = this.viewport(canvas_size);
+                    let world_under_mouse = vp.screen_to_world(mouse_screen);
+
                     this.zoom = (this.zoom * factor).clamp(0.05, 20.0);
-                    let scale = this.zoom / old_zoom;
-                    this.pan.x = mouse.x - (mouse.x - this.pan.x) * scale;
-                    this.pan.y = mouse.y - (mouse.y - this.pan.y) * scale;
+
+                    // Adjust camera so world_under_mouse stays at the same screen position
+                    let new_vp = this.viewport(canvas_size);
+                    let new_screen = new_vp.world_to_screen(world_under_mouse);
+                    let screen_delta = mouse_screen - new_screen;
+                    this.camera.x -= screen_delta.x / this.zoom;
+                    this.camera.y -= screen_delta.y / this.zoom;
+
                     cx.notify();
                 },
             ))
@@ -130,91 +114,82 @@ impl Render for GraphCanvas {
                     move |bounds, (), window, _cx| {
                         window.paint_quad(fill(bounds, rgb(0x1e1e2e)));
 
-                        let center = bounds.center();
-                        let r = px(NODE_RADIUS * zoom);
-                        let diameter = r * 2.0;
+                        let canvas_size = Vec2::new(
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                        );
+                        let viewport = Viewport {
+                            center: camera,
+                            size: canvas_size,
+                            zoom,
+                        };
 
-                        let view_min_x = bounds.origin.x - r;
-                        let view_max_x = bounds.origin.x + bounds.size.width + r;
-                        let view_min_y = bounds.origin.y - r;
-                        let view_max_y = bounds.origin.y + bounds.size.height + r;
+                        let commands = generate_draw_commands(&snapshot, &viewport);
+                        let lod = viewport.lod_level();
 
-                        // Pre-compute screen positions for all nodes
-                        let screen_pos: Vec<(Pixels, Pixels)> = nodes
+                        // Draw edges first (batched paths)
+                        let edge_commands: Vec<&DrawCommand> = commands
                             .iter()
-                            .map(|&(wx, wy, _)| {
-                                (
-                                    px(wx * zoom) + pan.x + center.x,
-                                    px(wy * zoom) + pan.y + center.y,
-                                )
-                            })
+                            .filter(|c| matches!(c, DrawCommand::Line { .. }))
                             .collect();
 
-                        // Draw edges — batched into chunked paths for performance.
-                        // Skip entirely when zoomed out past threshold (LOD: Dot level).
-                        if zoom >= EDGE_ZOOM_THRESHOLD {
-                            let edge_color = rgb(0x585b70);
+                        if !edge_commands.is_empty() {
                             let mut builder = PathBuilder::stroke(px(1.0));
-                            let mut count_in_batch = 0;
+                            let mut count = 0;
+                            let edge_color = rgb(0x585b70);
 
-                            for &(src, tgt) in &edges {
-                                let (sx, sy) = screen_pos[src];
-                                let (tx, ty) = screen_pos[tgt];
+                            for cmd in &edge_commands {
+                                if let DrawCommand::Line { from, to, .. } = cmd {
+                                    builder.move_to(point(px(from.x), px(from.y)));
+                                    builder.line_to(point(px(to.x), px(to.y)));
+                                    count += 1;
 
-                                // Skip if both endpoints are outside viewport
-                                let src_visible = sx >= view_min_x && sx <= view_max_x
-                                    && sy >= view_min_y && sy <= view_max_y;
-                                let tgt_visible = tx >= view_min_x && tx <= view_max_x
-                                    && ty >= view_min_y && ty <= view_max_y;
-                                if !src_visible && !tgt_visible {
-                                    continue;
-                                }
-
-                                builder.move_to(point(sx, sy));
-                                builder.line_to(point(tx, ty));
-                                count_in_batch += 1;
-
-                                if count_in_batch >= EDGE_BATCH_SIZE {
-                                    if let Ok(path) = builder.build() {
-                                        window.paint_path(path, edge_color);
+                                    if count >= EDGE_BATCH_SIZE {
+                                        if let Ok(path) = builder.build() {
+                                            window.paint_path(path, edge_color);
+                                        }
+                                        builder = PathBuilder::stroke(px(1.0));
+                                        count = 0;
                                     }
-                                    builder = PathBuilder::stroke(px(1.0));
-                                    count_in_batch = 0;
                                 }
                             }
-                            // Flush remaining edges
-                            if count_in_batch > 0 {
+                            if count > 0 {
                                 if let Ok(path) = builder.build() {
                                     window.paint_path(path, edge_color);
                                 }
                             }
                         }
 
-                        // Draw nodes — at very low zoom, use tiny squares instead of
-                        // rounded quads (skips corner radius GPU cost).
-                        let use_dots = zoom < DOT_ZOOM_THRESHOLD;
-                        let dot_size = px(3.0);
-                        let dot_half = px(1.5);
-
-                        for (i, &(_, _, color)) in nodes.iter().enumerate() {
-                            let (sx, sy) = screen_pos[i];
-                            if sx < view_min_x || sx > view_max_x || sy < view_min_y || sy > view_max_y {
-                                continue;
-                            }
-                            if use_dots {
-                                let dot_bounds = Bounds::new(
-                                    point(sx - dot_half, sy - dot_half),
-                                    size(dot_size, dot_size),
-                                );
-                                window.paint_quad(fill(dot_bounds, rgb(color)));
-                            } else {
+                        // Draw circles (nodes)
+                        let use_dots = lod == LodLevel::Dot;
+                        for cmd in &commands {
+                            if let DrawCommand::Circle {
+                                center,
+                                radius,
+                                color,
+                            } = cmd
+                            {
+                                let r = if use_dots { px(3.0) } else { px(*radius * zoom) };
+                                let c = point(px(center.x), px(center.y));
                                 let node_bounds = Bounds::new(
-                                    point(sx - r, sy - r),
-                                    size(diameter, diameter),
+                                    point(c.x - r, c.y - r),
+                                    size(r * 2.0, r * 2.0),
                                 );
-                                window.paint_quad(fill(node_bounds, rgb(color)).corner_radii(r));
+                                let col = color_to_rgb(*color);
+                                if use_dots {
+                                    window.paint_quad(fill(node_bounds, rgb(col)));
+                                } else {
+                                    window.paint_quad(
+                                        fill(node_bounds, rgb(col)).corner_radii(r),
+                                    );
+                                }
                             }
                         }
+
+                        // Draw text labels (only at Label/Full LOD)
+                        // Note: text rendering via paint_glyph is complex in GPUI.
+                        // For now we skip text in the canvas and will add it as
+                        // overlay div elements in a future iteration.
                     },
                 )
                 .size_full(),
@@ -223,6 +198,35 @@ impl Render for GraphCanvas {
 }
 
 fn main() {
+    // Load graph data before starting GPUI (blocking)
+    let snapshot = {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(async {
+            let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+            let graph =
+                u_forge_core::KnowledgeGraph::new(tmp.path()).expect("failed to create graph");
+
+            // Import the test data
+            let data_file = std::path::Path::new("defaults/data/memory.json");
+            if data_file.exists() {
+                let mut ingestion = u_forge_core::DataIngestion::new(&graph);
+                ingestion
+                    .import_json_data(data_file)
+                    .await
+                    .expect("failed to import data");
+                let stats = graph.get_stats().expect("failed to get stats");
+                eprintln!(
+                    "Loaded {} nodes, {} edges from memory.json",
+                    stats.node_count, stats.edge_count
+                );
+            } else {
+                eprintln!("Warning: defaults/data/memory.json not found, using empty graph");
+            }
+
+            build_snapshot(&graph).expect("failed to build snapshot")
+        })
+    };
+
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
@@ -230,7 +234,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| GraphCanvas::new()),
+            |_, cx| cx.new(|_| GraphCanvas::new(snapshot)),
         )
         .unwrap();
     });

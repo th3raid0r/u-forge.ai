@@ -12,3 +12,6 @@ u-forge-core = { path = "../u-forge-core" }
 u-forge-graph-view = { path = "../u-forge-graph-view" }
 u-forge-ui-traits = { path = "../u-forge-ui-traits" }
 gpui = "0.2.2"
+glam = "0.29"
+tokio = { version = "1.45", features = ["rt-multi-thread"] }
+tempfile = "3.20"
