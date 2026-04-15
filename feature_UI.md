@@ -161,16 +161,17 @@ The crate is split into focused modules under `src/`. `main.rs` is the binary en
 | File / directory | Contents |
 |---|---|
 | `lib.rs` | Module declarations, `actions!()` macro, re-exports (`AppView`, action types) |
-| `selection_model.rs` | `SelectionModel` — shared selection state observed by `TreePanel`, `GraphCanvas`, and `NodeEditorPanel` |
-| `text_field.rs` | `TextFieldView` — canvas-based text input widget (`EntityInputHandler`, cursor, IME, scroll) |
+| `selection_model.rs` | `SelectionModel` — shared selection state observed by `TreePanel`, `GraphCanvas`, `NodeEditorPanel`, and `SearchPanel` |
+| `text_field.rs` | `TextFieldView` — canvas-based text input widget (`EntityInputHandler`, cursor, IME, blink, vertical scroll (multiline), horizontal scroll (single-line)) |
 | `tree_panel.rs` | `TreePanel` — collapsible node-by-type sidebar; uses `w_full()` so parent container controls width |
+| `search_panel.rs` | `SearchPanel` — left sidebar search tab: FTS5 / Semantic / Hybrid modes, single-line query field, results list, `set_queues()` updater |
 | `right_panel.rs` | `RightPanel` — placeholder right panel entity (future chat/AI assistant) |
 | `graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
 | `node_editor/mod.rs` | `NodeEditorPanel` struct, constructor, tab management (`open_or_focus_tab`, `save_dirty_tabs`, `commit_array_add`) |
 | `node_editor/field_spec.rs` | `FieldSpec`, `FieldKind`, `EditorTab` — form field descriptions and dirty-state tracking |
 | `node_editor/render.rs` | `impl Render for NodeEditorPanel` — tab bar, multi-column form, pagination, dropdowns, array widgets |
-| `app_view/mod.rs` | `AppView` struct + data operations (`do_save`, `do_import_data`, `do_clear_data`, `refresh_snapshot`); panel size state; drag marker types |
-| `app_view/render.rs` | `impl Render for AppView` — menu bar, 3-panel resizable body layout, status bar, dropdown overlays |
+| `app_view/mod.rs` | `AppView` struct + data/AI operations (`do_save`, `do_import_data`, `do_clear_data`, `do_init_lemonade`, `do_embed_all`, `refresh_snapshot`); panel size state; drag marker types; `SidebarTab` enum |
+| `app_view/render.rs` | `impl Render for AppView` — menu bar, 3-panel resizable body layout, sidebar tab switching (Tree / Search), status bar, dropdown overlays |
 
 The `actions!()` macro is invoked once in `lib.rs`; all modules import action types via `use crate::{SaveLayout, …}`. The binary imports `AppView` and the action types from the library crate.
 
@@ -178,12 +179,14 @@ The `actions!()` macro is invoked once in `lib.rs`; all modules import action ty
 
 ### App shell (`AppView`)
 
-`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<NodeEditorPanel>`, `Entity<RightPanel>`, `Entity<SelectionModel>`, the shared `Arc<RwLock<GraphSnapshot>>`, boolean toggles (`sidebar_open`, `right_panel_open`, `file_menu_open`, `view_menu_open`), and user-adjustable panel sizes (`sidebar_width: f32`, `editor_ratio: f32`, `right_panel_width: f32`). It renders:
+`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SearchPanel>`, `Entity<NodeEditorPanel>`, `Entity<RightPanel>`, `Entity<SelectionModel>`, the shared `Arc<RwLock<GraphSnapshot>>`, boolean toggles (`sidebar_open`, `right_panel_open`, `file_menu_open`, `view_menu_open`), `sidebar_tab: SidebarTab` (Tree / Search), user-adjustable panel sizes (`sidebar_width`, `editor_ratio`, `right_panel_width`), AI infrastructure (`app_config`, `tokio_rt`, `inference_queue`, `hq_queue`), and status strings (`data_status`, `embedding_status`). It renders:
 - **Menu bar** (28 px, `flex_none`): "File" button (dropdown: Save / Ctrl+S) and "View" button (dropdown: checkable Left Panel / Ctrl+B, checkable Right Panel / Ctrl+J). Both dropdowns rendered with `deferred(anchored(...))`.
-- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional `TreePanel` (default 220 px, user-resizable) + workspace + optional `RightPanel` (default 280 px, user-resizable). Each visible side panel is wrapped in a sized container div; the panel entity itself uses `w_full()`.
+- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional left sidebar (default 220 px, user-resizable, shows `TreePanel` or `SearchPanel` based on `sidebar_tab`) + workspace + optional `RightPanel` (default 280 px, user-resizable). Each visible side panel is wrapped in a sized container div; the panel entity itself uses `w_full()`.
 - **Workspace** (`flex_col`, `flex_grow`): vertical split driven by `editor_ratio` — `NodeEditorPanel` (top, default 30%) + `GraphCanvas` (bottom, default 70%).
 - **Resize handles**: three 6 px drag handles sit between panels. Dragging updates the corresponding size field via `on_drag_move` + a `WeakEntity<AppView>` captured in the closure. Double-clicking any handle resets it to its default size. Handle cursor changes to `ResizeColumn`/`ResizeRow` on hover.
-- **Status bar** (24 px, `flex_none`, bottom): left section has panel toggle buttons (Tree, more coming), center shows graph stats (node/edge count from snapshot), right has a Chat toggle button. All toggle buttons highlight when their panel is open.
+- **Status bar** (24 px, `flex_none`, bottom): left section has panel toggle buttons (Tree, Search — clicking an active tab's button closes the sidebar; clicking the other tab switches and opens); center shows graph stats and amber `embedding_status`; right has a Chat toggle button. All toggle buttons highlight when their panel is open.
+
+**Async AI init flow**: `AppView::new()` calls `do_init_lemonade()` immediately. That method spawns a background task: `resolve_lemonade_url()` → `LemonadeServerCatalog::discover()` → `ModelSelector` → `ProviderFactory::build()` (concurrent via `futures::future::join_all`) → `InferenceQueueBuilder`. On success, stores `inference_queue`/`hq_queue`, calls `search_panel.set_queues()`, then calls `do_embed_all()`. If Lemonade is unreachable, the app continues with FTS5-only search. `do_embed_all()` calls `embed_all_chunks(graph, queue, EmbeddingTarget::Standard)` (and HQ if available); it only sets `embedding_status` when `total > 0` (i.e., unembedded chunks existed). `do_import_data()` chains `do_embed_all()` on success.
 
 ### Selection model (`SelectionModel`)
 
@@ -221,14 +224,15 @@ Nodes are sorted case-insensitively within each group; groups are sorted by type
 
 **Stored layout for click mapping:**
 ```rust
-enum TextFieldLayout {
-    Single(ShapedLine),                      // single-line field
-    Multi(Vec<(usize, WrappedLine)>),        // (byte_start, line) per '\n'-segment
-}
+struct TextFieldLayout(Vec<(usize, WrappedLine)>);
+// One entry per '\n'-delimited line segment; byte_start is the UTF-8 offset of
+// the first character of that line within the full content string.
 ```
-Updated every paint frame in `TextFieldView::shaped_layout`. The `on_mouse_down` handler converts the window-coordinate click to text-area-local coords (subtract `field_origin` + padding), then calls into this cached layout for exact glyph-level hit testing.
+Updated every paint frame in `TextFieldView::shaped_layout`. The `on_mouse_down` handler converts the window-coordinate click to text-area-local coords (subtract `field_origin` + padding + scroll offset), then calls into this cached layout for exact glyph-level hit testing.
 
 **Element origin:** Stored as `field_origin_x / field_origin_y` from `bounds.origin` inside the paint closure. Event positions from `MouseDownEvent::position` are in window coordinates — subtracting the stored origin converts them to element-local.
+
+**Single-line horizontal scroll:** When `multiline = false`, text is shaped with `wrap_width = None` (no wrapping). `h_scroll_offset: f32` tracks how far the view has scrolled right. `visible_width: f32` is updated each paint from `inner_w`. `text_origin` shifts by `pad_x - px(h_scroll_offset)`. `scroll_to_cursor()` dispatches on `multiline`: single-line calls `ensure_cursor_visible_h(cursor_x, visible_width)` which adjusts `h_scroll_offset` with an 8 px margin. Mouse click coords add `h_scroll_offset` to `local_x` for single-line mode so click-to-cursor mapping is correct when scrolled. `character_index_for_point` (IME handler) applies the same adjustment. `dynamic_h` for single-line is always `TEXT_FIELD_MIN_H` — no vertical growth.
 
 ### GPUI layout constraints (hard-won lessons)
 
@@ -284,7 +288,9 @@ The GPUI canvas saves positions **on explicit save** (Ctrl+S or File > Save) rat
 10d. ✅ **Unified text fields, scroll support, and editable array adds** — All text fields now use wrapped rendering (`shape_text` with `wrap_width`) and dynamically grow from single-line height (28 px) up to a cap (120 px) based on content. When content exceeds the cap, the field becomes scrollable via mouse wheel, with `overflow_hidden()` clipping and a `scroll_offset` applied to paint. `ensure_cursor_visible()` is called from key/mouse handlers (never from paint) to avoid render-loop oscillation. `TextFieldLayout` simplified to a single struct (no more `Single`/`Multi` enum). Array "+" button spawns an inline `TextFieldView` that commits on Enter via a new `TextSubmit` event. `set_content` now resets cursor to position 0 so fields don't auto-scroll to the bottom on load.
 10e. ✅ **Module decomposition** — Broke the monolithic 3,392-line `main.rs` into 10 focused files across 6 modules (see "Module structure" section above). `main.rs` is now the binary entry point only (~111 lines); all types live in a library target (`lib.rs`). `Cargo.toml` declares both `[lib]` and `[[bin]]` targets. Module organization follows Zed's conventions: one file per panel/concern, large render impls separated from data logic. No functional changes.
 10f. ✅ **Resizable panels** — All three panel boundaries are now user-draggable via 6 px resize handles (Zed `DraggedDock` pattern). `AppView` gains `sidebar_width`, `editor_ratio`, `right_panel_width` fields with sensible defaults and min/max clamping. Three marker structs (`ResizeSidebar`, `ResizeEditorCanvas`, `ResizeRightPanel`) implement `Render` returning `gpui::Empty`; they are passed as the drag payload to `on_drag` and matched by `on_drag_move`. `TreePanel` changed from fixed `w(px(SIDEBAR_W))` to `w_full()` — the parent container controls width. Right panel promoted from an inline div to a proper `RightPanel` entity (`right_panel.rs`). Double-click on any handle resets it to the default size via `on_click` + `event.click_count() == 2`.
-11. **Search** — text input → highlight matching nodes.
+11. ✅ **Search panel** — `SearchPanel` entity in left sidebar, toggled by "Search" button in status bar. `SidebarTab` enum (Tree / Search) on `AppView`. Three modes: FTS5 (always available), Semantic (requires Lemonade; uses HQ 4096-dim when `hq_queue` is set, standard 768-dim otherwise), Hybrid (`search_hybrid()` with RRF fusion). Query submitted via Enter key (`TextSubmit` event) or search button click. Results list: node name + type color dot; clicking a result calls `SelectionModel::select_by_id()` → canvas pans + editor tab opens. Semantic/Hybrid buttons are visually dimmed when no `inference_queue` is available. `set_queues()` method called from `AppView::do_init_lemonade()` success path.
+11b. ✅ **Async Lemonade init + embedding status** — `AppView` now holds `Arc<tokio::runtime::Runtime>` (persistent across the app lifetime), `Arc<AppConfig>`, `inference_queue`, `hq_queue`, and `embedding_status`. `do_init_lemonade()` runs on startup: discovers Lemonade, builds queue via `ProviderFactory` + `InferenceQueueBuilder`, then triggers `do_embed_all()`. `do_embed_all()` uses `embed_all_chunks()` (incremental — only unembedded chunks); only sets `embedding_status` when `total > 0` so already-embedded DBs show no noise. Status bar center shows amber embedding progress / completion. `do_import_data()` chains `do_embed_all()` after successful import.
+11c. ✅ **Single-line horizontal scroll in `TextFieldView`** — Search query input is single-line only. `wrap_width = None` prevents wrapping. `h_scroll_offset` + `visible_width` fields; `ensure_cursor_visible_h()` keeps cursor on screen with 8 px margin. Mouse click and IME `character_index_for_point` both compensate for `h_scroll_offset`. `dynamic_h` fixed at `TEXT_FIELD_MIN_H` for single-line fields.
 
 ---
 

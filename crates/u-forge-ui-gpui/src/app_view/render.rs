@@ -6,9 +6,9 @@ use gpui::{
 use crate::{ClearData, ImportData, SaveLayout, ToggleRightPanel, ToggleSidebar};
 
 use super::{
-    AppView, DEFAULT_EDITOR_RATIO, DEFAULT_RIGHT_PANEL_W, DEFAULT_SIDEBAR_W, MAX_PANE_RATIO,
-    MENU_BAR_H, MIN_PANEL_W, MIN_PANE_RATIO, MIN_WORKSPACE_W, RESIZE_HANDLE_SIZE,
-    ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H,
+    AppView, SidebarTab, DEFAULT_EDITOR_RATIO, DEFAULT_RIGHT_PANEL_W, DEFAULT_SIDEBAR_W,
+    MAX_PANE_RATIO, MENU_BAR_H, MIN_PANEL_W, MIN_PANE_RATIO, MIN_WORKSPACE_W,
+    RESIZE_HANDLE_SIZE, ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H,
 };
 
 impl Render for AppView {
@@ -16,10 +16,12 @@ impl Render for AppView {
         let file_menu_open = self.file_menu_open;
         let view_menu_open = self.view_menu_open;
         let sidebar_open = self.sidebar_open;
+        let sidebar_tab = self.sidebar_tab;
         let right_panel_open = self.right_panel_open;
         let sidebar_width = self.sidebar_width;
         let editor_ratio = self.editor_ratio;
         let right_panel_width = self.right_panel_width;
+        let embedding_status = self.embedding_status.clone();
 
         // Read graph stats for the status bar.
         let snap = self.snapshot.read();
@@ -180,7 +182,14 @@ impl Render for AppView {
                                 .h_full()
                                 .min_h_0()
                                 .overflow_hidden()
-                                .child(self.tree_panel.clone()),
+                                .child(match sidebar_tab {
+                                    SidebarTab::Tree => {
+                                        self.tree_panel.clone().into_any_element()
+                                    }
+                                    SidebarTab::Search => {
+                                        self.search_panel.clone().into_any_element()
+                                    }
+                                }),
                         )
                         .child(
                             // Sidebar resize handle — 6px wide, full height.
@@ -358,6 +367,7 @@ impl Render for AppView {
                             .flex_none()
                             .gap(px(2.0))
                             .px_1()
+                            // Tree button
                             .child(
                                 div()
                                     .id("status-tree-btn")
@@ -366,20 +376,64 @@ impl Render for AppView {
                                     .px_2()
                                     .h(px(STATUS_BAR_H - 4.0))
                                     .cursor_pointer()
-                                    .text_color(if sidebar_open {
-                                        rgba(0xcdd6f4ff)
-                                    } else {
-                                        rgba(0x6c7086ff)
-                                    })
-                                    .when(sidebar_open, |el| el.bg(rgba(0x45475a88)))
+                                    .text_color(
+                                        if sidebar_open && sidebar_tab == SidebarTab::Tree {
+                                            rgba(0xcdd6f4ff)
+                                        } else {
+                                            rgba(0x6c7086ff)
+                                        },
+                                    )
+                                    .when(
+                                        sidebar_open && sidebar_tab == SidebarTab::Tree,
+                                        |el| el.bg(rgba(0x45475a88)),
+                                    )
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.sidebar_open = !this.sidebar_open;
+                                            if this.sidebar_open && this.sidebar_tab == SidebarTab::Tree {
+                                                this.sidebar_open = false;
+                                            } else {
+                                                this.sidebar_open = true;
+                                                this.sidebar_tab = SidebarTab::Tree;
+                                            }
                                             cx.notify();
                                         }),
                                     )
                                     .child("Tree"),
+                            )
+                            // Search button
+                            .child(
+                                div()
+                                    .id("status-search-btn")
+                                    .flex()
+                                    .items_center()
+                                    .px_2()
+                                    .h(px(STATUS_BAR_H - 4.0))
+                                    .cursor_pointer()
+                                    .text_color(
+                                        if sidebar_open && sidebar_tab == SidebarTab::Search {
+                                            rgba(0xcdd6f4ff)
+                                        } else {
+                                            rgba(0x6c7086ff)
+                                        },
+                                    )
+                                    .when(
+                                        sidebar_open && sidebar_tab == SidebarTab::Search,
+                                        |el| el.bg(rgba(0x45475a88)),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            if this.sidebar_open && this.sidebar_tab == SidebarTab::Search {
+                                                this.sidebar_open = false;
+                                            } else {
+                                                this.sidebar_open = true;
+                                                this.sidebar_tab = SidebarTab::Search;
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("Search"),
                             ),
                     )
                     // ── Center: graph stats + operation status ────────────────
@@ -400,6 +454,9 @@ impl Render for AppView {
                         ));
                         if let Some(msg) = data_status {
                             center = center.child(div().text_color(rgba(0xa6e3a1ff)).child(msg));
+                        }
+                        if let Some(msg) = embedding_status {
+                            center = center.child(div().text_color(rgba(0xf9e2afff)).child(msg));
                         }
                         center
                     })

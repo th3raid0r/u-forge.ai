@@ -61,8 +61,12 @@ pub(crate) struct TextFieldView {
     content_height: f32,
     /// Visible height of the text area (bounds height minus padding), updated each paint.
     visible_height: f32,
-    /// Scroll offset (in pixels) for when content exceeds the visible area.
+    /// Vertical scroll offset (multiline only).
     scroll_offset: f32,
+    /// Horizontal scroll offset (single-line mode only).
+    h_scroll_offset: f32,
+    /// Visible width of the text area (bounds width minus padding), updated each paint.
+    visible_width: f32,
 }
 
 impl TextFieldView {
@@ -85,6 +89,8 @@ impl TextFieldView {
             content_height: 0.0,
             visible_height: 0.0,
             scroll_offset: 0.0,
+            h_scroll_offset: 0.0,
+            visible_width: 0.0,
         }
     }
 
@@ -193,9 +199,11 @@ impl TextFieldView {
         }
     }
 
-    /// Adjust scroll_offset so the cursor at the given y-position (relative to
-    /// content top) is visible within `visible_h` pixels.
+    /// Adjust vertical scroll_offset so the cursor is visible (multiline only).
     fn ensure_cursor_visible(&mut self, cursor_y: f32, visible_h: f32) {
+        if visible_h <= 0.0 {
+            return;
+        }
         let line_h = self.measured_line_h;
         let cursor_bottom = cursor_y + line_h;
         if cursor_y < self.scroll_offset {
@@ -206,11 +214,31 @@ impl TextFieldView {
         self.scroll_offset = self.scroll_offset.max(0.0);
     }
 
+    /// Adjust horizontal h_scroll_offset so the cursor is visible (single-line only).
+    fn ensure_cursor_visible_h(&mut self, cursor_x: f32, visible_w: f32) {
+        if visible_w <= 0.0 {
+            return;
+        }
+        // Keep a small margin so the cursor isn't flush against the edge.
+        let margin = 8.0_f32;
+        if cursor_x < self.h_scroll_offset + margin {
+            self.h_scroll_offset = (cursor_x - margin).max(0.0);
+        } else if cursor_x + margin > self.h_scroll_offset + visible_w {
+            self.h_scroll_offset = cursor_x + margin - visible_w;
+        }
+        self.h_scroll_offset = self.h_scroll_offset.max(0.0);
+    }
+
     /// Scroll to keep the current cursor visible, using cached layout from the
     /// previous paint frame. Called from key/mouse handlers — NOT from paint.
     fn scroll_to_cursor(&mut self) {
-        let (_, cy) = self.cursor_pos_from_layout(self.cursor);
-        self.ensure_cursor_visible(f32::from(cy), self.visible_height);
+        if self.multiline {
+            let (_, cy) = self.cursor_pos_from_layout(self.cursor);
+            self.ensure_cursor_visible(f32::from(cy), self.visible_height);
+        } else {
+            let (cx, _) = self.cursor_pos_from_layout(self.cursor);
+            self.ensure_cursor_visible_h(f32::from(cx), self.visible_width);
+        }
     }
 
     pub(crate) fn set_content(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -218,6 +246,7 @@ impl TextFieldView {
         self.cursor = 0;
         self.selection = None;
         self.scroll_offset = 0.0;
+        self.h_scroll_offset = 0.0;
         self.reset_blink(cx);
         cx.notify();
     }
@@ -442,9 +471,12 @@ impl EntityInputHandler for TextFieldView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        // Convert point (element-local) to text-area-local by subtracting padding.
-        let local_x = f32::from(point.x) - 6.0;
-        let local_y = f32::from(point.y) - 4.0;
+        // Convert point (element-local) to text-area-local by subtracting padding,
+        // adding scroll offset so IME popup tracks the actual glyph position.
+        let local_x = f32::from(point.x) - 6.0
+            + if self.multiline { 0.0 } else { self.h_scroll_offset };
+        let local_y = f32::from(point.y) - 4.0
+            + if self.multiline { self.scroll_offset } else { 0.0 };
         let utf8_offset = self.cursor_for_click(local_x, local_y);
         Some(self.utf8_to_utf16_offset(utf8_offset))
     }
@@ -473,6 +505,8 @@ impl Render for TextFieldView {
         let is_focused = focused;
         let cursor_visible = self.cursor_visible;
         let scroll_offset = self.scroll_offset;
+        let h_scroll_offset = self.h_scroll_offset;
+        let is_multiline = self.multiline;
 
         // The main canvas renders text and cursor via shape_line/paint, exactly
         // matching the glyph positions GPUI uses internally — like Zed does.
@@ -494,9 +528,22 @@ impl Render for TextFieldView {
 
                 let pad_x = px(6.0);
                 let pad_y = px(TEXT_FIELD_PAD_Y);
-                let scroll_px = px(scroll_offset);
-                let text_origin = bounds.origin + point(pad_x, pad_y - scroll_px);
                 let inner_w = bounds.size.width - pad_x * 2.0;
+
+                // Single-line: horizontal scroll, no word wrap.
+                // Multiline: vertical scroll, wrap at inner_w.
+                let text_origin = if is_multiline {
+                    let scroll_px = px(scroll_offset);
+                    bounds.origin + point(pad_x, pad_y - scroll_px)
+                } else {
+                    let h_scroll_px = px(h_scroll_offset);
+                    bounds.origin + point(pad_x - h_scroll_px, pad_y)
+                };
+                let wrap_width: Option<gpui::Pixels> = if is_multiline {
+                    Some(inner_w)
+                } else {
+                    None
+                };
 
                 // Split content by explicit newlines.
                 let raw_lines: Vec<&str> = if display.is_empty() {
@@ -509,7 +556,6 @@ impl Render for TextFieldView {
                 let mut byte_offset: usize = 0;
                 let mut y_acc = px(0.0);
 
-                // Always use wrapping (shape_text) so all fields can grow dynamically.
                 let mut stored_lines: Vec<(usize, WrappedLine)> = Vec::new();
 
                 for (line_idx, raw_line) in raw_lines.iter().enumerate() {
@@ -527,7 +573,7 @@ impl Render for TextFieldView {
                             line_text,
                             font_size,
                             &[run],
-                            Some(inner_w),
+                            wrap_width,
                             None,
                         ) {
                             for wl in wrapped {
@@ -615,6 +661,7 @@ impl Render for TextFieldView {
                     (f32::from(y_acc) + TEXT_FIELD_PAD_Y * 2.0).round();
                 let visible_h =
                     (f32::from(bounds.size.height) - TEXT_FIELD_PAD_Y * 2.0).max(0.0);
+                let visible_w = f32::from(inner_w).max(0.0);
 
                 paint_entity.update(cx, |this, _cx| {
                     this.field_origin_x = origin_x;
@@ -622,6 +669,7 @@ impl Render for TextFieldView {
                     this.measured_line_h = lh_f.max(1.0);
                     this.content_height = total_content_h;
                     this.visible_height = visible_h;
+                    this.visible_width = visible_w;
                 });
 
                 // Install the input handler so IME / platform text input works.
@@ -635,11 +683,12 @@ impl Render for TextFieldView {
         )
         .size_full();
 
-        // Dynamic field height: start at single-line, grow with content, cap at max.
-        let dynamic_h = self
-            .content_height
-            .max(TEXT_FIELD_MIN_H)
-            .min(TEXT_FIELD_MAX_H);
+        // Single-line: fixed height. Multiline: grow with content, capped at max.
+        let dynamic_h = if self.multiline {
+            self.content_height.max(TEXT_FIELD_MIN_H).min(TEXT_FIELD_MAX_H)
+        } else {
+            TEXT_FIELD_MIN_H
+        };
 
         let field = div()
             .id(SharedString::from(format!("tf-{}", cx.entity_id().as_u64())))
@@ -664,10 +713,11 @@ impl Render for TextFieldView {
                     window.focus(&this.focus);
                     // Convert window coordinates to text-area-local coordinates.
                     // Subtract element origin and padding, add scroll offset.
-                    let local_x = f32::from(event.position.x) - this.field_origin_x - 6.0;
+                    let local_x = f32::from(event.position.x) - this.field_origin_x - 6.0
+                        + if this.multiline { 0.0 } else { this.h_scroll_offset };
                     let local_y = f32::from(event.position.y) - this.field_origin_y
                         - TEXT_FIELD_PAD_Y
-                        + this.scroll_offset;
+                        + if this.multiline { this.scroll_offset } else { 0.0 };
                     this.cursor = this.cursor_for_click(local_x, local_y);
                     this.selection = None;
                     this.scroll_to_cursor();

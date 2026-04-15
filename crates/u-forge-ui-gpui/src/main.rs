@@ -9,13 +9,14 @@ use u_forge_graph_view::build_snapshot;
 use u_forge_ui_gpui::{AppView, ClearData, ImportData, SaveLayout, ToggleRightPanel, ToggleSidebar};
 
 fn main() {
-    let cfg = AppConfig::load_default();
+    let cfg = Arc::new(AppConfig::load_default());
     let data_dir = cfg.storage.db_path.clone();
     let data_file = cfg.data.import_file.clone();
     let schema_dir = cfg.data.schema_dir.clone();
 
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("failed to create tokio runtime"));
+
     let (snapshot, graph, schema_mgr) = {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         rt.block_on(async {
             let graph = Arc::new(
                 u_forge_core::KnowledgeGraph::new(&data_dir)
@@ -51,8 +52,6 @@ fn main() {
             }
 
             // Pre-load schemas so they're available synchronously in the UI.
-            // "default" holds hardcoded built-in types; "imported_schemas" holds
-            // the file-loaded types from defaults/schemas/*.schema.json.
             let schema_mgr = graph.get_schema_manager();
             if let Err(e) = schema_mgr.load_schema("default").await {
                 eprintln!("Warning: could not load default schema: {e}");
@@ -102,7 +101,7 @@ fn main() {
             },
             |_, cx| {
                 cx.new(|cx| {
-                    AppView::new(snapshot, graph, schema_mgr, data_file, schema_dir, cx)
+                    AppView::new(snapshot, graph, schema_mgr, data_file, schema_dir, cfg, rt, cx)
                 })
             },
         )

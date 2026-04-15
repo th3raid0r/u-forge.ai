@@ -4,12 +4,22 @@ use std::sync::Arc;
 
 use gpui::{prelude::*, Context, Empty, Entity};
 use parking_lot::RwLock;
-use u_forge_core::{KnowledgeGraph, SchemaManager};
+use u_forge_core::{
+    AppConfig, EmbeddingTarget, KnowledgeGraph, SchemaManager,
+    embed_all_chunks,
+    lemonade::{
+        Capability, GpuResourceManager, LemonadeServerCatalog, ProviderFactory,
+        resolve_lemonade_url, ModelSelector, QualityTier,
+    },
+    queue::{InferenceQueue, InferenceQueueBuilder},
+    ingest::build_hq_embed_queue,
+};
 use u_forge_graph_view::GraphSnapshot;
 
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
 use crate::right_panel::RightPanel;
+use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
 use crate::tree_panel::TreePanel;
 
@@ -71,9 +81,17 @@ impl Render for ResizeRightPanel {
     }
 }
 
+/// Which panel is currently shown in the left sidebar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SidebarTab {
+    Tree,
+    Search,
+}
+
 pub struct AppView {
     pub(crate) graph_canvas: Entity<GraphCanvas>,
     pub(crate) tree_panel: Entity<TreePanel>,
+    pub(crate) search_panel: Entity<SearchPanel>,
     pub(crate) node_editor: Entity<NodeEditorPanel>,
     pub(crate) right_panel: Entity<RightPanel>,
     #[allow(dead_code)]
@@ -85,6 +103,7 @@ pub struct AppView {
     pub(crate) file_menu_open: bool,
     pub(crate) view_menu_open: bool,
     pub(crate) sidebar_open: bool,
+    pub(crate) sidebar_tab: SidebarTab,
     pub(crate) right_panel_open: bool,
     /// Current sidebar width in pixels (user-resizable).
     pub(crate) sidebar_width: f32,
@@ -94,6 +113,16 @@ pub struct AppView {
     pub(crate) right_panel_width: f32,
     /// Status message displayed in the status bar during/after data operations.
     pub(crate) data_status: Option<String>,
+    /// Embedding progress/completion message shown in the status bar.
+    pub(crate) embedding_status: Option<String>,
+    /// Shared app config.
+    pub(crate) app_config: Arc<AppConfig>,
+    /// Persistent tokio runtime for async core calls from background tasks.
+    pub(crate) tokio_rt: Arc<tokio::runtime::Runtime>,
+    /// Standard embedding + reranking queue (None until Lemonade is discovered).
+    pub(crate) inference_queue: Option<InferenceQueue>,
+    /// High-quality embedding queue (None when HQ embedding is disabled or unavailable).
+    pub(crate) hq_queue: Option<InferenceQueue>,
 }
 
 impl AppView {
@@ -103,6 +132,8 @@ impl AppView {
         schema_mgr: Arc<SchemaManager>,
         data_file: std::path::PathBuf,
         schema_dir: std::path::PathBuf,
+        app_config: Arc<AppConfig>,
+        tokio_rt: Arc<tokio::runtime::Runtime>,
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
@@ -112,6 +143,15 @@ impl AppView {
         });
         let tree_panel =
             cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
+        let search_panel = cx.new(|cx| {
+            SearchPanel::new(
+                selection.clone(),
+                graph.clone(),
+                app_config.clone(),
+                tokio_rt.clone(),
+                cx,
+            )
+        });
         let node_editor = cx.new(|cx| {
             NodeEditorPanel::new(
                 snapshot_arc.clone(),
@@ -122,9 +162,11 @@ impl AppView {
             )
         });
         let right_panel = cx.new(|_| RightPanel::new());
-        Self {
+
+        let mut view = Self {
             graph_canvas,
             tree_panel,
+            search_panel,
             node_editor,
             right_panel,
             selection,
@@ -135,12 +177,21 @@ impl AppView {
             file_menu_open: false,
             view_menu_open: false,
             sidebar_open: false,
+            sidebar_tab: SidebarTab::Tree,
             right_panel_open: false,
             sidebar_width: DEFAULT_SIDEBAR_W,
             editor_ratio: DEFAULT_EDITOR_RATIO,
             right_panel_width: DEFAULT_RIGHT_PANEL_W,
             data_status: None,
-        }
+            embedding_status: None,
+            app_config,
+            tokio_rt,
+            inference_queue: None,
+            hq_queue: None,
+        };
+
+        view.do_init_lemonade(cx);
+        view
     }
 
     /// Rebuild the in-memory snapshot from the graph and push it to all child views.
@@ -193,6 +244,8 @@ impl AppView {
                             stats.objects_created, stats.relationships_created
                         ));
                         view.refresh_snapshot(cx);
+                        // Trigger embedding after successful import.
+                        view.do_embed_all(cx);
                     }
                     Err(e) => {
                         view.data_status = Some(format!("Import failed: {e}"));
@@ -239,5 +292,186 @@ impl AppView {
         }
 
         cx.notify();
+    }
+
+    /// Asynchronously discover Lemonade Server and build the InferenceQueue.
+    /// FTS5 search works immediately even if this fails.
+    pub(crate) fn do_init_lemonade(&mut self, cx: &mut Context<Self>) {
+        let app_config = self.app_config.clone();
+        let tokio_rt = self.tokio_rt.clone();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(async move {
+                        // Discover Lemonade Server URL.
+                        let url = match resolve_lemonade_url().await {
+                            Some(u) => u,
+                            None => return Err(anyhow::anyhow!("Lemonade Server not reachable")),
+                        };
+
+                        // Discover available models.
+                        let catalog = LemonadeServerCatalog::discover(&url).await?;
+                        let selector =
+                            ModelSelector::new(&catalog, &app_config.models, &app_config.embedding);
+                        let embed_models = selector.select_embedding_models();
+                        let reranker_sel = selector.select_reranker();
+
+                        let already_loaded: Vec<String> =
+                            catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
+
+                        // Build provider specs for embedding + optional reranker.
+                        let mut build_futs = Vec::new();
+                        for sel in embed_models.iter().filter(|s| s.quality_tier == QualityTier::Standard) {
+                            let weight = match sel.recipe.as_str() {
+                                "flm" => app_config.embedding.npu_weight,
+                                "llamacpp" => match sel.backend.as_deref() {
+                                    Some("rocm") | Some("vulkan") | Some("metal") => {
+                                        app_config.embedding.gpu_weight
+                                    }
+                                    _ => app_config.embedding.cpu_weight,
+                                },
+                                _ => app_config.embedding.cpu_weight,
+                            };
+                            build_futs.push((
+                                sel.clone(),
+                                Capability::Embedding,
+                                weight,
+                            ));
+                        }
+                        if let Some(r_sel) = reranker_sel {
+                            build_futs.push((r_sel, Capability::Reranking, 100));
+                        }
+
+                        let gpu_mgr = GpuResourceManager::new();
+                        let url_owned = url.clone();
+                        let loaded = already_loaded.clone();
+
+                        let provider_futs: Vec<_> = build_futs
+                            .iter()
+                            .map(|(sel, cap, weight)| {
+                                let s = sel.clone();
+                                let c = *cap;
+                                let w = *weight;
+                                let base = url_owned.clone();
+                                let ld = loaded.clone();
+                                let gm = Arc::clone(&gpu_mgr);
+                                async move {
+                                    ProviderFactory::build(&s, c, &base, w, Some(gm), &ld).await
+                                }
+                            })
+                            .collect();
+
+                        let build_results = futures::future::join_all(provider_futs).await;
+                        let providers: Vec<_> = build_results.into_iter().flatten().collect();
+
+                        if providers.is_empty() {
+                            return Err(anyhow::anyhow!("No embedding providers available"));
+                        }
+
+                        let queue = InferenceQueueBuilder::new()
+                            .with_providers(providers)
+                            .with_config((*app_config).clone())
+                            .build();
+
+                        // Build optional HQ embedding queue.
+                        let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
+
+                        Ok((queue, hq_queue))
+                    })
+                })
+                .await;
+
+            this.update(cx, |view: &mut AppView, cx| {
+                match result {
+                    Ok((queue, hq_queue)) => {
+                        eprintln!("Lemonade connected — embedding queue ready");
+                        view.inference_queue = Some(queue.clone());
+                        view.hq_queue = hq_queue.clone();
+
+                        // Push queues to search panel.
+                        view.search_panel.update(cx, |panel, _cx| {
+                            panel.set_queues(Some(queue), hq_queue);
+                        });
+
+                        // Trigger bulk embedding for any unembedded chunks.
+                        view.do_embed_all(cx);
+                    }
+                    Err(e) => {
+                        eprintln!("Lemonade init skipped: {e}");
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Trigger bulk embedding of all unembedded chunks (standard + optional HQ).
+    pub(crate) fn do_embed_all(&mut self, cx: &mut Context<Self>) {
+        let queue = match self.inference_queue.clone() {
+            Some(q) => q,
+            None => return,
+        };
+        let hq_queue = self.hq_queue.clone();
+        let graph = self.graph.clone();
+        let tokio_rt = self.tokio_rt.clone();
+
+        self.embedding_status = Some("Embedding…".to_string());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(async move {
+                        let std_result =
+                            embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard).await?;
+
+                        let hq_result = if let Some(hq) = &hq_queue {
+                            let r = embed_all_chunks(&graph, hq, EmbeddingTarget::HighQuality).await?;
+                            Some(r)
+                        } else {
+                            None
+                        };
+
+                        Ok::<_, anyhow::Error>((std_result, hq_result))
+                    })
+                })
+                .await;
+
+            this.update(cx, |view: &mut AppView, cx| {
+                match result {
+                    Ok((std_r, hq_r)) => {
+                        // Only report if something was actually embedded.
+                        // total == 0 means no unembedded chunks existed — nothing to do.
+                        view.embedding_status = if std_r.total == 0 {
+                            None
+                        } else if std_r.stored > 0 {
+                            let hq_suffix = hq_r
+                                .filter(|hq| hq.stored > 0)
+                                .map(|hq| format!(" (+{} HQ)", hq.stored))
+                                .unwrap_or_default();
+                            Some(format!("Embedded {}{} chunks", std_r.stored, hq_suffix))
+                        } else {
+                            // Had candidates but none stored (all failed).
+                            Some(format!(
+                                "Embedding: {}/{} failed",
+                                std_r.skipped, std_r.total
+                            ))
+                        };
+                    }
+                    Err(e) => {
+                        eprintln!("Embedding failed: {e}");
+                        view.embedding_status = Some(format!("Embedding failed: {e}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }

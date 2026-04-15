@@ -6301,6 +6301,8 @@ dependencies = [
 name = "u-forge-ui-gpui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "futures",
  "glam",
  "gpui",
  "parking_lot",
