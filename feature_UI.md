@@ -154,6 +154,25 @@ The view model produces `Vec<DrawCommand>` from a `GraphSnapshot` + `Viewport`. 
 
 ## GPUI Prototype (`u-forge-ui-gpui`)
 
+### Module structure
+
+The crate is split into focused modules under `src/`. `main.rs` is the binary entry point only (~111 lines); all types live in the library target (`lib.rs`):
+
+| File / directory | Contents |
+|---|---|
+| `lib.rs` | Module declarations, `actions!()` macro, re-exports (`AppView`, action types) |
+| `selection_model.rs` | `SelectionModel` — shared selection state observed by `TreePanel`, `GraphCanvas`, and `NodeEditorPanel` |
+| `text_field.rs` | `TextFieldView` — canvas-based text input widget (`EntityInputHandler`, cursor, IME, scroll) |
+| `tree_panel.rs` | `TreePanel` — 220 px sidebar listing nodes by type |
+| `graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
+| `node_editor/mod.rs` | `NodeEditorPanel` struct, constructor, tab management (`open_or_focus_tab`, `save_dirty_tabs`, `commit_array_add`) |
+| `node_editor/field_spec.rs` | `FieldSpec`, `FieldKind`, `EditorTab` — form field descriptions and dirty-state tracking |
+| `node_editor/render.rs` | `impl Render for NodeEditorPanel` — tab bar, multi-column form, pagination, dropdowns, array widgets |
+| `app_view/mod.rs` | `AppView` struct + data operations (`do_save`, `do_import_data`, `do_clear_data`, `refresh_snapshot`) |
+| `app_view/render.rs` | `impl Render for AppView` — menu bar, body layout, status bar, dropdown overlays |
+
+The `actions!()` macro is invoked once in `lib.rs`; all modules import action types via `use crate::{SaveLayout, …}`. The binary imports `AppView` and the action types from the library crate.
+
 **GPUI version:** Using `gpui = "0.2.2"` from crates.io (blade-graphics backend). The current `main` branch of the Zed repo has restructured into `gpui_platform`/`gpui_linux`/`gpui_wgpu` sub-crates with a different entry point (`gpui_platform::application()` instead of `Application::new()`). Stay on 0.2.2 until there is a clear need to upgrade — the crates.io release is stable enough for our purposes. Do not switch to a git dependency without a targeted API compatibility pass.
 
 ### App shell (`AppView`)
@@ -260,6 +279,7 @@ The GPUI canvas saves positions **on explicit save** (Ctrl+S or File > Save) rat
 10b. ✅ **Schema-driven editor with browser tabs** — `NodeEditorPanel` replaces `NodeDetailPanel` (top 30% of workspace). Browser-style tab system: selecting a node opens it in an editor tab; unpinned tabs are replaced when a new node is selected; pinned tabs stay open. Each tab renders a schema-driven form generated from `ObjectTypeSchema` properties. Form fields: `TextFieldView` (custom text input widget implementing `EntityInputHandler`) for String/Text/Number, clickable checkbox for Boolean, anchored dropdown overlay for Enum, tag-chip list with add/remove for Array. Multi-column layout: fields flow vertically into columns (300 px each); columns overflow into additional pages with "< Prev" / "Next >" navigation buttons. Dirty state: tabs turn orange (`0xfab387`) when edited values differ from DB. Save all: Ctrl+S / File > Save persists all dirty tabs via `KnowledgeGraph::update_object()` and saves layout positions, then patches the in-memory snapshot so tree panel and canvas reflect name changes. `SchemaManager::get_object_type_schema()` added as a sync cache accessor; default schema pre-loaded at startup.
 10c. ✅ **`TextFieldView` cursor and click accuracy** — Rewrote `TextFieldView::Render` to paint text via `shape_line`/`shape_text` + `ShapedLine::paint()`/`WrappedLine::paint()` on a `canvas` element instead of using a `SharedString` div child. Cursor position uses `x_for_index`/`position_for_index` on the shaped layout (pixel-exact). Click-to-cursor uses `closest_index_for_x`/`closest_index_for_position` on the same cached `TextFieldLayout` enum. Line height corrected to `font_size * phi (1.618)` (GPUI default). Element origin stored each frame so `MouseDownEvent::position` (window coords) is correctly converted to text-area-local coordinates. See "TextFieldView — canvas-based text rendering" section above.
 10d. ✅ **Unified text fields, scroll support, and editable array adds** — All text fields now use wrapped rendering (`shape_text` with `wrap_width`) and dynamically grow from single-line height (28 px) up to a cap (120 px) based on content. When content exceeds the cap, the field becomes scrollable via mouse wheel, with `overflow_hidden()` clipping and a `scroll_offset` applied to paint. `ensure_cursor_visible()` is called from key/mouse handlers (never from paint) to avoid render-loop oscillation. `TextFieldLayout` simplified to a single struct (no more `Single`/`Multi` enum). Array "+" button spawns an inline `TextFieldView` that commits on Enter via a new `TextSubmit` event. `set_content` now resets cursor to position 0 so fields don't auto-scroll to the bottom on load.
+10e. ✅ **Module decomposition** — Broke the monolithic 3,392-line `main.rs` into 10 focused files across 6 modules (see "Module structure" section above). `main.rs` is now the binary entry point only (~111 lines); all types live in a library target (`lib.rs`). `Cargo.toml` declares both `[lib]` and `[[bin]]` targets. Module organization follows Zed's conventions: one file per panel/concern, large render impls separated from data logic. No functional changes.
 11. **Search** — text input → highlight matching nodes.
 
 ---
