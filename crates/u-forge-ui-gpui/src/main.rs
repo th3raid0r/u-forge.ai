@@ -7,8 +7,8 @@ use gpui::{
     Application, Bounds, Context, Corner, ElementInputHandler, Entity, EntityInputHandler, Font,
     FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ScrollDelta,
-    ScrollWheelEvent, SharedString, Subscription, TextRun, UTF16Selection, Window, WindowBounds,
-    WindowOptions, actions, relative,
+    ScrollWheelEvent, ShapedLine, SharedString, Subscription, TextAlign, TextRun, UTF16Selection,
+    Window, WindowBounds, WindowOptions, WrappedLine, actions, relative,
 };
 use parking_lot::RwLock;
 use u_forge_core::{AppConfig, KnowledgeGraph, ObjectId};
@@ -42,6 +42,16 @@ const STATUS_BAR_H: f32 = 24.0;
 /// Event emitted by `TextFieldView` when its content changes.
 struct TextChanged(String);
 
+/// Cached shaped text layout from the most recent paint, used for click-to-cursor mapping.
+/// Stored per-line with the byte offset where each line starts in the content string.
+enum TextFieldLayout {
+    /// Single-line field: one ShapedLine covering the entire content.
+    Single(ShapedLine),
+    /// Multiline field: one WrappedLine per explicit '\n'-delimited line,
+    /// paired with the byte offset where that line starts in the content.
+    Multi(Vec<(usize, WrappedLine)>),
+}
+
 /// A minimal editable text field built on GPUI's `EntityInputHandler`.
 ///
 /// Handles basic cursor movement, character insertion (via platform IME),
@@ -57,6 +67,16 @@ struct TextFieldView {
     focus: FocusHandle,
     multiline: bool,
     placeholder: String,
+    /// Timestamp of last cursor-affecting action, for blink phase calculation.
+    cursor_reset_time: std::time::Instant,
+    /// Actual line height measured from font metrics, updated each paint.
+    measured_line_h: f32,
+    /// Element origin X in window coordinates, updated each paint.
+    field_origin_x: f32,
+    /// Element origin Y in window coordinates, updated each paint.
+    field_origin_y: f32,
+    /// Cached shaped layout from the most recent paint frame — used for click mapping.
+    shaped_layout: Option<TextFieldLayout>,
 }
 
 impl TextFieldView {
@@ -69,6 +89,83 @@ impl TextFieldView {
             focus: cx.focus_handle(),
             multiline,
             placeholder: placeholder.to_string(),
+            cursor_reset_time: std::time::Instant::now(),
+            measured_line_h: 19.0,
+            field_origin_x: 0.0,
+            field_origin_y: 0.0,
+            shaped_layout: None,
+        }
+    }
+
+    /// Reset the blink timer so the cursor is immediately visible after any edit/move.
+    fn reset_blink(&mut self) {
+        self.cursor_reset_time = std::time::Instant::now();
+    }
+
+    /// Map a click position (local to text area, after subtracting element origin
+    /// and padding) to a UTF-8 byte offset into `self.content`.
+    /// Uses the cached shaped layout from the most recent paint for exact glyph mapping.
+    fn cursor_for_click(&self, local_x: f32, local_y: f32) -> usize {
+        let line_h = px(self.measured_line_h);
+        match &self.shaped_layout {
+            Some(TextFieldLayout::Single(shaped)) => {
+                shaped.closest_index_for_x(px(local_x))
+            }
+            Some(TextFieldLayout::Multi(lines)) => {
+                // Determine which explicit line was clicked by accumulating
+                // the visual height of each WrappedLine.
+                let mut y_acc = px(0.0);
+                for (byte_start, wl) in lines {
+                    let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
+                    let line_visual_h = line_h * visual_rows;
+                    if px(local_y) < y_acc + line_visual_h || *byte_start == lines.last().map(|(b, _)| *b).unwrap_or(0) {
+                        // Click is within this WrappedLine. Use position relative to
+                        // this line's visual start.
+                        let rel_y = px(local_y) - y_acc;
+                        let pos = point(px(local_x), rel_y);
+                        let idx = wl.closest_index_for_position(pos, line_h)
+                            .unwrap_or_else(|i| i);
+                        return byte_start + idx;
+                    }
+                    y_acc += line_visual_h;
+                }
+                self.content.len()
+            }
+            None => {
+                // No layout yet (first frame); clamp to content length.
+                self.content.len().min(
+                    (local_x / self.measured_line_h.max(1.0) * 2.0) as usize,
+                )
+            }
+        }
+    }
+
+    /// Get cursor pixel position (x, y) relative to text area origin for a given
+    /// byte offset, using the cached shaped layout. Falls back to (0,0) if no layout.
+    fn cursor_pos_from_layout(&self, byte_offset: usize) -> (Pixels, Pixels) {
+        let line_h = px(self.measured_line_h);
+        match &self.shaped_layout {
+            Some(TextFieldLayout::Single(shaped)) => {
+                (shaped.x_for_index(byte_offset), px(0.0))
+            }
+            Some(TextFieldLayout::Multi(lines)) => {
+                let mut y_acc = px(0.0);
+                for (byte_start, wl) in lines {
+                    let line_len = wl.len();
+                    if byte_offset >= *byte_start && byte_offset <= *byte_start + line_len {
+                        let local_idx = byte_offset - byte_start;
+                        if let Some(pos) = wl.position_for_index(local_idx, line_h) {
+                            return (pos.x, y_acc + pos.y);
+                        }
+                        // Fallback: end of line
+                        return (wl.width(), y_acc);
+                    }
+                    let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
+                    y_acc += line_h * visual_rows;
+                }
+                (px(0.0), y_acc)
+            }
+            None => (px(0.0), px(0.0)),
         }
     }
 
@@ -76,6 +173,7 @@ impl TextFieldView {
         self.content = text.to_string();
         self.cursor = self.content.len();
         self.selection = None;
+        self.reset_blink();
         cx.notify();
     }
 
@@ -225,6 +323,7 @@ impl EntityInputHandler for TextFieldView {
             .replace_range(clamped_start..clamped_end, text);
         self.cursor = clamped_start + text.len();
         self.selection = None;
+        self.reset_blink();
 
         cx.emit(TextChanged(self.content.clone()));
         cx.notify();
@@ -279,15 +378,16 @@ impl EntityInputHandler for TextFieldView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        // Approximate: place the IME candidate window at the cursor position.
         let start = self.utf16_to_utf8_offset(range_utf16.start);
-        let char_count = self.content[..start.min(self.content.len())].chars().count();
-        let char_w: f32 = 7.2; // approximate monospace character width at text_xs
-        let x = element_bounds.origin.x + px(4.0 + char_count as f32 * char_w);
-        let y = element_bounds.origin.y;
+        let clamped = start.min(self.content.len());
+        let line_h = px(self.measured_line_h);
+        let pad = point(px(6.0), px(4.0));
+        let (cx_px, cy_px) = self.cursor_pos_from_layout(clamped);
+        let x = element_bounds.origin.x + pad.x + cx_px;
+        let y = element_bounds.origin.y + pad.y + cy_px;
         Some(Bounds::new(
             Point::new(x, y),
-            size(px(char_w), element_bounds.size.height),
+            size(px(8.0), line_h),
         ))
     }
 
@@ -297,17 +397,10 @@ impl EntityInputHandler for TextFieldView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        // Rough click-to-cursor: divide x offset by approximate char width.
-        let char_w: f32 = 7.2;
-        let x_offset = f32::from(point.x) - 4.0;
-        let char_idx = (x_offset / char_w).round().max(0.0) as usize;
-        // Convert char index to UTF-16 offset.
-        let utf8_offset = self
-            .content
-            .char_indices()
-            .nth(char_idx)
-            .map(|(i, _)| i)
-            .unwrap_or(self.content.len());
+        // Convert point (element-local) to text-area-local by subtracting padding.
+        let local_x = f32::from(point.x) - 6.0;
+        let local_y = f32::from(point.y) - 4.0;
+        let utf8_offset = self.cursor_for_click(local_x, local_y);
         Some(self.utf8_to_utf16_offset(utf8_offset))
     }
 }
@@ -316,54 +409,246 @@ impl Render for TextFieldView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
         let entity = cx.entity().clone();
-        let focus = self.focus.clone();
+        let paint_entity = cx.entity().clone();
 
-        // Determine display text + cursor char offset.
-        let display_text: SharedString = if self.content.is_empty() && !focused {
-            self.placeholder.clone().into()
-        } else {
-            self.content.clone().into()
-        };
-        let text_color = if self.content.is_empty() && !focused {
-            rgba(0x6c7086ff) // placeholder
-        } else {
-            rgba(0xcdd6f4ff) // normal text
-        };
-        let _cursor_char_offset = self.content[..self.cursor].chars().count();
+        // Schedule continuous repaints while focused so the cursor blink animates.
+        if focused {
+            cx.notify();
+        }
 
-        let h = if self.multiline { px(80.0) } else { px(28.0) };
+        // Prepare data for the paint canvas closure (captures by value).
+        let content = self.content.clone();
+        let placeholder = self.placeholder.clone();
+        let cursor_byte = self.cursor;
+        let is_focused = focused;
+        let blink_elapsed = self.cursor_reset_time.elapsed().as_millis();
 
-        div()
+        // The main canvas renders text and cursor via shape_line/paint, exactly
+        // matching the glyph positions GPUI uses internally — like Zed does.
+        // This guarantees the cursor aligns perfectly with the rendered text.
+        let is_multiline = self.multiline;
+        let text_canvas = canvas(
+            |_, _, _| {},
+            move |bounds, (), window, cx| {
+                let rem_size = window.rem_size();
+                let font_size = rem_size * 0.75; // text_xs = 0.75rem
+                let line_height = (font_size * 1.618_034).round();
+                let mono_font = font(".SystemUIMonospacedFont");
+
+                // Determine display text and color.
+                let (display, text_hsla) = if content.is_empty() && !is_focused {
+                    (placeholder.clone(), Hsla::from(rgba(0x6c7086ff)))
+                } else {
+                    (content.clone(), Hsla::from(rgba(0xcdd6f4ff)))
+                };
+
+                let pad_x = px(6.0);
+                let pad_y = px(4.0);
+                let text_origin = bounds.origin + point(pad_x, pad_y);
+                let inner_w = bounds.size.width - pad_x * 2.0;
+
+                // Split content by explicit newlines.
+                let raw_lines: Vec<&str> = if display.is_empty() {
+                    vec![""]
+                } else {
+                    display.split('\n').collect()
+                };
+
+                let mut cursor_pos: Option<gpui::Point<Pixels>> = None;
+                let mut byte_offset: usize = 0;
+                let mut y_acc = px(0.0);
+
+                if is_multiline {
+                    // ── Multiline: shape each line with wrap_width, store WrappedLines ──
+                    let mut stored_lines: Vec<(usize, WrappedLine)> = Vec::new();
+
+                    for (line_idx, raw_line) in raw_lines.iter().enumerate() {
+                        if !raw_line.is_empty() {
+                            let line_text: SharedString = (*raw_line).to_string().into();
+                            let run = TextRun {
+                                len: raw_line.len(),
+                                font: mono_font.clone(),
+                                color: text_hsla,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            if let Ok(wrapped) = window.text_system().shape_text(
+                                line_text,
+                                font_size,
+                                &[run],
+                                Some(inner_w),
+                                None,
+                            ) {
+                                // shape_text returns one WrappedLine per input line.
+                                for wl in wrapped {
+                                    let paint_origin = text_origin + point(px(0.0), y_acc);
+                                    let _ = wl.paint(
+                                        paint_origin,
+                                        line_height,
+                                        TextAlign::Left,
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+
+                                    // Cursor position within this line.
+                                    if cursor_pos.is_none()
+                                        && cursor_byte >= byte_offset
+                                        && cursor_byte <= byte_offset + raw_line.len()
+                                    {
+                                        let local = cursor_byte - byte_offset;
+                                        if let Some(p) = wl.position_for_index(local, line_height) {
+                                            cursor_pos = Some(point(p.x, y_acc + p.y));
+                                        }
+                                    }
+
+                                    let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
+                                    stored_lines.push((byte_offset, wl));
+                                    y_acc += line_height * visual_rows;
+                                }
+                            }
+                        } else {
+                            // Empty line — cursor may sit here.
+                            if cursor_pos.is_none() && cursor_byte == byte_offset {
+                                cursor_pos = Some(point(px(0.0), y_acc));
+                            }
+                            // Push an empty shaped line for click mapping.
+                            let run = TextRun {
+                                len: 0,
+                                font: mono_font.clone(),
+                                color: text_hsla,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            if let Ok(wrapped) = window.text_system().shape_text(
+                                SharedString::from(""),
+                                font_size,
+                                &[run],
+                                Some(inner_w),
+                                None,
+                            ) {
+                                for wl in wrapped {
+                                    stored_lines.push((byte_offset, wl));
+                                }
+                            }
+                            y_acc += line_height;
+                        }
+
+                        byte_offset += raw_line.len();
+                        if line_idx < raw_lines.len() - 1 {
+                            byte_offset += 1; // '\n'
+                        }
+                    }
+
+                    // Store layout for click handling.
+                    paint_entity.update(cx, |this, _cx| {
+                        this.shaped_layout = Some(TextFieldLayout::Multi(stored_lines));
+                    });
+                } else {
+                    // ── Single-line: shape as one line, no wrapping ──
+                    if !display.is_empty() {
+                        let line_text: SharedString = display.clone().into();
+                        let run = TextRun {
+                            len: display.len(),
+                            font: mono_font.clone(),
+                            color: text_hsla,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let shaped = window.text_system().shape_line(
+                            line_text,
+                            font_size,
+                            &[run],
+                            None,
+                        );
+                        let _ = shaped.paint(text_origin, line_height, window, cx);
+
+                        if cursor_byte <= display.len() {
+                            let cx_px = shaped.x_for_index(cursor_byte);
+                            cursor_pos = Some(point(cx_px, px(0.0)));
+                        }
+
+                        // Store for click handling.
+                        let stored = shaped.clone();
+                        paint_entity.update(cx, |this, _cx| {
+                            this.shaped_layout = Some(TextFieldLayout::Single(stored));
+                        });
+                    } else {
+                        cursor_pos = Some(point(px(0.0), px(0.0)));
+                        paint_entity.update(cx, |this, _cx| {
+                            this.shaped_layout = None;
+                        });
+                    }
+                }
+
+                // Paint the blinking cursor.
+                if is_focused {
+                    let visible = (blink_elapsed % 1000) < 500;
+                    if visible {
+                        let cp = cursor_pos.unwrap_or(point(px(0.0), px(0.0)));
+                        let cursor_origin = text_origin + cp;
+                        window.paint_quad(fill(
+                            gpui::Bounds::new(
+                                cursor_origin,
+                                size(px(1.5), line_height),
+                            ),
+                            rgba(0xcdd6f4ff),
+                        ));
+                    }
+                }
+
+                // Store measurements for click handling.
+                let lh_f = f32::from(line_height);
+                let origin_x = f32::from(bounds.origin.x);
+                let origin_y = f32::from(bounds.origin.y);
+                paint_entity.update(cx, |this, _cx| {
+                    this.field_origin_x = origin_x;
+                    this.field_origin_y = origin_y;
+                    this.measured_line_h = lh_f.max(1.0);
+                });
+
+                // Install the input handler so IME / platform text input works.
+                let focus2 = entity.read(cx).focus.clone();
+                window.handle_input(
+                    &focus2,
+                    ElementInputHandler::new(bounds, entity.clone()),
+                    cx,
+                );
+            },
+        )
+        .size_full();
+
+        let mut field = div()
             .id(SharedString::from(format!("tf-{}", cx.entity_id().as_u64())))
-            .flex()
-            .items_center()
+            .relative()
             .w_full()
-            .h(h)
-            .px(px(6.0))
             .bg(rgb(0x313244))
             .rounded(px(4.0))
             .border_1()
             .border_color(if focused { rgb(0x89b4fa) } else { rgb(0x45475a) })
-            .text_xs()
-            .font_family(".SystemUIMonospacedFont")
-            .text_color(text_color)
-            .track_focus(&self.focus)
+            .track_focus(&self.focus);
+
+        if self.multiline {
+            field = field.min_h(px(80.0));
+        } else {
+            field = field.h(px(28.0)).overflow_hidden();
+        }
+
+        field
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus);
-                    // Rough click-to-cursor.
-                    let char_w: f32 = 7.2;
-                    let x_offset = f32::from(event.position.x) - 4.0;
-                    let char_idx = (x_offset / char_w).round().max(0.0) as usize;
-                    let utf8_offset = this
-                        .content
-                        .char_indices()
-                        .nth(char_idx)
-                        .map(|(i, _)| i)
-                        .unwrap_or(this.content.len());
-                    this.cursor = utf8_offset;
+                    // Convert window coordinates to text-area-local coordinates.
+                    // Subtract element origin and padding (px=6, py=4).
+                    let local_x = f32::from(event.position.x) - this.field_origin_x - 6.0;
+                    let local_y = f32::from(event.position.y) - this.field_origin_y - 4.0;
+                    this.cursor = this.cursor_for_click(local_x, local_y);
                     this.selection = None;
+                    this.reset_blink();
                     cx.notify();
                 }),
             )
@@ -382,6 +667,7 @@ impl Render for TextFieldView {
                             this.content.drain(remove_at..next_char_end);
                             cx.emit(TextChanged(this.content.clone()));
                         }
+                        this.reset_blink();
                         cx.notify();
                     }
                     "delete" => {
@@ -394,26 +680,31 @@ impl Render for TextFieldView {
                             this.content.drain(this.cursor..next_char_end);
                             cx.emit(TextChanged(this.content.clone()));
                         }
+                        this.reset_blink();
                         cx.notify();
                     }
                     "left" => {
                         this.selection = None;
                         this.move_left();
+                        this.reset_blink();
                         cx.notify();
                     }
                     "right" => {
                         this.selection = None;
                         this.move_right();
+                        this.reset_blink();
                         cx.notify();
                     }
                     "home" => {
                         this.selection = None;
                         this.cursor = 0;
+                        this.reset_blink();
                         cx.notify();
                     }
                     "end" => {
                         this.selection = None;
                         this.cursor = this.content.len();
+                        this.reset_blink();
                         cx.notify();
                     }
                     "enter" => {
@@ -422,27 +713,14 @@ impl Render for TextFieldView {
                             this.content.insert(this.cursor, '\n');
                             this.cursor += 1;
                             cx.emit(TextChanged(this.content.clone()));
+                            this.reset_blink();
                             cx.notify();
                         }
                     }
                     _ => {}
                 }
             }))
-            .child(display_text)
-            // Invisible zero-size canvas that installs the input handler during paint.
-            .child(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, (), window, cx| {
-                        window.handle_input(
-                            &focus,
-                            ElementInputHandler::new(bounds, entity.clone()),
-                            cx,
-                        );
-                    },
-                )
-                .size_0(),
-            )
+            .child(text_canvas)
     }
 }
 
@@ -1156,6 +1434,26 @@ impl FieldSpec {
     }
 }
 
+/// Compare two JSON values for equality, treating string representations of
+/// numbers/booleans as equal to their typed counterparts. This is needed because
+/// the TextChanged handler always produces `Value::String`, but the original
+/// properties may store `Value::Number` or `Value::Bool`.
+fn values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    if a == b {
+        return true;
+    }
+    // Compare by string representation: if both render to the same text, treat as equal.
+    let a_str = match a {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let b_str = match b {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    a_str == b_str
+}
+
 /// A single editor tab representing one node being edited.
 struct EditorTab {
     node_id: ObjectId,
@@ -1295,10 +1593,14 @@ impl EditorTab {
 
         let name_changed =
             vals.get("name").and_then(|v| v.as_str()) != Some(orig.name.as_str());
-        let desc_changed = vals
+
+        // Treat empty string the same as None for description comparison.
+        let edited_desc = vals
             .get("description")
             .and_then(|v| v.as_str())
-            != orig.description.as_deref();
+            .filter(|s| !s.is_empty());
+        let orig_desc = orig.description.as_deref().filter(|s| !s.is_empty());
+        let desc_changed = edited_desc != orig_desc;
 
         let mut props_changed = false;
         if let Some(orig_obj) = orig.properties.as_object() {
@@ -1306,18 +1608,28 @@ impl EditorTab {
                 if k == "name" || k == "description" || k == "tags" {
                     continue;
                 }
+                // Treat empty string as equivalent to missing/null.
+                let edited_empty = v.as_str().is_some_and(|s| s.is_empty())
+                    || v.is_null();
                 match orig_obj.get(k) {
-                    Some(orig_v) if orig_v == v => {}
+                    Some(orig_v) if values_equal(orig_v, v) => {}
+                    None | Some(&serde_json::Value::Null) if edited_empty => {}
                     _ => {
                         props_changed = true;
                         break;
                     }
                 }
             }
-            // Check if original has keys that were removed
+            // Check if original has keys not present in edited_values
+            // (skip keys whose original value is null/empty — they match absence).
             if !props_changed {
-                for k in orig_obj.keys() {
-                    if !vals.contains_key(k) {
+                for (k, v) in orig_obj.iter() {
+                    if vals.contains_key(k) {
+                        continue;
+                    }
+                    let orig_empty = v.as_str().is_some_and(|s| s.is_empty())
+                        || v.is_null();
+                    if !orig_empty {
                         props_changed = true;
                         break;
                     }
@@ -1356,6 +1668,8 @@ struct NodeEditorPanel {
     schema_mgr: Arc<SchemaManager>,
     /// Open dropdown field key (for enum fields).
     dropdown_open: Option<String>,
+    /// Measured panel size in pixels, updated each frame via canvas measurement.
+    panel_size: gpui::Size<Pixels>,
     /// Subscriptions to text field changes — kept alive so events fire.
     _field_subs: Vec<Subscription>,
     _selection_sub: Subscription,
@@ -1384,6 +1698,10 @@ impl NodeEditorPanel {
             graph,
             schema_mgr,
             dropdown_open: None,
+            panel_size: gpui::Size {
+                width: px(900.0),
+                height: px(400.0),
+            },
             _field_subs: Vec::new(),
             _selection_sub: sub,
         }
@@ -1604,8 +1922,23 @@ impl NodeEditorPanel {
 
 impl Render for NodeEditorPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Measure panel size each frame so column layout adapts to window resizes.
+        let entity_for_measure = cx.entity().clone();
+        let measure_canvas = canvas(
+            |_, _, _| {},
+            move |bounds, (), _window, cx| {
+                entity_for_measure.update(cx, |this, _cx| {
+                    this.panel_size = bounds.size;
+                });
+            },
+        )
+        .w_full()
+        .h_full()
+        .absolute();
+
         let outer = div()
             .id("node-editor-panel")
+            .relative()
             .flex()
             .flex_col()
             .w_full()
@@ -1618,6 +1951,7 @@ impl Render for NodeEditorPanel {
 
         if self.tabs.is_empty() {
             return outer
+                .child(measure_canvas)
                 .items_center()
                 .justify_center()
                 .child(
@@ -1744,17 +2078,16 @@ impl Render for NodeEditorPanel {
 
         // ── Form content for active tab ──────────────────────────────────────
         if active_idx >= self.tabs.len() {
-            return outer.child(tab_bar);
+            return outer.child(measure_canvas).child(tab_bar);
         }
 
         let tab = &self.tabs[active_idx];
         let specs = tab.field_specs();
 
-        // Compute column/page layout.
-        // Use a reasonable default panel size; exact sizing is approximate.
-        let panel_w = 900.0_f32; // will be refined when we measure
-        let panel_h = 400.0_f32;
-        let available_h = panel_h - DETAIL_TAB_H - PAGE_NAV_H;
+        // Compute column/page layout using measured panel dimensions.
+        let panel_w = f32::from(self.panel_size.width);
+        let panel_h = f32::from(self.panel_size.height);
+        let available_h = (panel_h - DETAIL_TAB_H - PAGE_NAV_H).max(100.0);
         let max_cols = ((panel_w / COLUMN_W) as usize).max(1);
 
         // Greedy column fill to determine how many fields fit per page.
@@ -1805,8 +2138,11 @@ impl Render for NodeEditorPanel {
                 .id(("form-col", ci))
                 .flex()
                 .flex_col()
-                .w(px(COLUMN_W))
+                .min_w(px(200.0))
                 .gap(px(8.0));
+            col.style().flex_grow = Some(1.0);
+            col.style().flex_shrink = Some(1.0);
+            col.style().flex_basis = Some(relative(0.).into());
 
             for &fi in col_fields {
                 let spec = &specs[fi];
@@ -1941,7 +2277,7 @@ impl Render for NodeEditorPanel {
                                 .absolute()
                                 .top(px(30.0))
                                 .left_0()
-                                .w(px(COLUMN_W - 12.0))
+                                .w_full()
                                 .bg(rgb(0x313244))
                                 .border_1()
                                 .border_color(rgb(0x45475a))
@@ -2238,7 +2574,7 @@ impl Render for NodeEditorPanel {
             );
         }
 
-        outer.child(tab_bar).child(form_area)
+        outer.child(measure_canvas).child(tab_bar).child(form_area)
     }
 }
 
@@ -2414,6 +2750,7 @@ impl Render for AppView {
                     .id("body")
                     .flex()
                     .flex_row()
+                    .min_h_0()
                     .overflow_hidden();
                 body.style().flex_grow = Some(1.0);
                 body.style().flex_shrink = Some(1.0);
@@ -2428,7 +2765,10 @@ impl Render for AppView {
                 let mut workspace = div()
                     .id("workspace")
                     .flex()
-                    .flex_col();
+                    .flex_col()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden();
                 workspace.style().flex_grow = Some(1.0);
                 workspace.style().flex_shrink = Some(1.0);
                 workspace.style().flex_basis = Some(relative(0.).into());
@@ -2448,6 +2788,8 @@ impl Render for AppView {
                 // Graph canvas pane — 7 parts out of 10 (70%).
                 let mut graph_pane = div()
                     .w_full()
+                    .min_h_0()
+                    .overflow_hidden()
                     .child(self.graph_canvas.clone());
                 graph_pane.style().flex_grow = Some(7.0);
                 graph_pane.style().flex_shrink = Some(1.0);

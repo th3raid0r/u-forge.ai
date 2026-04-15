@@ -181,6 +181,34 @@ A 220 px sidebar listing all nodes grouped by `object_type`. Rendered as a two-d
 
 Nodes are sorted case-insensitively within each group; groups are sorted by type name. All groups start **collapsed** by default — the `collapsed` set is pre-populated with all type names at construction. Clicking a type header toggles its group. Clicking a node entry updates `SelectionModel`.
 
+### TextFieldView — canvas-based text rendering
+
+`TextFieldView` implements `EntityInputHandler` (GPUI's platform IME protocol) and renders text + cursor using `shape_line` / `shape_text` + `ShapedLine::paint()` / `WrappedLine::paint()` directly on a `canvas` element — **not** as a `SharedString` child of a div.
+
+**Why not div children?** When text is placed as a div child, GPUI's own text layout system owns the glyph positions. There is no public API to query those positions from outside the div's render tree. Any cursor overlay div positioned with hardcoded pixel offsets will drift from the actual glyphs as soon as the font, DPI, or font-size varies. This was the root cause of all five cursor/click bugs encountered.
+
+**Correct approach (same as Zed's `EditorElement`):**
+1. Call `window.text_system().shape_line(text, font_size, &[run], None)` (single-line) or `shape_text(text, font_size, &[run], Some(wrap_width), None)` (multiline with wrapping).
+2. Call `shaped.paint(origin, line_height, window, cx)` to draw the glyphs.
+3. Use `ShapedLine::x_for_index(byte_idx)` / `WrappedLineLayout::position_for_index(byte_idx, line_h)` to compute the pixel-exact cursor position from the same shaped data.
+4. Use `ShapedLine::closest_index_for_x(px)` / `WrappedLineLayout::closest_index_for_position(point, line_h)` to map a click position back to a byte index.
+
+**Key metrics:**
+- Font size: `window.rem_size() * 0.75` (matches `text_xs()` = 0.75 rem).
+- Line height: `(font_size * 1.618_034).round()` — GPUI's default line height is `phi()` = `relative(1.618034)`, applied to font size. The hardcoded 16px that was there before was wrong.
+- Character advance: `window.text_system().em_advance(font_id, font_size)` — used for the click-to-cursor fallback when no layout is cached yet.
+
+**Stored layout for click mapping:**
+```rust
+enum TextFieldLayout {
+    Single(ShapedLine),                      // single-line field
+    Multi(Vec<(usize, WrappedLine)>),        // (byte_start, line) per '\n'-segment
+}
+```
+Updated every paint frame in `TextFieldView::shaped_layout`. The `on_mouse_down` handler converts the window-coordinate click to text-area-local coords (subtract `field_origin` + padding), then calls into this cached layout for exact glyph-level hit testing.
+
+**Element origin:** Stored as `field_origin_x / field_origin_y` from `bounds.origin` inside the paint closure. Event positions from `MouseDownEvent::position` are in window coordinates — subtracting the stored origin converts them to element-local.
+
 ### GPUI layout constraints (hard-won lessons)
 
 These patterns are required for scroll areas to work correctly inside a flex layout:
@@ -230,6 +258,7 @@ The GPUI canvas saves positions **on explicit save** (Ctrl+S or File > Save) rat
 9. ✅ **`ObservableGraph`** — `GraphEvent` enum (`NodeAdded`, `NodeUpdated`, `NodeDeleted`, `EdgeAdded`, `EdgeDeleted`). `ObservableGraph` wraps `Arc<KnowledgeGraph>`, forwards mutating calls, broadcasts events via `tokio::sync::broadcast`. `Deref<Target = KnowledgeGraph>` exposes all read-only methods directly. `NodeView` now carries `properties: serde_json::Value` so the full schema-defined payload is available in the snapshot without extra DB queries.
 10. ✅ **Node detail panel** — (Superseded by item 10b.) Original `NodeDetailPanel` entity displayed read-only pretty-printed JSON. Replaced by the schema-driven editor below.
 10b. ✅ **Schema-driven editor with browser tabs** — `NodeEditorPanel` replaces `NodeDetailPanel` (top 30% of workspace). Browser-style tab system: selecting a node opens it in an editor tab; unpinned tabs are replaced when a new node is selected; pinned tabs stay open. Each tab renders a schema-driven form generated from `ObjectTypeSchema` properties. Form fields: `TextFieldView` (custom text input widget implementing `EntityInputHandler`) for String/Text/Number, clickable checkbox for Boolean, anchored dropdown overlay for Enum, tag-chip list with add/remove for Array. Multi-column layout: fields flow vertically into columns (300 px each); columns overflow into additional pages with "< Prev" / "Next >" navigation buttons. Dirty state: tabs turn orange (`0xfab387`) when edited values differ from DB. Save all: Ctrl+S / File > Save persists all dirty tabs via `KnowledgeGraph::update_object()` and saves layout positions, then patches the in-memory snapshot so tree panel and canvas reflect name changes. `SchemaManager::get_object_type_schema()` added as a sync cache accessor; default schema pre-loaded at startup.
+10c. ✅ **`TextFieldView` cursor and click accuracy** — Rewrote `TextFieldView::Render` to paint text via `shape_line`/`shape_text` + `ShapedLine::paint()`/`WrappedLine::paint()` on a `canvas` element instead of using a `SharedString` div child. Cursor position uses `x_for_index`/`position_for_index` on the shaped layout (pixel-exact). Click-to-cursor uses `closest_index_for_x`/`closest_index_for_position` on the same cached `TextFieldLayout` enum. Line height corrected to `font_size * phi (1.618)` (GPUI default). Element origin stored each frame so `MouseDownEvent::position` (window coords) is correctly converted to text-area-local coordinates. See "TextFieldView — canvas-based text rendering" section above.
 11. **Search** — text input → highlight matching nodes.
 
 ---
