@@ -67,8 +67,12 @@ struct TextFieldView {
     focus: FocusHandle,
     multiline: bool,
     placeholder: String,
-    /// Timestamp of last cursor-affecting action, for blink phase calculation.
-    cursor_reset_time: std::time::Instant,
+    /// Whether the cursor is currently visible (used for blinking).
+    cursor_visible: bool,
+    /// Epoch counter — incremented on every reset or stop to cancel stale blink timers.
+    blink_epoch: usize,
+    /// Tracks the focused state from the previous render, so we can detect changes.
+    was_focused: bool,
     /// Actual line height measured from font metrics, updated each paint.
     measured_line_h: f32,
     /// Element origin X in window coordinates, updated each paint.
@@ -89,7 +93,9 @@ impl TextFieldView {
             focus: cx.focus_handle(),
             multiline,
             placeholder: placeholder.to_string(),
-            cursor_reset_time: std::time::Instant::now(),
+            cursor_visible: true,
+            blink_epoch: 0,
+            was_focused: false,
             measured_line_h: 19.0,
             field_origin_x: 0.0,
             field_origin_y: 0.0,
@@ -97,9 +103,48 @@ impl TextFieldView {
         }
     }
 
-    /// Reset the blink timer so the cursor is immediately visible after any edit/move.
-    fn reset_blink(&mut self) {
-        self.cursor_reset_time = std::time::Instant::now();
+    /// Show cursor immediately and restart the blink cycle with a 500 ms head-start,
+    /// matching Zed's `pause_blinking` → `blink_cursors` pattern.
+    fn reset_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_visible = true;
+        self.blink_epoch += 1;
+        let epoch = self.blink_epoch;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| this.blink_tick(epoch, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Toggle cursor visibility and reschedule; cancelled automatically when epoch
+    /// no longer matches (i.e. `reset_blink` or `stop_blinking` was called).
+    fn blink_tick(&mut self, epoch: usize, cx: &mut Context<Self>) {
+        if epoch != self.blink_epoch {
+            return;
+        }
+        self.cursor_visible = !self.cursor_visible;
+        cx.notify();
+        self.blink_epoch += 1;
+        let next_epoch = self.blink_epoch;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| this.blink_tick(next_epoch, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Stop blinking and hide the cursor (called when focus is lost).
+    fn stop_blinking(&mut self) {
+        self.cursor_visible = false;
+        self.blink_epoch += 1; // invalidates any pending blink_tick timers
     }
 
     /// Map a click position (local to text area, after subtracting element origin
@@ -173,7 +218,7 @@ impl TextFieldView {
         self.content = text.to_string();
         self.cursor = self.content.len();
         self.selection = None;
-        self.reset_blink();
+        self.reset_blink(cx);
         cx.notify();
     }
 
@@ -323,7 +368,7 @@ impl EntityInputHandler for TextFieldView {
             .replace_range(clamped_start..clamped_end, text);
         self.cursor = clamped_start + text.len();
         self.selection = None;
-        self.reset_blink();
+        self.reset_blink(cx);
 
         cx.emit(TextChanged(self.content.clone()));
         cx.notify();
@@ -411,9 +456,14 @@ impl Render for TextFieldView {
         let entity = cx.entity().clone();
         let paint_entity = cx.entity().clone();
 
-        // Schedule continuous repaints while focused so the cursor blink animates.
-        if focused {
-            cx.notify();
+        // Start or stop the blink cycle when focus changes.
+        if focused != self.was_focused {
+            self.was_focused = focused;
+            if focused {
+                self.reset_blink(cx);
+            } else {
+                self.stop_blinking();
+            }
         }
 
         // Prepare data for the paint canvas closure (captures by value).
@@ -421,7 +471,7 @@ impl Render for TextFieldView {
         let placeholder = self.placeholder.clone();
         let cursor_byte = self.cursor;
         let is_focused = focused;
-        let blink_elapsed = self.cursor_reset_time.elapsed().as_millis();
+        let cursor_visible = self.cursor_visible;
 
         // The main canvas renders text and cursor via shape_line/paint, exactly
         // matching the glyph positions GPUI uses internally — like Zed does.
@@ -585,19 +635,16 @@ impl Render for TextFieldView {
                 }
 
                 // Paint the blinking cursor.
-                if is_focused {
-                    let visible = (blink_elapsed % 1000) < 500;
-                    if visible {
-                        let cp = cursor_pos.unwrap_or(point(px(0.0), px(0.0)));
-                        let cursor_origin = text_origin + cp;
-                        window.paint_quad(fill(
-                            gpui::Bounds::new(
-                                cursor_origin,
-                                size(px(1.5), line_height),
-                            ),
-                            rgba(0xcdd6f4ff),
-                        ));
-                    }
+                if is_focused && cursor_visible {
+                    let cp = cursor_pos.unwrap_or(point(px(0.0), px(0.0)));
+                    let cursor_origin = text_origin + cp;
+                    window.paint_quad(fill(
+                        gpui::Bounds::new(
+                            cursor_origin,
+                            size(px(1.5), line_height),
+                        ),
+                        rgba(0xcdd6f4ff),
+                    ));
                 }
 
                 // Store measurements for click handling.
@@ -648,7 +695,7 @@ impl Render for TextFieldView {
                     let local_y = f32::from(event.position.y) - this.field_origin_y - 4.0;
                     this.cursor = this.cursor_for_click(local_x, local_y);
                     this.selection = None;
-                    this.reset_blink();
+                    this.reset_blink(cx);
                     cx.notify();
                 }),
             )
@@ -667,7 +714,7 @@ impl Render for TextFieldView {
                             this.content.drain(remove_at..next_char_end);
                             cx.emit(TextChanged(this.content.clone()));
                         }
-                        this.reset_blink();
+                        this.reset_blink(cx);
                         cx.notify();
                     }
                     "delete" => {
@@ -680,31 +727,31 @@ impl Render for TextFieldView {
                             this.content.drain(this.cursor..next_char_end);
                             cx.emit(TextChanged(this.content.clone()));
                         }
-                        this.reset_blink();
+                        this.reset_blink(cx);
                         cx.notify();
                     }
                     "left" => {
                         this.selection = None;
                         this.move_left();
-                        this.reset_blink();
+                        this.reset_blink(cx);
                         cx.notify();
                     }
                     "right" => {
                         this.selection = None;
                         this.move_right();
-                        this.reset_blink();
+                        this.reset_blink(cx);
                         cx.notify();
                     }
                     "home" => {
                         this.selection = None;
                         this.cursor = 0;
-                        this.reset_blink();
+                        this.reset_blink(cx);
                         cx.notify();
                     }
                     "end" => {
                         this.selection = None;
                         this.cursor = this.content.len();
-                        this.reset_blink();
+                        this.reset_blink(cx);
                         cx.notify();
                     }
                     "enter" => {
@@ -713,7 +760,7 @@ impl Render for TextFieldView {
                             this.content.insert(this.cursor, '\n');
                             this.cursor += 1;
                             cx.emit(TextChanged(this.content.clone()));
-                            this.reset_blink();
+                            this.reset_blink(cx);
                             cx.notify();
                         }
                     }
