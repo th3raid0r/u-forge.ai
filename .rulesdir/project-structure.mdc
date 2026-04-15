@@ -119,7 +119,7 @@ export LEMONADE_URL=http://localhost:13305/api/v1
 - [crates/u-forge-graph-view/src/snapshot.rs](mdc:crates/u-forge-graph-view/src/snapshot.rs) — `GraphSnapshot`, `NodeView`, `EdgeView`, `LodLevel`, `build_snapshot()`.
 - [crates/u-forge-graph-view/src/layout.rs](mdc:crates/u-forge-graph-view/src/layout.rs) — Force-directed layout with grid-cell bucketed O(N) repulsion.
 - [crates/u-forge-ui-traits/src/lib.rs](mdc:crates/u-forge-ui-traits/src/lib.rs) — `DrawCommand`, `Viewport`, `generate_draw_commands()` rendering pipeline.
-- [crates/u-forge-ui-gpui/src/main.rs](mdc:crates/u-forge-ui-gpui/src/main.rs) — GPUI application: data load → snapshot → canvas render loop.
+- [crates/u-forge-ui-gpui/src/main.rs](mdc:crates/u-forge-ui-gpui/src/main.rs) — GPUI application: data load → schema pre-load → snapshot → `AppView` with `GraphCanvas`, `TreePanel`, `NodeEditorPanel` (schema-driven form editor with browser-style tabs).
 
 ## Module Map (u-forge-core)
 

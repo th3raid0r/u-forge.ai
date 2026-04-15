@@ -53,8 +53,8 @@ pub use ingest::{
     EmbeddingTarget, IngestionStats, SetupResult,
 };
 pub use schema::{
-    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
-    SchemaIngestion, SchemaManager, SchemaStats,
+    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType, SchemaDefinition,
+    ValidationResult, SchemaIngestion, SchemaManager, SchemaStats,
 };
 pub use rag::{build_rag_messages, format_search_context, RagContext};
 pub use search::{

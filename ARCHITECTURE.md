@@ -92,9 +92,9 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 
 | File | Role |
 |---|---|
-| `src/main.rs` | Application entry point: loads `defaults/data/memory.json` via `DataIngestion`, builds `GraphSnapshot`, opens a GPUI window with `GraphCanvas` |
+| `src/main.rs` | Application entry point: loads data, builds `GraphSnapshot`, pre-loads schemas, opens GPUI window with `AppView` root containing `GraphCanvas`, `TreePanel`, and `NodeEditorPanel` |
 
-`GraphCanvas` owns `Arc<GraphSnapshot>`, camera world-space `Vec2`, and zoom. `Render::render()` clones camera state into a `canvas()` closure, calls `generate_draw_commands()`, then maps `DrawCommand::Line` values to batched `PathBuilder` paths (500 edges per path) and `DrawCommand::Circle` to `paint_quad()` with `corner_radii`. Run with `cargo run -p u-forge-ui-gpui` from the workspace root.
+`AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<NodeEditorPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. The workspace is a 30/70 vertical split: `NodeEditorPanel` (top) + `GraphCanvas` (bottom). `GraphCanvas` owns `Arc<GraphSnapshot>`, camera world-space `Vec2`, and zoom. `Render::render()` clones camera state into a `canvas()` closure, calls `generate_draw_commands()`, then maps `DrawCommand::Line` values to batched `PathBuilder` paths (500 edges per path) and `DrawCommand::Circle` to `paint_quad()` with `corner_radii`. `NodeEditorPanel` provides browser-style tabs with schema-driven forms built on `TextFieldView` (custom `EntityInputHandler` widget), dirty-state tracking, and save-all via Ctrl+S. Run with `cargo run -p u-forge-ui-gpui` from the workspace root.
 
 **GPUI version:** `0.2.2` from crates.io (blade-graphics backend). Do not upgrade without a targeted API compatibility check — GPUI has no semver guarantees.
 

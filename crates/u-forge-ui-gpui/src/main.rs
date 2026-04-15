@@ -1,11 +1,13 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use glam::Vec2;
 use gpui::{
     anchored, canvas, deferred, div, fill, font, point, prelude::*, px, rgb, rgba, size, App,
-    Application, Bounds, Context, Corner, Entity, Font, Hsla, KeyBinding, Menu, MenuItem,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, TextRun, Window, WindowBounds,
+    Application, Bounds, Context, Corner, ElementInputHandler, Entity, EntityInputHandler, Font,
+    FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, SharedString, Subscription, TextRun, UTF16Selection, Window, WindowBounds,
     WindowOptions, actions, relative,
 };
 use parking_lot::RwLock;
@@ -34,6 +36,415 @@ const MENU_BAR_H: f32 = 28.0;
 
 /// Status bar height in pixels.
 const STATUS_BAR_H: f32 = 24.0;
+
+// ── Text field widget ────────────────────────────────────────────────────────
+
+/// Event emitted by `TextFieldView` when its content changes.
+struct TextChanged(String);
+
+/// A minimal editable text field built on GPUI's `EntityInputHandler`.
+///
+/// Handles basic cursor movement, character insertion (via platform IME),
+/// backspace, delete, home/end, and optional multiline editing.
+struct TextFieldView {
+    content: String,
+    /// Cursor position as a UTF-8 byte offset into `content`.
+    cursor: usize,
+    /// Optional selection range (start..end) in UTF-8 byte offsets.
+    selection: Option<Range<usize>>,
+    /// IME marked (composing) text range.
+    marked_range: Option<Range<usize>>,
+    focus: FocusHandle,
+    multiline: bool,
+    placeholder: String,
+}
+
+impl TextFieldView {
+    fn new(multiline: bool, placeholder: &str, cx: &mut Context<Self>) -> Self {
+        Self {
+            content: String::new(),
+            cursor: 0,
+            selection: None,
+            marked_range: None,
+            focus: cx.focus_handle(),
+            multiline,
+            placeholder: placeholder.to_string(),
+        }
+    }
+
+    fn set_content(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.content = text.to_string();
+        self.cursor = self.content.len();
+        self.selection = None;
+        cx.notify();
+    }
+
+    /// Delete the current selection, returning true if something was deleted.
+    fn delete_selection(&mut self) -> bool {
+        if let Some(sel) = self.selection.take() {
+            let start = sel.start.min(sel.end);
+            let end = sel.start.max(sel.end);
+            self.content.drain(start..end);
+            self.cursor = start;
+            true
+        } else {
+            false
+        }
+    }
+
+    // ── UTF-8 ↔ UTF-16 helpers ──────────────────────────────────────────────
+
+    fn utf8_to_utf16_offset(&self, utf8_offset: usize) -> usize {
+        self.content[..utf8_offset.min(self.content.len())]
+            .encode_utf16()
+            .count()
+    }
+
+    fn utf16_to_utf8_offset(&self, utf16_offset: usize) -> usize {
+        let mut utf16_count = 0usize;
+        for (byte_idx, ch) in self.content.char_indices() {
+            if utf16_count >= utf16_offset {
+                return byte_idx;
+            }
+            utf16_count += ch.len_utf16();
+        }
+        self.content.len()
+    }
+
+    /// Move cursor one character to the left.
+    fn move_left(&mut self) {
+        if self.cursor > 0 {
+            let prev = self.content[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.cursor = prev;
+        }
+    }
+
+    /// Move cursor one character to the right.
+    fn move_right(&mut self) {
+        if self.cursor < self.content.len() {
+            let next = self.content[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor + i)
+                .unwrap_or(self.content.len());
+            self.cursor = next;
+        }
+    }
+}
+
+impl Focusable for TextFieldView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl gpui::EventEmitter<TextChanged> for TextFieldView {}
+
+impl EntityInputHandler for TextFieldView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let start = self.utf16_to_utf8_offset(range.start);
+        let end = self.utf16_to_utf8_offset(range.end);
+        let clamped_start = start.min(self.content.len());
+        let clamped_end = end.min(self.content.len());
+        if clamped_start != start || clamped_end != end {
+            *adjusted_range = Some(
+                self.utf8_to_utf16_offset(clamped_start)
+                    ..self.utf8_to_utf16_offset(clamped_end),
+            );
+        }
+        Some(self.content[clamped_start..clamped_end].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let (start, end) = if let Some(ref sel) = self.selection {
+            (sel.start, sel.end)
+        } else {
+            (self.cursor, self.cursor)
+        };
+        let start16 = self.utf8_to_utf16_offset(start);
+        let end16 = self.utf8_to_utf16_offset(end);
+        Some(UTF16Selection {
+            range: start16..end16,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_range.as_ref().map(|r| {
+            self.utf8_to_utf16_offset(r.start)..self.utf8_to_utf16_offset(r.end)
+        })
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Clear any marked text first.
+        self.marked_range = None;
+
+        let (start, end) = if let Some(r) = range {
+            (
+                self.utf16_to_utf8_offset(r.start),
+                self.utf16_to_utf8_offset(r.end),
+            )
+        } else if let Some(ref sel) = self.selection {
+            (sel.start.min(sel.end), sel.start.max(sel.end))
+        } else {
+            (self.cursor, self.cursor)
+        };
+
+        let clamped_start = start.min(self.content.len());
+        let clamped_end = end.min(self.content.len());
+        self.content
+            .replace_range(clamped_start..clamped_end, text);
+        self.cursor = clamped_start + text.len();
+        self.selection = None;
+
+        cx.emit(TextChanged(self.content.clone()));
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (start, end) = if let Some(r) = range {
+            (
+                self.utf16_to_utf8_offset(r.start),
+                self.utf16_to_utf8_offset(r.end),
+            )
+        } else if let Some(ref sel) = self.selection {
+            (sel.start.min(sel.end), sel.start.max(sel.end))
+        } else {
+            (self.cursor, self.cursor)
+        };
+
+        let clamped_start = start.min(self.content.len());
+        let clamped_end = end.min(self.content.len());
+        self.content
+            .replace_range(clamped_start..clamped_end, new_text);
+
+        let mark_start = clamped_start;
+        let mark_end = clamped_start + new_text.len();
+        self.marked_range = Some(mark_start..mark_end);
+
+        if let Some(sel_range) = new_selected_range {
+            let sel_start = self.utf16_to_utf8_offset(sel_range.start) + clamped_start;
+            let sel_end = self.utf16_to_utf8_offset(sel_range.end) + clamped_start;
+            self.cursor = sel_end.min(self.content.len());
+            self.selection = Some(sel_start.min(self.content.len())..sel_end.min(self.content.len()));
+        } else {
+            self.cursor = mark_end;
+            self.selection = None;
+        }
+
+        cx.emit(TextChanged(self.content.clone()));
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // Approximate: place the IME candidate window at the cursor position.
+        let start = self.utf16_to_utf8_offset(range_utf16.start);
+        let char_count = self.content[..start.min(self.content.len())].chars().count();
+        let char_w: f32 = 7.2; // approximate monospace character width at text_xs
+        let x = element_bounds.origin.x + px(4.0 + char_count as f32 * char_w);
+        let y = element_bounds.origin.y;
+        Some(Bounds::new(
+            Point::new(x, y),
+            size(px(char_w), element_bounds.size.height),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        // Rough click-to-cursor: divide x offset by approximate char width.
+        let char_w: f32 = 7.2;
+        let x_offset = f32::from(point.x) - 4.0;
+        let char_idx = (x_offset / char_w).round().max(0.0) as usize;
+        // Convert char index to UTF-16 offset.
+        let utf8_offset = self
+            .content
+            .char_indices()
+            .nth(char_idx)
+            .map(|(i, _)| i)
+            .unwrap_or(self.content.len());
+        Some(self.utf8_to_utf16_offset(utf8_offset))
+    }
+}
+
+impl Render for TextFieldView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus.is_focused(window);
+        let entity = cx.entity().clone();
+        let focus = self.focus.clone();
+
+        // Determine display text + cursor char offset.
+        let display_text: SharedString = if self.content.is_empty() && !focused {
+            self.placeholder.clone().into()
+        } else {
+            self.content.clone().into()
+        };
+        let text_color = if self.content.is_empty() && !focused {
+            rgba(0x6c7086ff) // placeholder
+        } else {
+            rgba(0xcdd6f4ff) // normal text
+        };
+        let _cursor_char_offset = self.content[..self.cursor].chars().count();
+
+        let h = if self.multiline { px(80.0) } else { px(28.0) };
+
+        div()
+            .id(SharedString::from(format!("tf-{}", cx.entity_id().as_u64())))
+            .flex()
+            .items_center()
+            .w_full()
+            .h(h)
+            .px(px(6.0))
+            .bg(rgb(0x313244))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(if focused { rgb(0x89b4fa) } else { rgb(0x45475a) })
+            .text_xs()
+            .font_family(".SystemUIMonospacedFont")
+            .text_color(text_color)
+            .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    // Rough click-to-cursor.
+                    let char_w: f32 = 7.2;
+                    let x_offset = f32::from(event.position.x) - 4.0;
+                    let char_idx = (x_offset / char_w).round().max(0.0) as usize;
+                    let utf8_offset = this
+                        .content
+                        .char_indices()
+                        .nth(char_idx)
+                        .map(|(i, _)| i)
+                        .unwrap_or(this.content.len());
+                    this.cursor = utf8_offset;
+                    this.selection = None;
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                let key = event.keystroke.key.as_str();
+                match key {
+                    "backspace" => {
+                        if !this.delete_selection() && this.cursor > 0 {
+                            this.move_left();
+                            let remove_at = this.cursor;
+                            let next_char_end = this.content[remove_at..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(i, _)| remove_at + i)
+                                .unwrap_or(this.content.len());
+                            this.content.drain(remove_at..next_char_end);
+                            cx.emit(TextChanged(this.content.clone()));
+                        }
+                        cx.notify();
+                    }
+                    "delete" => {
+                        if !this.delete_selection() && this.cursor < this.content.len() {
+                            let next_char_end = this.content[this.cursor..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(i, _)| this.cursor + i)
+                                .unwrap_or(this.content.len());
+                            this.content.drain(this.cursor..next_char_end);
+                            cx.emit(TextChanged(this.content.clone()));
+                        }
+                        cx.notify();
+                    }
+                    "left" => {
+                        this.selection = None;
+                        this.move_left();
+                        cx.notify();
+                    }
+                    "right" => {
+                        this.selection = None;
+                        this.move_right();
+                        cx.notify();
+                    }
+                    "home" => {
+                        this.selection = None;
+                        this.cursor = 0;
+                        cx.notify();
+                    }
+                    "end" => {
+                        this.selection = None;
+                        this.cursor = this.content.len();
+                        cx.notify();
+                    }
+                    "enter" => {
+                        if this.multiline {
+                            this.delete_selection();
+                            this.content.insert(this.cursor, '\n');
+                            this.cursor += 1;
+                            cx.emit(TextChanged(this.content.clone()));
+                            cx.notify();
+                        }
+                    }
+                    _ => {}
+                }
+            }))
+            .child(display_text)
+            // Invisible zero-size canvas that installs the input handler during paint.
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, (), window, cx| {
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, entity.clone()),
+                            cx,
+                        );
+                    },
+                )
+                .size_0(),
+            )
+    }
+}
 
 // ── Selection model ──────────────────────────────────────────────────────────
 
@@ -445,7 +856,6 @@ impl Render for GraphCanvas {
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
                     if this.dragging_node.is_some() {
                         this.snapshot.write().rebuild_spatial_index();
-                        this.save_layout();
                         this.dragging_node = None;
                         cx.notify();
                     } else {
@@ -698,255 +1108,504 @@ impl Render for GraphCanvas {
     }
 }
 
-// ── Node detail panel ─────────────────────────────────────────────────────────
+// ── Node editor panel ─────────────────────────────────────────────────────────
 
-/// Height of the tab bar inside the detail panel.
+/// Height of the tab bar inside the editor panel.
 const DETAIL_TAB_H: f32 = 28.0;
 
-/// Read-only node detail panel rendered in the top 30% of the workspace.
+/// Target column width for the multi-column form layout.
+const COLUMN_W: f32 = 300.0;
+
+/// Height of a single-line form field (label + input + gap).
+const FIELD_H_SINGLE: f32 = 52.0;
+
+/// Height of a multiline form field (label + textarea + gap).
+const FIELD_H_MULTI: f32 = 104.0;
+
+/// Space reserved for page navigation buttons.
+const PAGE_NAV_H: f32 = 32.0;
+
+use std::collections::HashMap;
+use u_forge_core::{ObjectTypeSchema, PropertyType, SchemaManager};
+
+/// Describes a single form field for rendering.
+struct FieldSpec {
+    key: String,
+    label: String,
+    required: bool,
+    multiline: bool,
+    field_kind: FieldKind,
+}
+
+enum FieldKind {
+    Text,
+    Number,
+    Boolean,
+    Enum(Vec<String>),
+    Array,
+}
+
+impl FieldSpec {
+    fn height(&self) -> f32 {
+        match self.field_kind {
+            FieldKind::Boolean => FIELD_H_SINGLE,
+            FieldKind::Array => FIELD_H_MULTI,
+            _ if self.multiline => FIELD_H_MULTI,
+            _ => FIELD_H_SINGLE,
+        }
+    }
+}
+
+/// A single editor tab representing one node being edited.
+struct EditorTab {
+    node_id: ObjectId,
+    name: String,
+    #[allow(dead_code)]
+    object_type: String,
+    pinned: bool,
+    original: u_forge_core::ObjectMetadata,
+    edited_values: HashMap<String, serde_json::Value>,
+    schema: Option<ObjectTypeSchema>,
+    dirty: bool,
+    current_page: usize,
+    /// Text field entities for the form — keyed by field name.
+    field_entities: HashMap<String, Entity<TextFieldView>>,
+}
+
+impl EditorTab {
+    /// Build the ordered list of field specs from the schema + edited values.
+    fn field_specs(&self) -> Vec<FieldSpec> {
+        let mut specs = Vec::new();
+
+        // 1. name — always first
+        specs.push(FieldSpec {
+            key: "name".into(),
+            label: "Name".into(),
+            required: true,
+            multiline: false,
+            field_kind: FieldKind::Text,
+        });
+
+        // 2. description — always second
+        specs.push(FieldSpec {
+            key: "description".into(),
+            label: "Description".into(),
+            required: false,
+            multiline: true,
+            field_kind: FieldKind::Text,
+        });
+
+        if let Some(schema) = &self.schema {
+            // Collect required keys (excluding name/description/tags handled separately)
+            let skip = ["name", "description", "tags"];
+            let mut required_keys: Vec<&String> = schema
+                .required_properties
+                .iter()
+                .filter(|k| !skip.contains(&k.as_str()))
+                .collect();
+            required_keys.sort();
+
+            // Collect optional keys
+            let mut optional_keys: Vec<&String> = schema
+                .properties
+                .keys()
+                .filter(|k| {
+                    !skip.contains(&k.as_str())
+                        && !schema.required_properties.contains(k)
+                })
+                .collect();
+            optional_keys.sort();
+
+            for key in required_keys.iter().chain(optional_keys.iter()) {
+                if let Some(prop) = schema.properties.get(*key) {
+                    let (kind, multiline) = match &prop.property_type {
+                        PropertyType::Text => (FieldKind::Text, true),
+                        PropertyType::String | PropertyType::Reference(_) => {
+                            (FieldKind::Text, false)
+                        }
+                        PropertyType::Number => (FieldKind::Number, false),
+                        PropertyType::Boolean => (FieldKind::Boolean, false),
+                        PropertyType::Enum(vals) => {
+                            (FieldKind::Enum(vals.clone()), false)
+                        }
+                        PropertyType::Array(_) => (FieldKind::Array, false),
+                        PropertyType::Object(_) => (FieldKind::Text, true),
+                    };
+                    specs.push(FieldSpec {
+                        key: (*key).clone(),
+                        label: key.replace('_', " "),
+                        required: schema.required_properties.contains(key),
+                        multiline,
+                        field_kind: kind,
+                    });
+                }
+            }
+
+            // Extra properties not in schema
+            for key in self.edited_values.keys() {
+                if skip.contains(&key.as_str()) {
+                    continue;
+                }
+                if schema.properties.contains_key(key) {
+                    continue;
+                }
+                specs.push(FieldSpec {
+                    key: key.clone(),
+                    label: key.replace('_', " "),
+                    required: false,
+                    multiline: false,
+                    field_kind: FieldKind::Text,
+                });
+            }
+        } else {
+            // No schema — render all edited_values as text fields
+            let mut keys: Vec<&String> = self
+                .edited_values
+                .keys()
+                .filter(|k| !["name", "description", "tags"].contains(&k.as_str()))
+                .collect();
+            keys.sort();
+            for key in keys {
+                specs.push(FieldSpec {
+                    key: key.clone(),
+                    label: key.replace('_', " "),
+                    required: false,
+                    multiline: false,
+                    field_kind: FieldKind::Text,
+                });
+            }
+        }
+
+        // tags — always last
+        specs.push(FieldSpec {
+            key: "tags".into(),
+            label: "Tags".into(),
+            required: false,
+            multiline: false,
+            field_kind: FieldKind::Array,
+        });
+
+        specs
+    }
+
+    /// Recompute the dirty flag by comparing edited_values against original.
+    fn recompute_dirty(&mut self) {
+        let orig = &self.original;
+        let vals = &self.edited_values;
+
+        let name_changed =
+            vals.get("name").and_then(|v| v.as_str()) != Some(orig.name.as_str());
+        let desc_changed = vals
+            .get("description")
+            .and_then(|v| v.as_str())
+            != orig.description.as_deref();
+
+        let mut props_changed = false;
+        if let Some(orig_obj) = orig.properties.as_object() {
+            for (k, v) in vals.iter() {
+                if k == "name" || k == "description" || k == "tags" {
+                    continue;
+                }
+                match orig_obj.get(k) {
+                    Some(orig_v) if orig_v == v => {}
+                    _ => {
+                        props_changed = true;
+                        break;
+                    }
+                }
+            }
+            // Check if original has keys that were removed
+            if !props_changed {
+                for k in orig_obj.keys() {
+                    if !vals.contains_key(k) {
+                        props_changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let tags_changed = {
+            let edited_tags: Vec<String> = vals
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            edited_tags != orig.tags
+        };
+
+        self.dirty = name_changed || desc_changed || props_changed || tags_changed;
+    }
+}
+
+/// Editor panel with browser-style tabs for editing nodes.
 ///
-/// Observes `SelectionModel` and updates whenever the selection changes.
-/// Shows the selected node's data as formatted JSON in a scrollable view.
-struct NodeDetailPanel {
+/// Observes `SelectionModel` and opens tabs as nodes are selected.
+struct NodeEditorPanel {
+    tabs: Vec<EditorTab>,
+    active_tab: Option<usize>,
+    #[allow(dead_code)]
     selection: Entity<SelectionModel>,
+    #[allow(dead_code)]
     snapshot: Arc<RwLock<GraphSnapshot>>,
-    /// Keeps the selection subscription alive.
+    graph: Arc<KnowledgeGraph>,
+    schema_mgr: Arc<SchemaManager>,
+    /// Open dropdown field key (for enum fields).
+    dropdown_open: Option<String>,
+    /// Subscriptions to text field changes — kept alive so events fire.
+    _field_subs: Vec<Subscription>,
     _selection_sub: Subscription,
 }
 
-impl NodeDetailPanel {
+impl NodeEditorPanel {
     fn new(
         snapshot: Arc<RwLock<GraphSnapshot>>,
         selection: Entity<SelectionModel>,
+        graph: Arc<KnowledgeGraph>,
+        schema_mgr: Arc<SchemaManager>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let sub = cx.observe(&selection, |_this, _sel, cx| {
+        let sub = cx.observe(&selection, |this: &mut Self, sel, cx| {
+            let selected_id = sel.read(cx).selected_node_id;
+            if let Some(node_id) = selected_id {
+                this.open_or_focus_tab(node_id, cx);
+            }
             cx.notify();
         });
-        Self { selection, snapshot, _selection_sub: sub }
-    }
-}
-
-/// Target display column width for word-wrapping property values.
-const DISPLAY_COLS: usize = 72;
-
-/// Escape only the characters that are illegal inside a JSON string.
-/// Whitespace (newlines, tabs) is left for `word_wrap_str` to normalize.
-fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Split `s` into word-wrapped chunks.
-/// `first_avail` is the character budget for the first chunk;
-/// `cont_avail` is the budget for subsequent chunks.
-/// All whitespace sequences (including embedded newlines) are treated as
-/// word separators — the caller gets clean single-space-separated text.
-fn word_wrap_str(s: &str, first_avail: usize, cont_avail: usize) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut avail = first_avail;
-
-    for word in s.split_whitespace() {
-        if current.is_empty() {
-            current.push_str(word);
-        } else if current.len() + 1 + word.len() <= avail {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            chunks.push(current);
-            current = word.to_string();
-            avail = cont_avail;
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-    chunks
-}
-
-/// Format a string-valued property as one or more display lines with word
-/// wrapping. Continuation lines are indented to align with the opening `"`.
-fn string_prop_lines(key: &str, value: &str, comma: &str) -> Vec<String> {
-    let key_part = format!("    \"{}\": \"", escape_json(key));
-    let cont_indent = " ".repeat(key_part.len());
-    let first_avail = DISPLAY_COLS.saturating_sub(key_part.len() + 1); // +1 for closing `"`
-    let cont_avail = DISPLAY_COLS.saturating_sub(cont_indent.len());
-
-    // Fast path: fits on one line.
-    let single = format!("{}{}\"{}",  key_part, escape_json(value), comma);
-    if single.len() <= DISPLAY_COLS {
-        return vec![single];
-    }
-
-    let chunks = word_wrap_str(value, first_avail, cont_avail);
-    let n = chunks.len();
-    let mut lines: Vec<String> = Vec::new();
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let escaped = escape_json(&chunk);
-        let is_last = i == n - 1;
-        if i == 0 && is_last {
-            lines.push(format!("{}{}\"{}", key_part, escaped, comma));
-        } else if i == 0 {
-            lines.push(format!("{}{}", key_part, escaped));
-        } else if is_last {
-            lines.push(format!("{}{}\"{}",  cont_indent, escaped, comma));
-        } else {
-            lines.push(format!("{}{}", cont_indent, escaped));
-        }
-    }
-    lines
-}
-
-/// Format a non-string serde_json Value as a compact single-line string.
-fn json_value_to_display(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::Null => "null".into(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => format!("\"{}\"", escape_json(s)),
-        serde_json::Value::Array(arr) => {
-            if arr.is_empty() {
-                return "[]".into();
-            }
-            let all_scalar = arr.iter().all(|item| {
-                matches!(
-                    item,
-                    serde_json::Value::String(_)
-                        | serde_json::Value::Number(_)
-                        | serde_json::Value::Bool(_)
-                )
-            });
-            if all_scalar {
-                let items: Vec<String> = arr.iter().map(json_value_to_display).collect();
-                format!("[{}]", items.join(", "))
-            } else {
-                v.to_string()
-            }
-        }
-        serde_json::Value::Object(_) => v.to_string(),
-    }
-}
-
-/// Render a `NodeView` as display lines resembling pretty-printed JSON.
-///
-/// `description` and `tags` live in dedicated DB columns (not inside the
-/// `properties` JSON blob), so we merge them in at display time.
-/// The panel shows: id, name, type, then a unified `properties` block with
-/// description first, followed by all schema properties, with tags last if
-/// not already present in the properties map.
-fn node_json_lines(node: &u_forge_graph_view::NodeView) -> Vec<String> {
-    // Collect the merged property entries in display order.
-    // Each entry is (key, display_lines_for_value).
-    let mut prop_lines: Vec<Vec<String>> = Vec::new();
-
-    // 1. description (from the dedicated column) — shown first if present.
-    if let Some(desc) = &node.description {
-        prop_lines.push(vec!["__desc_placeholder__".into(), desc.clone()]);
-    }
-
-    // 2. All entries from the properties JSON blob.
-    //    Skip any key named "description" or "tags" to avoid duplication
-    //    (the ingestion pipeline sometimes stores them in both places).
-    let props_has_tags = node
-        .properties
-        .as_object()
-        .map(|o| o.contains_key("tags"))
-        .unwrap_or(false);
-
-    if let Some(obj) = node.properties.as_object() {
-        for (key, val) in obj.iter() {
-            if key.eq_ignore_ascii_case("description") {
-                continue; // already shown from the dedicated column
-            }
-            if key.eq_ignore_ascii_case("tags") {
-                continue; // handled below
-            }
-            prop_lines.push(vec!["__prop__".into(), key.clone(), val.to_string()]);
+        Self {
+            tabs: Vec::new(),
+            active_tab: None,
+            selection,
+            snapshot,
+            graph,
+            schema_mgr,
+            dropdown_open: None,
+            _field_subs: Vec::new(),
+            _selection_sub: sub,
         }
     }
 
-    // 3. tags — from properties if present, else fall back to the dedicated column.
-    if props_has_tags {
-        if let Some(v) = node.properties.as_object().and_then(|o| o.get("tags")) {
-            prop_lines.push(vec!["__tags_json__".into(), v.to_string()]);
+    /// Open a tab for the given node, or focus the existing one.
+    fn open_or_focus_tab(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
+        // Already open?
+        if let Some(idx) = self.tabs.iter().position(|t| t.node_id == node_id) {
+            self.active_tab = Some(idx);
+            return;
         }
-    } else if !node.tags.is_empty() {
-        let tag_list = node
-            .tags
-            .iter()
-            .map(|t| format!("\"{}\"", escape_json(t)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        prop_lines.push(vec!["__tags_list__".into(), tag_list]);
-    }
 
-    // ── Render ────────────────────────────────────────────────────────────────
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("{".into());
-    lines.push(format!("  \"id\": \"{}\",", node.id));
-    lines.push(format!("  \"name\": \"{}\",", escape_json(&node.name)));
-    lines.push(format!("  \"type\": \"{}\",", escape_json(&node.object_type)));
+        // Load the node from DB.
+        let meta = match self.graph.get_object(node_id) {
+            Ok(Some(m)) => m,
+            _ => return,
+        };
 
-    if prop_lines.is_empty() {
-        lines.push("  \"properties\": {}".into());
-    } else {
-        lines.push("  \"properties\": {".into());
-        let total = prop_lines.len();
-        for (i, entry) in prop_lines.iter().enumerate() {
-            let comma = if i < total - 1 { "," } else { "" };
-            match entry[0].as_str() {
-                "__desc_placeholder__" => {
-                    lines.extend(string_prop_lines("description", &entry[1], comma));
+        // Load schema for this object type.
+        let schema = self
+            .schema_mgr
+            .get_object_type_schema("default", &meta.object_type);
+
+        // Build edited_values from the metadata.
+        let mut edited_values = HashMap::new();
+        edited_values.insert(
+            "name".to_string(),
+            serde_json::Value::String(meta.name.clone()),
+        );
+        edited_values.insert(
+            "description".to_string(),
+            serde_json::Value::String(
+                meta.description.clone().unwrap_or_default(),
+            ),
+        );
+        if let Some(obj) = meta.properties.as_object() {
+            for (k, v) in obj {
+                if k.eq_ignore_ascii_case("description") || k.eq_ignore_ascii_case("tags") {
+                    continue;
                 }
-                "__prop__" => {
-                    let key = &entry[1];
-                    let val: serde_json::Value =
-                        serde_json::from_str(&entry[2]).unwrap_or(serde_json::Value::Null);
-                    match &val {
-                        serde_json::Value::String(s) => {
-                            lines.extend(string_prop_lines(key, s, comma));
-                        }
-                        _ => {
-                            lines.push(format!(
-                                "    \"{}\": {}{}",
-                                escape_json(key),
-                                json_value_to_display(&val),
-                                comma
-                            ));
-                        }
-                    }
+                edited_values.insert(k.clone(), v.clone());
+            }
+        }
+        edited_values.insert(
+            "tags".to_string(),
+            serde_json::Value::Array(
+                meta.tags.iter().map(|t| serde_json::Value::String(t.clone())).collect(),
+            ),
+        );
+
+        // Create text field entities for this tab.
+        let mut field_entities = HashMap::new();
+        let tmp_tab = EditorTab {
+            node_id,
+            name: meta.name.clone(),
+            object_type: meta.object_type.clone(),
+            pinned: false,
+            original: meta.clone(),
+            edited_values: edited_values.clone(),
+            schema: schema.clone(),
+            dirty: false,
+            current_page: 0,
+            field_entities: HashMap::new(),
+        };
+        let specs = tmp_tab.field_specs();
+        for spec in &specs {
+            match spec.field_kind {
+                FieldKind::Text | FieldKind::Number => {
+                    let multiline = spec.multiline;
+                    let placeholder = spec.label.clone();
+                    let key = spec.key.clone();
+                    let entity = cx.new(|cx| {
+                        let mut tf = TextFieldView::new(multiline, &placeholder, cx);
+                        let val = edited_values
+                            .get(&key)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        tf.set_content(val, cx);
+                        tf
+                    });
+                    field_entities.insert(spec.key.clone(), entity);
                 }
-                "__tags_json__" => {
-                    let val: serde_json::Value =
-                        serde_json::from_str(&entry[1]).unwrap_or(serde_json::Value::Null);
-                    lines.push(format!(
-                        "    \"tags\": {}{}",
-                        json_value_to_display(&val),
-                        comma
-                    ));
-                }
-                "__tags_list__" => {
-                    lines.push(format!("    \"tags\": [{}]{}", entry[1], comma));
+                FieldKind::Enum(_) => {
+                    // Enum uses a text display + dropdown, so we need a text field
+                    // to show the current value (read-only style, but clickable).
+                    let key = spec.key.clone();
+                    let entity = cx.new(|cx| {
+                        let mut tf = TextFieldView::new(false, &spec.label, cx);
+                        let val = edited_values
+                            .get(&key)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        tf.set_content(val, cx);
+                        tf
+                    });
+                    field_entities.insert(spec.key.clone(), entity);
                 }
                 _ => {}
             }
         }
-        lines.push("  }".into());
+
+        // Subscribe to text changes from each field. Keep subscriptions alive.
+        self._field_subs.clear();
+        for (key, entity) in &field_entities {
+            let key = key.clone();
+            let sub = cx.subscribe(entity, move |this: &mut Self, _tf, event: &TextChanged, cx| {
+                if let Some(tab_idx) = this.active_tab {
+                    if let Some(tab) = this.tabs.get_mut(tab_idx) {
+                        tab.edited_values.insert(key.clone(), serde_json::Value::String(event.0.clone()));
+                        if key == "name" {
+                            tab.name = event.0.clone();
+                        }
+                        tab.recompute_dirty();
+                        cx.notify();
+                    }
+                }
+            });
+            self._field_subs.push(sub);
+        }
+
+        let new_tab = EditorTab {
+            node_id,
+            name: meta.name.clone(),
+            object_type: meta.object_type.clone(),
+            pinned: false,
+            original: meta,
+            edited_values,
+            schema,
+            dirty: false,
+            current_page: 0,
+            field_entities,
+        };
+
+        // Replace the first unpinned tab, or append.
+        if let Some(idx) = self.tabs.iter().position(|t| !t.pinned) {
+            self.tabs[idx] = new_tab;
+            self.active_tab = Some(idx);
+        } else {
+            self.tabs.push(new_tab);
+            self.active_tab = Some(self.tabs.len() - 1);
+        }
     }
 
-    lines.push("}".into());
-    lines
+    /// Close a tab by index.
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active_tab = None;
+        } else if let Some(active) = self.active_tab {
+            if active >= self.tabs.len() {
+                self.active_tab = Some(self.tabs.len() - 1);
+            } else if active > idx {
+                self.active_tab = Some(active - 1);
+            }
+        }
+    }
+
+    /// Collect dirty tabs and save them to the DB. Returns count of saved nodes.
+    fn save_dirty_tabs(&mut self) -> usize {
+        let mut saved = 0;
+        for tab in &mut self.tabs {
+            if !tab.dirty {
+                continue;
+            }
+            let mut meta = tab.original.clone();
+            meta.name = tab
+                .edited_values
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&meta.name)
+                .to_string();
+            meta.description = tab
+                .edited_values
+                .get("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+
+            // Rebuild properties JSON.
+            let mut props = serde_json::Map::new();
+            for (k, v) in &tab.edited_values {
+                if ["name", "description", "tags"].contains(&k.as_str()) {
+                    continue;
+                }
+                props.insert(k.clone(), v.clone());
+            }
+            meta.properties = serde_json::Value::Object(props);
+
+            // Tags.
+            if let Some(tags_val) = tab.edited_values.get("tags") {
+                if let Some(arr) = tags_val.as_array() {
+                    meta.tags = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                }
+            }
+
+            if self.graph.update_object(meta.clone()).is_ok() {
+                tab.original = meta;
+                tab.dirty = false;
+                saved += 1;
+            }
+        }
+        saved
+    }
+
+    /// Return true if any tab has unsaved changes.
+    #[allow(dead_code)]
+    fn has_dirty_tabs(&self) -> bool {
+        self.tabs.iter().any(|t| t.dirty)
+    }
 }
 
-impl Render for NodeDetailPanel {
+impl Render for NodeEditorPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_idx = self.selection.read(cx).selected_node_idx;
-
         let outer = div()
-            .id("node-detail-panel")
+            .id("node-editor-panel")
             .flex()
             .flex_col()
             .w_full()
@@ -957,71 +1616,8 @@ impl Render for NodeDetailPanel {
             .border_b_1()
             .border_color(rgb(0x313244));
 
-        if let Some(idx) = selected_idx {
-            let snap = self.snapshot.read();
-            if idx < snap.nodes.len() {
-                let lines = node_json_lines(&snap.nodes[idx]);
-                drop(snap);
-
-                // Tab bar — single "Overview" tab for now.
-                let tab_bar = div()
-                    .id("detail-tab-bar")
-                    .flex()
-                    .flex_row()
-                    .flex_none()
-                    .h(px(DETAIL_TAB_H))
-                    .bg(rgb(0x181825))
-                    .border_b_1()
-                    .border_color(rgb(0x313244))
-                    .child(
-                        div()
-                            .id("tab-overview")
-                            .flex()
-                            .items_center()
-                            .px_3()
-                            .h_full()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(rgba(0xcdd6f4ff))
-                            .border_b_2()
-                            .border_color(rgb(0x89b4fa))
-                            .child("Overview"),
-                    );
-
-                // Scrollable JSON content.
-                let mut scroll = div()
-                    .id("detail-scroll")
-                    .flex()
-                    .flex_col()
-                    .overflow_y_scroll()
-                    .min_h_0()
-                    .p_3();
-                scroll.style().flex_grow = Some(1.0);
-                scroll.style().flex_shrink = Some(1.0);
-                scroll.style().flex_basis = Some(relative(0.).into());
-
-                for (i, line) in lines.into_iter().enumerate() {
-                    scroll = scroll.child(
-                        div()
-                            .id(("detail-line", i))
-                            .flex_none()
-                            .text_xs()
-                            .font_family(".SystemUIMonospacedFont")
-                            .text_color(rgba(0xcdd6f4ff))
-                            .child(line),
-                    );
-                }
-
-                outer.child(tab_bar).child(scroll)
-            } else {
-                drop(snap);
-                outer
-                    .items_center()
-                    .justify_center()
-                    .child(div().text_sm().text_color(rgba(0x6c7086ff)).child("—"))
-            }
-        } else {
-            outer
+        if self.tabs.is_empty() {
+            return outer
                 .items_center()
                 .justify_center()
                 .child(
@@ -1029,8 +1625,620 @@ impl Render for NodeDetailPanel {
                         .text_sm()
                         .text_color(rgba(0x6c7086ff))
                         .child("Select a node to view details"),
-                )
+                );
         }
+
+        let active_idx = self.active_tab.unwrap_or(0);
+
+        // ── Tab bar ──────────────────────────────────────────────────────────
+        let mut tab_bar = div()
+            .id("editor-tab-bar")
+            .flex()
+            .flex_row()
+            .flex_none()
+            .h(px(DETAIL_TAB_H))
+            .overflow_x_scroll()
+            .bg(rgb(0x181825))
+            .border_b_1()
+            .border_color(rgb(0x313244));
+
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let is_active = i == active_idx;
+            let is_dirty = tab.dirty;
+            let is_pinned = tab.pinned;
+            let tab_name: SharedString = tab.name.clone().into();
+
+            let accent_color = if is_dirty {
+                rgb(0xfab387) // Catppuccin peach (orange) for dirty
+            } else {
+                rgb(0x89b4fa) // Catppuccin blue for clean
+            };
+
+            let mut tab_el = div()
+                .id(("editor-tab", i))
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_none()
+                .h_full()
+                .px(px(8.0))
+                .gap(px(4.0))
+                .text_xs()
+                .cursor_pointer()
+                .text_color(if is_active {
+                    rgba(0xcdd6f4ff)
+                } else {
+                    rgba(0xa6adc8ff)
+                })
+                .bg(if is_active { rgb(0x1e1e2e) } else { rgb(0x181825) });
+
+            if is_active {
+                tab_el = tab_el.border_b_2().border_color(accent_color);
+            }
+
+            // Pin indicator
+            let pin_label: SharedString = if is_pinned { "P".into() } else { "o".into() };
+            let pin_btn = div()
+                .id(("tab-pin", i))
+                .text_xs()
+                .text_color(if is_pinned {
+                    rgba(0xf9e2afff)
+                } else {
+                    rgba(0x6c7086ff)
+                })
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        if let Some(tab) = this.tabs.get_mut(i) {
+                            tab.pinned = !tab.pinned;
+                        }
+                        cx.notify();
+                    }),
+                )
+                .child(pin_label);
+
+            // Tab name — click to activate
+            let name_el = div()
+                .id(("tab-name", i))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        this.active_tab = Some(i);
+                        cx.notify();
+                    }),
+                )
+                .child(tab_name);
+
+            // Close button
+            let close_btn = div()
+                .id(("tab-close", i))
+                .text_xs()
+                .text_color(rgba(0x6c7086ff))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        this.close_tab(i);
+                        cx.notify();
+                    }),
+                )
+                .child("x");
+
+            tab_el = tab_el.child(pin_btn).child(name_el).child(close_btn);
+
+            // Dirty indicator dot
+            if is_dirty {
+                tab_el = tab_el.child(
+                    div()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded(px(3.0))
+                        .bg(rgb(0xfab387)),
+                );
+            }
+
+            tab_bar = tab_bar.child(tab_el);
+        }
+
+        // ── Form content for active tab ──────────────────────────────────────
+        if active_idx >= self.tabs.len() {
+            return outer.child(tab_bar);
+        }
+
+        let tab = &self.tabs[active_idx];
+        let specs = tab.field_specs();
+
+        // Compute column/page layout.
+        // Use a reasonable default panel size; exact sizing is approximate.
+        let panel_w = 900.0_f32; // will be refined when we measure
+        let panel_h = 400.0_f32;
+        let available_h = panel_h - DETAIL_TAB_H - PAGE_NAV_H;
+        let max_cols = ((panel_w / COLUMN_W) as usize).max(1);
+
+        // Greedy column fill to determine how many fields fit per page.
+        let mut pages: Vec<Vec<Vec<usize>>> = Vec::new(); // pages[page][col][field_idx]
+        let mut current_page: Vec<Vec<usize>> = vec![Vec::new()];
+        let mut col_h = 0.0_f32;
+
+        for (fi, spec) in specs.iter().enumerate() {
+            let fh = spec.height();
+            if col_h + fh > available_h && !current_page.last().unwrap().is_empty() {
+                // Start a new column.
+                if current_page.len() < max_cols {
+                    current_page.push(Vec::new());
+                    col_h = 0.0;
+                } else {
+                    // Start a new page.
+                    pages.push(current_page);
+                    current_page = vec![Vec::new()];
+                    col_h = 0.0;
+                }
+            }
+            current_page.last_mut().unwrap().push(fi);
+            col_h += fh;
+        }
+        if !current_page.iter().all(|c| c.is_empty()) {
+            pages.push(current_page);
+        }
+
+        let total_pages = pages.len();
+        let current_page_idx = tab.current_page.min(total_pages.saturating_sub(1));
+        let page_cols = pages.get(current_page_idx).cloned().unwrap_or_default();
+
+        // Build the form columns.
+        let mut columns_div = div()
+            .id("form-columns")
+            .flex()
+            .flex_row()
+            .gap(px(12.0))
+            .p_3();
+        columns_div.style().flex_grow = Some(1.0);
+        columns_div.style().flex_shrink = Some(1.0);
+        columns_div.style().flex_basis = Some(relative(0.).into());
+
+        let dropdown_open = self.dropdown_open.clone();
+
+        for (ci, col_fields) in page_cols.iter().enumerate() {
+            let mut col = div()
+                .id(("form-col", ci))
+                .flex()
+                .flex_col()
+                .w(px(COLUMN_W))
+                .gap(px(8.0));
+
+            for &fi in col_fields {
+                let spec = &specs[fi];
+                let value = tab.edited_values.get(&spec.key);
+
+                // Label
+                let label_text = if spec.required {
+                    format!("{} *", spec.label)
+                } else {
+                    spec.label.clone()
+                };
+
+                let label = div()
+                    .text_xs()
+                    .text_color(rgba(0xa6adc8ff))
+                    .child(label_text);
+
+                // Widget
+                let widget: gpui::AnyElement = match &spec.field_kind {
+                    FieldKind::Boolean => {
+                        let checked = value
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let key = spec.key.clone();
+                        div()
+                            .id(SharedString::from(format!("bool-{}", spec.key)))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .h(px(28.0))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                    if let Some(tab_idx) = this.active_tab {
+                                        if let Some(t) = this.tabs.get_mut(tab_idx) {
+                                            let cur = t.edited_values
+                                                .get(&key)
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            t.edited_values.insert(
+                                                key.clone(),
+                                                serde_json::Value::Bool(!cur),
+                                            );
+                                            t.recompute_dirty();
+                                        }
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(16.0))
+                                    .h(px(16.0))
+                                    .rounded(px(3.0))
+                                    .border_1()
+                                    .border_color(rgb(0x45475a))
+                                    .bg(if checked { rgb(0x89b4fa) } else { rgb(0x313244) })
+                                    .when(checked, |el| {
+                                        el.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x1e1e2e))
+                                                .child("v"),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgba(0xcdd6f4ff))
+                                    .child(if checked { "true" } else { "false" }),
+                            )
+                            .into_any_element()
+                    }
+                    FieldKind::Enum(values) => {
+                        let current_val: SharedString = value
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                            .into();
+                        let key = spec.key.clone();
+                        let is_open = dropdown_open.as_deref() == Some(&spec.key);
+
+                        let mut enum_div = div()
+                            .id(SharedString::from(format!("enum-{}", spec.key)))
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .relative();
+
+                        // Current value button
+                        let select_btn = div()
+                            .id(SharedString::from(format!("enum-btn-{}", spec.key)))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .h(px(28.0))
+                            .px(px(6.0))
+                            .bg(rgb(0x313244))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(rgb(0x45475a))
+                            .text_xs()
+                            .text_color(rgba(0xcdd6f4ff))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let key = key.clone();
+                                    move |this, _: &MouseDownEvent, _window, cx| {
+                                        if this.dropdown_open.as_deref() == Some(&key) {
+                                            this.dropdown_open = None;
+                                        } else {
+                                            this.dropdown_open = Some(key.clone());
+                                        }
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(current_val)
+                            .child(div().text_xs().text_color(rgba(0x6c7086ff)).child("v"));
+
+                        enum_div = enum_div.child(select_btn);
+
+                        // Dropdown overlay
+                        if is_open {
+                            let mut dropdown = div()
+                                .id(SharedString::from(format!("enum-drop-{}", spec.key)))
+                                .absolute()
+                                .top(px(30.0))
+                                .left_0()
+                                .w(px(COLUMN_W - 12.0))
+                                .bg(rgb(0x313244))
+                                .border_1()
+                                .border_color(rgb(0x45475a))
+                                .rounded(px(4.0))
+                                .overflow_y_scroll()
+                                .max_h(px(150.0));
+
+                            for val in values {
+                                let val_str = val.clone();
+                                let key_inner = key.clone();
+                                let label: SharedString = val.clone().into();
+                                dropdown = dropdown.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "enum-opt-{}-{}",
+                                            spec.key, val
+                                        )))
+                                        .flex()
+                                        .items_center()
+                                        .h(px(24.0))
+                                        .px(px(6.0))
+                                        .text_xs()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style.bg(rgba(0x45475a88))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                                if let Some(tab_idx) = this.active_tab {
+                                                    if let Some(t) = this.tabs.get_mut(tab_idx) {
+                                                        t.edited_values.insert(
+                                                            key_inner.clone(),
+                                                            serde_json::Value::String(val_str.clone()),
+                                                        );
+                                                        // Also update the text field if it exists
+                                                        if let Some(tf) = t.field_entities.get(&key_inner) {
+                                                            tf.update(cx, |tf, cx| {
+                                                                tf.set_content(&val_str, cx);
+                                                            });
+                                                        }
+                                                        t.recompute_dirty();
+                                                    }
+                                                }
+                                                this.dropdown_open = None;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(label),
+                                );
+                            }
+
+                            enum_div = enum_div.child(dropdown);
+                        }
+
+                        enum_div.into_any_element()
+                    }
+                    FieldKind::Array => {
+                        // Render array items as comma-separated tags with an add field.
+                        let items: Vec<String> = value
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let key = spec.key.clone();
+
+                        let mut array_div = div()
+                            .id(SharedString::from(format!("arr-{}", spec.key)))
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(4.0))
+                            .min_h(px(28.0));
+
+                        for (item_idx, item) in items.iter().enumerate() {
+                            let item_label: SharedString = item.clone().into();
+                            let key_rm = key.clone();
+                            array_div = array_div.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "arr-item-{}-{}",
+                                        spec.key, item_idx
+                                    )))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(2.0))
+                                    .px(px(6.0))
+                                    .h(px(22.0))
+                                    .bg(rgb(0x45475a))
+                                    .rounded(px(3.0))
+                                    .text_xs()
+                                    .text_color(rgba(0xcdd6f4ff))
+                                    .child(item_label)
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "arr-rm-{}-{}",
+                                                spec.key, item_idx
+                                            )))
+                                            .text_xs()
+                                            .text_color(rgba(0xf38ba8ff))
+                                            .cursor_pointer()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this, _: &MouseDownEvent, _window, cx| {
+                                                        if let Some(tab_idx) = this.active_tab {
+                                                            if let Some(t) =
+                                                                this.tabs.get_mut(tab_idx)
+                                                            {
+                                                                if let Some(arr) = t
+                                                                    .edited_values
+                                                                    .get_mut(&key_rm)
+                                                                    .and_then(|v| v.as_array_mut())
+                                                                {
+                                                                    if item_idx < arr.len() {
+                                                                        arr.remove(item_idx);
+                                                                    }
+                                                                }
+                                                                t.recompute_dirty();
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                            .child("x"),
+                                    ),
+                            );
+                        }
+
+                        // "Add" button (placeholder — proper inline add later)
+                        let key_add = key.clone();
+                        array_div = array_div.child(
+                            div()
+                                .id(SharedString::from(format!("arr-add-{}", spec.key)))
+                                .flex()
+                                .items_center()
+                                .px(px(6.0))
+                                .h(px(22.0))
+                                .bg(rgba(0x89b4fa33))
+                                .rounded(px(3.0))
+                                .text_xs()
+                                .text_color(rgb(0x89b4fa))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                        if let Some(tab_idx) = this.active_tab {
+                                            if let Some(t) = this.tabs.get_mut(tab_idx) {
+                                                let arr = t
+                                                    .edited_values
+                                                    .entry(key_add.clone())
+                                                    .or_insert_with(|| {
+                                                        serde_json::Value::Array(Vec::new())
+                                                    });
+                                                if let Some(a) = arr.as_array_mut() {
+                                                    a.push(serde_json::Value::String(
+                                                        "new".into(),
+                                                    ));
+                                                }
+                                                t.recompute_dirty();
+                                            }
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("+"),
+                        );
+
+                        array_div.into_any_element()
+                    }
+                    _ => {
+                        // Text / Number — use the TextFieldView entity.
+                        if let Some(entity) = tab.field_entities.get(&spec.key) {
+                            div().child(entity.clone()).into_any_element()
+                        } else {
+                            // Fallback: display as static text.
+                            let display: SharedString = value
+                                .map(|v| match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                })
+                                .unwrap_or_default()
+                                .into();
+                            div()
+                                .h(px(28.0))
+                                .px(px(6.0))
+                                .bg(rgb(0x313244))
+                                .rounded(px(4.0))
+                                .text_xs()
+                                .text_color(rgba(0xcdd6f4ff))
+                                .child(display)
+                                .into_any_element()
+                        }
+                    }
+                };
+
+                let field_div = div()
+                    .id(SharedString::from(format!("field-{}", spec.key)))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(label)
+                    .child(widget);
+
+                col = col.child(field_div);
+            }
+
+            columns_div = columns_div.child(col);
+        }
+
+        // ── Page navigation overlay ──────────────────────────────────────────
+        let has_prev = current_page_idx > 0;
+        let has_next = current_page_idx + 1 < total_pages;
+
+        let mut form_area = div()
+            .id("form-area")
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .min_h_0()
+            .relative();
+        form_area.style().flex_grow = Some(1.0);
+        form_area.style().flex_shrink = Some(1.0);
+        form_area.style().flex_basis = Some(relative(0.).into());
+
+        form_area = form_area.child(columns_div);
+
+        if has_prev {
+            form_area = form_area.child(
+                div()
+                    .id("page-prev")
+                    .absolute()
+                    .top(px(4.0))
+                    .right(px(8.0))
+                    .flex()
+                    .items_center()
+                    .px(px(8.0))
+                    .h(px(24.0))
+                    .bg(rgba(0x313244dd))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .text_color(rgba(0xcdd6f4ff))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                            if let Some(tab_idx) = this.active_tab {
+                                if let Some(t) = this.tabs.get_mut(tab_idx) {
+                                    t.current_page = t.current_page.saturating_sub(1);
+                                }
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child("< Prev"),
+            );
+        }
+
+        if has_next {
+            form_area = form_area.child(
+                div()
+                    .id("page-next")
+                    .absolute()
+                    .bottom(px(4.0))
+                    .right(px(8.0))
+                    .flex()
+                    .items_center()
+                    .px(px(8.0))
+                    .h(px(24.0))
+                    .bg(rgba(0x313244dd))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .text_color(rgba(0xcdd6f4ff))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                            if let Some(tab_idx) = this.active_tab {
+                                if let Some(t) = this.tabs.get_mut(tab_idx) {
+                                    t.current_page += 1;
+                                }
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child("Next >"),
+            );
+        }
+
+        outer.child(tab_bar).child(form_area)
     }
 }
 
@@ -1039,7 +2247,7 @@ impl Render for NodeDetailPanel {
 struct AppView {
     graph_canvas: Entity<GraphCanvas>,
     tree_panel: Entity<TreePanel>,
-    node_detail: Entity<NodeDetailPanel>,
+    node_editor: Entity<NodeEditorPanel>,
     #[allow(dead_code)]
     selection: Entity<SelectionModel>,
     snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -1050,20 +2258,31 @@ struct AppView {
 }
 
 impl AppView {
-    fn new(snapshot: GraphSnapshot, graph: Arc<KnowledgeGraph>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        snapshot: GraphSnapshot,
+        graph: Arc<KnowledgeGraph>,
+        schema_mgr: Arc<SchemaManager>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
         let selection = cx.new(|_cx| SelectionModel::new(snapshot_arc.clone()));
         let graph_canvas = cx.new(|cx| {
-            GraphCanvas::new(snapshot_arc.clone(), graph, selection.clone(), cx)
+            GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx)
         });
         let tree_panel = cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
-        let node_detail = cx.new(|cx| {
-            NodeDetailPanel::new(snapshot_arc.clone(), selection.clone(), cx)
+        let node_editor = cx.new(|cx| {
+            NodeEditorPanel::new(
+                snapshot_arc.clone(),
+                selection.clone(),
+                graph.clone(),
+                schema_mgr,
+                cx,
+            )
         });
         Self {
             graph_canvas,
             tree_panel,
-            node_detail,
+            node_editor,
             selection,
             snapshot: snapshot_arc,
             file_menu_open: false,
@@ -1073,8 +2292,32 @@ impl AppView {
         }
     }
 
-    fn do_save(&self, cx: &Context<Self>) {
+    fn do_save(&mut self, cx: &mut Context<Self>) {
+        // 1. Save layout positions.
         self.graph_canvas.read(cx).save_layout();
+
+        // 2. Save all dirty editor tabs.
+        let saved = self.node_editor.update(cx, |editor, _cx| {
+            editor.save_dirty_tabs()
+        });
+
+        if saved > 0 {
+            // Update the snapshot so tree panel and canvas reflect edits.
+            let editor = self.node_editor.read(cx);
+            let mut snap = self.snapshot.write();
+            for tab in &editor.tabs {
+                if let Some(node) = snap.nodes.iter_mut().find(|n| n.id == tab.node_id) {
+                    node.name = tab.name.clone();
+                    if let Some(desc) = tab.edited_values.get("description").and_then(|v| v.as_str()) {
+                        node.description = if desc.is_empty() { None } else { Some(desc.to_string()) };
+                    }
+                }
+            }
+            drop(snap);
+            eprintln!("Saved {} node(s).", saved);
+        }
+
+        cx.notify();
     }
 }
 
@@ -1100,6 +2343,7 @@ impl Render for AppView {
             // Handle actions dispatched from native menu or keybindings.
             .on_action(cx.listener(|this, _: &SaveLayout, _window, cx| {
                 this.do_save(cx);
+                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
                 this.sidebar_open = !this.sidebar_open;
@@ -1196,7 +2440,7 @@ impl Render for AppView {
                     .flex_col()
                     .w_full()
                     .min_h_0()
-                    .child(self.node_detail.clone());
+                    .child(self.node_editor.clone());
                 editor.style().flex_grow = Some(3.0);
                 editor.style().flex_shrink = Some(1.0);
                 editor.style().flex_basis = Some(relative(0.).into());
@@ -1444,7 +2688,7 @@ fn main() {
     let cfg = AppConfig::load_default();
     let data_dir = cfg.storage.db_path;
 
-    let (snapshot, graph) = {
+    let (snapshot, graph, schema_mgr) = {
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         rt.block_on(async {
             let graph =
@@ -1474,8 +2718,14 @@ fn main() {
                 );
             }
 
+            // Pre-load schemas so they're available synchronously in the UI.
+            let schema_mgr = graph.get_schema_manager();
+            if let Err(e) = schema_mgr.load_schema("default").await {
+                eprintln!("Warning: could not load default schema: {e}");
+            }
+
             let snapshot = build_snapshot(&graph).expect("failed to build snapshot");
-            (snapshot, graph)
+            (snapshot, graph, schema_mgr)
         })
     };
 
@@ -1508,7 +2758,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| AppView::new(snapshot, graph, cx)),
+            |_, cx| cx.new(|cx| AppView::new(snapshot, graph, schema_mgr, cx)),
         )
         .unwrap();
     });
