@@ -13,23 +13,12 @@ use gpui::{
 use parking_lot::RwLock;
 use u_forge_core::{AppConfig, KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{build_snapshot, GraphSnapshot, LodLevel};
-use u_forge_ui_traits::{generate_draw_commands, DrawCommand, Viewport, NODE_RADIUS};
+use u_forge_ui_traits::{generate_draw_commands, node_color_for_type, DrawCommand, Viewport, NODE_RADIUS};
 
 actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ImportData]);
 
 /// Edges per batched PathBuilder.
 const EDGE_BATCH_SIZE: usize = 500;
-
-/// Legend entries matching the `type_color` palette in u-forge-ui-traits.
-const LEGEND_ENTRIES: &[(&str, u32)] = &[
-    ("Character / NPC", 0x89b4fa),
-    ("Location", 0xa6e3a1),
-    ("Faction", 0xf9e2af),
-    ("Quest", 0xf38ba8),
-    ("Item / Transport", 0xcba6f7),
-    ("Currency", 0x94e2d5),
-    ("Other", 0xcdd6f4),
-];
 
 /// Menu bar / status bar height in pixels.
 const MENU_BAR_H: f32 = 28.0;
@@ -902,17 +891,10 @@ impl TreePanel {
     }
 }
 
-/// Color for a type header in the tree panel, matching the node palette.
+/// Color for a type header in the tree panel — delegates to the shared palette.
 fn tree_type_color(object_type: &str) -> u32 {
-    match object_type {
-        "npc" | "character" => 0x89b4fa,
-        "location" => 0xa6e3a1,
-        "faction" => 0xf9e2af,
-        "quest" => 0xf38ba8,
-        "item" | "transportation" => 0xcba6f7,
-        "currency" => 0x94e2d5,
-        _ => 0xcdd6f4,
-    }
+    let [r, g, b, _] = node_color_for_type(object_type);
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 /// Width of the sidebar in pixels.
@@ -1272,6 +1254,15 @@ impl Render for GraphCanvas {
                         let snap = snapshot.read();
                         let commands = generate_draw_commands(&snap, &viewport, selected_node_idx);
                         let lod = viewport.lod_level();
+                        // Collect sorted unique types for the legend before releasing the lock.
+                        let mut legend_types: Vec<String> = {
+                            let mut seen = std::collections::BTreeSet::new();
+                            for node in &snap.nodes {
+                                seen.insert(node.object_type.clone());
+                            }
+                            seen.into_iter().collect()
+                        };
+                        legend_types.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
                         drop(snap);
 
                         // ── Edges (batched paths) ────────────────────────────────────
@@ -1389,12 +1380,12 @@ impl Render for GraphCanvas {
                         }
 
                         // ── Color legend (bottom-right of canvas pane) ───────────────
-                        {
+                        if !legend_types.is_empty() {
                             let entry_h = 20.0_f32;
                             let swatch = 12.0_f32;
                             let pad = 8.0_f32;
-                            let legend_w = 155.0_f32;
-                            let legend_h = LEGEND_ENTRIES.len() as f32 * entry_h + pad * 2.0;
+                            let legend_w = 160.0_f32;
+                            let legend_h = legend_types.len() as f32 * entry_h + pad * 2.0;
                             // Canvas-local bottom-right, then shifted to window coords.
                             let lx = canvas_size.x - legend_w - pad + ox;
                             let ly = canvas_size.y - legend_h - pad + oy;
@@ -1410,9 +1401,12 @@ impl Render for GraphCanvas {
                             let label_size = px(10.0);
                             let line_h = label_size * 1.3;
 
-                            for (i, (label, color_hex)) in LEGEND_ENTRIES.iter().enumerate() {
+                            for (i, type_name) in legend_types.iter().enumerate() {
                                 let row_y = ly + pad + i as f32 * entry_h;
                                 let center_y = row_y + entry_h / 2.0;
+
+                                let [r, g, b, _] = node_color_for_type(type_name);
+                                let color_hex = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
 
                                 window.paint_quad(
                                     fill(
@@ -1420,13 +1414,13 @@ impl Render for GraphCanvas {
                                             point(px(lx + pad), px(center_y - swatch / 2.0)),
                                             size(px(swatch), px(swatch)),
                                         ),
-                                        rgb(*color_hex),
+                                        rgb(color_hex),
                                     )
                                     .corner_radii(px(3.0)),
                                 );
 
                                 let run = TextRun {
-                                    len: label.len(),
+                                    len: type_name.len(),
                                     font: sys_font.clone(),
                                     color: Hsla::from(rgba(0xcdd6f4ff)),
                                     background_color: None,
@@ -1434,7 +1428,7 @@ impl Render for GraphCanvas {
                                     strikethrough: None,
                                 };
                                 let shaped = text_system.shape_line(
-                                    SharedString::from(*label),
+                                    SharedString::from(type_name.clone()),
                                     label_size,
                                     &[run],
                                     None,
@@ -1471,6 +1465,17 @@ const PAGE_NAV_H: f32 = 32.0;
 
 use std::collections::HashMap;
 use u_forge_core::{ObjectTypeSchema, PropertyType, SchemaManager};
+
+/// Infer a FieldKind from a JSON value's runtime type, used as a fallback when
+/// no schema is available or when a property is not declared in the schema.
+fn field_kind_from_value(v: &serde_json::Value) -> FieldKind {
+    match v {
+        serde_json::Value::Bool(_) => FieldKind::Boolean,
+        serde_json::Value::Number(_) => FieldKind::Number,
+        serde_json::Value::Array(_) => FieldKind::Array,
+        _ => FieldKind::Text,
+    }
+}
 
 /// Describes a single form field for rendering.
 struct FieldSpec {
@@ -1606,7 +1611,7 @@ impl EditorTab {
                 }
             }
 
-            // Extra properties not in schema
+            // Extra properties not in schema — infer kind from JSON value type.
             for key in self.edited_values.keys() {
                 if skip.contains(&key.as_str()) {
                     continue;
@@ -1614,16 +1619,19 @@ impl EditorTab {
                 if schema.properties.contains_key(key) {
                     continue;
                 }
+                let kind = self.edited_values.get(key)
+                    .map(field_kind_from_value)
+                    .unwrap_or(FieldKind::Text);
                 specs.push(FieldSpec {
                     key: key.clone(),
                     label: key.replace('_', " "),
                     required: false,
                     multiline: false,
-                    field_kind: FieldKind::Text,
+                    field_kind: kind,
                 });
             }
         } else {
-            // No schema — render all edited_values as text fields
+            // No schema — infer field kind from JSON value type.
             let mut keys: Vec<&String> = self
                 .edited_values
                 .keys()
@@ -1631,12 +1639,15 @@ impl EditorTab {
                 .collect();
             keys.sort();
             for key in keys {
+                let kind = self.edited_values.get(key)
+                    .map(field_kind_from_value)
+                    .unwrap_or(FieldKind::Text);
                 specs.push(FieldSpec {
                     key: key.clone(),
                     label: key.replace('_', " "),
                     required: false,
                     multiline: false,
-                    field_kind: FieldKind::Text,
+                    field_kind: kind,
                 });
             }
         }
@@ -1792,10 +1803,12 @@ impl NodeEditorPanel {
             _ => return,
         };
 
-        // Load schema for this object type.
+        // Load schema for this object type. File-loaded schemas live under
+        // "imported_schemas"; fall back to "default" for built-in types.
         let schema = self
             .schema_mgr
-            .get_object_type_schema("default", &meta.object_type);
+            .get_object_type_schema("imported_schemas", &meta.object_type)
+            .or_else(|| self.schema_mgr.get_object_type_schema("default", &meta.object_type));
 
         // Build edited_values from the metadata.
         let mut edited_values = HashMap::new();
@@ -1847,11 +1860,14 @@ impl NodeEditorPanel {
                     let key = spec.key.clone();
                     let entity = cx.new(|cx| {
                         let mut tf = TextFieldView::new(multiline, &placeholder, cx);
-                        let val = edited_values
+                        let val_str: String = edited_values
                             .get(&key)
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        tf.set_content(val, cx);
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default();
+                        tf.set_content(&val_str, cx);
                         tf
                     });
                     field_entities.insert(spec.key.clone(), entity);
@@ -3316,9 +3332,14 @@ fn main() {
             }
 
             // Pre-load schemas so they're available synchronously in the UI.
+            // "default" holds hardcoded built-in types; "imported_schemas" holds
+            // the file-loaded types from defaults/schemas/*.schema.json.
             let schema_mgr = graph.get_schema_manager();
             if let Err(e) = schema_mgr.load_schema("default").await {
                 eprintln!("Warning: could not load default schema: {e}");
+            }
+            if let Err(e) = schema_mgr.load_schema("imported_schemas").await {
+                eprintln!("Warning: could not load imported schemas: {e}");
             }
 
             let snapshot = build_snapshot(&graph).expect("failed to build snapshot");
