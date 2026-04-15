@@ -7,7 +7,7 @@ use gpui::{
     Application, Bounds, Context, Corner, ElementInputHandler, Entity, EntityInputHandler, Font,
     FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ScrollDelta,
-    ScrollWheelEvent, ShapedLine, SharedString, Subscription, TextAlign, TextRun, UTF16Selection,
+    ScrollWheelEvent, SharedString, Subscription, TextAlign, TextRun, UTF16Selection,
     Window, WindowBounds, WindowOptions, WrappedLine, actions, relative,
 };
 use parking_lot::RwLock;
@@ -15,7 +15,7 @@ use u_forge_core::{AppConfig, KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{build_snapshot, GraphSnapshot, LodLevel};
 use u_forge_ui_traits::{generate_draw_commands, DrawCommand, Viewport, NODE_RADIUS};
 
-actions!([SaveLayout, ToggleSidebar, ToggleRightPanel]);
+actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ImportData]);
 
 /// Edges per batched PathBuilder.
 const EDGE_BATCH_SIZE: usize = 500;
@@ -37,20 +37,26 @@ const MENU_BAR_H: f32 = 28.0;
 /// Status bar height in pixels.
 const STATUS_BAR_H: f32 = 24.0;
 
+/// Single-line text field height (px).
+const TEXT_FIELD_MIN_H: f32 = 28.0;
+/// Maximum text field height before scrolling kicks in (px).
+const TEXT_FIELD_MAX_H: f32 = 120.0;
+/// Vertical padding inside text fields (px).
+const TEXT_FIELD_PAD_Y: f32 = 4.0;
+
 // ── Text field widget ────────────────────────────────────────────────────────
 
 /// Event emitted by `TextFieldView` when its content changes.
 struct TextChanged(String);
 
+/// Event emitted by `TextFieldView` when Enter is pressed in a single-line field.
+#[allow(dead_code)]
+struct TextSubmit(String);
+
 /// Cached shaped text layout from the most recent paint, used for click-to-cursor mapping.
-/// Stored per-line with the byte offset where each line starts in the content string.
-enum TextFieldLayout {
-    /// Single-line field: one ShapedLine covering the entire content.
-    Single(ShapedLine),
-    /// Multiline field: one WrappedLine per explicit '\n'-delimited line,
-    /// paired with the byte offset where that line starts in the content.
-    Multi(Vec<(usize, WrappedLine)>),
-}
+/// One WrappedLine per explicit '\n'-delimited line, paired with the byte offset where
+/// that line starts in the content string. All fields use wrapped text for dynamic sizing.
+struct TextFieldLayout(Vec<(usize, WrappedLine)>);
 
 /// A minimal editable text field built on GPUI's `EntityInputHandler`.
 ///
@@ -81,6 +87,12 @@ struct TextFieldView {
     field_origin_y: f32,
     /// Cached shaped layout from the most recent paint frame — used for click mapping.
     shaped_layout: Option<TextFieldLayout>,
+    /// Total content height (in pixels) from the most recent paint — used to size the field div.
+    content_height: f32,
+    /// Visible height of the text area (bounds height minus padding), updated each paint.
+    visible_height: f32,
+    /// Scroll offset (in pixels) for when content exceeds the visible area.
+    scroll_offset: f32,
 }
 
 impl TextFieldView {
@@ -100,6 +112,9 @@ impl TextFieldView {
             field_origin_x: 0.0,
             field_origin_y: 0.0,
             shaped_layout: None,
+            content_height: 0.0,
+            visible_height: 0.0,
+            scroll_offset: 0.0,
         }
     }
 
@@ -153,10 +168,7 @@ impl TextFieldView {
     fn cursor_for_click(&self, local_x: f32, local_y: f32) -> usize {
         let line_h = px(self.measured_line_h);
         match &self.shaped_layout {
-            Some(TextFieldLayout::Single(shaped)) => {
-                shaped.closest_index_for_x(px(local_x))
-            }
-            Some(TextFieldLayout::Multi(lines)) => {
+            Some(TextFieldLayout(lines)) => {
                 // Determine which explicit line was clicked by accumulating
                 // the visual height of each WrappedLine.
                 let mut y_acc = px(0.0);
@@ -164,8 +176,6 @@ impl TextFieldView {
                     let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
                     let line_visual_h = line_h * visual_rows;
                     if px(local_y) < y_acc + line_visual_h || *byte_start == lines.last().map(|(b, _)| *b).unwrap_or(0) {
-                        // Click is within this WrappedLine. Use position relative to
-                        // this line's visual start.
                         let rel_y = px(local_y) - y_acc;
                         let pos = point(px(local_x), rel_y);
                         let idx = wl.closest_index_for_position(pos, line_h)
@@ -190,10 +200,7 @@ impl TextFieldView {
     fn cursor_pos_from_layout(&self, byte_offset: usize) -> (Pixels, Pixels) {
         let line_h = px(self.measured_line_h);
         match &self.shaped_layout {
-            Some(TextFieldLayout::Single(shaped)) => {
-                (shaped.x_for_index(byte_offset), px(0.0))
-            }
-            Some(TextFieldLayout::Multi(lines)) => {
+            Some(TextFieldLayout(lines)) => {
                 let mut y_acc = px(0.0);
                 for (byte_start, wl) in lines {
                     let line_len = wl.len();
@@ -202,7 +209,6 @@ impl TextFieldView {
                         if let Some(pos) = wl.position_for_index(local_idx, line_h) {
                             return (pos.x, y_acc + pos.y);
                         }
-                        // Fallback: end of line
                         return (wl.width(), y_acc);
                     }
                     let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
@@ -214,10 +220,31 @@ impl TextFieldView {
         }
     }
 
+    /// Adjust scroll_offset so the cursor at the given y-position (relative to
+    /// content top) is visible within `visible_h` pixels.
+    fn ensure_cursor_visible(&mut self, cursor_y: f32, visible_h: f32) {
+        let line_h = self.measured_line_h;
+        let cursor_bottom = cursor_y + line_h;
+        if cursor_y < self.scroll_offset {
+            self.scroll_offset = cursor_y;
+        } else if cursor_bottom > self.scroll_offset + visible_h {
+            self.scroll_offset = cursor_bottom - visible_h;
+        }
+        self.scroll_offset = self.scroll_offset.max(0.0);
+    }
+
+    /// Scroll to keep the current cursor visible, using cached layout from the
+    /// previous paint frame. Called from key/mouse handlers — NOT from paint.
+    fn scroll_to_cursor(&mut self) {
+        let (_, cy) = self.cursor_pos_from_layout(self.cursor);
+        self.ensure_cursor_visible(f32::from(cy), self.visible_height);
+    }
+
     fn set_content(&mut self, text: &str, cx: &mut Context<Self>) {
         self.content = text.to_string();
-        self.cursor = self.content.len();
+        self.cursor = 0;
         self.selection = None;
+        self.scroll_offset = 0.0;
         self.reset_blink(cx);
         cx.notify();
     }
@@ -286,6 +313,7 @@ impl Focusable for TextFieldView {
 }
 
 impl gpui::EventEmitter<TextChanged> for TextFieldView {}
+impl gpui::EventEmitter<TextSubmit> for TextFieldView {}
 
 impl EntityInputHandler for TextFieldView {
     fn text_for_range(
@@ -368,6 +396,7 @@ impl EntityInputHandler for TextFieldView {
             .replace_range(clamped_start..clamped_end, text);
         self.cursor = clamped_start + text.len();
         self.selection = None;
+        self.scroll_to_cursor();
         self.reset_blink(cx);
 
         cx.emit(TextChanged(self.content.clone()));
@@ -472,11 +501,11 @@ impl Render for TextFieldView {
         let cursor_byte = self.cursor;
         let is_focused = focused;
         let cursor_visible = self.cursor_visible;
+        let scroll_offset = self.scroll_offset;
 
         // The main canvas renders text and cursor via shape_line/paint, exactly
         // matching the glyph positions GPUI uses internally — like Zed does.
         // This guarantees the cursor aligns perfectly with the rendered text.
-        let is_multiline = self.multiline;
         let text_canvas = canvas(
             |_, _, _| {},
             move |bounds, (), window, cx| {
@@ -493,8 +522,9 @@ impl Render for TextFieldView {
                 };
 
                 let pad_x = px(6.0);
-                let pad_y = px(4.0);
-                let text_origin = bounds.origin + point(pad_x, pad_y);
+                let pad_y = px(TEXT_FIELD_PAD_Y);
+                let scroll_px = px(scroll_offset);
+                let text_origin = bounds.origin + point(pad_x, pad_y - scroll_px);
                 let inner_w = bounds.size.width - pad_x * 2.0;
 
                 // Split content by explicit newlines.
@@ -508,133 +538,94 @@ impl Render for TextFieldView {
                 let mut byte_offset: usize = 0;
                 let mut y_acc = px(0.0);
 
-                if is_multiline {
-                    // ── Multiline: shape each line with wrap_width, store WrappedLines ──
-                    let mut stored_lines: Vec<(usize, WrappedLine)> = Vec::new();
+                // Always use wrapping (shape_text) so all fields can grow dynamically.
+                let mut stored_lines: Vec<(usize, WrappedLine)> = Vec::new();
 
-                    for (line_idx, raw_line) in raw_lines.iter().enumerate() {
-                        if !raw_line.is_empty() {
-                            let line_text: SharedString = (*raw_line).to_string().into();
-                            let run = TextRun {
-                                len: raw_line.len(),
-                                font: mono_font.clone(),
-                                color: text_hsla,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            };
-                            if let Ok(wrapped) = window.text_system().shape_text(
-                                line_text,
-                                font_size,
-                                &[run],
-                                Some(inner_w),
-                                None,
-                            ) {
-                                // shape_text returns one WrappedLine per input line.
-                                for wl in wrapped {
-                                    let paint_origin = text_origin + point(px(0.0), y_acc);
-                                    let _ = wl.paint(
-                                        paint_origin,
-                                        line_height,
-                                        TextAlign::Left,
-                                        None,
-                                        window,
-                                        cx,
-                                    );
-
-                                    // Cursor position within this line.
-                                    if cursor_pos.is_none()
-                                        && cursor_byte >= byte_offset
-                                        && cursor_byte <= byte_offset + raw_line.len()
-                                    {
-                                        let local = cursor_byte - byte_offset;
-                                        if let Some(p) = wl.position_for_index(local, line_height) {
-                                            cursor_pos = Some(point(p.x, y_acc + p.y));
-                                        }
-                                    }
-
-                                    let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
-                                    stored_lines.push((byte_offset, wl));
-                                    y_acc += line_height * visual_rows;
-                                }
-                            }
-                        } else {
-                            // Empty line — cursor may sit here.
-                            if cursor_pos.is_none() && cursor_byte == byte_offset {
-                                cursor_pos = Some(point(px(0.0), y_acc));
-                            }
-                            // Push an empty shaped line for click mapping.
-                            let run = TextRun {
-                                len: 0,
-                                font: mono_font.clone(),
-                                color: text_hsla,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            };
-                            if let Ok(wrapped) = window.text_system().shape_text(
-                                SharedString::from(""),
-                                font_size,
-                                &[run],
-                                Some(inner_w),
-                                None,
-                            ) {
-                                for wl in wrapped {
-                                    stored_lines.push((byte_offset, wl));
-                                }
-                            }
-                            y_acc += line_height;
-                        }
-
-                        byte_offset += raw_line.len();
-                        if line_idx < raw_lines.len() - 1 {
-                            byte_offset += 1; // '\n'
-                        }
-                    }
-
-                    // Store layout for click handling.
-                    paint_entity.update(cx, |this, _cx| {
-                        this.shaped_layout = Some(TextFieldLayout::Multi(stored_lines));
-                    });
-                } else {
-                    // ── Single-line: shape as one line, no wrapping ──
-                    if !display.is_empty() {
-                        let line_text: SharedString = display.clone().into();
+                for (line_idx, raw_line) in raw_lines.iter().enumerate() {
+                    if !raw_line.is_empty() {
+                        let line_text: SharedString = (*raw_line).to_string().into();
                         let run = TextRun {
-                            len: display.len(),
+                            len: raw_line.len(),
                             font: mono_font.clone(),
                             color: text_hsla,
                             background_color: None,
                             underline: None,
                             strikethrough: None,
                         };
-                        let shaped = window.text_system().shape_line(
+                        if let Ok(wrapped) = window.text_system().shape_text(
                             line_text,
                             font_size,
                             &[run],
+                            Some(inner_w),
                             None,
-                        );
-                        let _ = shaped.paint(text_origin, line_height, window, cx);
+                        ) {
+                            for wl in wrapped {
+                                let paint_origin = text_origin + point(px(0.0), y_acc);
+                                let _ = wl.paint(
+                                    paint_origin,
+                                    line_height,
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                );
 
-                        if cursor_byte <= display.len() {
-                            let cx_px = shaped.x_for_index(cursor_byte);
-                            cursor_pos = Some(point(cx_px, px(0.0)));
+                                // Cursor position within this line.
+                                if cursor_pos.is_none()
+                                    && cursor_byte >= byte_offset
+                                    && cursor_byte <= byte_offset + raw_line.len()
+                                {
+                                    let local = cursor_byte - byte_offset;
+                                    if let Some(p) = wl.position_for_index(local, line_height) {
+                                        cursor_pos = Some(point(p.x, y_acc + p.y));
+                                    }
+                                }
+
+                                let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
+                                stored_lines.push((byte_offset, wl));
+                                y_acc += line_height * visual_rows;
+                            }
                         }
-
-                        // Store for click handling.
-                        let stored = shaped.clone();
-                        paint_entity.update(cx, |this, _cx| {
-                            this.shaped_layout = Some(TextFieldLayout::Single(stored));
-                        });
                     } else {
-                        cursor_pos = Some(point(px(0.0), px(0.0)));
-                        paint_entity.update(cx, |this, _cx| {
-                            this.shaped_layout = None;
-                        });
+                        // Empty line — cursor may sit here.
+                        if cursor_pos.is_none() && cursor_byte == byte_offset {
+                            cursor_pos = Some(point(px(0.0), y_acc));
+                        }
+                        // Push an empty shaped line for click mapping.
+                        let run = TextRun {
+                            len: 0,
+                            font: mono_font.clone(),
+                            color: text_hsla,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        if let Ok(wrapped) = window.text_system().shape_text(
+                            SharedString::from(""),
+                            font_size,
+                            &[run],
+                            Some(inner_w),
+                            None,
+                        ) {
+                            for wl in wrapped {
+                                stored_lines.push((byte_offset, wl));
+                            }
+                        }
+                        y_acc += line_height;
+                    }
+
+                    byte_offset += raw_line.len();
+                    if line_idx < raw_lines.len() - 1 {
+                        byte_offset += 1; // '\n'
                     }
                 }
 
-                // Paint the blinking cursor.
+                // Store layout for click handling.
+                paint_entity.update(cx, |this, _cx| {
+                    this.shaped_layout = Some(TextFieldLayout(stored_lines));
+                });
+
+                // Paint the blinking cursor (adjusted for scroll offset).
                 if is_focused && cursor_visible {
                     let cp = cursor_pos.unwrap_or(point(px(0.0), px(0.0)));
                     let cursor_origin = text_origin + cp;
@@ -647,14 +638,20 @@ impl Render for TextFieldView {
                     ));
                 }
 
-                // Store measurements for click handling.
+                // Store measurements for click handling and dynamic sizing.
+                // Round content_height to whole pixels to prevent sub-pixel oscillation.
                 let lh_f = f32::from(line_height);
                 let origin_x = f32::from(bounds.origin.x);
                 let origin_y = f32::from(bounds.origin.y);
+                let total_content_h = (f32::from(y_acc) + TEXT_FIELD_PAD_Y * 2.0).round();
+                let visible_h = (f32::from(bounds.size.height) - TEXT_FIELD_PAD_Y * 2.0).max(0.0);
+
                 paint_entity.update(cx, |this, _cx| {
                     this.field_origin_x = origin_x;
                     this.field_origin_y = origin_y;
                     this.measured_line_h = lh_f.max(1.0);
+                    this.content_height = total_content_h;
+                    this.visible_height = visible_h;
                 });
 
                 // Install the input handler so IME / platform text input works.
@@ -668,21 +665,20 @@ impl Render for TextFieldView {
         )
         .size_full();
 
-        let mut field = div()
+        // Dynamic field height: start at single-line, grow with content, cap at max.
+        let dynamic_h = self.content_height.max(TEXT_FIELD_MIN_H).min(TEXT_FIELD_MAX_H);
+
+        let field = div()
             .id(SharedString::from(format!("tf-{}", cx.entity_id().as_u64())))
             .relative()
             .w_full()
+            .h(px(dynamic_h))
             .bg(rgb(0x313244))
             .rounded(px(4.0))
             .border_1()
             .border_color(if focused { rgb(0x89b4fa) } else { rgb(0x45475a) })
+            .overflow_hidden()
             .track_focus(&self.focus);
-
-        if self.multiline {
-            field = field.min_h(px(80.0));
-        } else {
-            field = field.h(px(28.0)).overflow_hidden();
-        }
 
         field
             .on_mouse_down(
@@ -690,15 +686,29 @@ impl Render for TextFieldView {
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus);
                     // Convert window coordinates to text-area-local coordinates.
-                    // Subtract element origin and padding (px=6, py=4).
+                    // Subtract element origin and padding, add scroll offset.
                     let local_x = f32::from(event.position.x) - this.field_origin_x - 6.0;
-                    let local_y = f32::from(event.position.y) - this.field_origin_y - 4.0;
+                    let local_y = f32::from(event.position.y) - this.field_origin_y
+                        - TEXT_FIELD_PAD_Y + this.scroll_offset;
                     this.cursor = this.cursor_for_click(local_x, local_y);
                     this.selection = None;
+                    this.scroll_to_cursor();
                     this.reset_blink(cx);
                     cx.notify();
                 }),
             )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                if !this.multiline {
+                    return;
+                }
+                let delta_y = match event.delta {
+                    ScrollDelta::Pixels(p) => -f32::from(p.y),
+                    ScrollDelta::Lines(l) => -f32::from(l.y) * this.measured_line_h,
+                };
+                let max_scroll = (this.content_height - TEXT_FIELD_MAX_H).max(0.0);
+                this.scroll_offset = (this.scroll_offset + delta_y).clamp(0.0, max_scroll);
+                cx.notify();
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 let key = event.keystroke.key.as_str();
                 match key {
@@ -714,6 +724,7 @@ impl Render for TextFieldView {
                             this.content.drain(remove_at..next_char_end);
                             cx.emit(TextChanged(this.content.clone()));
                         }
+                        this.scroll_to_cursor();
                         this.reset_blink(cx);
                         cx.notify();
                     }
@@ -727,30 +738,35 @@ impl Render for TextFieldView {
                             this.content.drain(this.cursor..next_char_end);
                             cx.emit(TextChanged(this.content.clone()));
                         }
+                        this.scroll_to_cursor();
                         this.reset_blink(cx);
                         cx.notify();
                     }
                     "left" => {
                         this.selection = None;
                         this.move_left();
+                        this.scroll_to_cursor();
                         this.reset_blink(cx);
                         cx.notify();
                     }
                     "right" => {
                         this.selection = None;
                         this.move_right();
+                        this.scroll_to_cursor();
                         this.reset_blink(cx);
                         cx.notify();
                     }
                     "home" => {
                         this.selection = None;
                         this.cursor = 0;
+                        this.scroll_to_cursor();
                         this.reset_blink(cx);
                         cx.notify();
                     }
                     "end" => {
                         this.selection = None;
                         this.cursor = this.content.len();
+                        this.scroll_to_cursor();
                         this.reset_blink(cx);
                         cx.notify();
                     }
@@ -760,8 +776,11 @@ impl Render for TextFieldView {
                             this.content.insert(this.cursor, '\n');
                             this.cursor += 1;
                             cx.emit(TextChanged(this.content.clone()));
+                            this.scroll_to_cursor();
                             this.reset_blink(cx);
                             cx.notify();
+                        } else {
+                            cx.emit(TextSubmit(this.content.clone()));
                         }
                     }
                     _ => {}
@@ -1475,7 +1494,8 @@ impl FieldSpec {
         match self.field_kind {
             FieldKind::Boolean => FIELD_H_SINGLE,
             FieldKind::Array => FIELD_H_MULTI,
-            _ if self.multiline => FIELD_H_MULTI,
+            // Text fields use FIELD_H_SINGLE for layout estimation — actual height
+            // is dynamic (the TextFieldView grows with content up to TEXT_FIELD_MAX_H).
             _ => FIELD_H_SINGLE,
         }
     }
@@ -1720,6 +1740,8 @@ struct NodeEditorPanel {
     /// Subscriptions to text field changes — kept alive so events fire.
     _field_subs: Vec<Subscription>,
     _selection_sub: Subscription,
+    /// Active inline-add text field for array fields: (field_key, entity, subscription).
+    array_add_field: Option<(String, Entity<TextFieldView>, Subscription)>,
 }
 
 impl NodeEditorPanel {
@@ -1733,6 +1755,7 @@ impl NodeEditorPanel {
         let sub = cx.observe(&selection, |this: &mut Self, sel, cx| {
             let selected_id = sel.read(cx).selected_node_id;
             if let Some(node_id) = selected_id {
+                this.array_add_field = None;
                 this.open_or_focus_tab(node_id, cx);
             }
             cx.notify();
@@ -1751,6 +1774,7 @@ impl NodeEditorPanel {
             },
             _field_subs: Vec::new(),
             _selection_sub: sub,
+            array_add_field: None,
         }
     }
 
@@ -1964,6 +1988,29 @@ impl NodeEditorPanel {
     #[allow(dead_code)]
     fn has_dirty_tabs(&self) -> bool {
         self.tabs.iter().any(|t| t.dirty)
+    }
+
+    /// Commit the inline array-add text field: push its content into the array
+    /// and close the inline editor.
+    fn commit_array_add(&mut self, cx: &mut Context<Self>) {
+        if let Some((key, entity, _sub)) = self.array_add_field.take() {
+            let text = entity.read(cx).content.trim().to_string();
+            if !text.is_empty() {
+                if let Some(tab_idx) = self.active_tab {
+                    if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                        let arr = tab
+                            .edited_values
+                            .entry(key)
+                            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                        if let Some(a) = arr.as_array_mut() {
+                            a.push(serde_json::Value::String(text));
+                        }
+                        tab.recompute_dirty();
+                    }
+                }
+            }
+            cx.notify();
+        }
     }
 }
 
@@ -2461,44 +2508,62 @@ impl Render for NodeEditorPanel {
                             );
                         }
 
-                        // "Add" button (placeholder — proper inline add later)
-                        let key_add = key.clone();
-                        array_div = array_div.child(
-                            div()
-                                .id(SharedString::from(format!("arr-add-{}", spec.key)))
-                                .flex()
-                                .items_center()
-                                .px(px(6.0))
-                                .h(px(22.0))
-                                .bg(rgba(0x89b4fa33))
-                                .rounded(px(3.0))
-                                .text_xs()
-                                .text_color(rgb(0x89b4fa))
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                        if let Some(tab_idx) = this.active_tab {
-                                            if let Some(t) = this.tabs.get_mut(tab_idx) {
-                                                let arr = t
-                                                    .edited_values
-                                                    .entry(key_add.clone())
-                                                    .or_insert_with(|| {
-                                                        serde_json::Value::Array(Vec::new())
-                                                    });
-                                                if let Some(a) = arr.as_array_mut() {
-                                                    a.push(serde_json::Value::String(
-                                                        "new".into(),
-                                                    ));
+                        // Inline add: show text field if active for this key,
+                        // otherwise show the "+" button.
+                        let is_adding = self.array_add_field.as_ref()
+                            .is_some_and(|(k, _, _)| k == &key);
+
+                        if is_adding {
+                            let (_, ref add_entity, _) = self.array_add_field.as_ref().unwrap();
+                            array_div = array_div.child(
+                                div()
+                                    .id(SharedString::from(format!("arr-adding-{}", spec.key)))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .w(px(100.0))
+                                            .child(add_entity.clone()),
+                                    ),
+                            );
+                        } else {
+                            let key_add = key.clone();
+                            array_div = array_div.child(
+                                div()
+                                    .id(SharedString::from(format!("arr-add-{}", spec.key)))
+                                    .flex()
+                                    .items_center()
+                                    .px(px(6.0))
+                                    .h(px(22.0))
+                                    .bg(rgba(0x89b4fa33))
+                                    .rounded(px(3.0))
+                                    .text_xs()
+                                    .text_color(rgb(0x89b4fa))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                            // Create an inline text field for adding a new item.
+                                            let k = key_add.clone();
+                                            let entity = cx.new(|cx| {
+                                                TextFieldView::new(false, "new item", cx)
+                                            });
+                                            window.focus(&entity.read(cx).focus);
+                                            // Subscribe: on Enter, commit the value.
+                                            let sub = cx.subscribe(&entity, {
+                                                move |this: &mut Self, _tf, _event: &TextSubmit, cx| {
+                                                    this.commit_array_add(cx);
                                                 }
-                                                t.recompute_dirty();
-                                            }
-                                        }
-                                        cx.notify();
-                                    }),
-                                )
-                                .child("+"),
-                        );
+                                            });
+                                            this.array_add_field = Some((k, entity, sub));
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("+"),
+                            );
+                        }
 
                         array_div.into_any_element()
                     }
@@ -2634,10 +2699,15 @@ struct AppView {
     #[allow(dead_code)]
     selection: Entity<SelectionModel>,
     snapshot: Arc<RwLock<GraphSnapshot>>,
+    graph: Arc<KnowledgeGraph>,
+    data_file: std::path::PathBuf,
+    schema_dir: std::path::PathBuf,
     file_menu_open: bool,
     view_menu_open: bool,
     sidebar_open: bool,
     right_panel_open: bool,
+    /// Status message displayed in the status bar during/after data operations.
+    data_status: Option<String>,
 }
 
 impl AppView {
@@ -2645,6 +2715,8 @@ impl AppView {
         snapshot: GraphSnapshot,
         graph: Arc<KnowledgeGraph>,
         schema_mgr: Arc<SchemaManager>,
+        data_file: std::path::PathBuf,
+        schema_dir: std::path::PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
@@ -2668,11 +2740,77 @@ impl AppView {
             node_editor,
             selection,
             snapshot: snapshot_arc,
+            graph,
+            data_file,
+            schema_dir,
             file_menu_open: false,
             view_menu_open: false,
             sidebar_open: false,
             right_panel_open: false,
+            data_status: None,
         }
+    }
+
+    /// Rebuild the in-memory snapshot from the graph and push it to all child views.
+    fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
+        match u_forge_graph_view::build_snapshot(&self.graph) {
+            Ok(snap) => {
+                *self.snapshot.write() = snap;
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("Failed to rebuild snapshot: {e}");
+            }
+        }
+    }
+
+    fn do_clear_data(&mut self, cx: &mut Context<Self>) {
+        match self.graph.clear_all() {
+            Ok(()) => {
+                self.data_status = Some("Data cleared.".to_string());
+                self.refresh_snapshot(cx);
+            }
+            Err(e) => {
+                self.data_status = Some(format!("Clear failed: {e}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn do_import_data(&mut self, cx: &mut Context<Self>) {
+        let graph = self.graph.clone();
+        let data_file = self.data_file.clone();
+        let schema_dir = self.schema_dir.to_string_lossy().into_owned();
+
+        self.data_status = Some("Importing…".to_string());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = u_forge_core::ingest::setup_and_index(
+                &graph,
+                &schema_dir,
+                data_file.to_str().unwrap_or(""),
+            )
+            .await;
+
+            this.update(cx, |view: &mut AppView, cx| {
+                match result {
+                    Ok(stats) => {
+                        view.data_status = Some(format!(
+                            "Import done — {} nodes, {} edges",
+                            stats.objects_created, stats.relationships_created
+                        ));
+                        view.refresh_snapshot(cx);
+                    }
+                    Err(e) => {
+                        view.data_status = Some(format!("Import failed: {e}"));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn do_save(&mut self, cx: &mut Context<Self>) {
@@ -2735,6 +2873,12 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _window, cx| {
                 this.right_panel_open = !this.right_panel_open;
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ClearData, _window, cx| {
+                this.do_clear_data(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ImportData, _window, cx| {
+                this.do_import_data(cx);
             }))
             // ── Menu bar ──────────────────────────────────────────────────────
             .child(
@@ -2916,17 +3060,27 @@ impl Render for AppView {
                                     .child("Tree"),
                             ),
                     )
-                    // ── Center: graph stats ───────────────────────────────────
+                    // ── Center: graph stats + operation status ────────────────
                     .child({
+                        let data_status = self.data_status.clone();
                         let mut center = div()
                             .id("status-center")
                             .flex()
                             .flex_row()
                             .items_center()
                             .justify_center()
+                            .gap(px(12.0))
                             .text_color(rgba(0xa6adc8ff));
                         center.style().flex_grow = Some(1.0);
-                        center.child(format!("{} nodes  ·  {} edges", node_count, edge_count))
+                        center = center.child(format!("{} nodes  ·  {} edges", node_count, edge_count));
+                        if let Some(msg) = data_status {
+                            center = center.child(
+                                div()
+                                    .text_color(rgba(0xa6e3a1ff))
+                                    .child(msg),
+                            );
+                        }
+                        center
                     })
                     // ── Right: chat toggle button ─────────────────────────────
                     .child(
@@ -2972,7 +3126,7 @@ impl Render for AppView {
                         .child(
                             div()
                                 .id("file-dropdown")
-                                .w(px(180.0))
+                                .w(px(200.0))
                                 .bg(rgb(0x313244))
                                 .border_1()
                                 .border_color(rgb(0x45475a))
@@ -2986,6 +3140,7 @@ impl Render for AppView {
                                         .text_color(rgba(0xcdd6f4ff))
                                         .text_sm()
                                         .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -2995,6 +3150,53 @@ impl Render for AppView {
                                             }),
                                         )
                                         .child("Save                Ctrl+S"),
+                                )
+                                // ── separator ──
+                                .child(
+                                    div()
+                                        .h(px(1.0))
+                                        .w_full()
+                                        .bg(rgb(0x45475a)),
+                                )
+                                .child(
+                                    div()
+                                        .id("import-data-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.file_menu_open = false;
+                                                this.do_import_data(cx);
+                                            }),
+                                        )
+                                        .child("Import Data"),
+                                )
+                                .child(
+                                    div()
+                                        .id("clear-data-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xf38ba8ff))
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.file_menu_open = false;
+                                                this.do_clear_data(cx);
+                                            }),
+                                        )
+                                        .child("Clear Data"),
                                 ),
                         ),
                 ))
@@ -3075,7 +3277,9 @@ impl Render for AppView {
 
 fn main() {
     let cfg = AppConfig::load_default();
-    let data_dir = cfg.storage.db_path;
+    let data_dir = cfg.storage.db_path.clone();
+    let data_file = cfg.data.import_file.clone();
+    let schema_dir = cfg.data.schema_dir.clone();
 
     let (snapshot, graph, schema_mgr) = {
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
@@ -3085,20 +3289,24 @@ fn main() {
 
             let stats = graph.get_stats().expect("failed to get stats");
             if stats.node_count == 0 {
-                let data_file = std::path::Path::new("defaults/data/memory.json");
                 if data_file.exists() {
                     let mut ingestion = u_forge_core::DataIngestion::new(&graph);
                     ingestion
-                        .import_json_data(data_file)
+                        .import_json_data(&data_file)
                         .await
                         .expect("failed to import data");
                     let stats = graph.get_stats().expect("failed to get stats");
                     eprintln!(
-                        "Imported {} nodes, {} edges from memory.json",
-                        stats.node_count, stats.edge_count
+                        "Imported {} nodes, {} edges from {}",
+                        stats.node_count,
+                        stats.edge_count,
+                        data_file.display()
                     );
                 } else {
-                    eprintln!("Warning: defaults/data/memory.json not found, using empty graph");
+                    eprintln!(
+                        "Warning: import file '{}' not found, using empty graph",
+                        data_file.display()
+                    );
                 }
             } else {
                 eprintln!(
@@ -3118,7 +3326,7 @@ fn main() {
         })
     };
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().run(move |cx: &mut App| {
         // Register keybindings.
         cx.bind_keys([
             KeyBinding::new("ctrl-s", SaveLayout, None),
@@ -3130,7 +3338,12 @@ fn main() {
         cx.set_menus(vec![
             Menu {
                 name: "File".into(),
-                items: vec![MenuItem::action("Save", SaveLayout)],
+                items: vec![
+                    MenuItem::action("Save", SaveLayout),
+                    MenuItem::separator(),
+                    MenuItem::action("Import Data", ImportData),
+                    MenuItem::action("Clear Data", ClearData),
+                ],
             },
             Menu {
                 name: "View".into(),
@@ -3147,7 +3360,11 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| AppView::new(snapshot, graph, schema_mgr, cx)),
+            |_, cx| {
+                cx.new(|cx| {
+                    AppView::new(snapshot, graph, schema_mgr, data_file, schema_dir, cx)
+                })
+            },
         )
         .unwrap();
     });

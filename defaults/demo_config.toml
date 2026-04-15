@@ -2,6 +2,10 @@
 # This is a demo-specific config file and won't ship with the end product.
 # It's separate from u-forge.toml which is used by the application.
 
+[data]
+import_file = "./defaults/data/memory.json"
+schema_dir  = "./defaults/schemas"
+
 [database]
 # path = "./demo_data/kg"   # override the default DB location (default: <workspace>/demo_data/kg)
 #clear = true              # set to true to wipe the DB before loading (default: false)
