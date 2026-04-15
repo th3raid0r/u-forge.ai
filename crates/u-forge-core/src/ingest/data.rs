@@ -1,27 +1,40 @@
 //! Data ingestion module for u-forge.ai
 //!
-//! This module provides functionality for importing JSON data into the knowledge graph.
-//! It handles line-delimited JSON parsing and object/relationship creation with proper
-//! metadata handling.
+//! Imports the canonical JSONL export format produced by `convert_memorymesh`:
+//!
+//! ```json
+//! {"entitytype":"node","id":"<uuid>","nodetype":"faction",
+//!  "properties":{"name":"Galactic Empire","goals":["..."],...}}
+//! {"entitytype":"edge","from":"Mayor Salvor Hardin","to":"Terminus","edgeType":"located_in"}
+//! ```
+//!
+//! Field mapping:
+//! - `entitytype`   — discriminant tag ("node" | "edge")
+//! - `id`           — source UUID (stored as `_source_id` property; used for dedup)
+//! - `nodetype`     — schema type name (e.g. "npc", "faction", "location")
+//! - `properties`   — typed JSON object; arrays stay arrays, strings stay strings
+//!
+//! Dedup: nodes are matched first by `_source_id`, then by `(nodetype, name)`.
 
 use crate::types::*;
 use crate::KnowledgeGraph;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "entitytype")]
 pub enum JsonEntry {
     #[serde(rename = "node")]
     Node {
-        name: String,
-        #[serde(rename = "nodeType")]
+        id: String,
+        #[serde(rename = "nodetype")]
         node_type: String,
-        metadata: Vec<String>,
+        properties: Map<String, Value>,
     },
     #[serde(rename = "edge")]
     Edge {
@@ -56,7 +69,7 @@ impl<'a> DataIngestion<'a> {
         }
     }
 
-    /// Import JSON data from a file into the knowledge graph
+    /// Import JSONL data from a file into the knowledge graph.
     pub async fn import_json_data<P: AsRef<Path>>(&mut self, data_file: P) -> Result<()> {
         let data_file = data_file.as_ref();
         info!("Loading JSON data from: {:?}", data_file);
@@ -67,7 +80,6 @@ impl<'a> DataIngestion<'a> {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
 
-        // Parse line-delimited JSON
         for (line_num, line) in file_content.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -100,11 +112,8 @@ impl<'a> DataIngestion<'a> {
             edges.len()
         );
 
-        // Create objects first
         let mut name_to_id = HashMap::new();
         self.create_objects(nodes, &mut name_to_id).await?;
-
-        // Then create relationships
         self.create_relationships(edges, &name_to_id).await?;
 
         Ok(())
@@ -123,40 +132,48 @@ impl<'a> DataIngestion<'a> {
 
         for entry in nodes {
             if let JsonEntry::Node {
-                name,
+                id: source_id,
                 node_type,
-                metadata,
+                properties,
             } = entry
             {
-                // BUG-6 fix: Check for an existing object with the same type+name before
-                // inserting to prevent duplicate nodes on repeated imports.
-                match self.graph.find_by_name(&node_type, &name) {
-                    Ok(existing) if !existing.is_empty() => {
-                        let existing_id = existing[0].id;
+                let name = match properties
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                {
+                    Some(n) => n,
+                    None => {
                         warn!(
-                            "Skipping duplicate object '{}' (type: '{}'), reusing existing id {}",
-                            name, node_type, existing_id
+                            "Node (id={}, type={}) has no 'name' in properties — skipping",
+                            source_id, node_type
                         );
-                        name_to_id.insert(name, existing_id);
                         continue;
                     }
-                    Err(e) => {
-                        warn!("Dedup check failed for '{}': {}", name, e);
-                    }
-                    _ => {}
+                };
+
+                // Dedup: check by source_id first, then by (type, name).
+                let existing_id = self.find_existing(&source_id, &node_type, &name);
+                if let Some(existing) = existing_id {
+                    warn!(
+                        "Skipping duplicate '{}' (type: '{}'), reusing existing id {}",
+                        name, node_type, existing
+                    );
+                    name_to_id.insert(name, existing);
+                    continue;
                 }
 
                 let object_metadata = self
-                    .create_object_by_type(&name, &node_type, &metadata)
+                    .create_object_by_type(&source_id, &node_type, &properties)
                     .await?;
 
-                match self.graph.add_object(object_metadata.clone()) {
+                match self.graph.add_object(object_metadata) {
                     Ok(id) => {
                         name_to_id.insert(name, id);
                         self.stats.objects_created += 1;
                     }
                     Err(e) => {
-                        error!("Failed to add object {}: {}", name, e);
+                        error!("Failed to add object '{}': {}", name, e);
                     }
                 }
             }
@@ -164,6 +181,23 @@ impl<'a> DataIngestion<'a> {
 
         info!("Created {} objects total", self.stats.objects_created);
         Ok(())
+    }
+
+    /// Check for a pre-existing object by (type, name).
+    ///
+    /// The `source_id` parameter is accepted for forward-compatibility but is not yet
+    /// queryable — a property-index lookup can be added once `find_by_property` exists
+    /// on `KnowledgeGraph`.
+    fn find_existing(
+        &self,
+        _source_id: &str,
+        node_type: &str,
+        name: &str,
+    ) -> Option<ObjectId> {
+        match self.graph.find_by_name(node_type, name) {
+            Ok(results) if !results.is_empty() => Some(results[0].id),
+            _ => None,
+        }
     }
 
     async fn create_relationships(
@@ -180,9 +214,6 @@ impl<'a> DataIngestion<'a> {
                 edge_type,
             } = entry
             {
-                // BUG-7 fix: Resolve node names using the session map first, then fall back
-                // to a storage scan so edges referencing nodes from prior imports resolve
-                // correctly across sessions.
                 let from_id = self.resolve_node_id(&from, name_to_id);
                 let to_id = self.resolve_node_id(&to, name_to_id);
 
@@ -216,17 +247,15 @@ impl<'a> DataIngestion<'a> {
         name: &str,
         name_to_id: &HashMap<String, ObjectId>,
     ) -> Option<ObjectId> {
-        // Fast path: current session
         if let Some(&id) = name_to_id.get(name) {
             return Some(id);
         }
 
-        // Slow path: cross-session storage lookup (O(N) on CF_NAMES)
         match self.graph.find_by_name_only(name) {
             Ok(results) if !results.is_empty() => {
                 if results.len() > 1 {
                     warn!(
-                        "Ambiguous node name '{}' matched {} objects in storage; using first match",
+                        "Ambiguous node name '{}' matched {} objects; using first match",
                         name,
                         results.len()
                     );
@@ -243,16 +272,21 @@ impl<'a> DataIngestion<'a> {
 
     async fn create_object_by_type(
         &self,
-        name: &str,
+        source_id: &str,
         node_type: &str,
-        metadata: &[String],
+        properties: &Map<String, Value>,
     ) -> Result<ObjectMetadata> {
         use crate::ObjectBuilder;
 
-        // First, check if this type exists in any available schema
+        let name = properties
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Check whether the schema defines this type so we can use the exact type name.
         let schema_manager = self.graph.get_schema_manager();
         let use_original_type = if let Ok(schemas) = schema_manager.list_schemas() {
-            // Try imported_schemas first, then default
             let mut found = false;
             for schema_name in ["imported_schemas", "default"] {
                 if schemas.contains(&schema_name.to_string()) {
@@ -269,73 +303,60 @@ impl<'a> DataIngestion<'a> {
             false
         };
 
-        let object_metadata = if use_original_type {
-            // Use the original type from JSON if it exists in schema
-            let mut builder = ObjectBuilder::custom(node_type.to_string(), name.to_string());
-            builder = self.add_metadata_to_builder(builder, metadata);
-            builder.build()
+        let mut builder = if use_original_type {
+            ObjectBuilder::custom(node_type.to_string(), name.clone())
         } else {
-            // Fall back to the original mapping logic
             match node_type {
-                "location" => {
-                    let mut builder = ObjectBuilder::location(name.to_string());
-                    builder = self.add_metadata_to_builder(builder, metadata);
-                    builder.build()
-                }
-                "npc" | "player_character" => {
-                    let mut builder = ObjectBuilder::character(name.to_string());
-                    builder = self.add_metadata_to_builder(builder, metadata);
-                    builder.build()
-                }
-                "faction" => {
-                    let mut builder = ObjectBuilder::faction(name.to_string());
-                    builder = self.add_metadata_to_builder(builder, metadata);
-                    builder.build()
-                }
+                "location" => ObjectBuilder::location(name.clone()),
+                "npc" | "player_character" => ObjectBuilder::character(name.clone()),
+                "faction" => ObjectBuilder::faction(name.clone()),
                 "quest" | "setting_reference" | "system_reference" | "temporal" => {
-                    let mut builder = ObjectBuilder::event(name.to_string());
-                    builder = self.add_metadata_to_builder(builder, metadata);
-                    builder.build()
+                    ObjectBuilder::event(name.clone())
                 }
                 "artifact" | "currency" | "inventory" | "transportation" | "skills" => {
-                    let mut builder = ObjectBuilder::item(name.to_string());
-                    builder = self.add_metadata_to_builder(builder, metadata);
-                    builder.build()
+                    ObjectBuilder::item(name.clone())
                 }
-                _ => {
-                    let mut builder =
-                        ObjectBuilder::custom(node_type.to_string(), name.to_string());
-                    builder = self.add_metadata_to_builder(builder, metadata);
-                    builder.build()
-                }
+                _ => ObjectBuilder::custom(node_type.to_string(), name.clone()),
             }
         };
 
-        Ok(object_metadata)
+        // Store source id for future dedup without depending on name stability.
+        builder = builder.with_property("_source_id".to_string(), source_id.to_string());
+
+        builder = self.add_properties_to_builder(builder, properties);
+        Ok(builder.build())
     }
 
-    fn add_metadata_to_builder(
+    fn add_properties_to_builder(
         &self,
         mut builder: crate::ObjectBuilder,
-        metadata: &[String],
+        properties: &Map<String, Value>,
     ) -> crate::ObjectBuilder {
-        for meta_item in metadata {
-            // Handle different metadata formats
-            if meta_item.contains(':') {
-                // Key-value pair
-                let parts: Vec<&str> = meta_item.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    let key = parts[0].trim();
-                    let value = parts[1].trim();
+        for (key, value) in properties {
+            // "name" is already set as the object's canonical name field.
+            if key == "name" {
+                continue;
+            }
+
+            match value {
+                Value::String(s) => {
                     if key.eq_ignore_ascii_case("description") {
-                        builder = builder.with_description(value.to_string());
+                        builder = builder.with_description(s.clone());
                     } else {
-                        builder = builder.with_property(key.to_string(), value.to_string());
+                        builder = builder.with_property(key.clone(), s.clone());
                     }
                 }
-            } else {
-                // Tag
-                builder = builder.with_tag(meta_item.clone());
+                Value::Array(arr) if key.eq_ignore_ascii_case("tags") => {
+                    for item in arr {
+                        if let Value::String(tag) = item {
+                            builder = builder.with_tag(tag.clone());
+                        }
+                    }
+                }
+                // Arrays and any other typed value (number, bool, nested object)
+                other => {
+                    builder = builder.with_json_property(key.clone(), other.clone());
+                }
             }
         }
         builder
@@ -345,6 +366,7 @@ impl<'a> DataIngestion<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::TempDir;
 
     fn create_test_graph() -> (TempDir, KnowledgeGraph) {
@@ -355,8 +377,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_parsing() {
-        let json_data = r#"{"type": "node", "name": "Test Location", "nodeType": "location", "metadata": ["tag1", "property:value"]}
-{"type": "edge", "from": "Location A", "to": "Location B", "edgeType": "connects_to"}"#;
+        let json_data = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"location","properties":{"name":"Test Location","description":"A place"}}
+{"entitytype":"edge","from":"Location A","to":"Location B","edgeType":"connects_to"}"#;
 
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
@@ -376,28 +398,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metadata_parsing() {
+    async fn test_properties_parsing() {
         let (_temp_dir, graph) = create_test_graph();
         let ingestion = DataIngestion::new(&graph);
 
-        let metadata = vec![
-            "simple_tag".to_string(),
-            "key:value".to_string(),
-            "another:complex value".to_string(),
-        ];
+        let mut props = Map::new();
+        props.insert("name".to_string(), json!("Test"));
+        props.insert("description".to_string(), json!("A test location"));
+        props.insert("tags".to_string(), json!(["tag1", "tag2"]));
+        props.insert("goals".to_string(), json!(["goal1", "goal2"]));
+        props.insert("status".to_string(), json!("Active"));
 
         let builder = crate::ObjectBuilder::location("Test".to_string());
-        let builder = ingestion.add_metadata_to_builder(builder, &metadata);
+        let builder = ingestion.add_properties_to_builder(builder, &props);
         let object = builder.build();
 
-        assert!(object.tags.contains(&"simple_tag".to_string()));
+        assert!(object.tags.contains(&"tag1".to_string()));
+        assert!(object.tags.contains(&"tag2".to_string()));
+        assert_eq!(object.description.as_deref(), Some("A test location"));
         assert_eq!(
-            object.properties.get("key").and_then(|v| v.as_str()),
-            Some("value")
+            object.properties.get("status").and_then(|v| v.as_str()),
+            Some("Active")
         );
-        assert_eq!(
-            object.properties.get("another").and_then(|v| v.as_str()),
-            Some("complex value")
-        );
+        // Array property stored as JSON
+        assert!(object.properties.get("goals").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_import_roundtrip() {
+        let (_temp_dir, graph) = create_test_graph();
+        let mut ingestion = DataIngestion::new(&graph);
+
+        let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"location","properties":{"name":"Terminus","description":"A frontier world","tags":["planet","foundation"]}}
+{"entitytype":"node","id":"00000000-0000-0000-0000-000000000002","nodetype":"npc","properties":{"name":"Hari Seldon","role":"Mathematician","currentLocation":"Terminus"}}
+{"entitytype":"edge","from":"Hari Seldon","to":"Terminus","edgeType":"located_in"}"#;
+
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("test.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        ingestion.import_json_data(&file).await.unwrap();
+
+        let stats = ingestion.get_stats();
+        assert_eq!(stats.objects_created, 2);
+        assert_eq!(stats.relationships_created, 1);
+        assert_eq!(stats.parse_errors, 0);
     }
 }

@@ -86,15 +86,15 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 |---|---|---|
 | `src/lib.rs` | All rendering contracts + `generate_draw_commands()` | `DrawCommand`, `Viewport`, `GraphRenderer`, `generate_draw_commands()` |
 
-`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment (Catppuccin Mocha palette keyed on `object_type`) → `DrawCommand` list. `u-forge-ui-gpui` consumes this list — it never touches `GraphSnapshot` directly.
+`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment → `DrawCommand` list. `u-forge-ui-gpui` consumes this list — it never touches `GraphSnapshot` directly. Colors are assigned by `pub fn node_color_for_type(name: &str) -> [u8; 4]`: FNV-1a hashes the type name, scatters it across the hue wheel via the golden angle (137.5°), and fixes saturation/lightness to match Catppuccin Mocha accent values. Any type name — including future ones — gets a stable, distinct color with no code changes. The tree panel header colors and graph canvas legend both call the same function.
 
 ## Module Map (u-forge-ui-gpui)
 
 | File | Role |
 |---|---|
-| `src/main.rs` | Application entry point: loads `defaults/data/memory.json` via `DataIngestion`, builds `GraphSnapshot`, opens a GPUI window with `GraphCanvas` |
+| `src/main.rs` | Application entry point: loads data, builds `GraphSnapshot`, pre-loads schemas, opens GPUI window with `AppView` root containing `GraphCanvas`, `TreePanel`, and `NodeEditorPanel` |
 
-`GraphCanvas` owns `Arc<GraphSnapshot>`, camera world-space `Vec2`, and zoom. `Render::render()` clones camera state into a `canvas()` closure, calls `generate_draw_commands()`, then maps `DrawCommand::Line` values to batched `PathBuilder` paths (500 edges per path) and `DrawCommand::Circle` to `paint_quad()` with `corner_radii`. Run with `cargo run -p u-forge-ui-gpui` from the workspace root.
+`AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<NodeEditorPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. The workspace is a 30/70 vertical split: `NodeEditorPanel` (top) + `GraphCanvas` (bottom). `GraphCanvas` owns `Arc<GraphSnapshot>`, camera world-space `Vec2`, and zoom. `Render::render()` clones camera state into a `canvas()` closure, calls `generate_draw_commands()`, then maps `DrawCommand::Line` values to batched `PathBuilder` paths (500 edges per path) and `DrawCommand::Circle` to `paint_quad()` with `corner_radii`. `NodeEditorPanel` provides browser-style tabs with schema-driven forms built on `TextFieldView` (custom `EntityInputHandler` widget), dirty-state tracking, and save-all via Ctrl+S. Run with `cargo run -p u-forge-ui-gpui` from the workspace root.
 
 **GPUI version:** `0.2.2` from crates.io (blade-graphics backend). Do not upgrade without a targeted API compatibility check — GPUI has no semver guarantees.
 
@@ -740,8 +740,10 @@ no Lemonade Server required (`MockEmbeddingProvider` + `TempDir`).
 ## Data Ingestion (`src/ingest/data.rs`)
 
 Two-pass JSONL import: collect all nodes → create objects with name→ID map →
-resolve edge names → create edges. Metadata strings `"key:value"` become
-properties; plain strings become tags.
+resolve edge names → create edges. The canonical format uses `entitytype`/`nodetype`/`properties`
+fields; `properties` is a typed JSON object where array-typed fields are native JSON arrays.
+See `.rulesdir/json-data-formats.mdc` for the full format spec and the `convert_memorymesh`
+tool for migrating legacy MemoryMesh exports.
 
 `create_objects` calls `find_by_name` before inserting — if a node with the same
 type and name already exists, the existing ID is reused (no duplicates).
@@ -842,8 +844,12 @@ build` or `cargo test`.
 
 ## Sample Data
 
-`defaults/data/memory.json`: ~220 nodes + ~312 edges modeling Isaac Asimov's
-Foundation universe. JSONL format. Used by the CLI demo for end-to-end testing.
+`defaults/data/memory.jsonl`: ~220 nodes + ~312 edges modeling Isaac Asimov's
+Foundation universe. Canonical JSONL format (`entitytype`/`nodetype`/`properties` with
+typed JSON values). Used by the CLI demo and UI for end-to-end testing.
+
+`defaults/data/memory.json`: original MemoryMesh export (legacy `type`/`nodeType`/`metadata`
+format). Kept as a conversion reference; use `memory.jsonl` for imports.
 
 `defaults/schemas/`: 13 `.schema.json` files — `add_npc`, `add_player_character`,
 `add_location`, `add_faction`, `add_quest`, `add_artifact`, `add_currency`,

@@ -218,6 +218,22 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Look up an `ObjectTypeSchema` synchronously from the cache.
+    ///
+    /// Returns `None` if the schema or object type has not been loaded yet.
+    /// Callers should ensure `load_schema` has been called at least once
+    /// (e.g. at app startup) before relying on this method.
+    pub fn get_object_type_schema(
+        &self,
+        schema_name: &str,
+        type_name: &str,
+    ) -> Option<ObjectTypeSchema> {
+        self.schema_cache
+            .read()
+            .get(schema_name)
+            .and_then(|s| s.object_types.get(type_name).cloned())
+    }
+
     /// List all available schemas
     pub fn list_schemas(&self) -> Result<Vec<String>> {
         self.storage.list_schemas()

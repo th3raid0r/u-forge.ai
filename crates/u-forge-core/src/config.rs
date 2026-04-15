@@ -396,6 +396,53 @@ impl Default for StorageConfig {
     }
 }
 
+// ── DataConfig ────────────────────────────────────────────────────────────────
+
+/// Data import settings.
+///
+/// Corresponds to the `[data]` section of `u-forge.toml`.
+/// Also honoured by `defaults/demo_config.toml` for the CLI demo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataConfig {
+    /// Path to the JSONL file loaded on startup (and by File > Import Data).
+    ///
+    /// Defaults to `./defaults/data/memory.json` relative to the working
+    /// directory.  Override in `u-forge.toml` to point at your own world file.
+    ///
+    /// # Example
+    /// ```toml
+    /// [data]
+    /// import_file = "./my-campaign/world.jsonl"
+    /// ```
+    #[serde(default = "DataConfig::default_import_file")]
+    pub import_file: PathBuf,
+
+    /// Directory containing `*.schema.json` files.
+    ///
+    /// Defaults to `./defaults/schemas`.
+    #[serde(default = "DataConfig::default_schema_dir")]
+    pub schema_dir: PathBuf,
+}
+
+impl DataConfig {
+    fn default_import_file() -> PathBuf {
+        PathBuf::from("./defaults/data/memory.json")
+    }
+
+    fn default_schema_dir() -> PathBuf {
+        PathBuf::from("./defaults/schemas")
+    }
+}
+
+impl Default for DataConfig {
+    fn default() -> Self {
+        Self {
+            import_file: Self::default_import_file(),
+            schema_dir: Self::default_schema_dir(),
+        }
+    }
+}
+
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 /// Top-level application configuration.
@@ -419,6 +466,10 @@ pub struct AppConfig {
     /// Storage / persistence settings.
     #[serde(default)]
     pub storage: StorageConfig,
+
+    /// Data import settings.
+    #[serde(default)]
+    pub data: DataConfig,
 }
 
 impl AppConfig {

@@ -80,17 +80,54 @@ pub trait GraphRenderer {
 
 // ── Node color palette ───────────────────────────────────────────────────────
 
-/// Catppuccin Mocha palette for node types.
+/// Convert HSL (h in [0,360), s and l in [0,1]) to sRGB bytes.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r1, g1, b1) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    (
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
+}
+
+/// Return a stable, visually distinct RGBA color for any object type name.
+///
+/// Hue is derived from the type name via FNV-1a hash scattered with the golden
+/// angle (137.5°), giving maximally-separated hues for any set of names.
+/// Saturation and lightness are fixed to match the Catppuccin Mocha accent
+/// palette (~75 % / 76 %), so every color looks at home on the dark background.
+pub fn node_color_for_type(object_type: &str) -> [u8; 4] {
+    // FNV-1a hash of the type name — fast and well-distributed.
+    let hash = object_type
+        .bytes()
+        .fold(2_166_136_261_u32, |acc, b| {
+            acc.wrapping_mul(16_777_619).wrapping_add(b as u32)
+        });
+    // Golden-angle scatter: multiply by φ fractional part, wrap to [0, 1).
+    let hue = ((hash as f64 * 0.618_033_988_749_895).fract() * 360.0) as f32;
+    let (r, g, b) = hsl_to_rgb(hue, 0.75, 0.76);
+    [r, g, b, 255]
+}
+
+/// Internal alias kept for brevity inside this module.
+#[inline(always)]
 fn type_color(object_type: &str) -> [u8; 4] {
-    match object_type {
-        "npc" | "character" => [137, 180, 250, 255], // blue
-        "location" => [166, 227, 161, 255],          // green
-        "faction" => [249, 226, 175, 255],           // yellow
-        "quest" => [243, 139, 168, 255],             // red
-        "item" | "transportation" => [203, 166, 247, 255], // mauve
-        "currency" => [148, 226, 213, 255],          // teal
-        _ => [205, 214, 244, 255],                   // text (default)
-    }
+    node_color_for_type(object_type)
 }
 
 const EDGE_COLOR: [u8; 4] = [88, 91, 112, 200]; // surface2 with alpha

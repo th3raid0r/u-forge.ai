@@ -6280,7 +6280,9 @@ dependencies = [
  "anyhow",
  "glam",
  "rstar",
+ "serde_json",
  "tempfile",
+ "tokio",
  "u-forge-core",
 ]
 
@@ -6302,6 +6304,7 @@ dependencies = [
  "glam",
  "gpui",
  "parking_lot",
+ "serde_json",
  "tempfile",
  "tokio",
  "u-forge-core",

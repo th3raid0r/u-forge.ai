@@ -1,67 +1,98 @@
 ---
-globs: defaults/data/*.json,defaults/schemas/*.json,*.json
+globs: defaults/data/*.jsonl,defaults/data/*.json,defaults/schemas/*.json,*.json
 description: JSON data and schema file formats for u-forge.ai
 ---
 
 # JSON Data Formats
 
-## JSONL Data Files (defaults/data/)
+## Canonical JSONL Data Files (defaults/data/)
 
-Line-delimited JSON. Two entry types:
+Line-delimited JSON (`.jsonl`). Two entry types:
 
 ### Node
 ```json
-{"type":"node","name":"Hari Seldon","nodeType":"npc","metadata":["role:psychohistorian","Description: Creator of psychohistory"]}
+{"entitytype":"node","id":"<uuid>","nodetype":"npc","properties":{"name":"Hari Seldon","role":"psychohistorian","skills":["Psychohistory-5"],"tags":["Founder"]}}
 ```
 
 Fields:
-- `type`: always `"node"`
-- `name`: object name (used for edge resolution by name)
-- `nodeType`: must match a schema type (npc, location, faction, quest, artifact, etc.)
-- `metadata`: array of strings. `"key:value"` → property. Bare string → tag. `"Description: ..."` → description.
+- `entitytype`: always `"node"`
+- `id`: UUID v4 string — generated at conversion time, stable across re-imports
+- `nodetype`: must match a schema type (`npc`, `location`, `faction`, etc.)
+- `properties`: typed JSON object. Values match the property types declared in the schema:
+  - `string`/`text`/`number` fields → JSON string or number
+  - `array` fields → native JSON array (e.g. `["a", "b"]`)
+  - `boolean` fields → JSON boolean
 
 ### Edge
 ```json
-{"type":"edge","from":"Hari Seldon","to":"Trantor","edgeType":"lived_on"}
+{"entitytype":"edge","from":"Hari Seldon","to":"Trantor","edgeType":"lived_on"}
 ```
 
 Fields:
-- `type`: always `"edge"`
-- `from`: source node name (must exist in same or prior import — see BUG-7)
+- `entitytype`: always `"edge"`
+- `from`: source node name (resolved against the name index)
 - `to`: target node name
-- `edgeType`: string-based relationship type (flexible, no enum restriction)
+- `edgeType`: string-based relationship type
 
 ### Supported Node Types
 npc, player_character, location, faction, quest, artifact, currency, skills, temporal, setting_reference, system_reference, transportation, inventory
 
-### Import Pipeline (data_ingestion.rs)
+---
+
+## Legacy Format (pre-conversion)
+
+The older export format used by MemoryMesh and similar tools:
+
+```json
+{"type":"node","name":"Hari Seldon","nodeType":"npc","metadata":["role:psychohistorian","skills:Psychohistory-5","Founder"]}
+```
+
+Key differences from canonical:
+- `type`/`nodeType` instead of `entitytype`/`nodetype`
+- No top-level `id` field
+- `metadata`: array of `"key:value"` strings; bare strings become tags
+- Array-typed fields stored as comma-separated strings, not native JSON arrays
+
+---
+
+## Conversion Tool (`convert_memorymesh`)
+
+```bash
+cargo run --example convert_memorymesh -- [input.jsonl] [output.jsonl]
+```
+
+Located at `crates/u-forge-core/examples/convert_memorymesh.rs`. Converts legacy MemoryMesh JSONL exports to canonical u-forge format:
+
+- Renames `type` → `entitytype`, `nodeType` → `nodetype`, `metadata` → `properties`
+- Generates a fresh UUID for each node's `id`
+- Parses `"key:value"` metadata strings into typed JSON values
+- Promotes array-typed fields (per schema) from comma-separated strings to native JSON arrays
+- Strips fields not present in the schema for the node's type (emits a warning per discard)
+- Accumulates bare tags (no colon) into the `tags` array
+- Passes edges through with field renames applied
+
+If input/output paths are omitted, stdin/stdout are used.
+
+---
+
+## Import Pipeline (`data_ingestion.rs`)
 
 Two-pass: collect all nodes → create objects with name→ID map → resolve edge names → create edges.
 
-**BUG-6 (resolved):** Before inserting a node, `DataIngestion::create_objects` calls
-`graph.find_by_name(object_type, name)`. If a matching object already exists, the
-insert is skipped and the existing ID is recorded in the session map. A `warn!` log
-is emitted for each skipped duplicate. Re-importing the same JSONL file is now safe.
+**Deduplication:** Before inserting a node, `DataIngestion::create_objects` calls `graph.find_by_name(object_type, name)`. If a matching object already exists, the insert is skipped and the existing ID is recorded in the session map. Re-importing the same JSONL file is safe.
 
-**BUG-7 (resolved):** Edge name resolution uses `DataIngestion::resolve_node_id`,
-which checks the in-session `name_to_id` map first (O(1)), then falls back to
-`graph.find_by_name_only(name)` — a storage scan against the `idx_nodes_name_only`
-index (O(log N)). Edges referencing nodes created in previous import sessions now
-resolve correctly. If a name matches multiple objects across types, the first match
-is used with a `warn!` log.
-
-### Import Deduplication — How It Works
+**Cross-session edge resolution:** `resolve_node_id` checks the in-session `name_to_id` map first (O(1)), then falls back to `graph.find_by_name_only(name)` — a storage scan against `idx_nodes_name_only` (O(log N)). Edges referencing nodes from prior import sessions resolve correctly.
 
 ```
 For each node entry in the JSONL:
   1. Call find_by_name(node_type, name) against SQLite
-  2. If found → skip insert, record existing id in session map, emit warn log
+  2. If found → skip insert, record existing id in session map
   3. If not found → create ObjectMetadata, call add_object, record new id
 
 For each edge entry in the JSONL:
   resolve_node_id(name, session_map):
     1. Check session_map (current import session)   → O(1)
-    2. Else call storage.find_nodes_by_name_only()  → O(log N) via idx_nodes_name_only
+    2. Else call storage.find_nodes_by_name_only()  → O(log N)
     3. Else log error "Missing node reference" and skip edge
 ```
 
@@ -76,64 +107,40 @@ Named `*.schema.json`. Define object types and validation rules.
   "name": "add_npc",
   "description": "Add a new NPC to the knowledge graph",
   "properties": {
-    "name": {
-      "type": "string",
-      "description": "NPC name",
-      "required": true,
-      "validation": { "min_length": 1, "max_length": 100 }
-    },
-    "role": {
-      "type": "string",
-      "description": "NPC role",
-      "required": true,
-      "validation": { "allowed_values": ["merchant", "guard", "noble"] }
-    },
+    "name": { "type": "string", "required": true },
+    "skills": { "type": "array", "description": "Skills the NPC possesses" },
     "currentLocation": {
       "type": "string",
-      "description": "Current location",
-      "relationship": {
-        "edgeType": "located_in",
-        "targetType": "location"
-      }
+      "relationship": { "edgeType": "located_in" }
     }
   }
 }
 ```
 
 ### Property types
-`string`, `text`, `number`, `boolean`, `array`, `object`, `reference`
+`string`, `text`, `number`, `boolean`, `array`, `object`, `reference`, `enum`
 
 ### Validation rules
 `min_length`, `max_length`, `min_value`, `max_value`, `pattern` (regex), `allowed_values`, `required`
 
 ### Naming convention
-Files use `add_` prefix in `name` field (MCP tool convention). `SchemaIngestion` strips the prefix — `add_npc` becomes `npc` internally.
+Files use `add_` prefix in `name` field (MCP tool convention). `SchemaIngestion` strips the prefix — `add_npc` becomes `npc` internally. Schemas are saved under the `"imported_schemas"` namespace; the UI loads both `"default"` (built-in hardcoded types) and `"imported_schemas"` at startup.
 
-## Import Validation Commands
-
-```bash
-# Check JSON syntax
-cat file.json | jq .
-
-# Count nodes by type
-jq -c 'select(.type == "node") | .nodeType' defaults/data/memory.json | sort | uniq -c
-
-# Find edges
-jq -c 'select(.type == "edge")' defaults/data/memory.json | head
-```
+---
 
 ## Sample Data
 
-`defaults/data/memory.json`: ~220 nodes + ~312 edges from Isaac Asimov's Foundation
-universe. Used by the CLI demo and integration tests.
+`defaults/data/memory.jsonl`: ~220 nodes + ~312 edges from Isaac Asimov's Foundation universe. Canonical JSONL format. Used by the CLI demo and integration tests.
 
-Re-importing this file is safe — deduplication (BUG-6 fix) prevents duplicate nodes.
-Cross-session edges resolve correctly via the storage name index (BUG-7 fix).
+`defaults/data/memory.json`: original MemoryMesh export — legacy format, kept as a conversion reference. Use `memory.jsonl` for all imports.
 
 ```bash
-# Count nodes by type after import
-jq -r 'select(.type == "node") | .nodeType' defaults/data/memory.json | sort | uniq -c | sort -rn
+# Count nodes by type
+jq -c 'select(.entitytype == "node") | .nodetype' defaults/data/memory.jsonl | sort | uniq -c
 
-# Verify no parse errors
-cargo run --example cli_demo 2>&1 | grep "Parse errors"
+# Inspect a specific type
+jq -c 'select(.entitytype == "node" and .nodetype == "npc")' defaults/data/memory.jsonl | head -2
+
+# Find edges
+jq -c 'select(.entitytype == "edge")' defaults/data/memory.jsonl | head
 ```

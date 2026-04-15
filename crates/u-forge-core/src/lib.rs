@@ -37,7 +37,7 @@ pub use ai::embeddings::{
     LemonadeProvider,
 };
 pub use builder::ObjectBuilder;
-pub use config::{AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, EmbeddingDeviceConfig, ModelConfig, ModelLoadParams, StorageConfig};
+pub use config::{AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig, ModelConfig, ModelLoadParams, StorageConfig};
 pub use graph::{
     GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
     HIGH_QUALITY_EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS,
@@ -53,8 +53,8 @@ pub use ingest::{
     EmbeddingTarget, IngestionStats, SetupResult,
 };
 pub use schema::{
-    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationResult,
-    SchemaIngestion, SchemaManager, SchemaStats,
+    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType, SchemaDefinition,
+    ValidationResult, SchemaIngestion, SchemaManager, SchemaStats,
 };
 pub use rag::{build_rag_messages, format_search_context, RagContext};
 pub use search::{

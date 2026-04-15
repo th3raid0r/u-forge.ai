@@ -158,11 +158,65 @@ The view model produces `Vec<DrawCommand>` from a `GraphSnapshot` + `Viewport`. 
 
 ### App shell (`AppView`)
 
-`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>` and a `file_menu_open: bool` toggle. It renders:
-- **Menu bar** (28 px, `flex_none`): a "File" button that toggles an inline dropdown. The dropdown's single item dispatches `SaveLayout`. The `SaveLayout` action is also reachable via Ctrl+S and registered with `cx.set_menus()` for native menu support on macOS.
-- **Workspace** (remaining height, `flex_col`): a 30/70 flex-grow split. Top 30% is the editor placeholder; bottom 70% hosts `Entity<GraphCanvas>`.
+`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<NodeEditorPanel>`, `Entity<SelectionModel>`, the shared `Arc<RwLock<GraphSnapshot>>`, and boolean toggles (`sidebar_open`, `right_panel_open`, `file_menu_open`, `view_menu_open`). It renders:
+- **Menu bar** (28 px, `flex_none`): "File" button (dropdown: Save / Ctrl+S) and "View" button (dropdown: checkable Left Panel / Ctrl+B, checkable Right Panel / Ctrl+J). Both dropdowns rendered with `deferred(anchored(...))`.
+- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional `TreePanel` (220 px, `flex_none`) on the left + main workspace + optional right panel (280 px, `flex_none`) for chat (placeholder).
+- **Workspace** (`flex_col`, `flex_grow`): 30/70 vertical split — `NodeEditorPanel` (top) + `GraphCanvas` (bottom).
+- **Status bar** (24 px, `flex_none`, bottom): left section has panel toggle buttons (Tree, more coming), center shows graph stats (node/edge count from snapshot), right has a Chat toggle button. All toggle buttons highlight when their panel is open.
 
-The File dropdown is rendered with `deferred(anchored(...))` so it paints on top of all other content.
+### Selection model (`SelectionModel`)
+
+A shared GPUI entity that both `TreePanel` and `GraphCanvas` observe. Holds `selected_node_idx: Option<usize>` and `selected_node_id: Option<ObjectId>`. Key API:
+- `select_by_idx(idx, cx)` — called from canvas clicks; keeps both fields in sync.
+- `select_by_id(id, cx)` — called from tree panel clicks; looks up the index via snapshot scan.
+- `clear(cx)` — deselects.
+
+Both panels observe the entity via `cx.observe(&selection, callback)`. Observers fire whenever `SelectionModel` calls `cx.notify()`. `GraphCanvas` pans the camera to the selected node when the selection originates externally (tree panel). A `suppress_pan: bool` flag prevents the canvas from panning to a node it just selected itself.
+
+### Tree panel (`TreePanel`)
+
+A 220 px sidebar listing all nodes grouped by `object_type`. Rendered as a two-div structure:
+1. Fixed 28 px "NODES" header (`flex_none`).
+2. `overflow_y_scroll()` + `flex_grow` content area containing collapsible type groups and node entries.
+
+Nodes are sorted case-insensitively within each group; groups are sorted by type name. All groups start **collapsed** by default — the `collapsed` set is pre-populated with all type names at construction. Clicking a type header toggles its group. Clicking a node entry updates `SelectionModel`.
+
+### TextFieldView — canvas-based text rendering
+
+`TextFieldView` implements `EntityInputHandler` (GPUI's platform IME protocol) and renders text + cursor using `shape_line` / `shape_text` + `ShapedLine::paint()` / `WrappedLine::paint()` directly on a `canvas` element — **not** as a `SharedString` child of a div.
+
+**Why not div children?** When text is placed as a div child, GPUI's own text layout system owns the glyph positions. There is no public API to query those positions from outside the div's render tree. Any cursor overlay div positioned with hardcoded pixel offsets will drift from the actual glyphs as soon as the font, DPI, or font-size varies. This was the root cause of all five cursor/click bugs encountered.
+
+**Correct approach (same as Zed's `EditorElement`):**
+1. Call `window.text_system().shape_line(text, font_size, &[run], None)` (single-line) or `shape_text(text, font_size, &[run], Some(wrap_width), None)` (multiline with wrapping).
+2. Call `shaped.paint(origin, line_height, window, cx)` to draw the glyphs.
+3. Use `ShapedLine::x_for_index(byte_idx)` / `WrappedLineLayout::position_for_index(byte_idx, line_h)` to compute the pixel-exact cursor position from the same shaped data.
+4. Use `ShapedLine::closest_index_for_x(px)` / `WrappedLineLayout::closest_index_for_position(point, line_h)` to map a click position back to a byte index.
+
+**Key metrics:**
+- Font size: `window.rem_size() * 0.75` (matches `text_xs()` = 0.75 rem).
+- Line height: `(font_size * 1.618_034).round()` — GPUI's default line height is `phi()` = `relative(1.618034)`, applied to font size. The hardcoded 16px that was there before was wrong.
+- Character advance: `window.text_system().em_advance(font_id, font_size)` — used for the click-to-cursor fallback when no layout is cached yet.
+
+**Stored layout for click mapping:**
+```rust
+enum TextFieldLayout {
+    Single(ShapedLine),                      // single-line field
+    Multi(Vec<(usize, WrappedLine)>),        // (byte_start, line) per '\n'-segment
+}
+```
+Updated every paint frame in `TextFieldView::shaped_layout`. The `on_mouse_down` handler converts the window-coordinate click to text-area-local coords (subtract `field_origin` + padding), then calls into this cached layout for exact glyph-level hit testing.
+
+**Element origin:** Stored as `field_origin_x / field_origin_y` from `bounds.origin` inside the paint closure. Event positions from `MouseDownEvent::position` are in window coordinates — subtracting the stored origin converts them to element-local.
+
+### GPUI layout constraints (hard-won lessons)
+
+These patterns are required for scroll areas to work correctly inside a flex layout:
+
+- **`overflow_hidden()` on the body container** — without this, flex children that render more content than their computed size will grow the parent rather than clip. Apply to any container that must not exceed its allocated bounds.
+- **`min_h_0()` on flex children with scrollable content** — flex items have `min-height: auto` by default, which prevents them from shrinking below their content height. `min_h_0()` overrides this so the item can shrink to its flex-allocated size and let the inner `overflow_y_scroll()` div take over.
+- **Separate shell div from scroll area div** — the outer div (`flex_col`, `flex_none` width, `min_h_0()`) provides the fixed size; an inner div (`overflow_y_scroll()`, `flex_grow`) holds the scrollable content. Combining these on a single div causes layout issues.
+- **`flex_none` on the sidebar** — the tree panel must not participate in flex stretching; only the workspace should grow.
 
 ### Canvas architecture
 
@@ -185,7 +239,7 @@ Node canvas positions are stored in the `node_positions` SQLite table (see `ARCH
 
 `build_snapshot()` in `u-forge-graph-view` always runs force-directed layout first (so new nodes get valid initial positions), then overwrites with saved positions for any node that has a stored entry. This means the layout pass is never fully skipped, but its result is overridden for known nodes — giving correct placement for mixed new+existing graphs.
 
-The GPUI canvas saves positions **on every node drag completion** (mouse-up after a node move) rather than only on window close. The database path defaults to `./data/db/` and is configurable via the `[storage] db_path` key in `u-forge.toml`. Import from `memory.json` runs only on first launch (when the graph is empty).
+The GPUI canvas saves positions **on explicit save** (Ctrl+S or File > Save) rather than on every drag-end. The `SaveLayout` action triggers `do_save()` which saves both layout positions and any dirty editor tabs. The database path defaults to `./data/db/` and is configurable via the `[storage] db_path` key in `u-forge.toml`. Import from `memory.json` runs only on first launch (when the graph is empty).
 
 `GraphSnapshot::rebuild_spatial_index()` rebuilds the R-tree from current `nodes[].position` values; called after each drag so hit-testing stays accurate.
 
@@ -199,9 +253,14 @@ The GPUI canvas saves positions **on every node drag completion** (mouse-up afte
 4. ✅ **Wire GPUI prototype** — renders `memory.json` (220 nodes, 312 edges) with pan, zoom, LOD, type-colored nodes.
 5. ✅ **Position persistence + node dragging** — `node_positions` table, `save_layout()`/`load_layout()`, drag-to-reposition nodes in the canvas, autosave on drag-end, persistent DB.
 6. ✅ **App shell** — `AppView` root view wrapping `GraphCanvas`. Menu bar (File > Save, Ctrl+S, `SaveLayout` action). 30/70 flex-grow workspace split: editor placeholder (top) + graph canvas (bottom). Canvas coordinate fix: `bounds.origin` offset applied to all paint positions; mouse events subtract `bounds.origin` before `screen_to_world`. `overflow_hidden()` clips paint to pane bounds.
-7. **`ObservableGraph`** — event-driven incremental updates.
-8. **Node detail panel** — click handler → detail view with node data.
-9. **Search** — text input → highlight matching nodes.
+7. ✅ **Tree view nav + shared selection** — `SelectionModel` entity shared between `TreePanel` and `GraphCanvas`. Tree panel lists nodes by type (collapsed by default, collapsible groups, alphabetical sort). Selecting a node in the tree highlights it in the graph and pans the camera to it. Canvas clicks update the tree highlight. `suppress_pan` flag prevents the canvas from panning when it originated the selection. Sidebar toggled via Ctrl+B or "Nodes" menu bar button. GPUI layout fix: `overflow_hidden()` on body + `min_h_0()` on flex children enables true scroll containment.
+8. ✅ **Status bar + View menu** — Status bar (24 px) at bottom: left panel-toggle buttons (Tree), centered graph stats (node/edge count), right Chat toggle. View menu dropdown with checkable Left Panel (Ctrl+B) and Right Panel (Ctrl+J) items. Right panel placeholder (280 px, "Chat — coming soon"). `ToggleRightPanel` action registered.
+9. ✅ **`ObservableGraph`** — `GraphEvent` enum (`NodeAdded`, `NodeUpdated`, `NodeDeleted`, `EdgeAdded`, `EdgeDeleted`). `ObservableGraph` wraps `Arc<KnowledgeGraph>`, forwards mutating calls, broadcasts events via `tokio::sync::broadcast`. `Deref<Target = KnowledgeGraph>` exposes all read-only methods directly. `NodeView` now carries `properties: serde_json::Value` so the full schema-defined payload is available in the snapshot without extra DB queries.
+10. ✅ **Node detail panel** — (Superseded by item 10b.) Original `NodeDetailPanel` entity displayed read-only pretty-printed JSON. Replaced by the schema-driven editor below.
+10b. ✅ **Schema-driven editor with browser tabs** — `NodeEditorPanel` replaces `NodeDetailPanel` (top 30% of workspace). Browser-style tab system: selecting a node opens it in an editor tab; unpinned tabs are replaced when a new node is selected; pinned tabs stay open. Each tab renders a schema-driven form generated from `ObjectTypeSchema` properties. Form fields: `TextFieldView` (custom text input widget implementing `EntityInputHandler`) for String/Text/Number, clickable checkbox for Boolean, anchored dropdown overlay for Enum, tag-chip list with add/remove for Array. Multi-column layout: fields flow vertically into columns (300 px each); columns overflow into additional pages with "< Prev" / "Next >" navigation buttons. Dirty state: tabs turn orange (`0xfab387`) when edited values differ from DB. Save all: Ctrl+S / File > Save persists all dirty tabs via `KnowledgeGraph::update_object()` and saves layout positions, then patches the in-memory snapshot so tree panel and canvas reflect name changes. `SchemaManager::get_object_type_schema()` added as a sync cache accessor; default schema pre-loaded at startup.
+10c. ✅ **`TextFieldView` cursor and click accuracy** — Rewrote `TextFieldView::Render` to paint text via `shape_line`/`shape_text` + `ShapedLine::paint()`/`WrappedLine::paint()` on a `canvas` element instead of using a `SharedString` div child. Cursor position uses `x_for_index`/`position_for_index` on the shaped layout (pixel-exact). Click-to-cursor uses `closest_index_for_x`/`closest_index_for_position` on the same cached `TextFieldLayout` enum. Line height corrected to `font_size * phi (1.618)` (GPUI default). Element origin stored each frame so `MouseDownEvent::position` (window coords) is correctly converted to text-area-local coordinates. See "TextFieldView — canvas-based text rendering" section above.
+10d. ✅ **Unified text fields, scroll support, and editable array adds** — All text fields now use wrapped rendering (`shape_text` with `wrap_width`) and dynamically grow from single-line height (28 px) up to a cap (120 px) based on content. When content exceeds the cap, the field becomes scrollable via mouse wheel, with `overflow_hidden()` clipping and a `scroll_offset` applied to paint. `ensure_cursor_visible()` is called from key/mouse handlers (never from paint) to avoid render-loop oscillation. `TextFieldLayout` simplified to a single struct (no more `Single`/`Multi` enum). Array "+" button spawns an inline `TextFieldView` that commits on Enter via a new `TextSubmit` event. `set_content` now resets cursor to position 0 so fields don't auto-scroll to the bottom on load.
+11. **Search** — text input → highlight matching nodes.
 
 ---
 

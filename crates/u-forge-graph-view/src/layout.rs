@@ -148,6 +148,7 @@ mod tests {
             description: None,
             position: Vec2::ZERO,
             tags: vec![],
+            properties: serde_json::Value::Object(Default::default()),
         }
     }
 

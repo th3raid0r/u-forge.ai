@@ -2,6 +2,10 @@
 # Path to the SQLite database directory. Defaults to ./data/db if omitted.
 db_path = "./data/db"
 
+[data]
+import_file = "./defaults/data/memory.jsonl"
+schema_dir  = "./defaults/schemas"
+
 [embedding]
 npu_enabled = true
 high_quality_embedding = true
