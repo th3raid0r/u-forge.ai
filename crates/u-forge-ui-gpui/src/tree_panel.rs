@@ -70,9 +70,6 @@ fn tree_type_color(object_type: &str) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-/// Width of the sidebar in pixels.
-pub(crate) const SIDEBAR_W: f32 = 220.0;
-
 impl Render for TreePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_id = self.selection.read(cx).selected_node_id;
@@ -83,7 +80,7 @@ impl Render for TreePanel {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_W))
+            .w_full()
             .h_full()
             .min_h_0()
             .bg(rgb(0x181825))

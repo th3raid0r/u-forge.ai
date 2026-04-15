@@ -1,11 +1,15 @@
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, relative, rgb, rgba, Context, Corner,
-    MouseButton, MouseDownEvent, Render, Window,
+    anchored, deferred, div, point, prelude::*, px, relative, rgb, rgba, App, ClickEvent, Context,
+    Corner, MouseButton, MouseDownEvent, Render, StyleRefinement, Window,
 };
 
 use crate::{ClearData, ImportData, SaveLayout, ToggleRightPanel, ToggleSidebar};
 
-use super::{AppView, MENU_BAR_H, STATUS_BAR_H};
+use super::{
+    AppView, DEFAULT_EDITOR_RATIO, DEFAULT_RIGHT_PANEL_W, DEFAULT_SIDEBAR_W, MAX_PANE_RATIO,
+    MENU_BAR_H, MIN_PANEL_W, MIN_PANE_RATIO, MIN_WORKSPACE_W, RESIZE_HANDLE_SIZE,
+    ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H,
+};
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -13,12 +17,18 @@ impl Render for AppView {
         let view_menu_open = self.view_menu_open;
         let sidebar_open = self.sidebar_open;
         let right_panel_open = self.right_panel_open;
+        let sidebar_width = self.sidebar_width;
+        let editor_ratio = self.editor_ratio;
+        let right_panel_width = self.right_panel_width;
 
         // Read graph stats for the status bar.
         let snap = self.snapshot.read();
         let node_count = snap.nodes.len();
         let edge_count = snap.edges.len();
         drop(snap);
+
+        // Weak handle used by drag-move closures to update panel sizes.
+        let handle = cx.weak_entity();
 
         div()
             .id("app-root")
@@ -102,34 +112,131 @@ impl Render for AppView {
             )
             // ── Body: optional sidebar + main content ─────────────────────────
             .child({
+                // Clone handles for the drag-move closures.
+                let handle_sidebar = handle.clone();
+                let handle_right = handle.clone();
+
                 let mut body = div()
                     .id("body")
                     .flex()
                     .flex_row()
                     .min_h_0()
-                    .overflow_hidden();
+                    .overflow_hidden()
+                    // Handle sidebar resize drags
+                    .on_drag_move::<ResizeSidebar>(move |event, _window, cx: &mut App| {
+                        let mouse_x = f32::from(event.event.position.x);
+                        let body_left = f32::from(event.bounds.origin.x);
+                        let body_w = f32::from(event.bounds.size.width);
+                        let new_width = mouse_x - body_left;
+                        handle_sidebar
+                            .update(cx, |view, cx| {
+                                let right_w = if view.right_panel_open {
+                                    view.right_panel_width + RESIZE_HANDLE_SIZE
+                                } else {
+                                    0.0
+                                };
+                                let max_w = (body_w - MIN_WORKSPACE_W - right_w).max(MIN_PANEL_W);
+                                view.sidebar_width = new_width.clamp(MIN_PANEL_W, max_w);
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    // Handle right panel resize drags
+                    .on_drag_move::<ResizeRightPanel>(move |event, _window, cx: &mut App| {
+                        let mouse_x = f32::from(event.event.position.x);
+                        let body_right = f32::from(event.bounds.origin.x)
+                            + f32::from(event.bounds.size.width);
+                        let body_w = f32::from(event.bounds.size.width);
+                        let new_width = body_right - mouse_x;
+                        handle_right
+                            .update(cx, |view, cx| {
+                                let sidebar_w = if view.sidebar_open {
+                                    view.sidebar_width + RESIZE_HANDLE_SIZE
+                                } else {
+                                    0.0
+                                };
+                                let max_w =
+                                    (body_w - MIN_WORKSPACE_W - sidebar_w).max(MIN_PANEL_W);
+                                view.right_panel_width = new_width.clamp(MIN_PANEL_W, max_w);
+                                cx.notify();
+                            })
+                            .ok();
+                    });
                 body.style().flex_grow = Some(1.0);
                 body.style().flex_shrink = Some(1.0);
                 body.style().flex_basis = Some(relative(0.).into());
 
-                // Left sidebar (tree panel)
+                // Left sidebar (tree panel) + resize handle
                 if sidebar_open {
-                    body = body.child(self.tree_panel.clone());
+                    let handle_reset = handle.clone();
+                    body = body
+                        .child(
+                            div()
+                                .id("sidebar-container")
+                                .flex()
+                                .flex_col()
+                                .flex_none()
+                                .w(px(sidebar_width))
+                                .h_full()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .child(self.tree_panel.clone()),
+                        )
+                        .child(
+                            // Sidebar resize handle — 6px wide, full height.
+                            div()
+                                .id("sidebar-resize-handle")
+                                .flex_none()
+                                .w(px(RESIZE_HANDLE_SIZE))
+                                .h_full()
+                                .cursor_col_resize()
+                                .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                                .on_drag(ResizeSidebar, |_, _, _, cx: &mut App| {
+                                    cx.new(|_| ResizeSidebar)
+                                })
+                                .on_click(move |event: &ClickEvent, _window, cx: &mut App| {
+                                    if event.click_count() == 2 {
+                                        handle_reset
+                                            .update(cx, |view, cx| {
+                                                view.sidebar_width = DEFAULT_SIDEBAR_W;
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    }
+                                }),
+                        );
                 }
 
-                // Main workspace: editor 30% + graph 70% (vertical split)
+                // Main workspace: editor + canvas (vertical split)
+                let handle_editor = handle.clone();
                 let mut workspace = div()
                     .id("workspace")
                     .flex()
                     .flex_col()
                     .min_h_0()
                     .min_w_0()
-                    .overflow_hidden();
+                    .overflow_hidden()
+                    // Handle editor/canvas resize drags
+                    .on_drag_move::<ResizeEditorCanvas>(move |event, _window, cx: &mut App| {
+                        let mouse_y = f32::from(event.event.position.y);
+                        let ws_top = f32::from(event.bounds.origin.y);
+                        let ws_h = f32::from(event.bounds.size.height);
+                        if ws_h > 0.0 {
+                            let ratio =
+                                ((mouse_y - ws_top) / ws_h).clamp(MIN_PANE_RATIO, MAX_PANE_RATIO);
+                            handle_editor
+                                .update(cx, |view, cx| {
+                                    view.editor_ratio = ratio;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }
+                    });
                 workspace.style().flex_grow = Some(1.0);
                 workspace.style().flex_shrink = Some(1.0);
                 workspace.style().flex_basis = Some(relative(0.).into());
 
-                // Node detail pane — 3 parts out of 10 (30%).
+                // Node detail pane — proportional to editor_ratio.
                 let mut editor = div()
                     .id("editor-pane")
                     .flex()
@@ -137,42 +244,92 @@ impl Render for AppView {
                     .w_full()
                     .min_h_0()
                     .child(self.node_editor.clone());
-                editor.style().flex_grow = Some(3.0);
+                editor.style().flex_grow = Some(editor_ratio);
                 editor.style().flex_shrink = Some(1.0);
                 editor.style().flex_basis = Some(relative(0.).into());
 
-                // Graph canvas pane — 7 parts out of 10 (70%).
+                // Editor/canvas resize handle — full width, 6px tall.
+                let handle_editor_reset = handle.clone();
+                let editor_canvas_handle = div()
+                    .id("editor-canvas-resize-handle")
+                    .flex_none()
+                    .w_full()
+                    .h(px(RESIZE_HANDLE_SIZE))
+                    .cursor_row_resize()
+                    .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                    .on_drag(ResizeEditorCanvas, |_, _, _, cx: &mut App| {
+                        cx.new(|_| ResizeEditorCanvas)
+                    })
+                    .on_click(move |event: &ClickEvent, _window, cx: &mut App| {
+                        if event.click_count() == 2 {
+                            handle_editor_reset
+                                .update(cx, |view, cx| {
+                                    view.editor_ratio = DEFAULT_EDITOR_RATIO;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }
+                    });
+
+                // Graph canvas pane — remainder of workspace height.
+                let canvas_ratio = 1.0 - editor_ratio;
                 let mut graph_pane = div()
                     .w_full()
                     .min_h_0()
                     .overflow_hidden()
                     .child(self.graph_canvas.clone());
-                graph_pane.style().flex_grow = Some(7.0);
+                graph_pane.style().flex_grow = Some(canvas_ratio);
                 graph_pane.style().flex_shrink = Some(1.0);
                 graph_pane.style().flex_basis = Some(relative(0.).into());
 
-                body = body.child(workspace.child(editor).child(graph_pane));
+                body = body.child(
+                    workspace
+                        .child(editor)
+                        .child(editor_canvas_handle)
+                        .child(graph_pane),
+                );
 
-                // Right panel placeholder (chat)
+                // Right panel + resize handle on its left edge.
                 if right_panel_open {
-                    body = body.child(
-                        div()
-                            .id("right-panel")
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .w(px(280.0))
-                            .h_full()
-                            .min_h_0()
-                            .bg(rgb(0x181825))
-                            .border_l_1()
-                            .border_color(rgb(0x313244))
-                            .items_center()
-                            .justify_center()
-                            .text_color(rgba(0x6c7086ff))
-                            .text_sm()
-                            .child("Chat — coming soon"),
-                    );
+                    let handle_right_reset = handle.clone();
+                    body = body
+                        .child(
+                            // Right resize handle
+                            div()
+                                .id("right-panel-resize-handle")
+                                .flex_none()
+                                .w(px(RESIZE_HANDLE_SIZE))
+                                .h_full()
+                                .cursor_col_resize()
+                                .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                                .on_drag(ResizeRightPanel, |_, _, _, cx: &mut App| {
+                                    cx.new(|_| ResizeRightPanel)
+                                })
+                                .on_click(
+                                    move |event: &ClickEvent, _window, cx: &mut App| {
+                                        if event.click_count() == 2 {
+                                            handle_right_reset
+                                                .update(cx, |view, cx| {
+                                                    view.right_panel_width = DEFAULT_RIGHT_PANEL_W;
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                        }
+                                    },
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("right-panel-container")
+                                .flex()
+                                .flex_col()
+                                .flex_none()
+                                .w(px(right_panel_width))
+                                .h_full()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .child(self.right_panel.clone()),
+                        );
                 }
 
                 body
@@ -242,8 +399,7 @@ impl Render for AppView {
                             node_count, edge_count
                         ));
                         if let Some(msg) = data_status {
-                            center = center
-                                .child(div().text_color(rgba(0xa6e3a1ff)).child(msg));
+                            center = center.child(div().text_color(rgba(0xa6e3a1ff)).child(msg));
                         }
                         center
                     })

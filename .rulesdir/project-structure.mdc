@@ -122,12 +122,13 @@ export LEMONADE_URL=http://localhost:13305/api/v1
 - [crates/u-forge-ui-gpui/src/main.rs](mdc:crates/u-forge-ui-gpui/src/main.rs) — Binary entry point only: tokio runtime, config, `KnowledgeGraph` init, schema pre-load, GPUI `Application` setup. All types live in the library target.
 - [crates/u-forge-ui-gpui/src/lib.rs](mdc:crates/u-forge-ui-gpui/src/lib.rs) — Library root: `mod` declarations, `actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ImportData])`, `pub use app_view::AppView`.
 - [crates/u-forge-ui-gpui/src/app_view/mod.rs](mdc:crates/u-forge-ui-gpui/src/app_view/mod.rs) — `AppView` struct + constructor + data operations (`refresh_snapshot`, `do_import_data`, `do_clear_data`, `do_save`).
-- [crates/u-forge-ui-gpui/src/app_view/render.rs](mdc:crates/u-forge-ui-gpui/src/app_view/render.rs) — `impl Render for AppView`: menu bar, 3-panel body layout, status bar, dropdown overlays.
+- [crates/u-forge-ui-gpui/src/app_view/render.rs](mdc:crates/u-forge-ui-gpui/src/app_view/render.rs) — `impl Render for AppView`: menu bar, 3-panel resizable body layout (drag handles between all boundaries), status bar, dropdown overlays.
 - [crates/u-forge-ui-gpui/src/graph_canvas.rs](mdc:crates/u-forge-ui-gpui/src/graph_canvas.rs) — `GraphCanvas`: pan/zoom canvas, LOD edge batching, viewport culling, `save_layout()`.
 - [crates/u-forge-ui-gpui/src/node_editor/mod.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/mod.rs) — `NodeEditorPanel` struct + tab management (`open_or_focus_tab`, `close_tab`, `save_dirty_tabs`).
 - [crates/u-forge-ui-gpui/src/node_editor/field_spec.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/field_spec.rs) — `FieldKind`, `FieldSpec`, `EditorTab`, layout constants.
 - [crates/u-forge-ui-gpui/src/node_editor/render.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/render.rs) — `impl Render for NodeEditorPanel`: tab bar, schema-driven multi-column form, pagination.
-- [crates/u-forge-ui-gpui/src/tree_panel.rs](mdc:crates/u-forge-ui-gpui/src/tree_panel.rs) — `TreePanel`: collapsible type-grouped node list sidebar.
+- [crates/u-forge-ui-gpui/src/tree_panel.rs](mdc:crates/u-forge-ui-gpui/src/tree_panel.rs) — `TreePanel`: collapsible type-grouped node list sidebar; uses `w_full()`, parent container controls width.
+- [crates/u-forge-ui-gpui/src/right_panel.rs](mdc:crates/u-forge-ui-gpui/src/right_panel.rs) — `RightPanel`: placeholder right panel entity (future chat/AI assistant).
 - [crates/u-forge-ui-gpui/src/text_field.rs](mdc:crates/u-forge-ui-gpui/src/text_field.rs) — `TextFieldView`: canvas-based text input with pixel-exact cursor, IME, blink timer.
 - [crates/u-forge-ui-gpui/src/selection_model.rs](mdc:crates/u-forge-ui-gpui/src/selection_model.rs) — `SelectionModel`: shared GPUI entity observed by `TreePanel`, `GraphCanvas`, and `NodeEditorPanel`.
 

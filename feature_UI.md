@@ -163,13 +163,14 @@ The crate is split into focused modules under `src/`. `main.rs` is the binary en
 | `lib.rs` | Module declarations, `actions!()` macro, re-exports (`AppView`, action types) |
 | `selection_model.rs` | `SelectionModel` — shared selection state observed by `TreePanel`, `GraphCanvas`, and `NodeEditorPanel` |
 | `text_field.rs` | `TextFieldView` — canvas-based text input widget (`EntityInputHandler`, cursor, IME, scroll) |
-| `tree_panel.rs` | `TreePanel` — 220 px sidebar listing nodes by type |
+| `tree_panel.rs` | `TreePanel` — collapsible node-by-type sidebar; uses `w_full()` so parent container controls width |
+| `right_panel.rs` | `RightPanel` — placeholder right panel entity (future chat/AI assistant) |
 | `graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
 | `node_editor/mod.rs` | `NodeEditorPanel` struct, constructor, tab management (`open_or_focus_tab`, `save_dirty_tabs`, `commit_array_add`) |
 | `node_editor/field_spec.rs` | `FieldSpec`, `FieldKind`, `EditorTab` — form field descriptions and dirty-state tracking |
 | `node_editor/render.rs` | `impl Render for NodeEditorPanel` — tab bar, multi-column form, pagination, dropdowns, array widgets |
-| `app_view/mod.rs` | `AppView` struct + data operations (`do_save`, `do_import_data`, `do_clear_data`, `refresh_snapshot`) |
-| `app_view/render.rs` | `impl Render for AppView` — menu bar, body layout, status bar, dropdown overlays |
+| `app_view/mod.rs` | `AppView` struct + data operations (`do_save`, `do_import_data`, `do_clear_data`, `refresh_snapshot`); panel size state; drag marker types |
+| `app_view/render.rs` | `impl Render for AppView` — menu bar, 3-panel resizable body layout, status bar, dropdown overlays |
 
 The `actions!()` macro is invoked once in `lib.rs`; all modules import action types via `use crate::{SaveLayout, …}`. The binary imports `AppView` and the action types from the library crate.
 
@@ -177,10 +178,11 @@ The `actions!()` macro is invoked once in `lib.rs`; all modules import action ty
 
 ### App shell (`AppView`)
 
-`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<NodeEditorPanel>`, `Entity<SelectionModel>`, the shared `Arc<RwLock<GraphSnapshot>>`, and boolean toggles (`sidebar_open`, `right_panel_open`, `file_menu_open`, `view_menu_open`). It renders:
+`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<NodeEditorPanel>`, `Entity<RightPanel>`, `Entity<SelectionModel>`, the shared `Arc<RwLock<GraphSnapshot>>`, boolean toggles (`sidebar_open`, `right_panel_open`, `file_menu_open`, `view_menu_open`), and user-adjustable panel sizes (`sidebar_width: f32`, `editor_ratio: f32`, `right_panel_width: f32`). It renders:
 - **Menu bar** (28 px, `flex_none`): "File" button (dropdown: Save / Ctrl+S) and "View" button (dropdown: checkable Left Panel / Ctrl+B, checkable Right Panel / Ctrl+J). Both dropdowns rendered with `deferred(anchored(...))`.
-- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional `TreePanel` (220 px, `flex_none`) on the left + main workspace + optional right panel (280 px, `flex_none`) for chat (placeholder).
-- **Workspace** (`flex_col`, `flex_grow`): 30/70 vertical split — `NodeEditorPanel` (top) + `GraphCanvas` (bottom).
+- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional `TreePanel` (default 220 px, user-resizable) + workspace + optional `RightPanel` (default 280 px, user-resizable). Each visible side panel is wrapped in a sized container div; the panel entity itself uses `w_full()`.
+- **Workspace** (`flex_col`, `flex_grow`): vertical split driven by `editor_ratio` — `NodeEditorPanel` (top, default 30%) + `GraphCanvas` (bottom, default 70%).
+- **Resize handles**: three 6 px drag handles sit between panels. Dragging updates the corresponding size field via `on_drag_move` + a `WeakEntity<AppView>` captured in the closure. Double-clicking any handle resets it to its default size. Handle cursor changes to `ResizeColumn`/`ResizeRow` on hover.
 - **Status bar** (24 px, `flex_none`, bottom): left section has panel toggle buttons (Tree, more coming), center shows graph stats (node/edge count from snapshot), right has a Chat toggle button. All toggle buttons highlight when their panel is open.
 
 ### Selection model (`SelectionModel`)
@@ -236,6 +238,7 @@ These patterns are required for scroll areas to work correctly inside a flex lay
 - **`min_h_0()` on flex children with scrollable content** — flex items have `min-height: auto` by default, which prevents them from shrinking below their content height. `min_h_0()` overrides this so the item can shrink to its flex-allocated size and let the inner `overflow_y_scroll()` div take over.
 - **Separate shell div from scroll area div** — the outer div (`flex_col`, `flex_none` width, `min_h_0()`) provides the fixed size; an inner div (`overflow_y_scroll()`, `flex_grow`) holds the scrollable content. Combining these on a single div causes layout issues.
 - **`flex_none` on the sidebar** — the tree panel must not participate in flex stretching; only the workspace should grow.
+- **`WeakEntity<T>` for drag callbacks** — `on_drag_move` and `on_click` closures receive `&mut App` (no `Context<V>`). Capture `cx.weak_entity()` before building the element tree, then call `handle.update(cx, |view, cx| { … })` inside the closure to mutate view state. This is the correct pattern for GPUI 0.2.2 whenever event handlers need access to a view but `cx.listener()` isn't available.
 
 ### Canvas architecture
 
@@ -280,6 +283,7 @@ The GPUI canvas saves positions **on explicit save** (Ctrl+S or File > Save) rat
 10c. ✅ **`TextFieldView` cursor and click accuracy** — Rewrote `TextFieldView::Render` to paint text via `shape_line`/`shape_text` + `ShapedLine::paint()`/`WrappedLine::paint()` on a `canvas` element instead of using a `SharedString` div child. Cursor position uses `x_for_index`/`position_for_index` on the shaped layout (pixel-exact). Click-to-cursor uses `closest_index_for_x`/`closest_index_for_position` on the same cached `TextFieldLayout` enum. Line height corrected to `font_size * phi (1.618)` (GPUI default). Element origin stored each frame so `MouseDownEvent::position` (window coords) is correctly converted to text-area-local coordinates. See "TextFieldView — canvas-based text rendering" section above.
 10d. ✅ **Unified text fields, scroll support, and editable array adds** — All text fields now use wrapped rendering (`shape_text` with `wrap_width`) and dynamically grow from single-line height (28 px) up to a cap (120 px) based on content. When content exceeds the cap, the field becomes scrollable via mouse wheel, with `overflow_hidden()` clipping and a `scroll_offset` applied to paint. `ensure_cursor_visible()` is called from key/mouse handlers (never from paint) to avoid render-loop oscillation. `TextFieldLayout` simplified to a single struct (no more `Single`/`Multi` enum). Array "+" button spawns an inline `TextFieldView` that commits on Enter via a new `TextSubmit` event. `set_content` now resets cursor to position 0 so fields don't auto-scroll to the bottom on load.
 10e. ✅ **Module decomposition** — Broke the monolithic 3,392-line `main.rs` into 10 focused files across 6 modules (see "Module structure" section above). `main.rs` is now the binary entry point only (~111 lines); all types live in a library target (`lib.rs`). `Cargo.toml` declares both `[lib]` and `[[bin]]` targets. Module organization follows Zed's conventions: one file per panel/concern, large render impls separated from data logic. No functional changes.
+10f. ✅ **Resizable panels** — All three panel boundaries are now user-draggable via 6 px resize handles (Zed `DraggedDock` pattern). `AppView` gains `sidebar_width`, `editor_ratio`, `right_panel_width` fields with sensible defaults and min/max clamping. Three marker structs (`ResizeSidebar`, `ResizeEditorCanvas`, `ResizeRightPanel`) implement `Render` returning `gpui::Empty`; they are passed as the drag payload to `on_drag` and matched by `on_drag_move`. `TreePanel` changed from fixed `w(px(SIDEBAR_W))` to `w_full()` — the parent container controls width. Right panel promoted from an inline div to a proper `RightPanel` entity (`right_panel.rs`). Double-click on any handle resets it to the default size via `on_click` + `event.click_count() == 2`.
 11. **Search** — text input → highlight matching nodes.
 
 ---

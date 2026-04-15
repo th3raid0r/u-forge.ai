@@ -2,13 +2,14 @@ mod render;
 
 use std::sync::Arc;
 
-use gpui::{prelude::*, Context, Entity};
+use gpui::{prelude::*, Context, Empty, Entity};
 use parking_lot::RwLock;
 use u_forge_core::{KnowledgeGraph, SchemaManager};
 use u_forge_graph_view::GraphSnapshot;
 
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
+use crate::right_panel::RightPanel;
 use crate::selection_model::SelectionModel;
 use crate::tree_panel::TreePanel;
 
@@ -20,10 +21,61 @@ pub(crate) const MENU_BAR_H: f32 = 28.0;
 /// Status bar height in pixels.
 pub(crate) const STATUS_BAR_H: f32 = 24.0;
 
+/// Default sidebar (left panel) width in pixels.
+pub(crate) const DEFAULT_SIDEBAR_W: f32 = 220.0;
+
+/// Default fraction of workspace height allocated to the editor pane.
+pub(crate) const DEFAULT_EDITOR_RATIO: f32 = 0.3;
+
+/// Default right panel width in pixels.
+pub(crate) const DEFAULT_RIGHT_PANEL_W: f32 = 280.0;
+
+/// Minimum width for any side panel.
+pub(crate) const MIN_PANEL_W: f32 = 120.0;
+
+/// Minimum width for the central workspace.
+pub(crate) const MIN_WORKSPACE_W: f32 = 200.0;
+
+/// Minimum fraction for the editor/canvas vertical split.
+pub(crate) const MIN_PANE_RATIO: f32 = 0.1;
+
+/// Maximum fraction for the editor/canvas vertical split.
+pub(crate) const MAX_PANE_RATIO: f32 = 0.9;
+
+/// Width/height of resize drag handles in pixels.
+pub(crate) const RESIZE_HANDLE_SIZE: f32 = 6.0;
+
+// ── Drag marker types ─────────────────────────────────────────────────────────
+
+/// Drag marker for resizing the left sidebar edge.
+pub(crate) struct ResizeSidebar;
+impl Render for ResizeSidebar {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// Drag marker for resizing the editor/canvas vertical split.
+pub(crate) struct ResizeEditorCanvas;
+impl Render for ResizeEditorCanvas {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// Drag marker for resizing the right panel edge.
+pub(crate) struct ResizeRightPanel;
+impl Render for ResizeRightPanel {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 pub struct AppView {
     pub(crate) graph_canvas: Entity<GraphCanvas>,
     pub(crate) tree_panel: Entity<TreePanel>,
     pub(crate) node_editor: Entity<NodeEditorPanel>,
+    pub(crate) right_panel: Entity<RightPanel>,
     #[allow(dead_code)]
     pub(crate) selection: Entity<SelectionModel>,
     pub(crate) snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -34,6 +86,12 @@ pub struct AppView {
     pub(crate) view_menu_open: bool,
     pub(crate) sidebar_open: bool,
     pub(crate) right_panel_open: bool,
+    /// Current sidebar width in pixels (user-resizable).
+    pub(crate) sidebar_width: f32,
+    /// Fraction of workspace height for the editor pane (0.0..1.0).
+    pub(crate) editor_ratio: f32,
+    /// Current right panel width in pixels (user-resizable).
+    pub(crate) right_panel_width: f32,
     /// Status message displayed in the status bar during/after data operations.
     pub(crate) data_status: Option<String>,
 }
@@ -63,10 +121,12 @@ impl AppView {
                 cx,
             )
         });
+        let right_panel = cx.new(|_| RightPanel::new());
         Self {
             graph_canvas,
             tree_panel,
             node_editor,
+            right_panel,
             selection,
             snapshot: snapshot_arc,
             graph,
@@ -76,6 +136,9 @@ impl AppView {
             view_menu_open: false,
             sidebar_open: false,
             right_panel_open: false,
+            sidebar_width: DEFAULT_SIDEBAR_W,
+            editor_ratio: DEFAULT_EDITOR_RATIO,
+            right_panel_width: DEFAULT_RIGHT_PANEL_W,
             data_status: None,
         }
     }
