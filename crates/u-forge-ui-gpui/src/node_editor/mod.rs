@@ -10,7 +10,7 @@ use u_forge_core::{EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, SchemaMan
 use u_forge_graph_view::GraphSnapshot;
 
 use crate::selection_model::SelectionModel;
-use crate::text_field::{TextChanged, TextFieldView};
+use crate::text_field::{TextArrowKey, TextChanged, TextFieldView, TextSubmit};
 
 pub(crate) use field_spec::{EditableEdge, EditorTab, FieldKind};
 
@@ -29,6 +29,12 @@ pub(crate) struct EdgeNodeDropdown {
     pub(crate) filter_text: String,
     /// Subscription that keeps the `TextChanged` handler alive.
     pub(crate) _filter_sub: Subscription,
+    /// Subscription that selects the highlighted result when Enter is pressed.
+    pub(crate) _submit_sub: Subscription,
+    /// Subscription that moves the highlight on Up/Down arrow keys.
+    pub(crate) _arrow_sub: Subscription,
+    /// Index of the currently highlighted candidate (0 = first).
+    pub(crate) highlighted_idx: usize,
 }
 
 // ── Node editor panel ─────────────────────────────────────────────────────────
@@ -232,6 +238,7 @@ impl NodeEditorPanel {
             original_edges: Vec::new(),
             edge_type_entities: Vec::new(),
             is_new,
+            active_subtab: field_spec::SubTab::default(),
         };
         let specs = tmp_tab.field_specs();
         for spec in &specs {
@@ -286,6 +293,7 @@ impl NodeEditorPanel {
             original_edges: db_edges,
             edge_type_entities,
             is_new,
+            active_subtab: field_spec::SubTab::default(),
         };
 
         // Replace the first unpinned non-dirty tab, or append.
@@ -540,11 +548,16 @@ impl NodeEditorPanel {
 
     // ── Edge editing helpers ──────────────────────────────────────────────
 
-    /// Add a new empty edge row to the active tab and create its type-field entity.
+    /// Add a new edge row to the active tab, pre-populated with the current node as source.
     pub(crate) fn add_edge_row(&mut self, cx: &mut Context<Self>) {
         if let Some(tab_idx) = self.active_tab {
             if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                tab.edited_edges.push(EditableEdge::empty());
+                let node_id = tab.node_id;
+                let node_name = tab.name.clone();
+                let mut edge = EditableEdge::empty();
+                edge.from = Some(node_id);
+                edge.from_name = node_name;
+                tab.edited_edges.push(edge);
                 let entity = cx.new(|cx| TextFieldView::new(false, "edge type", cx));
                 tab.edge_type_entities.push(entity);
                 tab.recompute_dirty();
@@ -592,6 +605,64 @@ impl NodeEditorPanel {
             move |this: &mut Self, _tf, event: &TextChanged, cx| {
                 if let Some(dd) = &mut this.edge_node_dropdown {
                     dd.filter_text = event.0.clone();
+                    dd.highlighted_idx = 0; // Reset to first result when filter changes.
+                }
+                cx.notify();
+            }
+        });
+
+        let submit_sub = cx.subscribe(&filter_entity, {
+            move |this: &mut Self, _tf, _event: &TextSubmit, cx| {
+                let (filter_lower, highlighted) = match &this.edge_node_dropdown {
+                    Some(dd) => (dd.filter_text.to_lowercase(), dd.highlighted_idx),
+                    None => return,
+                };
+                let snap = this.snapshot.read();
+                let mut candidates: Vec<(u_forge_core::ObjectId, String)> = snap
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        filter_lower.is_empty()
+                            || n.name.to_lowercase().contains(&filter_lower)
+                            || n.object_type.to_lowercase().contains(&filter_lower)
+                    })
+                    .map(|n| (n.id, n.name.clone()))
+                    .collect();
+                drop(snap);
+                candidates.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                let target = highlighted.min(candidates.len().saturating_sub(1));
+                if let Some((id, name)) = candidates.into_iter().nth(target) {
+                    this.select_edge_node(id, name, cx);
+                }
+            }
+        });
+
+        let arrow_sub = cx.subscribe(&filter_entity, {
+            move |this: &mut Self, _tf, event: &TextArrowKey, cx| {
+                let filter_lower = match &this.edge_node_dropdown {
+                    Some(dd) => dd.filter_text.to_lowercase(),
+                    None => return,
+                };
+                let snap = this.snapshot.read();
+                let count = snap
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        filter_lower.is_empty()
+                            || n.name.to_lowercase().contains(&filter_lower)
+                            || n.object_type.to_lowercase().contains(&filter_lower)
+                    })
+                    .count()
+                    .min(10);
+                drop(snap);
+                if let Some(dd) = &mut this.edge_node_dropdown {
+                    if event.0 {
+                        // Down
+                        dd.highlighted_idx = (dd.highlighted_idx + 1).min(count.saturating_sub(1));
+                    } else {
+                        // Up
+                        dd.highlighted_idx = dd.highlighted_idx.saturating_sub(1);
+                    }
                 }
                 cx.notify();
             }
@@ -603,6 +674,9 @@ impl NodeEditorPanel {
             filter_entity,
             filter_text: String::new(),
             _filter_sub: sub,
+            _submit_sub: submit_sub,
+            _arrow_sub: arrow_sub,
+            highlighted_idx: 0,
         });
         cx.notify();
     }

@@ -31,6 +31,17 @@ pub(crate) const EDGE_SECTION_HEADER_H: f32 = 28.0;
 /// Height of the "Add Edge" button row.
 pub(crate) const EDGE_ADD_BTN_H: f32 = 28.0;
 
+/// Height of the Properties / Edges sub-tab bar inside each node editor tab.
+pub(crate) const SUBTAB_BAR_H: f32 = 24.0;
+
+/// Which sub-tab is active inside a node editor tab.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub(crate) enum SubTab {
+    #[default]
+    Properties,
+    Edges,
+}
+
 // ── Field types ───────────────────────────────────────────────────────────────
 
 /// Infer a FieldKind from a JSON value's runtime type, used as a fallback when
@@ -186,6 +197,9 @@ pub(crate) struct EditorTab {
     /// `is_new` **and** have an empty name are discarded and the DB record is
     /// deleted.
     pub(crate) is_new: bool,
+
+    /// Which sub-tab (Properties or Edges) is currently visible.
+    pub(crate) active_subtab: SubTab,
 }
 
 impl EditorTab {
