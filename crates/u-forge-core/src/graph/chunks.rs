@@ -158,4 +158,21 @@ impl KnowledgeGraphStorage {
         }
         Ok(chunks)
     }
+
+    /// Delete all text chunks belonging to `node_id`.
+    ///
+    /// This removes the chunk rows from `chunks`; the `chunks_ad` and
+    /// `chunks_vec_ad` / `chunks_vec_hq_ad` triggers automatically clean up
+    /// the corresponding FTS5 and vector-index entries.
+    ///
+    /// Used by the rechunk-on-save path to replace stale chunks with freshly
+    /// flattened content.
+    pub fn delete_chunks_for_node(&self, node_id: ObjectId) -> Result<usize> {
+        let conn = self.conn.lock();
+        let id_str = node_id.hyphenated().to_string();
+        let deleted = conn
+            .execute("DELETE FROM chunks WHERE object_id = ?1", params![id_str])
+            .context("Failed to delete chunks for node")?;
+        Ok(deleted)
+    }
 }

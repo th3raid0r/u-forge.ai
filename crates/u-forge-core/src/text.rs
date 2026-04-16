@@ -1,13 +1,22 @@
 //! Text splitting utility for chunk-size management.
 
+use std::sync::LazyLock;
+
+use tiktoken_rs::CoreBPE;
+
 use crate::graph::MAX_CHUNK_TOKENS;
+
+/// Cached o200k_harmony BPE tokenizer — constructed once, reused forever.
+///
+/// `o200k_harmony()` parses a ~200 k-entry vocabulary on every call; caching
+/// it here turns repeated `count_tokens` invocations (e.g. inside
+/// [`split_text`]'s per-word loop) from O(N × vocab_parse) into O(N × encode).
+static O200K_BPE: LazyLock<CoreBPE> =
+    LazyLock::new(|| tiktoken_rs::o200k_harmony().expect("o200k_harmony is always available"));
 
 /// Count tokens in `text` using the o200k_harmony BPE tokenizer.
 pub(crate) fn count_tokens(text: &str) -> usize {
-    tiktoken_rs::o200k_harmony()
-        .expect("o200k_harmony is always available")
-        .encode_with_special_tokens(text)
-        .len()
+    O200K_BPE.encode_with_special_tokens(text).len()
 }
 
 /// Split `text` into pieces of at most [`MAX_CHUNK_TOKENS`] tokens, breaking
@@ -96,10 +105,7 @@ mod tests {
         // Build content clearly longer than MAX_CHUNK_TOKENS tokens.
         let word = "extraordinary"; // ~3 tokens each
         let repeats = (MAX_CHUNK_TOKENS / 3) * 4;
-        let content = (0..repeats)
-            .map(|_| word)
-            .collect::<Vec<_>>()
-            .join(" ");
+        let content = (0..repeats).map(|_| word).collect::<Vec<_>>().join(" ");
 
         assert!(
             count_tokens(&content) > MAX_CHUNK_TOKENS,
@@ -118,10 +124,7 @@ mod tests {
         }
 
         let original_words: Vec<_> = content.split_whitespace().collect();
-        let rejoined_words: Vec<_> = pieces
-            .iter()
-            .flat_map(|p| p.split_whitespace())
-            .collect();
+        let rejoined_words: Vec<_> = pieces.iter().flat_map(|p| p.split_whitespace()).collect();
         assert_eq!(original_words, rejoined_words);
     }
 

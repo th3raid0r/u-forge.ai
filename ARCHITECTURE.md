@@ -95,21 +95,25 @@ All paths below are relative to `crates/u-forge-agent/`.
 
 | File | Role | Key Types |
 |---|---|---|
-| `src/lib.rs` | All agent types, tools, and stream events | `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `GraphAgent`, `AgentStreamEvent` |
+| `src/lib.rs` | All agent types, tools, and stream events | `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `UpsertNodeTool`, `UpsertEdgeTool`, `GraphAgent`, `AgentStreamEvent`, `ToolError` |
 
 **Tools** (all implement `rig::tool::Tool`):
 - `FtsSearchTool` — wraps `KnowledgeGraph::search_chunks_fts()`; groups results by node. Args: `FtsSearchArgs { query, limit }`.
 - `SemanticSearchTool` — embeds the query via `InferenceQueue::embed()`, runs `search_chunks_semantic()`; groups by node with distances. Args: `SemanticSearchArgs { query, limit }`.
 - `HybridSearchTool` — calls `search::search_hybrid()`; returns fully hydrated `NodeSearchResult` entries including edges and content. Args: `HybridSearchArgs { query, limit, alpha, rerank }`.
+- `UpsertNodeTool` — creates or updates a node; re-chunks and embeds (standard + HQ) before returning. Args: `UpsertNodeArgs { node_id, name, object_type, description, properties, tags }`.
+- `UpsertEdgeTool` — creates or updates an edge; re-embeds both endpoint nodes. Resolves nodes by UUID or exact name via `resolve_node()` helper. Args: `UpsertEdgeArgs { source, target, edge_type, weight }`.
 
-**`GraphAgent`** wraps a `rig::providers::openai::CompletionsClient` pointed at Lemonade's `/api/v1` endpoint. Built via `GraphAgent::new(url, graph, queue, system_prompt)`. Each call constructs a fresh rig agent with all three tools registered.
+**`GraphAgent`** wraps a `rig::providers::openai::CompletionsClient` pointed at Lemonade's `/api/v1` endpoint. Built via `GraphAgent::new(url, graph, queue, hq_queue, system_prompt)`. Each call constructs a fresh rig agent with all five tools registered.
 
-- `prompt(model_id, msg, max_turns)` — blocking multi-turn tool loop; returns final response string.
-- `prompt_stream(model_id, msg, max_turns)` — returns `mpsc::Receiver<AgentStreamEvent>`; spawns a tokio task that drives `agent.stream_prompt(&msg).multi_turn(n).await` and forwards events.
+- `prompt(model_id, msg, history, max_turns)` — blocking multi-turn tool loop; returns final response string.
+- `prompt_stream(model_id, msg, history, max_turns)` — returns `mpsc::Receiver<AgentStreamEvent>`; spawns a tokio task that drives `agent.stream_prompt(&msg).multi_turn(n).await` and forwards events.
 
 **`AgentStreamEvent`** variants: `ReasoningDelta(String)`, `TextDelta(String)`, `ToolCallStart { internal_id, name, args_display }`, `ToolResult { internal_id, content }`, `Done(String)`, `Error(String)`.
 
 **Note on `fts5_sanitize`:** `u-forge-core::search::sanitize::fts5_sanitize` is `pub(super)` and not re-exported; `u-forge-agent` inlines the same logic (keep only alphanumeric + spaces, collapse whitespace).
+
+**`ToolError`** (renamed from `SearchToolError`) is the shared error type for all five tools: wraps an `anyhow::Error` as a `String`.
 
 ## Module Map (u-forge-ui-gpui)
 
@@ -790,6 +794,20 @@ tool for migrating legacy MemoryMesh exports.
 type and name already exists, the existing ID is reused (no duplicates).
 `resolve_node_id` calls `KnowledgeGraph::find_by_name_only` as a storage fallback
 before failing, allowing edges to reference nodes from prior import sessions.
+
+### Per-Node Re-Chunking (`src/ingest/embedding.rs`)
+
+`rechunk_and_embed(graph, queue, hq_queue, object_id)` is the per-node analogue of `embed_all_chunks`:
+1. Load node metadata and resolve edge display lines.
+2. Delete existing chunks (triggers clean up FTS5 + vector indexes).
+3. Flatten via `ObjectMetadata::flatten_for_embedding()`.
+4. Create new chunks via `add_text_chunk()`.
+5. Embed each chunk with the standard queue (768-dim).
+6. If `hq_queue` is provided, embed each chunk at high quality (4096-dim).
+
+The function blocks until all embeddings are stored, so callers (agent tools, UI save) can guarantee the node is immediately searchable after the call returns.
+
+`KnowledgeGraph::delete_chunks_for_node(object_id)` (added in `graph/chunks.rs`) runs `DELETE FROM chunks WHERE object_id = ?1` — the existing triggers on `chunks` automatically clean up FTS5 and both vector-index tables.
 
 ---
 

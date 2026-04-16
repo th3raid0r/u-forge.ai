@@ -289,11 +289,7 @@ pub enum ChunkType {
 
 impl TextChunk {
     pub fn new(object_id: ObjectId, content: String, chunk_type: ChunkType) -> Self {
-        let token_count = tiktoken_rs::o200k_harmony()
-            .expect("o200k_harmony is always available")
-            .encode_with_special_tokens(&content)
-            .len()
-            .max(1);
+        let token_count = crate::text::count_tokens(&content).max(1);
         Self {
             id: ChunkId::new_v4(),
             object_id,

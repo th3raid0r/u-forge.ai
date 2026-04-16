@@ -183,14 +183,13 @@ impl NodeEditorPanel {
         self._field_subs.clear();
         for (key, entity) in &field_entities {
             let key: String = key.clone();
-            let sub =
-                cx.subscribe(entity, move |this: &mut Self, _tf, event: &TextChanged, cx| {
+            let sub = cx.subscribe(
+                entity,
+                move |this: &mut Self, _tf, event: &TextChanged, cx| {
                     if let Some(tab_idx) = this.active_tab {
                         if let Some(tab) = this.tabs.get_mut(tab_idx) {
-                            tab.edited_values.insert(
-                                key.clone(),
-                                serde_json::Value::String(event.0.clone()),
-                            );
+                            tab.edited_values
+                                .insert(key.clone(), serde_json::Value::String(event.0.clone()));
                             if key == "name" {
                                 tab.name = event.0.clone();
                             }
@@ -198,7 +197,8 @@ impl NodeEditorPanel {
                             cx.notify();
                         }
                     }
-                });
+                },
+            );
             self._field_subs.push(sub);
         }
 
@@ -242,9 +242,14 @@ impl NodeEditorPanel {
         }
     }
 
-    /// Collect dirty tabs and save them to the DB. Returns count of saved nodes.
-    pub(crate) fn save_dirty_tabs(&mut self) -> usize {
+    /// Collect dirty tabs and save them to the DB.
+    ///
+    /// Returns `(count, saved_ids)` — the number of nodes persisted and the
+    /// [`ObjectId`] of each one, so the caller can trigger per-node
+    /// re-chunking and re-embedding.
+    pub(crate) fn save_dirty_tabs(&mut self) -> (usize, Vec<ObjectId>) {
         let mut saved = 0;
+        let mut saved_ids = Vec::new();
         for tab in &mut self.tabs {
             if !tab.dirty {
                 continue;
@@ -284,12 +289,13 @@ impl NodeEditorPanel {
             }
 
             if self.graph.update_object(meta.clone()).is_ok() {
+                saved_ids.push(tab.node_id);
                 tab.original = meta;
                 tab.dirty = false;
                 saved += 1;
             }
         }
-        saved
+        (saved, saved_ids)
     }
 
     /// Return true if any tab has unsaved changes.

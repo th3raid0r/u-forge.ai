@@ -6,14 +6,15 @@ use gpui::{prelude::*, Context, Empty, Entity};
 use parking_lot::RwLock;
 use u_forge_agent::GraphAgent;
 use u_forge_core::{
-    AppConfig, EmbeddingTarget, KnowledgeGraph, SchemaManager,
     embed_all_chunks,
+    ingest::{build_hq_embed_queue, rechunk_and_embed},
     lemonade::{
-        Capability, GpuResourceManager, LemonadeServerCatalog, ProviderFactory,
-        resolve_lemonade_url, ModelSelector, QualityTier,
+        resolve_lemonade_url, Capability, GpuResourceManager, LemonadeServerCatalog, ModelSelector,
+        ProviderFactory, QualityTier,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
-    ingest::build_hq_embed_queue,
+    types::ObjectId,
+    AppConfig, EmbeddingTarget, KnowledgeGraph, SchemaManager,
 };
 use u_forge_graph_view::GraphSnapshot;
 
@@ -139,11 +140,9 @@ impl AppView {
     ) -> Self {
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
         let selection = cx.new(|_cx| SelectionModel::new(snapshot_arc.clone()));
-        let graph_canvas = cx.new(|cx| {
-            GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx)
-        });
-        let tree_panel =
-            cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
+        let graph_canvas = cx
+            .new(|cx| GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx));
+        let tree_panel = cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
         let search_panel = cx.new(|cx| {
             SearchPanel::new(
                 selection.clone(),
@@ -208,7 +207,8 @@ impl AppView {
         match u_forge_graph_view::build_snapshot(&self.graph) {
             Ok(snap) => {
                 *self.snapshot.write() = snap;
-                self.tree_panel.update(cx, |panel, cx| panel.refresh_groups(cx));
+                self.tree_panel
+                    .update(cx, |panel, cx| panel.refresh_groups(cx));
                 cx.notify();
             }
             Err(e) => {
@@ -273,7 +273,7 @@ impl AppView {
         self.graph_canvas.read(cx).save_layout();
 
         // 2. Save all dirty editor tabs.
-        let saved = self
+        let (saved, saved_ids) = self
             .node_editor
             .update(cx, |editor, _cx| editor.save_dirty_tabs());
 
@@ -299,9 +299,79 @@ impl AppView {
             }
             drop(snap);
             eprintln!("Saved {} node(s).", saved);
+
+            // 3. Re-chunk and embed every saved node so semantic search stays current.
+            if !saved_ids.is_empty() {
+                self.do_rechunk_and_embed(saved_ids, cx);
+            }
         }
 
         cx.notify();
+    }
+
+    /// Asynchronously re-chunk and embed a set of nodes (standard + optional HQ).
+    ///
+    /// Used by [`do_save`] to keep embeddings in sync with edited node content.
+    /// Each node's old chunks are deleted, fresh chunks are created from the
+    /// flattened metadata, and embeddings are computed before the task completes.
+    fn do_rechunk_and_embed(&mut self, node_ids: Vec<ObjectId>, cx: &mut Context<Self>) {
+        let queue = match self.inference_queue.clone() {
+            Some(q) => q,
+            None => return, // No embedding queue yet — nothing to do.
+        };
+        let hq_queue = self.hq_queue.clone();
+        let graph = self.graph.clone();
+        let tokio_rt = self.tokio_rt.clone();
+        let count = node_ids.len();
+
+        self.embedding_status = Some(format!("Re-embedding {count} node(s)…"));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(async {
+                        let hq_ref = hq_queue.as_ref();
+                        let mut total_chunks = 0usize;
+                        let mut errors = 0usize;
+                        for oid in &node_ids {
+                            match rechunk_and_embed(&graph, &queue, hq_ref, *oid).await {
+                                Ok(n) => total_chunks += n,
+                                Err(e) => {
+                                    eprintln!("rechunk_and_embed({oid}): {e:#}");
+                                    errors += 1;
+                                }
+                            }
+                        }
+                        Ok::<_, anyhow::Error>((total_chunks, errors))
+                    })
+                })
+                .await;
+
+            this.update(cx, |view: &mut AppView, cx| {
+                match result {
+                    Ok((chunks, 0)) if chunks > 0 => {
+                        view.embedding_status = Some(format!("Re-embedded {chunks} chunk(s)"));
+                    }
+                    Ok((chunks, errs)) if errs > 0 => {
+                        view.embedding_status = Some(format!(
+                            "Re-embedded {chunks} chunk(s), {errs} node(s) failed"
+                        ));
+                    }
+                    Ok(_) => {
+                        view.embedding_status = None;
+                    }
+                    Err(e) => {
+                        eprintln!("Re-embed failed: {e}");
+                        view.embedding_status = Some(format!("Re-embed failed: {e}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Asynchronously discover Lemonade Server and build the InferenceQueue + ChatProvider.
@@ -328,12 +398,18 @@ impl AppView {
                         let embed_models = selector.select_embedding_models();
                         let reranker_sel = selector.select_reranker();
 
-                        let already_loaded: Vec<String> =
-                            catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
+                        let already_loaded: Vec<String> = catalog
+                            .loaded
+                            .iter()
+                            .map(|m| m.model_name.clone())
+                            .collect();
 
                         // Build provider specs for embedding + optional reranker.
                         let mut build_futs = Vec::new();
-                        for sel in embed_models.iter().filter(|s| s.quality_tier == QualityTier::Standard) {
+                        for sel in embed_models
+                            .iter()
+                            .filter(|s| s.quality_tier == QualityTier::Standard)
+                        {
                             let weight = match sel.recipe.as_str() {
                                 "flm" => app_config.embedding.npu_weight,
                                 "llamacpp" => match sel.backend.as_deref() {
@@ -344,11 +420,7 @@ impl AppView {
                                 },
                                 _ => app_config.embedding.cpu_weight,
                             };
-                            build_futs.push((
-                                sel.clone(),
-                                Capability::Embedding,
-                                weight,
-                            ));
+                            build_futs.push((sel.clone(), Capability::Embedding, weight));
                         }
                         if let Some(r_sel) = reranker_sel {
                             build_futs.push((r_sel, Capability::Reranking, 100));
@@ -417,6 +489,9 @@ impl AppView {
                         view.inference_queue = Some(queue.clone());
                         view.hq_queue = hq_queue.clone();
 
+                        // Wrap HQ queue in Arc before it's consumed below.
+                        let hq_arc = hq_queue.clone().map(Arc::new);
+
                         // Push queues to search panel.
                         view.search_panel.update(cx, |panel, _cx| {
                             panel.set_queues(Some(queue.clone()), hq_queue);
@@ -425,7 +500,13 @@ impl AppView {
                         // Build the graph agent and wire it to the chat panel.
                         let graph = view.graph.clone();
                         let system_prompt = view.app_config.chat.system_prompt.clone();
-                        match GraphAgent::new(&lemonade_url, graph, Arc::new(queue), system_prompt) {
+                        match GraphAgent::new(
+                            &lemonade_url,
+                            graph,
+                            Arc::new(queue),
+                            hq_arc,
+                            system_prompt,
+                        ) {
                             Ok(agent) => {
                                 view.chat_panel.update(cx, |panel, _cx| {
                                     panel.set_agent(agent);
@@ -479,7 +560,8 @@ impl AppView {
                             embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard).await?;
 
                         let hq_result = if let Some(hq) = &hq_queue {
-                            let r = embed_all_chunks(&graph, hq, EmbeddingTarget::HighQuality).await?;
+                            let r =
+                                embed_all_chunks(&graph, hq, EmbeddingTarget::HighQuality).await?;
                             Some(r)
                         } else {
                             None

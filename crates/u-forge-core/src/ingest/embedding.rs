@@ -39,6 +39,79 @@ pub struct EmbeddingResult {
     pub total: usize,
 }
 
+/// Re-chunk a single object and embed all its chunks, waiting until complete.
+///
+/// This is the per-node analogue of the bulk [`embed_all_chunks`] pipeline:
+/// 1. Load the node's metadata and resolve edge display lines.
+/// 2. Delete all existing chunks for the node (triggers clean up FTS5 + vector indexes).
+/// 3. Flatten the node into embedding text via [`ObjectMetadata::flatten_for_embedding`].
+/// 4. Create new chunk(s) via [`KnowledgeGraph::add_text_chunk`].
+/// 5. Embed every chunk with `queue` (standard 768-dim).
+/// 6. If `hq_queue` is provided, also embed every chunk at high quality (4096-dim).
+///
+/// Returns the number of chunks created (and embedded).
+///
+/// # Errors
+/// - Node not found.
+/// - Embedding queue has no workers.
+/// - Any individual embed or upsert call fails.
+pub async fn rechunk_and_embed(
+    graph: &KnowledgeGraph,
+    queue: &InferenceQueue,
+    hq_queue: Option<&InferenceQueue>,
+    object_id: crate::types::ObjectId,
+) -> Result<usize> {
+    use crate::types::ChunkType;
+
+    let meta = graph
+        .get_object(object_id)?
+        .ok_or_else(|| anyhow::anyhow!("Node {object_id} not found"))?;
+
+    let edge_lines = graph.edge_display_lines(&meta);
+    let flat_text = meta.flatten_for_embedding(&edge_lines);
+
+    // Remove stale chunks (triggers clean up FTS5 + vector tables).
+    let deleted = graph.delete_chunks_for_node(object_id)?;
+    if deleted > 0 {
+        tracing::debug!(object_id = %object_id, deleted, "Deleted old chunks");
+    }
+
+    // Create fresh chunks from the flattened text.
+    let chunk_ids = graph.add_text_chunk(object_id, flat_text, ChunkType::Description)?;
+    if chunk_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Retrieve the newly created chunks so we have their content for embedding.
+    let chunks = graph.get_text_chunks(object_id)?;
+
+    // Embed every chunk with the standard queue.
+    for chunk in &chunks {
+        let vec = queue.embed(&chunk.content).await?;
+        graph.upsert_chunk_embedding(chunk.id, &vec)?;
+    }
+
+    // Embed with the HQ queue if available.
+    if let Some(hq) = hq_queue {
+        if hq.has_embedding() {
+            for chunk in &chunks {
+                let hq_vec = hq.embed(&chunk.content).await?;
+                graph.upsert_chunk_embedding_hq(chunk.id, &hq_vec)?;
+            }
+        }
+    }
+
+    tracing::info!(
+        object_id = %object_id,
+        name = %meta.name,
+        chunks = chunks.len(),
+        hq = hq_queue.map_or(false, |q| q.has_embedding()),
+        "Rechunked and embedded node"
+    );
+
+    Ok(chunks.len())
+}
+
 /// Embed all un-embedded chunks in `graph` using `queue`.
 ///
 /// Returns `Ok(EmbeddingResult)` with `total == 0` when:
@@ -145,7 +218,11 @@ pub async fn build_hq_embed_queue(
     let hq_model_id = hq_model.model_id.clone();
     info!(model = %hq_model_id, "Loading HQ embedding model");
 
-    let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
+    let already_loaded: Vec<String> = catalog
+        .loaded
+        .iter()
+        .map(|m| m.model_name.clone())
+        .collect();
 
     let built: BuiltProvider = match ProviderFactory::build(
         &hq_model,
@@ -165,7 +242,8 @@ pub async fn build_hq_embed_queue(
     };
 
     // Verify dimensions before registering.
-    if let crate::lemonade::provider_factory::ProviderSlot::Embedding(ref provider) = built.provider {
+    if let crate::lemonade::provider_factory::ProviderSlot::Embedding(ref provider) = built.provider
+    {
         let dims = provider.dimensions().unwrap_or(0);
         if dims != HIGH_QUALITY_EMBEDDING_DIMENSIONS {
             warn!(
@@ -277,7 +355,10 @@ mod tests {
         }
 
         let stats = graph.get_stats().unwrap();
-        assert_eq!(stats.chunk_count, 10, "Expected 10 chunks after initial inserts");
+        assert_eq!(
+            stats.chunk_count, 10,
+            "Expected 10 chunks after initial inserts"
+        );
         assert_eq!(stats.embedded_count, 0, "No chunks embedded yet");
 
         // First pass: embed all 10.
@@ -290,7 +371,10 @@ mod tests {
         assert_eq!(result.skipped, 0);
 
         let stats = graph.get_stats().unwrap();
-        assert_eq!(stats.embedded_count, 10, "All 10 chunks should now be embedded");
+        assert_eq!(
+            stats.embedded_count, 10,
+            "All 10 chunks should now be embedded"
+        );
 
         // Add 2 more objects with chunks.
         for i in 10..12 {
@@ -308,18 +392,27 @@ mod tests {
 
         let stats = graph.get_stats().unwrap();
         assert_eq!(stats.chunk_count, 12);
-        assert_eq!(stats.embedded_count, 10, "The 2 new chunks should be unembedded");
+        assert_eq!(
+            stats.embedded_count, 10,
+            "The 2 new chunks should be unembedded"
+        );
 
         // Second pass: only the 2 new chunks should be processed.
         let result = embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard)
             .await
             .unwrap();
 
-        assert_eq!(result.total, 2, "Only 2 unembedded chunks should be processed");
+        assert_eq!(
+            result.total, 2,
+            "Only 2 unembedded chunks should be processed"
+        );
         assert_eq!(result.stored, 2);
         assert_eq!(result.skipped, 0);
 
         let stats = graph.get_stats().unwrap();
-        assert_eq!(stats.embedded_count, 12, "All 12 chunks should now be embedded");
+        assert_eq!(
+            stats.embedded_count, 12,
+            "All 12 chunks should now be embedded"
+        );
     }
 }

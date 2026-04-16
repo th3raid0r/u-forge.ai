@@ -33,30 +33,32 @@ pub mod types;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use ai::embeddings::{
-    EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
-    LemonadeProvider,
+    EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType, LemonadeProvider,
 };
 pub use builder::ObjectBuilder;
-pub use config::{AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig, ModelConfig, ModelLoadParams, StorageConfig};
+pub use config::{
+    AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig,
+    ModelConfig, ModelLoadParams, StorageConfig,
+};
 pub use graph::{
     GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
     HIGH_QUALITY_EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS,
 };
+pub use ingest::{
+    build_hq_embed_queue, embed_all_chunks, rechunk_and_embed, setup_and_index, DataIngestion,
+    EmbeddingResult, EmbeddingTarget, IngestionStats, SetupResult,
+};
 pub use lemonade::{
-    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, StreamToken,
+    load_model, ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage,
     GpuResourceManager, GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth,
     LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, LoadedModelEntry, ModelLoadOptions,
-    SttGuard, TranscriptionResult, load_model,
-};
-pub use ingest::{
-    build_hq_embed_queue, embed_all_chunks, setup_and_index, DataIngestion, EmbeddingResult,
-    EmbeddingTarget, IngestionStats, SetupResult,
-};
-pub use schema::{
-    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType, SchemaDefinition,
-    ValidationResult, SchemaIngestion, SchemaManager, SchemaStats,
+    StreamToken, SttGuard, TranscriptionResult,
 };
 pub use rag::{build_rag_messages, format_search_context, RagContext};
+pub use schema::{
+    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType, SchemaDefinition,
+    SchemaIngestion, SchemaManager, SchemaStats, ValidationResult,
+};
 pub use search::{
     search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
 };
@@ -222,11 +224,7 @@ impl KnowledgeGraph {
     /// Return a page of nodes ordered by name.
     ///
     /// Use for incremental full-graph snapshots without loading all nodes at once.
-    pub fn get_nodes_paginated(
-        &self,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<ObjectMetadata>> {
+    pub fn get_nodes_paginated(&self, offset: usize, limit: usize) -> Result<Vec<ObjectMetadata>> {
         self.storage.get_nodes_paginated(offset, limit)
     }
 
@@ -323,6 +321,14 @@ impl KnowledgeGraph {
         self.storage.get_unembedded_chunks_hq()
     }
 
+    /// Delete all text chunks belonging to `object_id`.
+    ///
+    /// Triggers on `chunks` automatically clean up FTS5 and vector-index rows.
+    /// Returns the number of chunks deleted.
+    pub fn delete_chunks_for_node(&self, object_id: ObjectId) -> Result<usize> {
+        self.storage.delete_chunks_for_node(object_id)
+    }
+
     // ── Search ────────────────────────────────────────────────────────────────
 
     /// Exact name lookup scoped to a single object type.
@@ -392,7 +398,8 @@ impl KnowledgeGraph {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
-        self.storage.search_chunks_semantic_hq(query_embedding, limit)
+        self.storage
+            .search_chunks_semantic_hq(query_embedding, limit)
     }
 
     // ── Graph traversal ───────────────────────────────────────────────────────
