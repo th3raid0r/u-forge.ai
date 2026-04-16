@@ -289,26 +289,20 @@ pub enum ChunkType {
 
 impl TextChunk {
     pub fn new(object_id: ObjectId, content: String, chunk_type: ChunkType) -> Self {
+        let token_count = tiktoken_rs::o200k_harmony()
+            .expect("o200k_harmony is always available")
+            .encode_with_special_tokens(&content)
+            .len()
+            .max(1);
         Self {
             id: ChunkId::new_v4(),
             object_id,
-            token_count: estimate_token_count(&content),
+            token_count,
             content,
             created_at: chrono::Utc::now(),
             chunk_type,
         }
     }
-}
-
-/// Conservative token count estimation.
-///
-/// Uses ~3 characters per token, which is closer to the actual ratio for
-/// dense English prose (character backstories, location descriptions, lore
-/// entries). This intentionally overestimates slightly to avoid exceeding LLM
-/// context windows when assembling RAG context. The same ratio is used by
-/// `split_text()` in `text.rs`.
-fn estimate_token_count(text: &str) -> usize {
-    text.len().div_ceil(3).max(1)
 }
 
 /// Query result for graph traversal and search

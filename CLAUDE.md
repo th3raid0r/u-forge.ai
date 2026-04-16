@@ -43,5 +43,5 @@ See `.rules` for the full list. Summary:
 
 ## Active Features
 
-- **`feature_UI.md`** — Alpha complete. Native GPUI desktop app: graph canvas with pan/zoom/LOD, schema-driven node editor with browser-style tabs, FTS5/semantic/hybrid search panel, streaming LLM chat panel with model selector and thinking separation. Crates: `u-forge-graph-view`, `u-forge-ui-traits`, `u-forge-ui-gpui`.
+- **`feature_UI.md`** — Alpha complete. Native GPUI desktop app: graph canvas with pan/zoom/LOD, schema-driven node editor with browser-style tabs, FTS5/semantic/hybrid search panel, streaming LLM chat panel with rig-based agent tool loop (collapsible tool calls, streaming reasoning/thinking). Crates: `u-forge-graph-view`, `u-forge-ui-traits`, `u-forge-ui-gpui`, `u-forge-agent`.
 - **`feature_TS-Agent-Sandbox.md`** — Not started. Embedded V8 TypeScript sandbox: `u-forge-ts-runtime` with `deno_core` ops and `.d.ts` contract. Skeleton crate at `crates/u-forge-ts-runtime/`.

@@ -196,7 +196,19 @@ impl TextFieldView {
                     let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
                     y_acc += line_h * visual_rows;
                 }
-                (px(0.0), y_acc)
+                // Byte offset is past the known layout (stale layout after typing).
+                // Clamp to the end of the last line instead of jumping below it.
+                if let Some((_, last_wl)) = lines.last() {
+                    let last_rows = (last_wl.wrap_boundaries().len() + 1) as f32;
+                    let last_line_y = y_acc - line_h * last_rows;
+                    if let Some(pos) = last_wl.position_for_index(last_wl.len(), line_h) {
+                        (pos.x, last_line_y + pos.y)
+                    } else {
+                        (last_wl.width(), last_line_y + line_h * (last_rows - 1.0))
+                    }
+                } else {
+                    (px(0.0), px(0.0))
+                }
             }
             None => (px(0.0), px(0.0)),
         }
@@ -236,6 +248,13 @@ impl TextFieldView {
     /// previous paint frame. Called from key/mouse handlers — NOT from paint.
     fn scroll_to_cursor(&mut self) {
         if self.multiline {
+            // While the field is still growing (content_height < max), the div
+            // expands to fit so the cursor is always visible — no scroll needed.
+            // Only engage viewport-following once the field has hit its cap.
+            if self.content_height < TEXT_FIELD_MAX_H {
+                self.scroll_offset = 0.0;
+                return;
+            }
             let (_, cy) = self.cursor_pos_from_layout(self.cursor);
             self.ensure_cursor_visible(f32::from(cy), self.visible_height);
         } else {

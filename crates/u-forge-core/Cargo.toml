@@ -56,6 +56,9 @@ mime_guess = "2.0"
 # Regular expressions (schema property validation)
 regex = "1.10"
 
+# Tokenizer (real token counting for chunk splitting and RAG context assembly)
+tiktoken-rs = "0.11.0"
+
 # TOML configuration (device config files)
 toml = "0.8"
 

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use gpui::{prelude::*, Context, Empty, Entity};
 use parking_lot::RwLock;
+use u_forge_agent::GraphAgent;
 use u_forge_core::{
     AppConfig, EmbeddingTarget, KnowledgeGraph, SchemaManager,
     embed_all_chunks,
@@ -164,7 +165,8 @@ impl AppView {
         let chat_panel = cx.new(|cx| {
             ChatPanel::new(
                 app_config.chat.system_prompt.clone(),
-                app_config.chat.max_history_turns,
+                app_config.chat.max_context_tokens,
+                app_config.chat.response_reserve,
                 tokio_rt.clone(),
                 cx,
             )
@@ -403,24 +405,38 @@ impl AppView {
                             u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
                         });
 
-                        Ok((queue, hq_queue, chat_provider, llm_available))
+                        Ok((url, queue, hq_queue, chat_provider, llm_available))
                     })
                 })
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
-                    Ok((queue, hq_queue, chat_provider, llm_models)) => {
+                    Ok((lemonade_url, queue, hq_queue, chat_provider, llm_models)) => {
                         eprintln!("Lemonade connected — embedding queue ready");
                         view.inference_queue = Some(queue.clone());
                         view.hq_queue = hq_queue.clone();
 
                         // Push queues to search panel.
                         view.search_panel.update(cx, |panel, _cx| {
-                            panel.set_queues(Some(queue), hq_queue);
+                            panel.set_queues(Some(queue.clone()), hq_queue);
                         });
 
-                        // Push chat provider to chat panel.
+                        // Build the graph agent and wire it to the chat panel.
+                        let graph = view.graph.clone();
+                        let system_prompt = view.app_config.chat.system_prompt.clone();
+                        match GraphAgent::new(&lemonade_url, graph, Arc::new(queue), system_prompt) {
+                            Ok(agent) => {
+                                view.chat_panel.update(cx, |panel, _cx| {
+                                    panel.set_agent(agent);
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("GraphAgent init failed: {e}");
+                            }
+                        }
+
+                        // Push chat provider to chat panel (model list + direct streaming fallback).
                         if let Some(provider) = chat_provider {
                             view.chat_panel.update(cx, |panel, _cx| {
                                 panel.set_provider(provider, llm_models);
