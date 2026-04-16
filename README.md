@@ -78,7 +78,6 @@ u-forge.ai will detect the server automatically on startup. Semantic search and 
 1. **Polish the Alpha** — UI refinement, better onboarding, error handling.
 2. **AI agents** — Let AI assistants query and modify your knowledge graph autonomously via a sandboxed scripting environment.
 3. **Agentic workflows** — Higher-level automation: "fill in the history of this faction", "suggest connections between these characters".
-4. **Web UI** — A browser-based interface once the core feature set stabilizes.
 
 ---
 
