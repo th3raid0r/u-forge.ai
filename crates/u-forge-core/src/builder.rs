@@ -65,7 +65,7 @@ impl ObjectBuilder {
     }
 
     pub fn with_description(mut self, description: String) -> Self {
-        self.metadata.description = Some(description);
+        self.metadata = self.metadata.with_description(description);
         self
     }
 
@@ -83,6 +83,7 @@ impl ObjectBuilder {
         self.metadata.add_tag(tag);
         self
     }
+
 
     /// Consume the builder and return the finished [`ObjectMetadata`].
     pub fn build(self) -> ObjectMetadata {

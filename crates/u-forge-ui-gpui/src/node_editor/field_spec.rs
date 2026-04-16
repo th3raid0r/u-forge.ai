@@ -339,7 +339,11 @@ impl EditorTab {
             .get("description")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        let orig_desc = orig.description.as_deref().filter(|s| !s.is_empty());
+        let orig_desc = orig
+            .properties
+            .get("description")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         let desc_changed = edited_desc != orig_desc;
 
         let mut props_changed = false;
@@ -385,7 +389,17 @@ impl EditorTab {
                         .collect()
                 })
                 .unwrap_or_default();
-            edited_tags != orig.tags
+            let orig_tags: Vec<String> = orig
+                .properties
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            edited_tags != orig_tags
         };
 
         // ── Edge dirty check ──────────────────────────────────────────────

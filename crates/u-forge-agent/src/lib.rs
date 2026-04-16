@@ -141,11 +141,17 @@ fn format_node_result(result: &NodeSearchResult, index: usize) -> String {
         result.score,
         result.sources.label()
     ));
-    if let Some(desc) = &result.node.description {
+    if let Some(desc) = result.node.get_property("description") {
         s.push_str(&format!("  Description: {desc}\n"));
     }
-    if !result.node.tags.is_empty() {
-        s.push_str(&format!("  Tags: {}\n", result.node.tags.join(", ")));
+    let tags: Vec<&str> = result
+        .node
+        .get_json_property("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if !tags.is_empty() {
+        s.push_str(&format!("  Tags: {}\n", tags.join(", ")));
     }
     if !result.edges.is_empty() {
         s.push_str("  Relationships:\n");
@@ -599,20 +605,7 @@ impl Tool for UpsertNodeTool {
         // Apply caller-provided fields.
         meta.name = args.name;
         meta.object_type = args.object_type;
-
-        // Extract description and tags from properties, mirroring the JSONL ingest pipeline.
-        if let Some(mut props) = args.properties {
-            if let Some(obj) = props.as_object_mut() {
-                if let Some(serde_json::Value::String(desc)) = obj.remove("description") {
-                    meta.description = if desc.is_empty() { None } else { Some(desc) };
-                }
-                if let Some(serde_json::Value::Array(tag_arr)) = obj.remove("tags") {
-                    meta.tags = tag_arr
-                        .into_iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect();
-                }
-            }
+        if let Some(props) = args.properties {
             if props.is_object() {
                 meta.properties = props;
             }

@@ -101,7 +101,7 @@ All paths below are relative to `crates/u-forge-agent/`.
 - `FtsSearchTool` — wraps `KnowledgeGraph::search_chunks_fts()`; groups results by node. Args: `FtsSearchArgs { query, limit }`.
 - `SemanticSearchTool` — embeds the query via `InferenceQueue::embed()`, runs `search_chunks_semantic()`; groups by node with distances. Args: `SemanticSearchArgs { query, limit }`.
 - `HybridSearchTool` — calls `search::search_hybrid()`; returns fully hydrated `NodeSearchResult` entries including edges and content. Args: `HybridSearchArgs { query, limit, alpha, rerank }`.
-- `UpsertNodeTool` — creates or updates a node; re-chunks and embeds (standard + HQ) before returning. Args: `UpsertNodeArgs { node_id, name, object_type, description, properties, tags }`.
+- `UpsertNodeTool` — creates or updates a node; re-chunks and embeds (standard + HQ) before returning. Args: `UpsertNodeArgs { node_id, name, object_type, properties }`. All schema fields — including `"description"` and `"tags"` — go inside `properties`; search results include the node UUID so the agent can upsert by ID.
 - `UpsertEdgeTool` — creates or updates an edge; re-embeds both endpoint nodes. Resolves nodes by UUID or exact name via `resolve_node()` helper. Args: `UpsertEdgeArgs { source, target, edge_type, weight }`.
 
 **`GraphAgent`** wraps a `rig::providers::openai::CompletionsClient` pointed at Lemonade's `/api/v1` endpoint. Built via `GraphAgent::new(url, graph, queue, hq_queue, system_prompt)`. Each call constructs a fresh rig agent with all five tools registered.
@@ -203,9 +203,7 @@ id          TEXT PRIMARY KEY,
 object_type TEXT NOT NULL,
 schema_name TEXT,
 name        TEXT NOT NULL,
-description TEXT,
-tags        TEXT NOT NULL DEFAULT '[]',   -- JSON array
-properties  TEXT NOT NULL DEFAULT '{}',   -- JSON object
+properties  TEXT NOT NULL DEFAULT '{}',   -- JSON object; all schema fields including "description" and "tags"
 created_at  TEXT NOT NULL,
 updated_at  TEXT NOT NULL
 ```
@@ -294,8 +292,7 @@ Read on startup by `build_snapshot()` to restore the last user-arranged layout.
   automatically via indexed FK scans. O(log N) instead of O(N).
 - Edge uniqueness (`UNIQUE(source_id, target_id, edge_type)`) replaces the old
   manual adjacency-list deduplication.
-- `tags` and `properties` are stored as JSON text and deserialized via `serde_json`
-  at the Rust layer. No JSON1 extension queries are needed for current operations.
+- `properties` is stored as JSON text and deserialized via `serde_json` at the Rust layer. All schema-defined fields — including `"description"` and `"tags"` — live uniformly inside this blob. There are no separate `description`/`tags` columns. Atomic single-property updates use SQLite's `json_set()` via `KnowledgeGraphStorage::set_node_property()`.
 - `GET COUNT(*)` and `SUM(token_count)` queries replace the old full-scan
   `get_stats` implementation.
 - The old `AdjacencyList` struct (with separate `outgoing`/`incoming` `Vec<Edge>`
@@ -854,10 +851,7 @@ The function blocks until all embeddings are stored, so callers (agent tools, UI
   MCP tool actions. `SchemaIngestion` strips the `add_` prefix, but the file names
   still leak an external convention.
 - **`save_schema` is `async` but contains no `.await`** — `list_schemas` and `delete_schema` have been made sync. `save_schema` remains `async` because it is called with `.await` by `load_schema`, `register_object_type`, and `register_edge_type`; making it sync would require updating all those callers. Minor, but misleading.
-- **`tags` and `properties` as JSON text** — stored as opaque strings, not as
-  SQLite JSON1 columns. Filtering or querying inside these fields requires
-  deserializing at the Rust layer. Acceptable for now; revisit if query patterns
-  demand it.
+- **`properties` as JSON text** — stored as an opaque string, not as a SQLite JSON1 column. Filtering or querying inside the blob requires deserializing at the Rust layer, or using `json_set`/`json_extract` for targeted mutations. Acceptable for now; revisit if query patterns demand indexed property access.
 - **`inheritance` in `ObjectTypeSchema` is never acted on** — still present as a
   schema field, still ignored at runtime.
 

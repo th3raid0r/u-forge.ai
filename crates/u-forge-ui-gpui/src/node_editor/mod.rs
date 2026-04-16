@@ -170,30 +170,22 @@ impl NodeEditorPanel {
             "name".to_string(),
             serde_json::Value::String(meta.name.clone()),
         );
-        edited_values.insert(
-            "description".to_string(),
-            serde_json::Value::String(meta.description.clone().unwrap_or_default()),
-        );
         if let Some(obj) = meta.properties.as_object() {
             for (k, v) in obj {
-                if k.eq_ignore_ascii_case("name")
-                    || k.eq_ignore_ascii_case("description")
-                    || k.eq_ignore_ascii_case("tags")
-                {
+                if k.eq_ignore_ascii_case("name") {
                     continue;
                 }
                 edited_values.insert(k.clone(), v.clone());
             }
         }
-        edited_values.insert(
-            "tags".to_string(),
-            serde_json::Value::Array(
-                meta.tags
-                    .iter()
-                    .map(|t| serde_json::Value::String(t.clone()))
-                    .collect(),
-            ),
-        );
+        // Ensure description and tags always have entries in edited_values so
+        // the UI fields render even when not yet set on the node.
+        edited_values
+            .entry("description".to_string())
+            .or_insert(serde_json::Value::String(String::new()));
+        edited_values
+            .entry("tags".to_string())
+            .or_insert(serde_json::Value::Array(vec![]));
 
         // ── Load edges incident on this node ──────────────────────────────
         let db_edges = self.graph.get_relationships(node_id).unwrap_or_default();
@@ -419,32 +411,24 @@ impl NodeEditorPanel {
                 .and_then(|v| v.as_str())
                 .unwrap_or(&meta.name)
                 .to_string();
-            meta.description = tab
-                .edited_values
-                .get("description")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-
-            // Rebuild properties JSON.
+            // Rebuild properties JSON from all edited values except "name"
+            // (which is a top-level field). All schema properties — including
+            // "description" and "tags" — are stored uniformly in properties.
             let mut props = serde_json::Map::new();
             for (k, v) in &tab.edited_values {
-                if ["name", "description", "tags"].contains(&k.as_str()) {
+                if k == "name" {
                     continue;
+                }
+                // Drop empty strings for description so the key stays absent
+                // rather than storing an empty string.
+                if k == "description" {
+                    if v.as_str().is_some_and(|s| s.is_empty()) {
+                        continue;
+                    }
                 }
                 props.insert(k.clone(), v.clone());
             }
             meta.properties = serde_json::Value::Object(props);
-
-            // Tags.
-            if let Some(tags_val) = tab.edited_values.get("tags") {
-                if let Some(arr) = tags_val.as_array() {
-                    meta.tags = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                }
-            }
 
             if self.graph.update_object(meta.clone()).is_ok() {
                 // ── Save edge changes ─────────────────────────────────────

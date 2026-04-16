@@ -18,15 +18,12 @@ impl KnowledgeGraphStorage {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO nodes
-                 (id, object_type, schema_name, name, description,
-                  tags, properties, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 (id, object_type, schema_name, name, properties, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                  object_type  = excluded.object_type,
                  schema_name  = excluded.schema_name,
                  name         = excluded.name,
-                 description  = excluded.description,
-                 tags         = excluded.tags,
                  properties   = excluded.properties,
                  updated_at   = excluded.updated_at",
             params![
@@ -34,8 +31,6 @@ impl KnowledgeGraphStorage {
                 metadata.object_type,
                 metadata.schema_name,
                 metadata.name,
-                metadata.description,
-                serde_json::to_string(&metadata.tags).context("Failed to serialise node tags")?,
                 metadata.properties.to_string(),
                 metadata.created_at.to_rfc3339(),
                 metadata.updated_at.to_rfc3339(),
@@ -50,8 +45,7 @@ impl KnowledgeGraphStorage {
         let conn = self.conn.lock();
         let result = conn
             .query_row(
-                "SELECT id, object_type, schema_name, name, description,
-                        tags, properties, created_at, updated_at
+                "SELECT id, object_type, schema_name, name, properties, created_at, updated_at
                  FROM nodes
                  WHERE id = ?1",
                 params![id.hyphenated().to_string()],
@@ -61,11 +55,9 @@ impl KnowledgeGraphStorage {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
                     ))
                 },
             )
@@ -74,9 +66,9 @@ impl KnowledgeGraphStorage {
 
         match result {
             None => Ok(None),
-            Some((id_s, ot, sn, nm, desc, tags, props, ca, ua)) => Ok(Some(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?)),
+            Some((id_s, ot, sn, nm, props, ca, ua)) => {
+                Ok(Some(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?))
+            }
         }
     }
 
@@ -84,8 +76,7 @@ impl KnowledgeGraphStorage {
     pub fn get_all_objects(&self) -> Result<Vec<ObjectMetadata>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, object_type, schema_name, name, description,
-                    tags, properties, created_at, updated_at
+            "SELECT id, object_type, schema_name, name, properties, created_at, updated_at
              FROM nodes",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -94,20 +85,16 @@ impl KnowledgeGraphStorage {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
             ))
         })?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, ot, sn, nm, desc, tags, props, ca, ua) = row?;
-            out.push(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?);
+            let (id_s, ot, sn, nm, props, ca, ua) = row?;
+            out.push(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?);
         }
         Ok(out)
     }
@@ -118,8 +105,7 @@ impl KnowledgeGraphStorage {
     pub fn find_nodes_by_name(&self, object_type: &str, name: &str) -> Result<Vec<ObjectMetadata>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, object_type, schema_name, name, description,
-                    tags, properties, created_at, updated_at
+            "SELECT id, object_type, schema_name, name, properties, created_at, updated_at
              FROM nodes
              WHERE object_type = ?1 AND name = ?2",
         )?;
@@ -129,20 +115,16 @@ impl KnowledgeGraphStorage {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
             ))
         })?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, ot, sn, nm, desc, tags, props, ca, ua) = row?;
-            out.push(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?);
+            let (id_s, ot, sn, nm, props, ca, ua) = row?;
+            out.push(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?);
         }
         Ok(out)
     }
@@ -154,8 +136,7 @@ impl KnowledgeGraphStorage {
     pub fn find_nodes_by_name_only(&self, name: &str) -> Result<Vec<ObjectMetadata>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, object_type, schema_name, name, description,
-                    tags, properties, created_at, updated_at
+            "SELECT id, object_type, schema_name, name, properties, created_at, updated_at
              FROM nodes
              WHERE name = ?1",
         )?;
@@ -165,20 +146,16 @@ impl KnowledgeGraphStorage {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
             ))
         })?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, ot, sn, nm, desc, tags, props, ca, ua) = row?;
-            out.push(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?);
+            let (id_s, ot, sn, nm, props, ca, ua) = row?;
+            out.push(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?);
         }
         Ok(out)
     }
@@ -194,37 +171,59 @@ impl KnowledgeGraphStorage {
     ) -> Result<Vec<ObjectMetadata>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, object_type, schema_name, name, description,
-                    tags, properties, created_at, updated_at
+            "SELECT id, object_type, schema_name, name, properties, created_at, updated_at
              FROM nodes
              ORDER BY name
              LIMIT ?1 OFFSET ?2",
         )?;
-        let rows = stmt.query_map(
-            params![limit as i64, offset as i64],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                ))
-            },
-        )?;
+        let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, ot, sn, nm, desc, tags, props, ca, ua) = row?;
-            out.push(row_to_metadata(
-                id_s, ot, sn, nm, desc, tags, props, ca, ua,
-            )?);
+            let (id_s, ot, sn, nm, props, ca, ua) = row?;
+            out.push(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?);
         }
         Ok(out)
+    }
+
+    /// Atomically set a single property on a node using SQLite's `json_set`.
+    ///
+    /// `value` must be a valid JSON-encoded value (e.g. `"\"foo\""` for a
+    /// string, `"42"` for a number, `"[\"a\",\"b\"]"` for an array).
+    /// The node's `updated_at` timestamp is bumped on every call.
+    pub fn set_node_property(
+        &self,
+        id: ObjectId,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let json_path = format!("$.{key}");
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE nodes
+             SET properties = json_set(properties, ?1, json(?2)),
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![
+                json_path,
+                value.to_string(),
+                now,
+                id.hyphenated().to_string(),
+            ],
+        )
+        .context("Failed to set node property")?;
+        Ok(())
     }
 
     /// Delete a node by ID.

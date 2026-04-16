@@ -34,8 +34,6 @@ CREATE TABLE IF NOT EXISTS nodes (
     object_type TEXT NOT NULL,
     schema_name TEXT,
     name        TEXT NOT NULL,
-    description TEXT,
-    tags        TEXT NOT NULL DEFAULT '[]',
     properties  TEXT NOT NULL DEFAULT '{}',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
@@ -228,17 +226,14 @@ pub(super) fn str_to_chunk_type(s: &str) -> ChunkType {
     }
 }
 
-/// Build an `ObjectMetadata` from the nine column values returned by every
+/// Build an `ObjectMetadata` from the seven column values returned by every
 /// `SELECT … FROM nodes` query.  Centralising this avoids repeating
 /// fallible parsing logic across multiple methods.
-#[allow(clippy::too_many_arguments)] // mirrors the fixed 9-column SELECT schema
 pub(super) fn row_to_metadata(
     id_str: String,
     object_type: String,
     schema_name: Option<String>,
     name: String,
-    description: Option<String>,
-    tags_str: String,
     props_str: String,
     created_at_str: String,
     updated_at_str: String,
@@ -249,9 +244,6 @@ pub(super) fn row_to_metadata(
         object_type,
         schema_name,
         name,
-        description,
-        tags: serde_json::from_str(&tags_str)
-            .with_context(|| format!("Invalid tags JSON: '{tags_str}'"))?,
         properties: serde_json::from_str(&props_str)
             .with_context(|| format!("Invalid properties JSON: '{props_str}'"))?,
         created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
@@ -467,7 +459,7 @@ mod tests {
         assert_eq!(got.name, "Gandalf");
         assert_eq!(got.object_type, "character");
         assert_eq!(
-            got.description,
+            got.get_property("description"),
             Some("A wise and ancient wizard.".to_string())
         );
 
