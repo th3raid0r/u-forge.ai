@@ -10,6 +10,7 @@ The project is a Cargo workspace. All source lives under `crates/`:
 | `u-forge-graph-view` | lib | Complete | Graph view model + layout engine (see `feature_UI.md`) |
 | `u-forge-ui-traits` | lib | Complete | Framework-agnostic rendering contracts (see `feature_UI.md`) |
 | `u-forge-ui-gpui` | lib + bin | Alpha | GPUI native desktop app — graph canvas, node editor, search, chat (see `feature_UI.md`) |
+| `u-forge-agent` | lib | Complete | Rig-based LLM agent with FTS5/Semantic/Hybrid graph search tools and streaming event loop |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
 `defaults/` (schemas + sample data) stays at the workspace root. Both example entry points and `examples/common/mod.rs` resolve it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
@@ -88,6 +89,28 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 
 `DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment → `DrawCommand` list. `u-forge-ui-gpui` consumes this list — it never touches `GraphSnapshot` directly. Colors are assigned by `pub fn node_color_for_type(name: &str) -> [u8; 4]`: FNV-1a hashes the type name, scatters it across the hue wheel via the golden angle (137.5°), and fixes saturation/lightness to match Catppuccin Mocha accent values. Any type name — including future ones — gets a stable, distinct color with no code changes. The tree panel header colors and graph canvas legend both call the same function.
 
+## Module Map (u-forge-agent)
+
+All paths below are relative to `crates/u-forge-agent/`.
+
+| File | Role | Key Types |
+|---|---|---|
+| `src/lib.rs` | All agent types, tools, and stream events | `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `GraphAgent`, `AgentStreamEvent` |
+
+**Tools** (all implement `rig::tool::Tool`):
+- `FtsSearchTool` — wraps `KnowledgeGraph::search_chunks_fts()`; groups results by node. Args: `FtsSearchArgs { query, limit }`.
+- `SemanticSearchTool` — embeds the query via `InferenceQueue::embed()`, runs `search_chunks_semantic()`; groups by node with distances. Args: `SemanticSearchArgs { query, limit }`.
+- `HybridSearchTool` — calls `search::search_hybrid()`; returns fully hydrated `NodeSearchResult` entries including edges and content. Args: `HybridSearchArgs { query, limit, alpha, rerank }`.
+
+**`GraphAgent`** wraps a `rig::providers::openai::CompletionsClient` pointed at Lemonade's `/api/v1` endpoint. Built via `GraphAgent::new(url, graph, queue, system_prompt)`. Each call constructs a fresh rig agent with all three tools registered.
+
+- `prompt(model_id, msg, max_turns)` — blocking multi-turn tool loop; returns final response string.
+- `prompt_stream(model_id, msg, max_turns)` — returns `mpsc::Receiver<AgentStreamEvent>`; spawns a tokio task that drives `agent.stream_prompt(&msg).multi_turn(n).await` and forwards events.
+
+**`AgentStreamEvent`** variants: `ReasoningDelta(String)`, `TextDelta(String)`, `ToolCallStart { internal_id, name, args_display }`, `ToolResult { internal_id, content }`, `Done(String)`, `Error(String)`.
+
+**Note on `fts5_sanitize`:** `u-forge-core::search::sanitize::fts5_sanitize` is `pub(super)` and not re-exported; `u-forge-agent` inlines the same logic (keep only alphanumeric + spaces, collapse whitespace).
+
 ## Module Map (u-forge-ui-gpui)
 
 | File / directory | Role |
@@ -98,7 +121,7 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 | `src/text_field.rs` | `TextFieldView` — canvas-based text input (`EntityInputHandler`, cursor, IME, blink, scroll, `submit_on_enter` flag) |
 | `src/tree_panel.rs` | `TreePanel` — collapsible node-by-type sidebar |
 | `src/search_panel.rs` | `SearchPanel` — FTS5 / Semantic / Hybrid search modes, query field, results list |
-| `src/chat_panel.rs` | `ChatPanel` — streaming LLM chat: model selector dropdown, enter-to-submit toggle, message history with thinking/content separation |
+| `src/chat_panel.rs` | `ChatPanel` — streaming LLM chat: model selector dropdown, enter-to-submit toggle, message history with thinking/content separation and collapsible tool call entries; routes through `GraphAgent` when available |
 | `src/graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
 | `src/node_editor/mod.rs` | `NodeEditorPanel` struct, tab management, save logic |
 | `src/node_editor/field_spec.rs` | `FieldSpec`, `FieldKind`, `EditorTab` — form field descriptions and dirty-state tracking |
@@ -108,9 +131,9 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 
 `AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SearchPanel>`, `Entity<NodeEditorPanel>`, `Entity<ChatPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. Layout: 28 px menu bar + horizontal body (optional left sidebar showing TreePanel or SearchPanel + vertical workspace with NodeEditorPanel / GraphCanvas 30/70 split + optional ChatPanel) + 24 px status bar. All panel boundaries are user-resizable via drag handles.
 
-`ChatPanel` provides streaming LLM chat via `LemonadeChatProvider::complete_stream()`. Features: model selector dropdown (populated from `ModelSelector::select_llm_models()` after Lemonade discovery), enter-to-submit toggle (controls whether Enter submits or inserts a newline in the multiline input), message history with color-coded roles (User/Assistant/Thinking), and a "Generating..." streaming indicator. Thinking tokens (`StreamToken::Thinking`) are displayed separately from content tokens and removed if empty.
+`ChatPanel` provides two message paths: when a `GraphAgent` is set (the normal path after Lemonade init), messages route through `GraphAgent::prompt_stream()` which drives the rig multi-turn tool loop; when no agent is configured, it falls back to direct `LemonadeChatProvider::complete_stream()`. Message history has color-coded roles: User (blue), Assistant (green), Thinking (yellow/dimmed), ToolCall (purple accent). Tool call entries are collapsible — collapsed by default, click to reveal JSON args and tool result. Reasoning tokens stream into the Thinking entry from both paths.
 
-`do_init_lemonade()` discovers Lemonade Server asynchronously on startup, builds embedding/reranking queues, selects LLM models, constructs a `LemonadeChatProvider`, and pushes it to both `SearchPanel` (for queues) and `ChatPanel` (for chat). If Lemonade is unreachable, the app continues with FTS5-only search and no chat.
+`do_init_lemonade()` discovers Lemonade Server asynchronously on startup, builds embedding/reranking queues, selects LLM models, constructs a `LemonadeChatProvider` and a `GraphAgent`, and pushes both to `ChatPanel`. If Lemonade is unreachable, the app continues with FTS5-only search and no chat.
 
 Run with `cargo run -p u-forge-ui-gpui` from the workspace root.
 

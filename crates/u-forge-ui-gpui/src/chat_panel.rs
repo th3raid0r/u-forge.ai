@@ -4,6 +4,7 @@ use gpui::{
     div, prelude::*, px, rgb, rgba, relative, Context, Entity, MouseButton, MouseDownEvent,
     ScrollHandle, Window,
 };
+use u_forge_agent::GraphAgent;
 use u_forge_core::{
     lemonade::{LemonadeChatProvider, SelectedModel},
     ChatMessage, ChatRequest, StreamToken,
@@ -19,12 +20,47 @@ enum ChatRole {
     Assistant,
     /// Model thinking/reasoning — rendered separately from content.
     Thinking,
+    /// A tool call made by the agent during the response loop.
+    ToolCall,
 }
 
 #[derive(Debug, Clone)]
 struct ChatEntry {
     role: ChatRole,
+    /// Main text content (or tool name for `ToolCall` entries).
     text: String,
+    /// For `ToolCall` entries: the pretty-printed JSON arguments.
+    tool_args: Option<String>,
+    /// For `ToolCall` entries: the tool result text (filled in when available).
+    tool_result: Option<String>,
+    /// Stable ID correlating a `ToolCall` entry with its result event.
+    tool_internal_id: Option<String>,
+    /// Whether the tool call body is collapsed (default true).
+    collapsed: bool,
+}
+
+impl ChatEntry {
+    fn text(role: ChatRole, text: String) -> Self {
+        Self {
+            role,
+            text,
+            tool_args: None,
+            tool_result: None,
+            tool_internal_id: None,
+            collapsed: false,
+        }
+    }
+
+    fn tool_call(internal_id: String, name: String, args: String) -> Self {
+        Self {
+            role: ChatRole::ToolCall,
+            text: name,
+            tool_args: Some(args),
+            tool_result: None,
+            tool_internal_id: Some(internal_id),
+            collapsed: true,
+        }
+    }
 }
 
 // ── ChatPanel ───────────────────────────────────────────────────────────────
@@ -45,8 +81,11 @@ pub(crate) struct ChatPanel {
     selected_model_idx: usize,
     /// Whether the model selector dropdown is open.
     model_dropdown_open: bool,
-    /// The active chat provider (None until Lemonade is discovered).
+    /// The active chat provider for direct streaming (None until Lemonade is discovered).
     chat_provider: Option<LemonadeChatProvider>,
+    /// Rig agent with graph search tools (None until Lemonade + graph are wired up).
+    /// When present, messages are routed through the agent loop instead of direct streaming.
+    agent: Option<Arc<GraphAgent>>,
     /// System prompt from config.
     system_prompt: String,
     /// Max history turns to keep in context.
@@ -104,6 +143,7 @@ impl ChatPanel {
             selected_model_idx: 0,
             model_dropdown_open: false,
             chat_provider: None,
+            agent: None,
             system_prompt,
             max_history_turns,
             tokio_rt,
@@ -123,37 +163,164 @@ impl ChatPanel {
         self.selected_model_idx = 0;
     }
 
-    /// Send the current input as a user message and start streaming the response.
+    /// Called from AppView once the graph, inference queue, and Lemonade URL
+    /// are all available. Enables the agent tool-calling path.
+    pub(crate) fn set_agent(&mut self, agent: GraphAgent) {
+        self.agent = Some(Arc::new(agent));
+    }
+
+    /// Send the current input. Routes to the agent loop when an agent is
+    /// available, otherwise falls back to direct LLM streaming.
     fn do_send(&mut self, cx: &mut Context<Self>) {
         let text = self.input_field.read(cx).content.trim().to_string();
         if text.is_empty() || self.streaming {
             return;
         }
 
+        // Clear input and record the user message immediately.
+        self.input_field.update(cx, |field, cx| {
+            field.set_content("", cx);
+        });
+        self.messages.push(ChatEntry::text(ChatRole::User, text.clone()));
+        self.streaming = true;
+        cx.notify();
+
+        // ── Agent path ────────────────────────────────────────────────────────
+        // When a GraphAgent is wired up, route through the tool-calling loop
+        // with streaming output. Tool calls appear as collapsible entries.
+        if let Some(agent) = self.agent.clone() {
+            let model_id = if !self.available_models.is_empty() {
+                self.available_models[self.selected_model_idx].model_id.clone()
+            } else {
+                String::new()
+            };
+            let tokio_rt = self.tokio_rt.clone();
+
+            cx.spawn(async move |this, cx| {
+                // Get the mpsc::Receiver on the background executor.
+                let mut rx = cx
+                    .background_executor()
+                    .spawn(async move {
+                        tokio_rt.block_on(agent.prompt_stream(&model_id, &text, 10))
+                    })
+                    .await;
+
+                // Add placeholder entries for thinking and response text.
+                this.update(cx, |view: &mut ChatPanel, cx| {
+                    view.messages.push(ChatEntry::text(ChatRole::Thinking, String::new()));
+                    view.messages.push(ChatEntry::text(ChatRole::Assistant, String::new()));
+                    cx.notify();
+                })
+                .ok();
+
+                use u_forge_agent::AgentStreamEvent;
+                loop {
+                    let event = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let e = rx.recv().await;
+                            (rx, e)
+                        })
+                        .await;
+                    rx = event.0;
+                    match event.1 {
+                        None => {
+                            // Channel closed without Done — treat as finished.
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                view.streaming = false;
+                                cx.notify();
+                            })
+                            .ok();
+                            break;
+                        }
+                        Some(AgentStreamEvent::ReasoningDelta(delta)) => {
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                if let Some(entry) = view.messages.iter_mut().rev()
+                                    .find(|e| matches!(e.role, ChatRole::Thinking))
+                                {
+                                    entry.text.push_str(&delta);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Some(AgentStreamEvent::TextDelta(delta)) => {
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                if let Some(entry) = view.messages.iter_mut().rev()
+                                    .find(|e| matches!(e.role, ChatRole::Assistant))
+                                {
+                                    entry.text.push_str(&delta);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Some(AgentStreamEvent::ToolCallStart { internal_id, name, args_display }) => {
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                view.messages.push(ChatEntry::tool_call(internal_id, name, args_display));
+                                // Ensure there's a fresh assistant entry after the tool call.
+                                view.messages.push(ChatEntry::text(ChatRole::Assistant, String::new()));
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Some(AgentStreamEvent::ToolResult { internal_id, content }) => {
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                if let Some(entry) = view.messages.iter_mut()
+                                    .find(|e| e.tool_internal_id.as_deref() == Some(&internal_id))
+                                {
+                                    entry.tool_result = Some(content);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Some(AgentStreamEvent::Done(_)) => {
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                // Drop empty thinking and assistant placeholders.
+                                view.messages.retain(|e| match e.role {
+                                    ChatRole::Thinking | ChatRole::Assistant => !e.text.is_empty(),
+                                    _ => true,
+                                });
+                                view.streaming = false;
+                                cx.notify();
+                            })
+                            .ok();
+                            break;
+                        }
+                        Some(AgentStreamEvent::Error(e)) => {
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                if let Some(entry) = view.messages.iter_mut().rev()
+                                    .find(|e| matches!(e.role, ChatRole::Assistant))
+                                {
+                                    entry.text.push_str(&format!("\n[Agent error: {e}]"));
+                                }
+                                view.streaming = false;
+                                cx.notify();
+                            })
+                            .ok();
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+            return;
+        }
+
+        // ── Direct streaming path (fallback when no agent is configured) ──────
         let provider = match &self.chat_provider {
             Some(p) => p.clone(),
             None => {
-                self.messages.push(ChatEntry {
-                    role: ChatRole::Assistant,
-                    text: "Chat unavailable — Lemonade Server not connected.".to_string(),
-                });
+                self.messages.push(ChatEntry::text(
+                    ChatRole::Assistant,
+                    "Chat unavailable — Lemonade Server not connected.".to_string(),
+                ));
+                self.streaming = false;
                 cx.notify();
                 return;
             }
         };
-
-        // Clear input.
-        self.input_field.update(cx, |field, cx| {
-            field.set_content("", cx);
-        });
-
-        // Add user message to history.
-        self.messages.push(ChatEntry {
-            role: ChatRole::User,
-            text: text.clone(),
-        });
-        self.streaming = true;
-        cx.notify();
 
         // Build the message list for the API.
         let mut api_messages = Vec::new();
@@ -205,14 +372,8 @@ impl ChatPanel {
 
             // Add placeholder entries for thinking and content.
             this.update(cx, |view: &mut ChatPanel, cx| {
-                view.messages.push(ChatEntry {
-                    role: ChatRole::Thinking,
-                    text: String::new(),
-                });
-                view.messages.push(ChatEntry {
-                    role: ChatRole::Assistant,
-                    text: String::new(),
-                });
+                view.messages.push(ChatEntry::text(ChatRole::Thinking, String::new()));
+                view.messages.push(ChatEntry::text(ChatRole::Assistant, String::new()));
                 cx.notify();
             })
             .ok();
@@ -332,48 +493,153 @@ impl Render for ChatPanel {
             .enumerate()
             .filter(|(_, e)| !e.text.is_empty())
             .map(|(i, entry)| {
-                let (bg, label_color, label, text_color) = match entry.role {
-                    ChatRole::User => (
-                        rgb(0x313244),
-                        rgba(0x89b4faff), // blue
-                        "You",
-                        rgba(0xcdd6f4ff),
-                    ),
-                    ChatRole::Assistant => (
-                        rgb(0x1e1e2e),
-                        rgba(0xa6e3a1ff), // green
-                        "Assistant",
-                        rgba(0xcdd6f4ff),
-                    ),
-                    ChatRole::Thinking => (
-                        rgb(0x181825),
-                        rgba(0xf9e2afff), // yellow
-                        "Thinking",
-                        rgba(0x6c7086ff), // dimmed
-                    ),
-                };
+                match entry.role {
+                    ChatRole::ToolCall => {
+                        // ── Tool call entry (collapsible) ────────────────────
+                        let collapsed = entry.collapsed;
+                        let tool_name = entry.text.clone();
+                        let tool_args = entry.tool_args.clone().unwrap_or_default();
+                        let tool_result = entry.tool_result.clone();
+                        let chevron = if collapsed { "▶" } else { "▼" };
+                        let header_label = format!("{chevron} ⚙ {tool_name}");
 
-                div()
-                    .id(gpui::ElementId::Name(format!("msg-{i}").into()))
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .bg(bg)
-                    .child(
+                        let mut el = div()
+                            .id(gpui::ElementId::Name(format!("msg-{i}").into()))
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0x1e1e2e))
+                            .border_l_1()
+                            .border_color(rgba(0xcba6f7aa)) // purple accent
+                            .child(
+                                div()
+                                    .id(gpui::ElementId::Name(format!("tc-hdr-{i}").into()))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |view, _: &MouseDownEvent, _window, cx| {
+                                            if let Some(entry) = view.messages.get_mut(i) {
+                                                entry.collapsed = !entry.collapsed;
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgba(0xcba6f7ff)) // purple
+                                            .child(header_label),
+                                    )
+                                    .when(tool_result.is_some(), |row| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgba(0xa6e3a188))
+                                                .child("✓"),
+                                        )
+                                    }),
+                            );
+
+                        if !collapsed {
+                            el = el
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(0x181825))
+                                        .rounded(px(3.0))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgba(0x6c7086ff))
+                                                .child("Args:"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgba(0xcdd6f4cc))
+                                                .child(tool_args),
+                                        ),
+                                );
+                            if let Some(result) = tool_result {
+                                el = el.child(
+                                    div()
+                                        .mt_1()
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(0x181825))
+                                        .rounded(px(3.0))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgba(0x6c7086ff))
+                                                .child("Result:"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgba(0xa6e3a1cc))
+                                                .child(result),
+                                        ),
+                                );
+                            }
+                        }
+                        el
+                    }
+                    _ => {
+                        // ── Regular text entry ───────────────────────────────
+                        let (bg, label_color, label, text_color) = match entry.role {
+                            ChatRole::User => (
+                                rgb(0x313244),
+                                rgba(0x89b4faff), // blue
+                                "You",
+                                rgba(0xcdd6f4ff),
+                            ),
+                            ChatRole::Assistant => (
+                                rgb(0x1e1e2e),
+                                rgba(0xa6e3a1ff), // green
+                                "Assistant",
+                                rgba(0xcdd6f4ff),
+                            ),
+                            ChatRole::Thinking => (
+                                rgb(0x181825),
+                                rgba(0xf9e2afff), // yellow
+                                "Thinking",
+                                rgba(0x6c7086ff), // dimmed
+                            ),
+                            ChatRole::ToolCall => unreachable!(),
+                        };
+
                         div()
-                            .text_xs()
-                            .text_color(label_color)
-                            .pb(px(2.0))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(text_color)
-                            .child(entry.text.clone()),
-                    )
+                            .id(gpui::ElementId::Name(format!("msg-{i}").into()))
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .bg(bg)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(label_color)
+                                    .pb(px(2.0))
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(text_color)
+                                    .child(entry.text.clone()),
+                            )
+                    }
+                }
             })
             .collect();
 
