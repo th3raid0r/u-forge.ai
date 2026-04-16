@@ -35,13 +35,13 @@ pub struct HistoryMessage {
 /// (role markers + separator bytes).
 const TOKENS_PER_MESSAGE: usize = 4;
 
-/// Count BPE tokens in `text` using the cl100k_base encoding.
+/// Count BPE tokens in `text` using the o200k_harmony encoding.
 ///
-/// cl100k_base is used by GPT-4, GPT-3.5-turbo, and is a close approximation
-/// for Llama-family models. Close enough for context-window budgeting.
+/// o200k_harmony is used by GPT-4o and is becoming the standard for local
+/// open-weight models. Close enough for context-window budgeting.
 pub fn count_tokens(text: &str) -> usize {
-    tiktoken_rs::cl100k_base()
-        .expect("cl100k_base is always available")
+    tiktoken_rs::o200k_harmony()
+        .expect("o200k_harmony is always available")
         .encode_with_special_tokens(text)
         .len()
 }
