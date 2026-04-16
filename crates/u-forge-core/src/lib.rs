@@ -221,6 +221,13 @@ impl KnowledgeGraph {
         self.storage.get_all_edges()
     }
 
+    /// Delete a specific edge by its (from, to, edge_type) triplet.
+    ///
+    /// This is idempotent — deleting a non-existent edge succeeds silently.
+    pub fn delete_edge(&self, from: ObjectId, to: ObjectId, edge_type: &str) -> Result<()> {
+        self.storage.delete_edge(from, to, edge_type)
+    }
+
     /// Return a page of nodes ordered by name.
     ///
     /// Use for incremental full-graph snapshots without loading all nodes at once.

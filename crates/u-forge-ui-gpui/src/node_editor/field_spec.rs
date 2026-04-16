@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use gpui::Entity;
-use u_forge_core::{ObjectId, ObjectMetadata, ObjectTypeSchema, PropertyType};
+use u_forge_core::{Edge, ObjectId, ObjectMetadata, ObjectTypeSchema, PropertyType};
 
 use crate::text_field::TextFieldView;
 
@@ -21,6 +21,15 @@ pub(crate) const FIELD_H_MULTI: f32 = 104.0;
 
 /// Space reserved for page navigation buttons.
 pub(crate) const PAGE_NAV_H: f32 = 32.0;
+
+/// Height of a single edge row in the edge editing section.
+pub(crate) const EDGE_ROW_H: f32 = 34.0;
+
+/// Height of the "EDGES" section header.
+pub(crate) const EDGE_SECTION_HEADER_H: f32 = 28.0;
+
+/// Height of the "Add Edge" button row.
+pub(crate) const EDGE_ADD_BTN_H: f32 = 28.0;
 
 // ── Field types ───────────────────────────────────────────────────────────────
 
@@ -57,7 +66,13 @@ impl FieldSpec {
         match self.field_kind {
             FieldKind::Boolean => FIELD_H_SINGLE,
             FieldKind::Array => FIELD_H_MULTI,
-            _ => if self.multiline { FIELD_H_MULTI } else { FIELD_H_SINGLE },
+            _ => {
+                if self.multiline {
+                    FIELD_H_MULTI
+                } else {
+                    FIELD_H_SINGLE
+                }
+            }
         }
     }
 }
@@ -82,6 +97,65 @@ pub(crate) fn values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool
     a_str == b_str
 }
 
+// ── Edge editing types ────────────────────────────────────────────────────────
+
+/// An edge being edited in the node editor.
+///
+/// Unlike the core `Edge` type this uses `Option<ObjectId>` for endpoints
+/// because a freshly-added row starts with both endpoints unset until the user
+/// picks nodes from the dropdowns.
+pub(crate) struct EditableEdge {
+    /// Source node (left-hand side of the relationship).
+    pub(crate) from: Option<ObjectId>,
+    /// Target node (right-hand side of the relationship).
+    pub(crate) to: Option<ObjectId>,
+    /// The relationship label, e.g. `"led_by"`.
+    pub(crate) edge_type: String,
+    /// Cached display name of the `from` node (for rendering without a DB lookup).
+    pub(crate) from_name: String,
+    /// Cached display name of the `to` node (for rendering without a DB lookup).
+    pub(crate) to_name: String,
+}
+
+impl EditableEdge {
+    /// Create an `EditableEdge` from a persisted `Edge`, resolving display
+    /// names from the provided lookup map.
+    pub(crate) fn from_edge(edge: &Edge, names: &HashMap<ObjectId, String>) -> Self {
+        Self {
+            from: Some(edge.from),
+            to: Some(edge.to),
+            edge_type: edge.edge_type.as_str().to_string(),
+            from_name: names
+                .get(&edge.from)
+                .cloned()
+                .unwrap_or_else(|| edge.from.to_string()),
+            to_name: names
+                .get(&edge.to)
+                .cloned()
+                .unwrap_or_else(|| edge.to.to_string()),
+        }
+    }
+
+    /// Create a blank edge row (user will fill via dropdowns).
+    pub(crate) fn empty() -> Self {
+        Self {
+            from: None,
+            to: None,
+            edge_type: String::new(),
+            from_name: String::new(),
+            to_name: String::new(),
+        }
+    }
+
+    /// Return `true` when both endpoints are set and the edge type is non-empty
+    /// — i.e. the edge is complete enough to persist.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.from.is_some() && self.to.is_some() && !self.edge_type.trim().is_empty()
+    }
+}
+
+// ── Editor tab ────────────────────────────────────────────────────────────────
+
 /// A single editor tab representing one node being edited.
 pub(crate) struct EditorTab {
     pub(crate) node_id: ObjectId,
@@ -96,6 +170,22 @@ pub(crate) struct EditorTab {
     pub(crate) current_page: usize,
     /// Text field entities for the form — keyed by field name.
     pub(crate) field_entities: HashMap<String, Entity<TextFieldView>>,
+
+    // ── Edge editing state ────────────────────────────────────────────────
+    /// The edges as currently edited by the user (may contain incomplete rows).
+    pub(crate) edited_edges: Vec<EditableEdge>,
+    /// The edges as they were when the tab was opened — used for dirty tracking.
+    pub(crate) original_edges: Vec<Edge>,
+    /// Text field entities for each edge's type string, indexed in parallel
+    /// with `edited_edges`.
+    pub(crate) edge_type_entities: Vec<Entity<TextFieldView>>,
+
+    // ── New-node lifecycle ────────────────────────────────────────────────
+    /// `true` when this tab was created via the tree-panel "+" button and has
+    /// not yet been saved with a non-empty name.  On save, tabs that are still
+    /// `is_new` **and** have an empty name are discarded and the DB record is
+    /// deleted.
+    pub(crate) is_new: bool,
 }
 
 impl EditorTab {
@@ -135,9 +225,7 @@ impl EditorTab {
             let mut optional_keys: Vec<&String> = schema
                 .properties
                 .keys()
-                .filter(|k| {
-                    !skip.contains(&k.as_str()) && !schema.required_properties.contains(k)
-                })
+                .filter(|k| !skip.contains(&k.as_str()) && !schema.required_properties.contains(k))
                 .collect();
             optional_keys.sort();
 
@@ -222,13 +310,15 @@ impl EditorTab {
         specs
     }
 
-    /// Recompute the dirty flag by comparing edited_values against original.
+    /// Recompute the dirty flag by comparing edited_values and edited_edges
+    /// against their original counterparts.
     pub(crate) fn recompute_dirty(&mut self) {
         let orig = &self.original;
         let vals = &self.edited_values;
 
-        let name_changed =
-            vals.get("name").and_then(|v| v.as_str()) != Some(orig.name.as_str());
+        // ── Property dirty checks ─────────────────────────────────────────
+
+        let name_changed = vals.get("name").and_then(|v| v.as_str()) != Some(orig.name.as_str());
 
         // Treat empty string the same as None for description comparison.
         let edited_desc = vals
@@ -245,8 +335,7 @@ impl EditorTab {
                     continue;
                 }
                 // Treat empty string as equivalent to missing/null.
-                let edited_empty =
-                    v.as_str().is_some_and(|s| s.is_empty()) || v.is_null();
+                let edited_empty = v.as_str().is_some_and(|s| s.is_empty()) || v.is_null();
                 match orig_obj.get(k) {
                     Some(orig_v) if values_equal(orig_v, v) => {}
                     None | Some(&serde_json::Value::Null) if edited_empty => {}
@@ -263,8 +352,7 @@ impl EditorTab {
                     if vals.contains_key(k) {
                         continue;
                     }
-                    let orig_empty =
-                        v.as_str().is_some_and(|s| s.is_empty()) || v.is_null();
+                    let orig_empty = v.as_str().is_some_and(|s| s.is_empty()) || v.is_null();
                     if !orig_empty {
                         props_changed = true;
                         break;
@@ -286,6 +374,58 @@ impl EditorTab {
             edited_tags != orig.tags
         };
 
-        self.dirty = name_changed || desc_changed || props_changed || tags_changed;
+        // ── Edge dirty check ──────────────────────────────────────────────
+
+        let edges_changed = self.are_edges_dirty();
+
+        // ── New-node tabs are always dirty so they participate in save. ───
+
+        self.dirty = self.is_new
+            || name_changed
+            || desc_changed
+            || props_changed
+            || tags_changed
+            || edges_changed;
+    }
+
+    /// Compare `edited_edges` against `original_edges` to decide if edges
+    /// have been modified.
+    ///
+    /// Only *complete* edited edges (both endpoints + non-empty type) are
+    /// considered — incomplete placeholder rows are ignored for the purpose
+    /// of dirty tracking because they will be discarded on save anyway.
+    fn are_edges_dirty(&self) -> bool {
+        // Collect the set of complete edited edges as (from, to, type) tuples.
+        let edited_set: Vec<(ObjectId, ObjectId, &str)> = self
+            .edited_edges
+            .iter()
+            .filter(|e| e.is_complete())
+            .map(|e| (e.from.unwrap(), e.to.unwrap(), e.edge_type.trim()))
+            .collect();
+
+        let orig_set: Vec<(ObjectId, ObjectId, &str)> = self
+            .original_edges
+            .iter()
+            .map(|e| (e.from, e.to, e.edge_type.as_str()))
+            .collect();
+
+        if edited_set.len() != orig_set.len() {
+            return true;
+        }
+
+        // Order-independent comparison: every original edge must appear in
+        // edited and vice-versa.
+        for triple in &orig_set {
+            if !edited_set.contains(triple) {
+                return true;
+            }
+        }
+        for triple in &edited_set {
+            if !orig_set.contains(triple) {
+                return true;
+            }
+        }
+
+        false
     }
 }

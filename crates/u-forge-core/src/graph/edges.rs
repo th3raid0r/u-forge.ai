@@ -162,4 +162,21 @@ impl KnowledgeGraphStorage {
         }
         Ok(neighbors)
     }
+
+    /// Delete a specific edge identified by its (source, target, edge_type) triplet.
+    ///
+    /// Returns `Ok(())` even if the edge did not exist (idempotent delete).
+    pub fn delete_edge(&self, from: ObjectId, to: ObjectId, edge_type: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2 AND edge_type = ?3",
+            params![
+                from.hyphenated().to_string(),
+                to.hyphenated().to_string(),
+                edge_type,
+            ],
+        )
+        .context("Failed to delete edge")?;
+        Ok(())
+    }
 }

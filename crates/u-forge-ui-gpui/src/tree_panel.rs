@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use gpui::{div, prelude::*, px, rgb, rgba, relative, Context, Entity, MouseButton, MouseDownEvent, Window};
+use gpui::{
+    div, prelude::*, px, relative, rgb, rgba, Context, Entity, MouseButton, MouseDownEvent, Window,
+};
 use parking_lot::RwLock;
 use u_forge_core::ObjectId;
 use u_forge_graph_view::GraphSnapshot;
@@ -9,16 +11,30 @@ use u_forge_ui_traits::node_color_for_type;
 
 use crate::selection_model::SelectionModel;
 
+// ── Events emitted by TreePanel ─────────────────────────────────────────────
+
+/// Emitted when the user clicks the "+" button on a type group header.
+/// Payload is the `object_type` string for the new node.
+pub(crate) struct CreateNodeRequest(pub String);
+
+/// Emitted when the user clicks the delete button next to a node entry.
+/// Payload is the `ObjectId` of the node to delete.
+pub(crate) struct DeleteNodeRequest(pub ObjectId);
+
 // ── Tree panel ──────────────────────────────────────────────────────────────
 
 /// A group of nodes sharing the same object_type, for the tree panel.
 struct TypeGroup {
     type_name: String,
-    /// (index into snapshot.nodes, display name)
+    /// (index into snapshot.nodes, display name, ObjectId)
     entries: Vec<(usize, String, ObjectId)>,
 }
 
 /// Sidebar tree view listing all nodes grouped by type, alphabetically.
+///
+/// Emits [`CreateNodeRequest`] and [`DeleteNodeRequest`] events that the
+/// parent `AppView` subscribes to in order to perform DB mutations and
+/// refresh the snapshot.
 pub(crate) struct TreePanel {
     selection: Entity<SelectionModel>,
     snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -27,6 +43,9 @@ pub(crate) struct TreePanel {
     /// Which type groups are collapsed (by type_name).
     collapsed: std::collections::HashSet<String>,
 }
+
+impl gpui::EventEmitter<CreateNodeRequest> for TreePanel {}
+impl gpui::EventEmitter<DeleteNodeRequest> for TreePanel {}
 
 impl TreePanel {
     pub(crate) fn new(
@@ -54,10 +73,11 @@ impl TreePanel {
     fn build_groups(snap: &GraphSnapshot) -> Vec<TypeGroup> {
         let mut by_type: BTreeMap<String, Vec<(usize, String, ObjectId)>> = BTreeMap::new();
         for (idx, node) in snap.nodes.iter().enumerate() {
-            by_type
-                .entry(node.object_type.clone())
-                .or_default()
-                .push((idx, node.name.clone(), node.id));
+            by_type.entry(node.object_type.clone()).or_default().push((
+                idx,
+                node.name.clone(),
+                node.id,
+            ));
         }
         let mut groups: Vec<TypeGroup> = by_type
             .into_iter()
@@ -130,36 +150,73 @@ impl Render for TreePanel {
             let count = group.entries.len();
             let collapse_label = format!(
                 "{} {} ({})",
-                if is_collapsed { "▸" } else { "▾" },
+                if is_collapsed { "\u{25B8}" } else { "\u{25BE}" },
                 type_name,
                 count
             );
             let type_name_for_click = type_name.clone();
+            let type_name_for_add = type_name.clone();
 
-            // Type group header
+            // Type group header row: collapse toggle on the left, "+" button on the right.
             scroll_area = scroll_area.child(
                 div()
                     .id(("type-group", group_idx))
                     .flex()
+                    .flex_row()
                     .items_center()
+                    .justify_between()
                     .h(px(24.0))
                     .px_2()
                     .flex_none()
-                    .text_color(rgb(type_color))
                     .text_xs()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                            if this.collapsed.contains(&type_name_for_click) {
-                                this.collapsed.remove(&type_name_for_click);
-                            } else {
-                                this.collapsed.insert(type_name_for_click.clone());
-                            }
-                            cx.notify();
-                        }),
+                    // Collapse/expand label (left side) — clicking toggles collapse.
+                    .child(
+                        div()
+                            .id(("type-collapse", group_idx))
+                            .flex()
+                            .items_center()
+                            .text_color(rgb(type_color))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let tn = type_name_for_click.clone();
+                                    move |this, _: &MouseDownEvent, _window, cx| {
+                                        if this.collapsed.contains(&tn) {
+                                            this.collapsed.remove(&tn);
+                                        } else {
+                                            this.collapsed.insert(tn.clone());
+                                        }
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(collapse_label),
                     )
-                    .child(collapse_label),
+                    // "+" add-node button (right side).
+                    .child(
+                        div()
+                            .id(("type-add", group_idx))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_color(rgba(0xa6e3a1ff)) // Catppuccin green
+                            .hover(|style| style.bg(rgba(0xa6e3a122)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                    cx.emit(CreateNodeRequest(type_name_for_add.clone()));
+                                    // Auto-expand the group so the new node is visible.
+                                    this.collapsed.remove(&type_name_for_click);
+                                    cx.notify();
+                                }),
+                            )
+                            .child("+"),
+                    ),
             );
 
             // Node entries (if not collapsed)
@@ -167,9 +224,10 @@ impl Render for TreePanel {
                 for (entry_idx, (_node_idx, name, node_id)) in group.entries.iter().enumerate() {
                     let is_selected = selected_id == Some(*node_id);
                     let node_id = *node_id;
-                    let display_name = if name.len() > 26 {
-                        let mut s: String = name.chars().take(25).collect();
-                        s.push('…');
+                    let node_id_for_delete = node_id;
+                    let display_name = if name.len() > 24 {
+                        let mut s: String = name.chars().take(23).collect();
+                        s.push('\u{2026}');
                         s
                     } else {
                         name.clone()
@@ -179,7 +237,9 @@ impl Render for TreePanel {
                         div()
                             .id(("node-entry", group_idx * 10000 + entry_idx))
                             .flex()
+                            .flex_row()
                             .items_center()
+                            .justify_between()
                             .h(px(22.0))
                             .pl(px(20.0))
                             .pr(px(4.0))
@@ -192,6 +252,7 @@ impl Render for TreePanel {
                                 rgba(0xa6adc8ff)
                             })
                             .when(is_selected, |el| el.bg(rgba(0x45475aaa)))
+                            // Click on the node name area to select it.
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -200,7 +261,44 @@ impl Render for TreePanel {
                                     });
                                 }),
                             )
-                            .child(display_name),
+                            // Node name on the left.
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .child(display_name),
+                            )
+                            // Delete button on the right.
+                            .child(
+                                div()
+                                    .id(("node-delete", group_idx * 10000 + entry_idx))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(18.0))
+                                    .h(px(18.0))
+                                    .rounded(px(3.0))
+                                    .flex_none()
+                                    .cursor_pointer()
+                                    .text_color(rgba(0xf38ba8aa)) // Catppuccin red (muted)
+                                    .hover(|style| {
+                                        style.bg(rgba(0xf38ba822)).text_color(rgba(0xf38ba8ff))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |_this, event: &MouseDownEvent, _window, cx| {
+                                                // Stop propagation: prevent the parent row's
+                                                // on_mouse_down from selecting the node.
+                                                let _ = event;
+                                                cx.emit(DeleteNodeRequest(node_id_for_delete));
+                                            },
+                                        ),
+                                    )
+                                    .child("\u{2715}"), // ✕ multiplication sign
+                            ),
                     );
                 }
             }

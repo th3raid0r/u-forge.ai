@@ -2,7 +2,7 @@ mod render;
 
 use std::sync::Arc;
 
-use gpui::{prelude::*, Context, Empty, Entity};
+use gpui::{prelude::*, Context, Empty, Entity, Subscription};
 use parking_lot::RwLock;
 use u_forge_agent::GraphAgent;
 use u_forge_core::{
@@ -14,7 +14,7 @@ use u_forge_core::{
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     types::ObjectId,
-    AppConfig, EmbeddingTarget, KnowledgeGraph, SchemaManager,
+    AppConfig, EmbeddingTarget, KnowledgeGraph, ObjectMetadata, SchemaManager,
 };
 use u_forge_graph_view::GraphSnapshot;
 
@@ -23,7 +23,7 @@ use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
-use crate::tree_panel::TreePanel;
+use crate::tree_panel::{CreateNodeRequest, DeleteNodeRequest, TreePanel};
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -125,6 +125,8 @@ pub struct AppView {
     pub(crate) inference_queue: Option<InferenceQueue>,
     /// High-quality embedding queue (None when HQ embedding is disabled or unavailable).
     pub(crate) hq_queue: Option<InferenceQueue>,
+    /// Subscriptions to tree panel create/delete events — kept alive so handlers fire.
+    _tree_subs: Vec<Subscription>,
 }
 
 impl AppView {
@@ -143,6 +145,20 @@ impl AppView {
         let graph_canvas = cx
             .new(|cx| GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx));
         let tree_panel = cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
+
+        // Subscribe to tree panel create/delete events.
+        let tree_sub_create = cx.subscribe(
+            &tree_panel,
+            |this: &mut Self, _tree, event: &CreateNodeRequest, cx| {
+                this.create_node(&event.0, cx);
+            },
+        );
+        let tree_sub_delete = cx.subscribe(
+            &tree_panel,
+            |this: &mut Self, _tree, event: &DeleteNodeRequest, cx| {
+                this.delete_node_by_id(event.0, cx);
+            },
+        );
         let search_panel = cx.new(|cx| {
             SearchPanel::new(
                 selection.clone(),
@@ -196,6 +212,7 @@ impl AppView {
             tokio_rt,
             inference_queue: None,
             hq_queue: None,
+            _tree_subs: vec![tree_sub_create, tree_sub_delete],
         };
 
         view.do_init_lemonade(cx);
@@ -272,33 +289,22 @@ impl AppView {
         // 1. Save layout positions.
         self.graph_canvas.read(cx).save_layout();
 
-        // 2. Save all dirty editor tabs.
-        let (saved, saved_ids) = self
+        // 2. Save all dirty editor tabs (also discards empty new nodes).
+        let (saved, saved_ids, discarded_ids) = self
             .node_editor
-            .update(cx, |editor, _cx| editor.save_dirty_tabs());
+            .update(cx, |editor, cx| editor.save_dirty_tabs(cx));
+
+        // If any nodes were discarded, refresh the full snapshot.
+        if !discarded_ids.is_empty() {
+            eprintln!("Discarded {} empty new node(s).", discarded_ids.len());
+            self.refresh_snapshot(cx);
+        }
 
         if saved > 0 {
-            // Update the snapshot so tree panel and canvas reflect edits.
-            let editor = self.node_editor.read(cx);
-            let mut snap = self.snapshot.write();
-            for tab in &editor.tabs {
-                if let Some(node) = snap.nodes.iter_mut().find(|n| n.id == tab.node_id) {
-                    node.name = tab.name.clone();
-                    if let Some(desc) = tab
-                        .edited_values
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                    {
-                        node.description = if desc.is_empty() {
-                            None
-                        } else {
-                            Some(desc.to_string())
-                        };
-                    }
-                }
-            }
-            drop(snap);
             eprintln!("Saved {} node(s).", saved);
+
+            // Refresh snapshot fully when edges may have changed.
+            self.refresh_snapshot(cx);
 
             // 3. Re-chunk and embed every saved node so semantic search stays current.
             if !saved_ids.is_empty() {
@@ -306,6 +312,75 @@ impl AppView {
             }
         }
 
+        cx.notify();
+    }
+
+    // ── Node create / delete (driven by tree panel events) ────────────────
+
+    /// Create a new empty node of the given type, persist it, refresh the
+    /// snapshot, and navigate to it in the editor (marked as `is_new`).
+    fn create_node(&mut self, object_type: &str, cx: &mut Context<Self>) {
+        let meta = ObjectMetadata::new(object_type.to_string(), String::new());
+        let node_id = meta.id;
+
+        match self.graph.add_object(meta) {
+            Ok(_id) => {
+                // Refresh snapshot so the tree panel and canvas see the new node.
+                self.refresh_snapshot(cx);
+
+                // Select the new node — this triggers the editor's observer,
+                // but we use `open_new_node_tab` directly so the `is_new` flag
+                // is set correctly.
+                self.selection.update(cx, |sel, cx| {
+                    sel.select_by_id(Some(node_id), cx);
+                });
+                self.node_editor.update(cx, |editor, cx| {
+                    editor.open_new_node_tab(node_id, cx);
+                });
+
+                // Ensure the sidebar is open on the tree tab so the user sees
+                // the newly created node.
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Tree;
+            }
+            Err(e) => {
+                self.data_status = Some(format!("Failed to create node: {e}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Delete a node by its `ObjectId`, close any open editor tab for it,
+    /// and refresh the snapshot.
+    fn delete_node_by_id(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
+        // Close the editor tab for this node if one is open.
+        self.node_editor.update(cx, |editor, cx| {
+            if let Some(idx) = editor.tabs.iter().position(|t| t.node_id == node_id) {
+                editor.close_tab(idx, cx);
+            }
+            cx.notify();
+        });
+
+        // Remove stale edge references in other open tabs before deleting.
+        self.node_editor.update(cx, |editor, _cx| {
+            editor.remove_stale_edge_refs(node_id);
+        });
+
+        // Clear the selection if it pointed to this node.
+        let selected = self.selection.read(cx).selected_node_id;
+        if selected == Some(node_id) {
+            self.selection.update(cx, |sel, cx| sel.clear(cx));
+        }
+
+        // Delete from DB (cascades to edges, chunks, etc.).
+        match self.graph.delete_object(node_id) {
+            Ok(()) => {
+                self.refresh_snapshot(cx);
+            }
+            Err(e) => {
+                self.data_status = Some(format!("Delete failed: {e}"));
+            }
+        }
         cx.notify();
     }
 
