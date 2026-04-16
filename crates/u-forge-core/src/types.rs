@@ -213,8 +213,8 @@ impl ObjectMetadata {
     /// type, description, all properties, tags, and any pre-formatted edge lines.
     /// Pass `edge_lines` as `&[]` when edges are not available.
     ///
-    /// Properties whose keys duplicate the explicit fields (`name`, `type`,
-    /// `description`) are skipped to avoid redundant text.
+    /// Internal properties whose keys begin with `_` (e.g. `_source_id`) are
+    /// excluded — they are system bookkeeping fields with no semantic meaning.
     pub fn flatten_for_embedding(&self, edge_lines: &[String]) -> String {
         let mut parts: Vec<String> = Vec::new();
 
@@ -229,6 +229,9 @@ impl ObjectMetadata {
 
         if let Some(props) = self.properties.as_object() {
             for (key, val) in props {
+                if key.starts_with('_') {
+                    continue;
+                }
                 let val_str = match val {
                     serde_json::Value::String(s) if !s.is_empty() => s.clone(),
                     serde_json::Value::Number(n) => n.to_string(),

@@ -1,6 +1,6 @@
 # Feature: High-Performance Native UI
 
-## Status: In Progress
+## Status: Alpha Complete
 ## Prerequisites: `feature_refactor-for-extensibility.md` complete ✓ (workspace split + `get_all_edges()`)
 
 ---
@@ -154,15 +154,39 @@ The view model produces `Vec<DrawCommand>` from a `GraphSnapshot` + `Viewport`. 
 
 ## GPUI Prototype (`u-forge-ui-gpui`)
 
+### Module structure
+
+The crate is split into focused modules under `src/`. `main.rs` is the binary entry point only (~111 lines); all types live in the library target (`lib.rs`):
+
+| File / directory | Contents |
+|---|---|
+| `lib.rs` | Module declarations, `actions!()` macro, re-exports (`AppView`, action types) |
+| `selection_model.rs` | `SelectionModel` — shared selection state observed by `TreePanel`, `GraphCanvas`, `NodeEditorPanel`, and `SearchPanel` |
+| `text_field.rs` | `TextFieldView` — canvas-based text input widget (`EntityInputHandler`, cursor, IME, blink, vertical scroll (multiline), horizontal scroll (single-line), `submit_on_enter` flag for chat) |
+| `tree_panel.rs` | `TreePanel` — collapsible node-by-type sidebar; uses `w_full()` so parent container controls width |
+| `search_panel.rs` | `SearchPanel` — left sidebar search tab: FTS5 / Semantic / Hybrid modes, single-line query field, results list, `set_queues()` updater |
+| `chat_panel.rs` | `ChatPanel` — streaming LLM chat: model selector dropdown, enter-to-submit toggle, multiline input + send button, message history with thinking/reasoning separation, `set_provider()` updater |
+| `graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
+| `node_editor/mod.rs` | `NodeEditorPanel` struct, constructor, tab management (`open_or_focus_tab`, `save_dirty_tabs`, `commit_array_add`) |
+| `node_editor/field_spec.rs` | `FieldSpec`, `FieldKind`, `EditorTab` — form field descriptions and dirty-state tracking |
+| `node_editor/render.rs` | `impl Render for NodeEditorPanel` — tab bar, multi-column form, pagination, dropdowns, array widgets |
+| `app_view/mod.rs` | `AppView` struct + data/AI operations (`do_save`, `do_import_data`, `do_clear_data`, `do_init_lemonade`, `do_embed_all`, `refresh_snapshot`); panel size state; drag marker types; `SidebarTab` enum |
+| `app_view/render.rs` | `impl Render for AppView` — menu bar, 3-panel resizable body layout, sidebar tab switching (Tree / Search), status bar, dropdown overlays |
+
+The `actions!()` macro is invoked once in `lib.rs`; all modules import action types via `use crate::{SaveLayout, …}`. The binary imports `AppView` and the action types from the library crate.
+
 **GPUI version:** Using `gpui = "0.2.2"` from crates.io (blade-graphics backend). The current `main` branch of the Zed repo has restructured into `gpui_platform`/`gpui_linux`/`gpui_wgpu` sub-crates with a different entry point (`gpui_platform::application()` instead of `Application::new()`). Stay on 0.2.2 until there is a clear need to upgrade — the crates.io release is stable enough for our purposes. Do not switch to a git dependency without a targeted API compatibility pass.
 
 ### App shell (`AppView`)
 
-`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<NodeEditorPanel>`, `Entity<SelectionModel>`, the shared `Arc<RwLock<GraphSnapshot>>`, and boolean toggles (`sidebar_open`, `right_panel_open`, `file_menu_open`, `view_menu_open`). It renders:
+`AppView` is the GPUI root view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SearchPanel>`, `Entity<NodeEditorPanel>`, `Entity<ChatPanel>`, `Entity<SelectionModel>`, the shared `Arc<RwLock<GraphSnapshot>>`, boolean toggles (`sidebar_open`, `right_panel_open`, `file_menu_open`, `view_menu_open`), `sidebar_tab: SidebarTab` (Tree / Search), user-adjustable panel sizes (`sidebar_width`, `editor_ratio`, `right_panel_width`), AI infrastructure (`app_config`, `tokio_rt`, `inference_queue`, `hq_queue`), and status strings (`data_status`, `embedding_status`). It renders:
 - **Menu bar** (28 px, `flex_none`): "File" button (dropdown: Save / Ctrl+S) and "View" button (dropdown: checkable Left Panel / Ctrl+B, checkable Right Panel / Ctrl+J). Both dropdowns rendered with `deferred(anchored(...))`.
-- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional `TreePanel` (220 px, `flex_none`) on the left + main workspace + optional right panel (280 px, `flex_none`) for chat (placeholder).
-- **Workspace** (`flex_col`, `flex_grow`): 30/70 vertical split — `NodeEditorPanel` (top) + `GraphCanvas` (bottom).
-- **Status bar** (24 px, `flex_none`, bottom): left section has panel toggle buttons (Tree, more coming), center shows graph stats (node/edge count from snapshot), right has a Chat toggle button. All toggle buttons highlight when their panel is open.
+- **Body** (remaining height, `flex_row`, `overflow_hidden()`): optional left sidebar (default 220 px, user-resizable, shows `TreePanel` or `SearchPanel` based on `sidebar_tab`) + workspace + optional `ChatPanel` (default 280 px, user-resizable). Each visible side panel is wrapped in a sized container div; the panel entity itself uses `w_full()`.
+- **Workspace** (`flex_col`, `flex_grow`): vertical split driven by `editor_ratio` — `NodeEditorPanel` (top, default 30%) + `GraphCanvas` (bottom, default 70%).
+- **Resize handles**: three 6 px drag handles sit between panels. Dragging updates the corresponding size field via `on_drag_move` + a `WeakEntity<AppView>` captured in the closure. Double-clicking any handle resets it to its default size. Handle cursor changes to `ResizeColumn`/`ResizeRow` on hover.
+- **Status bar** (24 px, `flex_none`, bottom): left section has panel toggle buttons (Tree, Search — clicking an active tab's button closes the sidebar; clicking the other tab switches and opens); center shows graph stats and amber `embedding_status`; right has a Chat toggle button. All toggle buttons highlight when their panel is open.
+
+**Async AI init flow**: `AppView::new()` calls `do_init_lemonade()` immediately. That method spawns a background task: `resolve_lemonade_url()` → `LemonadeServerCatalog::discover()` → `ModelSelector` → `ProviderFactory::build()` (concurrent via `futures::future::join_all`) → `InferenceQueueBuilder`. On success, stores `inference_queue`/`hq_queue`, calls `search_panel.set_queues()`, selects LLM models via `selector.select_llm_models()`, builds a `LemonadeChatProvider` for the first model (with GPU manager for llamacpp:rocm/vulkan/metal recipes), pushes it to `chat_panel.set_provider()`, then calls `do_embed_all()`. If Lemonade is unreachable, the app continues with FTS5-only search and no chat. `do_embed_all()` calls `embed_all_chunks(graph, queue, EmbeddingTarget::Standard)` (and HQ if available); it only sets `embedding_status` when `total > 0` (i.e., unembedded chunks existed). `do_import_data()` chains `do_embed_all()` on success.
 
 ### Selection model (`SelectionModel`)
 
@@ -200,14 +224,15 @@ Nodes are sorted case-insensitively within each group; groups are sorted by type
 
 **Stored layout for click mapping:**
 ```rust
-enum TextFieldLayout {
-    Single(ShapedLine),                      // single-line field
-    Multi(Vec<(usize, WrappedLine)>),        // (byte_start, line) per '\n'-segment
-}
+struct TextFieldLayout(Vec<(usize, WrappedLine)>);
+// One entry per '\n'-delimited line segment; byte_start is the UTF-8 offset of
+// the first character of that line within the full content string.
 ```
-Updated every paint frame in `TextFieldView::shaped_layout`. The `on_mouse_down` handler converts the window-coordinate click to text-area-local coords (subtract `field_origin` + padding), then calls into this cached layout for exact glyph-level hit testing.
+Updated every paint frame in `TextFieldView::shaped_layout`. The `on_mouse_down` handler converts the window-coordinate click to text-area-local coords (subtract `field_origin` + padding + scroll offset), then calls into this cached layout for exact glyph-level hit testing.
 
 **Element origin:** Stored as `field_origin_x / field_origin_y` from `bounds.origin` inside the paint closure. Event positions from `MouseDownEvent::position` are in window coordinates — subtracting the stored origin converts them to element-local.
+
+**Single-line horizontal scroll:** When `multiline = false`, text is shaped with `wrap_width = None` (no wrapping). `h_scroll_offset: f32` tracks how far the view has scrolled right. `visible_width: f32` is updated each paint from `inner_w`. `text_origin` shifts by `pad_x - px(h_scroll_offset)`. `scroll_to_cursor()` dispatches on `multiline`: single-line calls `ensure_cursor_visible_h(cursor_x, visible_width)` which adjusts `h_scroll_offset` with an 8 px margin. Mouse click coords add `h_scroll_offset` to `local_x` for single-line mode so click-to-cursor mapping is correct when scrolled. `character_index_for_point` (IME handler) applies the same adjustment. `dynamic_h` for single-line is always `TEXT_FIELD_MIN_H` — no vertical growth.
 
 ### GPUI layout constraints (hard-won lessons)
 
@@ -217,6 +242,7 @@ These patterns are required for scroll areas to work correctly inside a flex lay
 - **`min_h_0()` on flex children with scrollable content** — flex items have `min-height: auto` by default, which prevents them from shrinking below their content height. `min_h_0()` overrides this so the item can shrink to its flex-allocated size and let the inner `overflow_y_scroll()` div take over.
 - **Separate shell div from scroll area div** — the outer div (`flex_col`, `flex_none` width, `min_h_0()`) provides the fixed size; an inner div (`overflow_y_scroll()`, `flex_grow`) holds the scrollable content. Combining these on a single div causes layout issues.
 - **`flex_none` on the sidebar** — the tree panel must not participate in flex stretching; only the workspace should grow.
+- **`WeakEntity<T>` for drag callbacks** — `on_drag_move` and `on_click` closures receive `&mut App` (no `Context<V>`). Capture `cx.weak_entity()` before building the element tree, then call `handle.update(cx, |view, cx| { … })` inside the closure to mutate view state. This is the correct pattern for GPUI 0.2.2 whenever event handlers need access to a view but `cx.listener()` isn't available.
 
 ### Canvas architecture
 
@@ -254,13 +280,18 @@ The GPUI canvas saves positions **on explicit save** (Ctrl+S or File > Save) rat
 5. ✅ **Position persistence + node dragging** — `node_positions` table, `save_layout()`/`load_layout()`, drag-to-reposition nodes in the canvas, autosave on drag-end, persistent DB.
 6. ✅ **App shell** — `AppView` root view wrapping `GraphCanvas`. Menu bar (File > Save, Ctrl+S, `SaveLayout` action). 30/70 flex-grow workspace split: editor placeholder (top) + graph canvas (bottom). Canvas coordinate fix: `bounds.origin` offset applied to all paint positions; mouse events subtract `bounds.origin` before `screen_to_world`. `overflow_hidden()` clips paint to pane bounds.
 7. ✅ **Tree view nav + shared selection** — `SelectionModel` entity shared between `TreePanel` and `GraphCanvas`. Tree panel lists nodes by type (collapsed by default, collapsible groups, alphabetical sort). Selecting a node in the tree highlights it in the graph and pans the camera to it. Canvas clicks update the tree highlight. `suppress_pan` flag prevents the canvas from panning when it originated the selection. Sidebar toggled via Ctrl+B or "Nodes" menu bar button. GPUI layout fix: `overflow_hidden()` on body + `min_h_0()` on flex children enables true scroll containment.
-8. ✅ **Status bar + View menu** — Status bar (24 px) at bottom: left panel-toggle buttons (Tree), centered graph stats (node/edge count), right Chat toggle. View menu dropdown with checkable Left Panel (Ctrl+B) and Right Panel (Ctrl+J) items. Right panel placeholder (280 px, "Chat — coming soon"). `ToggleRightPanel` action registered.
+8. ✅ **Status bar + View menu** — Status bar (24 px) at bottom: left panel-toggle buttons (Tree), centered graph stats (node/edge count), right Chat toggle. View menu dropdown with checkable Left Panel (Ctrl+B) and Right Panel (Ctrl+J) items. `ToggleRightPanel` action registered.
 9. ✅ **`ObservableGraph`** — `GraphEvent` enum (`NodeAdded`, `NodeUpdated`, `NodeDeleted`, `EdgeAdded`, `EdgeDeleted`). `ObservableGraph` wraps `Arc<KnowledgeGraph>`, forwards mutating calls, broadcasts events via `tokio::sync::broadcast`. `Deref<Target = KnowledgeGraph>` exposes all read-only methods directly. `NodeView` now carries `properties: serde_json::Value` so the full schema-defined payload is available in the snapshot without extra DB queries.
 10. ✅ **Node detail panel** — (Superseded by item 10b.) Original `NodeDetailPanel` entity displayed read-only pretty-printed JSON. Replaced by the schema-driven editor below.
 10b. ✅ **Schema-driven editor with browser tabs** — `NodeEditorPanel` replaces `NodeDetailPanel` (top 30% of workspace). Browser-style tab system: selecting a node opens it in an editor tab; unpinned tabs are replaced when a new node is selected; pinned tabs stay open. Each tab renders a schema-driven form generated from `ObjectTypeSchema` properties. Form fields: `TextFieldView` (custom text input widget implementing `EntityInputHandler`) for String/Text/Number, clickable checkbox for Boolean, anchored dropdown overlay for Enum, tag-chip list with add/remove for Array. Multi-column layout: fields flow vertically into columns (300 px each); columns overflow into additional pages with "< Prev" / "Next >" navigation buttons. Dirty state: tabs turn orange (`0xfab387`) when edited values differ from DB. Save all: Ctrl+S / File > Save persists all dirty tabs via `KnowledgeGraph::update_object()` and saves layout positions, then patches the in-memory snapshot so tree panel and canvas reflect name changes. `SchemaManager::get_object_type_schema()` added as a sync cache accessor; default schema pre-loaded at startup.
 10c. ✅ **`TextFieldView` cursor and click accuracy** — Rewrote `TextFieldView::Render` to paint text via `shape_line`/`shape_text` + `ShapedLine::paint()`/`WrappedLine::paint()` on a `canvas` element instead of using a `SharedString` div child. Cursor position uses `x_for_index`/`position_for_index` on the shaped layout (pixel-exact). Click-to-cursor uses `closest_index_for_x`/`closest_index_for_position` on the same cached `TextFieldLayout` enum. Line height corrected to `font_size * phi (1.618)` (GPUI default). Element origin stored each frame so `MouseDownEvent::position` (window coords) is correctly converted to text-area-local coordinates. See "TextFieldView — canvas-based text rendering" section above.
 10d. ✅ **Unified text fields, scroll support, and editable array adds** — All text fields now use wrapped rendering (`shape_text` with `wrap_width`) and dynamically grow from single-line height (28 px) up to a cap (120 px) based on content. When content exceeds the cap, the field becomes scrollable via mouse wheel, with `overflow_hidden()` clipping and a `scroll_offset` applied to paint. `ensure_cursor_visible()` is called from key/mouse handlers (never from paint) to avoid render-loop oscillation. `TextFieldLayout` simplified to a single struct (no more `Single`/`Multi` enum). Array "+" button spawns an inline `TextFieldView` that commits on Enter via a new `TextSubmit` event. `set_content` now resets cursor to position 0 so fields don't auto-scroll to the bottom on load.
-11. **Search** — text input → highlight matching nodes.
+10e. ✅ **Module decomposition** — Broke the monolithic 3,392-line `main.rs` into 10 focused files across 6 modules (see "Module structure" section above). `main.rs` is now the binary entry point only (~111 lines); all types live in a library target (`lib.rs`). `Cargo.toml` declares both `[lib]` and `[[bin]]` targets. Module organization follows Zed's conventions: one file per panel/concern, large render impls separated from data logic. No functional changes.
+10f. ✅ **Resizable panels** — All three panel boundaries are now user-draggable via 6 px resize handles (Zed `DraggedDock` pattern). `AppView` gains `sidebar_width`, `editor_ratio`, `right_panel_width` fields with sensible defaults and min/max clamping. Three marker structs (`ResizeSidebar`, `ResizeEditorCanvas`, `ResizeRightPanel`) implement `Render` returning `gpui::Empty`; they are passed as the drag payload to `on_drag` and matched by `on_drag_move`. `TreePanel` changed from fixed `w(px(SIDEBAR_W))` to `w_full()` — the parent container controls width. Double-click on any handle resets it to the default size via `on_click` + `event.click_count() == 2`.
+11. ✅ **Search panel** — `SearchPanel` entity in left sidebar, toggled by "Search" button in status bar. `SidebarTab` enum (Tree / Search) on `AppView`. Three modes: FTS5 (always available), Semantic (requires Lemonade; uses HQ 4096-dim when `hq_queue` is set, standard 768-dim otherwise), Hybrid (`search_hybrid()` with RRF fusion). Query submitted via Enter key (`TextSubmit` event) or search button click. Results list: node name + type color dot; clicking a result calls `SelectionModel::select_by_id()` → canvas pans + editor tab opens. Semantic/Hybrid buttons are visually dimmed when no `inference_queue` is available. `set_queues()` method called from `AppView::do_init_lemonade()` success path.
+11b. ✅ **Async Lemonade init + embedding status** — `AppView` now holds `Arc<tokio::runtime::Runtime>` (persistent across the app lifetime), `Arc<AppConfig>`, `inference_queue`, `hq_queue`, and `embedding_status`. `do_init_lemonade()` runs on startup: discovers Lemonade, builds queue via `ProviderFactory` + `InferenceQueueBuilder`, then triggers `do_embed_all()`. `do_embed_all()` uses `embed_all_chunks()` (incremental — only unembedded chunks); only sets `embedding_status` when `total > 0` so already-embedded DBs show no noise. Status bar center shows amber embedding progress / completion. `do_import_data()` chains `do_embed_all()` after successful import.
+11c. ✅ **Single-line horizontal scroll in `TextFieldView`** — Search query input is single-line only. `wrap_width = None` prevents wrapping. `h_scroll_offset` + `visible_width` fields; `ensure_cursor_visible_h()` keeps cursor on screen with 8 px margin. Mouse click and IME `character_index_for_point` both compensate for `h_scroll_offset`. `dynamic_h` fixed at `TEXT_FIELD_MIN_H` for single-line fields.
+12. ✅ **Chat panel** — `ChatPanel` entity replaces the placeholder `RightPanel` in the right sidebar (default 280 px, user-resizable). Streaming LLM chat via `LemonadeChatProvider::complete_stream()` with `enable_thinking: true`. Model selector dropdown populated from `ModelSelector::select_llm_models()` after Lemonade discovery; each entry shows model ID + device label (GPU/NPU/CPU). Enter-to-submit toggle: checkbox controls whether Enter submits (Shift+Enter newlines) or Enter newlines (Shift+Enter submits); implemented via `TextFieldView.submit_on_enter` flag that modifies the Enter key handler. Multiline input field + "Send" button. Message history with color-coded roles: User (blue), Assistant (green), Thinking (yellow/dimmed). Thinking tokens (`StreamToken::Thinking`) displayed separately and removed if model produced none. "Generating..." indicator while streaming. `AppView::do_init_lemonade()` extended to select LLM models, build `LemonadeChatProvider` (with `GpuResourceManager` for GPU recipes), and call `chat_panel.set_provider()`. Stream consumer runs on GPUI background executor; tokens fed back to entity via `this.update()`.
 
 ---
 

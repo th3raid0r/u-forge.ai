@@ -27,8 +27,7 @@ pub struct DatabaseConfig {
 pub fn load_toml_config<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Could not read config file '{path}': {e}"))?;
-    toml::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Could not parse config file '{path}': {e}"))
+    toml::from_str(&text).map_err(|e| anyhow::anyhow!("Could not parse config file '{path}': {e}"))
 }
 
 // ── Argument parsing ──────────────────────────────────────────────────────────
@@ -67,7 +66,7 @@ pub fn resolve_demo_args() -> DemoArgs {
         .or_else(|| std::env::var("UFORGE_DATA_FILE").ok())
         .unwrap_or_else(|| {
             format!(
-                "{}/../../defaults/data/memory.json",
+                "{}/../../defaults/data/memory.jsonl",
                 env!("CARGO_MANIFEST_DIR")
             )
         });

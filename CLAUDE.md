@@ -8,7 +8,7 @@ Read `.rules` first for every task. Rule files in `.rulesdir/` have more detail 
 
 ## Project summary
 
-Local-first TTRPG worldbuilding tool with an AI-powered knowledge graph. Written in Rust. Uses SQLite (FTS5 + sqlite-vec ANN) for storage, Lemonade Server for all AI inference (embedding, STT, TTS, LLM, reranking). The `KnowledgeGraph` facade is intentionally decoupled from AI — it works without a running server. AI capabilities are opt-in via `InferenceQueue`.
+Local-first TTRPG worldbuilding tool with an AI-powered knowledge graph. Written in Rust. Native desktop UI built on GPUI (Zed editor's GPU-accelerated framework) — Alpha. Uses SQLite (FTS5 + sqlite-vec ANN) for storage, Lemonade Server for all AI inference (embedding, STT, TTS, LLM, reranking). The `KnowledgeGraph` facade is intentionally decoupled from AI — it works without a running server. AI capabilities are opt-in via `InferenceQueue`.
 
 ---
 
@@ -36,12 +36,12 @@ See `.rules` for the full list. Summary:
 | `.rulesdir/schema-system.mdc` | Schema format, validation, property types |
 | `.rulesdir/json-data-formats.mdc` | JSONL import format, two-pass pipeline |
 | `ARCHITECTURE.md` | Full module map, workspace layout, SQLite schema, hardware design, design decisions |
-| `feature_UI.md` | GPUI native UI — graph view model, spatial indexing, GPUI prototype |
+| `feature_UI.md` | GPUI native desktop UI (Alpha) — graph canvas, node editor, search, chat |
 | `feature_TS-Agent-Sandbox.md` | deno_core TypeScript agentic sandbox with restricted op surface |
 
 ---
 
 ## Active Features
 
-- **`feature_UI.md`** — Native GPUI graph visualization: `u-forge-graph-view` view model + GPUI prototype. Skeleton crate at `crates/u-forge-ui-gpui/`.
-- **`feature_TS-Agent-Sandbox.md`** — Embedded V8 TypeScript sandbox: `u-forge-ts-runtime` with `deno_core` ops and `.d.ts` contract. Skeleton crate at `crates/u-forge-ts-runtime/`.
+- **`feature_UI.md`** — Alpha complete. Native GPUI desktop app: graph canvas with pan/zoom/LOD, schema-driven node editor with browser-style tabs, FTS5/semantic/hybrid search panel, streaming LLM chat panel with model selector and thinking separation. Crates: `u-forge-graph-view`, `u-forge-ui-traits`, `u-forge-ui-gpui`.
+- **`feature_TS-Agent-Sandbox.md`** — Not started. Embedded V8 TypeScript sandbox: `u-forge-ts-runtime` with `deno_core` ops and `.d.ts` contract. Skeleton crate at `crates/u-forge-ts-runtime/`.
