@@ -42,6 +42,8 @@ pub(crate) struct TextFieldView {
     marked_range: Option<Range<usize>>,
     pub(crate) focus: FocusHandle,
     multiline: bool,
+    /// When true on a multiline field, Enter emits `TextSubmit` and Shift+Enter inserts a newline.
+    pub(crate) submit_on_enter: bool,
     placeholder: String,
     /// Whether the cursor is currently visible (used for blinking).
     cursor_visible: bool,
@@ -78,6 +80,7 @@ impl TextFieldView {
             marked_range: None,
             focus: cx.focus_handle(),
             multiline,
+            submit_on_enter: false,
             placeholder: placeholder.to_string(),
             cursor_visible: true,
             blink_epoch: 0,
@@ -799,14 +802,22 @@ impl Render for TextFieldView {
                         cx.notify();
                     }
                     "enter" => {
+                        let shift = event.keystroke.modifiers.shift;
                         if this.multiline {
-                            this.delete_selection();
-                            this.content.insert(this.cursor, '\n');
-                            this.cursor += 1;
-                            cx.emit(TextChanged(this.content.clone()));
-                            this.scroll_to_cursor();
-                            this.reset_blink(cx);
-                            cx.notify();
+                            // submit_on_enter: Enter submits, Shift+Enter newline.
+                            // !submit_on_enter: Enter newline, Shift+Enter submits.
+                            let should_submit = this.submit_on_enter != shift;
+                            if should_submit {
+                                cx.emit(TextSubmit(this.content.clone()));
+                            } else {
+                                this.delete_selection();
+                                this.content.insert(this.cursor, '\n');
+                                this.cursor += 1;
+                                cx.emit(TextChanged(this.content.clone()));
+                                this.scroll_to_cursor();
+                                this.reset_blink(cx);
+                                cx.notify();
+                            }
                         } else {
                             cx.emit(TextSubmit(this.content.clone()));
                         }

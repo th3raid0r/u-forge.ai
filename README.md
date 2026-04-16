@@ -4,13 +4,18 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)
-![Status](https://img.shields.io/badge/status-Early%20Prototype-orange.svg)
+![Status](https://img.shields.io/badge/status-Alpha-yellow.svg)
 
 ## What is u-forge.ai?
 
 A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI-assisted knowledge graph for managing worlds — characters, locations, factions, quests, and their relationships — with full-text and semantic search.
 
-**⚠️ Status: Early prototype. No GUI yet; everything runs as a CLI demo.**
+**Alpha UI now available.** The native desktop application is built on [GPUI](https://gpui.rs/) (the GPU-accelerated UI framework from the Zed editor). It provides a graph canvas with pan/zoom, a schema-driven node editor, FTS5/semantic/hybrid search, and a streaming LLM chat panel — all running locally with no cloud dependency.
+
+```bash
+# Launch the UI
+cargo run -p u-forge-ui-gpui
+```
 
 ---
 
@@ -18,23 +23,21 @@ A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI
 
 | Area | Status |
 |---|---|
-| SQLite knowledge graph (nodes, edges, chunks, schemas) | ✅ Working |
-| Full-text search via SQLite FTS5 | ✅ Working |
-| Semantic (vector) search via sqlite-vec ANN (`chunks_vec` vec0 table) | ✅ Working |
-| Hybrid search — FTS5 + ANN + RRF merge + optional rerank (`src/search/`) | ✅ Working |
-| Flexible JSON schema system with validation (13 TTRPG types) | ✅ Working |
-| JSONL data ingestion — two-pass node + edge import, deduplication | ✅ Working |
-| `ObjectBuilder` fluent API | ✅ Working |
-| Catalog-driven model selection (`LemonadeServerCatalog`, `ModelSelector`) | ✅ Working |
-| Lemonade Server embedding provider (`LemonadeProvider`) | ✅ Working |
-| Lemonade Server transcription provider (`LemonadeTranscriptionProvider`) | ✅ Working |
-| Unified inference queue (`InferenceQueue`) — embed, transcribe, TTS, LLM, rerank | ✅ Working |
-| Reranking via Lemonade Server (`LemonadeRerankProvider`) | ✅ Working |
-| `cli_demo` — hybrid search + rerank pipeline demo with Foundation universe data | ✅ Working |
-| `cli_chat` — interactive RAG chat REPL (hybrid search + LLM) | ✅ Working |
-| axum HTTP / WebSocket server | 🔜 Planned |
-| Streaming LLM responses | 🔜 Planned |
-| Web UI | 🔜 Planned |
+| **Native desktop UI (GPUI)** — graph canvas, node editor, search, chat | **Alpha** |
+| SQLite knowledge graph (nodes, edges, chunks, schemas) | Working |
+| Full-text search via SQLite FTS5 | Working |
+| Semantic (vector) search via sqlite-vec ANN (`chunks_vec` vec0 table) | Working |
+| Hybrid search — FTS5 + ANN + RRF merge + optional rerank | Working |
+| Flexible JSON schema system with validation (13 TTRPG types) | Working |
+| JSONL data ingestion — two-pass node + edge import, deduplication | Working |
+| Catalog-driven model selection (`LemonadeServerCatalog`, `ModelSelector`) | Working |
+| Unified inference queue (`InferenceQueue`) — embed, transcribe, TTS, LLM, rerank | Working |
+| Streaming LLM chat with thinking/reasoning separation | Working |
+| `cli_demo` — hybrid search + rerank pipeline demo | Working |
+| `cli_chat` — interactive RAG chat REPL (hybrid search + LLM) | Working |
+| TypeScript agentic sandbox (`deno_core` V8 embedding) | Planned |
+| Agentic workflows (AI-driven graph operations) | Planned |
+| HTTP / WebSocket server + web UI | Distant |
 
 ---
 
@@ -43,9 +46,11 @@ A **local-first TTRPG worldbuilding tool** that gives game masters a private, AI
 | Layer | Technology |
 |---|---|
 | Language | Rust (multi-crate Cargo workspace) |
+| Desktop UI | [GPUI 0.2.2](https://gpui.rs/) (Zed editor's GPU-accelerated framework) |
 | Storage | SQLite via `rusqlite` (bundled — zero system deps) |
 | Full-text search | SQLite FTS5 |
 | Vector search | sqlite-vec ANN (`vec0` virtual table, cosine distance) |
+| Graph layout | Force-directed (grid-cell bucketed O(N) repulsion) + R-tree spatial index |
 | Embeddings / LLM / Reranking / TTS / STT | [Lemonade Server](https://github.com/lemonade-sdk/lemonade) HTTP API (optional) |
 | Async runtime | Tokio 1.x |
 | Serialization | serde\_json |
@@ -61,13 +66,24 @@ cargo build
 # Run all tests (no server required)
 cargo test -- --test-threads=1
 
-# Run the CLI demo with Foundation universe sample data
-cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
+# Launch the native UI
+cargo run -p u-forge-ui-gpui
 ```
 
 No `source env.sh`. No model downloads required to build and test.
 
-### With Lemonade Server (embeddings + reranking + LLM + transcription)
+### The Desktop UI
+
+The GPUI app provides:
+
+- **Graph canvas** — pan/zoom visualization of the knowledge graph with LOD rendering, type-colored nodes, edge rendering, and a legend. Drag nodes to rearrange; positions are persisted to SQLite.
+- **Schema-driven node editor** — browser-style tabs with form fields generated from JSON schemas. Supports text, number, boolean, enum, and array fields. Dirty-state tracking with orange tab indicators; Ctrl+S saves all.
+- **Tree panel** — collapsible sidebar listing all nodes grouped by type, with selection synced to the canvas and editor.
+- **Search panel** — FTS5 (always available), semantic, and hybrid search modes. Semantic/hybrid require Lemonade Server.
+- **Chat panel** — streaming LLM chat with model selector, enter-to-submit toggle, and thinking/reasoning token separation. Requires Lemonade Server with an LLM model.
+- **Resizable panels** — all panel boundaries are draggable; double-click to reset.
+
+### With Lemonade Server (embeddings + reranking + LLM + chat)
 
 ```bash
 # Install and start Lemonade Server
@@ -76,7 +92,7 @@ sudo snap install lemonade-server        # Linux
 # Pull models you want to use
 lemonade-server pull embed-gemma-300m-FLM      # embeddings (NPU, 0.62 GB)
 lemonade-server pull bge-reranker-v2-m3-GGUF   # reranking (GPU/CPU)
-lemonade-server pull whisper-v3-turbo-FLM      # transcription (NPU, 1.55 GB)
+lemonade-server pull GLM-4.7-Flash-GGUF        # LLM for chat (GPU)
 
 lemonade-server serve                    # leave running
 ```
@@ -104,27 +120,22 @@ results.
 # Set LEMONADE_URL only to override (e.g. non-standard port):
 export LEMONADE_URL="http://localhost:13305/api/v1"
 
-cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
+cargo run -p u-forge-ui-gpui
 ```
 
-The CLI demo will detect hardware capabilities, list available models, run FTS5
-search over the Foundation universe dataset, and — when a reranker model is
-available — demonstrate the FTS5 → rerank pipeline.
+The UI auto-discovers Lemonade Server on startup. When connected, semantic/hybrid search and the chat panel become available. When not connected, the app continues with FTS5-only search and the chat panel shows a connection message.
 
-### Interactive RAG chat (`cli_chat`)
-
-`cli_chat` is an interactive REPL that grounds every response in the knowledge
-graph.  It requires an LLM model in addition to the embedding and reranker.
+### CLI demos
 
 ```bash
-# Pull an LLM (if you haven't already)
-lemonade-server pull GLM-4.7-Flash-GGUF
+# CLI demo — hardware caps, FTS5, semantic, reranking
+cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 
-# Start the chat demo
+# Interactive RAG chat REPL
 cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_chat
 ```
 
-**REPL commands:**
+**`cli_chat` REPL commands:**
 
 | Command | Effect |
 |---|---|
@@ -136,22 +147,10 @@ cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_chat
 
 | Scenario | Behaviour |
 |---|---|
-| No Lemonade Server | Prints setup instructions and exits |
-| Lemonade running but no LLM model | Lists available models and exits |
-| LLM available but no embedding model | Chat works with FTS5-only search (noted on startup) |
-| Full stack (embedding + LLM + reranker) | Hybrid search → rerank → LLM response |
-
-**Config** — add a `[chat]` section to `defaults/demo_config.toml` to override defaults:
-
-```toml
-[chat]
-system_prompt = "You are a knowledgeable assistant..."
-max_history_turns = 10   # turn-pairs retained in context
-max_tokens = 1024
-temperature = 0.7
-alpha = 0.5              # 0.0 = FTS-only, 1.0 = semantic-only
-search_limit = 3         # knowledge graph nodes to retrieve per turn
-```
+| No Lemonade Server | UI works with FTS5-only search; chat panel shows connection message |
+| Lemonade running but no LLM model | Search works; chat unavailable |
+| LLM available but no embedding model | Chat works with FTS5-only search |
+| Full stack (embedding + LLM + reranker) | Hybrid search + rerank + streaming LLM chat |
 
 ### Environment Variables
 
@@ -165,8 +164,8 @@ search_limit = 3         # knowledge graph nodes to retrieve per turn
 ### Device Configuration
 
 Device weights and enable/disable state are controlled by an optional TOML file at:
-- `$XDG_CONFIG_HOME/u-forge-devices.toml` (or `~/.config/u-forge-devices.toml`)
-- `./u-forge-devices.toml` (current directory)
+- `./u-forge.toml` (current directory)
+- `$XDG_CONFIG_HOME/u-forge/config.toml` (or `~/.config/u-forge/config.toml`)
 
 If no file exists, defaults are used (all devices enabled: NPU=100, GPU=50, CPU=10).
 
@@ -180,51 +179,14 @@ gpu_weight = 40
 cpu_enabled = false
 cpu_weight = 10
 
-[models.context_limits]
-"embed-gemma-300m-FLM"     = 2048
-"user.ggml-org/embeddinggemma-300M-GGUF"   = 2048
-"nomic-embed-text-v1-GGUF"  = 2048
-"Qwen3-Embedding-8B-GGUF"  = 32768
+[chat]
+preferred_device = "gpu"
+system_prompt = "You are a knowledgeable assistant..."
+
+[chat.gpu]
+model = "Gemma-4-26B-A4B-it-GGUF"
+max_tokens = 262144
 ```
-
-Example `demo_config.toml`:
-```toml
-# It's separate from u-forge.toml which is used by the application.
-
-[database]
-# path = "./demo_data/kg"   # override the default DB location (default: <workspace>/demo_data/kg)
-# clear = true              # set to true to wipe the DB before loading (default: false)
-
-[fts]
-[[fts.queries]]
-query = "mayor"
-limit = 3
-
-[semantic]
-[[semantic.queries]]
-query = "Who is the leader of the Foundation?"
-limit = 5
-
-[rerank]
-[[rerank.queries]]
-query = "Who is the leader of the Foundation?"
-semantic_limit = 6
-
-[hybrid]
-queries = ["Mayor"]
-alpha_sweep_query = "Mayor"
-alpha_sweep_values = [0.0, 0.5, 1.0]
-
-[hybrid.config]
-alpha = 0.5
-fts_limit = 10
-semantic_limit = 10
-rerank = true
-limit = 3
-
-```
-
-When multiple embedding workers are available, the highest-weight idle worker is selected. This configuration only affects the inference queue's device selection strategy — it does not require code changes.
 
 ---
 
@@ -251,9 +213,9 @@ u-forge.ai/
 │   │       ├── common/             # Shared helpers (config, args, KG setup, embedding)
 │   │       ├── cli_demo.rs         # Demo: hardware caps, FTS5, reranking
 │   │       └── cli_chat.rs         # Interactive RAG chat REPL
-│   ├── u-forge-graph-view/ # Graph view model + layout (see feature_UI.md)
-│   ├── u-forge-ui-traits/  # Framework-agnostic rendering contracts (see feature_UI.md)
-│   ├── u-forge-ui-gpui/    # GPUI native app (see feature_UI.md)
+│   ├── u-forge-graph-view/ # Graph view model + layout engine
+│   ├── u-forge-ui-traits/  # Framework-agnostic rendering contracts
+│   ├── u-forge-ui-gpui/    # GPUI native desktop app (Alpha)
 │   └── u-forge-ts-runtime/ # Embedded deno_core TypeScript sandbox (skeleton — see feature_TS-Agent-Sandbox.md)
 ├── defaults/
 │   ├── data/memory.json    # Foundation universe JSONL (~220 nodes, ~312 edges)
@@ -274,15 +236,27 @@ details rather than this document.
 | Document | Purpose |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Module map, SQLite schema, hardware architecture, inference queue, design decisions |
+| [feature_UI.md](feature_UI.md) | Native GPUI desktop UI — design, implementation, module structure |
+| [feature_TS-Agent-Sandbox.md](feature_TS-Agent-Sandbox.md) | TypeScript agentic sandbox design |
 | [.rulesdir/](.rulesdir/) | AI assistant context rules (7 `.mdc` files) |
+
+---
+
+## Roadmap
+
+1. **Native desktop UI (GPUI)** — Alpha complete. Graph canvas, node editor, search, chat.
+2. **TypeScript agentic sandbox** — Embed a sandboxed V8 runtime via `deno_core` for AI-driven graph operations.
+3. **Agentic workflows** — AI agents that can query, create, and modify knowledge graph nodes via TypeScript programs.
+4. **Polish and stabilization** — UI refinement, performance tuning, error handling improvements.
+5. **HTTP server + web UI** — Distant. Requires core feature set to stabilize first.
 
 ---
 
 ## Sample Data
 
 `defaults/data/memory.json` models Isaac Asimov's **Foundation** universe (~220 nodes,
-~312 edges). Used by `cli_demo` for end-to-end testing of the full pipeline: schema
-load → data import → FTS5 indexing → search → rerank.
+~312 edges). Used by the UI and CLI demos for end-to-end testing of the full pipeline:
+schema load, data import, FTS5 indexing, search, rerank.
 
 ---
 

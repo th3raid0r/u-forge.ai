@@ -7,9 +7,9 @@ The project is a Cargo workspace. All source lives under `crates/`:
 | Crate | Kind | Status | Purpose |
 |-------|------|--------|---------|
 | `u-forge-core` | lib | Complete | All current source — storage, AI, hardware, queue, search, schema, ingest |
-| `u-forge-graph-view` | lib | In Progress | Graph view model + layout engine (see `feature_UI.md`) |
-| `u-forge-ui-traits` | lib | In Progress | Framework-agnostic rendering contracts (see `feature_UI.md`) |
-| `u-forge-ui-gpui` | bin | In Progress | GPUI native app — pan/zoom canvas, LOD rendering (see `feature_UI.md`) |
+| `u-forge-graph-view` | lib | Complete | Graph view model + layout engine (see `feature_UI.md`) |
+| `u-forge-ui-traits` | lib | Complete | Framework-agnostic rendering contracts (see `feature_UI.md`) |
+| `u-forge-ui-gpui` | lib + bin | Alpha | GPUI native desktop app — graph canvas, node editor, search, chat (see `feature_UI.md`) |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
 `defaults/` (schemas + sample data) stays at the workspace root. Both example entry points and `examples/common/mod.rs` resolve it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
@@ -90,11 +90,29 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 
 ## Module Map (u-forge-ui-gpui)
 
-| File | Role |
+| File / directory | Role |
 |---|---|
-| `src/main.rs` | Application entry point: loads data, builds `GraphSnapshot`, pre-loads schemas, opens GPUI window with `AppView` root containing `GraphCanvas`, `TreePanel`, and `NodeEditorPanel` |
+| `src/main.rs` | Binary entry point: tokio runtime, config, `KnowledgeGraph` init, schema pre-load, GPUI `Application` setup |
+| `src/lib.rs` | Module declarations, `actions!()` macro, re-exports (`AppView`, action types) |
+| `src/selection_model.rs` | `SelectionModel` — shared selection state observed by `TreePanel`, `GraphCanvas`, `NodeEditorPanel`, and `SearchPanel` |
+| `src/text_field.rs` | `TextFieldView` — canvas-based text input (`EntityInputHandler`, cursor, IME, blink, scroll, `submit_on_enter` flag) |
+| `src/tree_panel.rs` | `TreePanel` — collapsible node-by-type sidebar |
+| `src/search_panel.rs` | `SearchPanel` — FTS5 / Semantic / Hybrid search modes, query field, results list |
+| `src/chat_panel.rs` | `ChatPanel` — streaming LLM chat: model selector dropdown, enter-to-submit toggle, message history with thinking/content separation |
+| `src/graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
+| `src/node_editor/mod.rs` | `NodeEditorPanel` struct, tab management, save logic |
+| `src/node_editor/field_spec.rs` | `FieldSpec`, `FieldKind`, `EditorTab` — form field descriptions and dirty-state tracking |
+| `src/node_editor/render.rs` | `impl Render for NodeEditorPanel` — tab bar, multi-column form, pagination |
+| `src/app_view/mod.rs` | `AppView` struct + data/AI operations (`do_save`, `do_import_data`, `do_clear_data`, `do_init_lemonade`, `do_embed_all`, `refresh_snapshot`) |
+| `src/app_view/render.rs` | `impl Render for AppView` — menu bar, 3-panel resizable body layout, status bar |
 
-`AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<NodeEditorPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. The workspace is a 30/70 vertical split: `NodeEditorPanel` (top) + `GraphCanvas` (bottom). `GraphCanvas` owns `Arc<GraphSnapshot>`, camera world-space `Vec2`, and zoom. `Render::render()` clones camera state into a `canvas()` closure, calls `generate_draw_commands()`, then maps `DrawCommand::Line` values to batched `PathBuilder` paths (500 edges per path) and `DrawCommand::Circle` to `paint_quad()` with `corner_radii`. `NodeEditorPanel` provides browser-style tabs with schema-driven forms built on `TextFieldView` (custom `EntityInputHandler` widget), dirty-state tracking, and save-all via Ctrl+S. Run with `cargo run -p u-forge-ui-gpui` from the workspace root.
+`AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SearchPanel>`, `Entity<NodeEditorPanel>`, `Entity<ChatPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. Layout: 28 px menu bar + horizontal body (optional left sidebar showing TreePanel or SearchPanel + vertical workspace with NodeEditorPanel / GraphCanvas 30/70 split + optional ChatPanel) + 24 px status bar. All panel boundaries are user-resizable via drag handles.
+
+`ChatPanel` provides streaming LLM chat via `LemonadeChatProvider::complete_stream()`. Features: model selector dropdown (populated from `ModelSelector::select_llm_models()` after Lemonade discovery), enter-to-submit toggle (controls whether Enter submits or inserts a newline in the multiline input), message history with color-coded roles (User/Assistant/Thinking), and a "Generating..." streaming indicator. Thinking tokens (`StreamToken::Thinking`) are displayed separately from content tokens and removed if empty.
+
+`do_init_lemonade()` discovers Lemonade Server asynchronously on startup, builds embedding/reranking queues, selects LLM models, constructs a `LemonadeChatProvider`, and pushes it to both `SearchPanel` (for queues) and `ChatPanel` (for chat). If Lemonade is unreachable, the app continues with FTS5-only search and no chat.
+
+Run with `cargo run -p u-forge-ui-gpui` from the workspace root.
 
 **GPUI version:** `0.2.2` from crates.io (blade-graphics backend). Do not upgrade without a targeted API compatibility check — GPUI has no semver guarantees.
 
@@ -778,21 +796,15 @@ before failing, allowing edges to reference nodes from prior import sessions.
 
 ## Design Decisions — Questionable / Still Open
 
-- **`chat.rs` must use hand-crafted HTTP, not `async-openai`** — Lemonade Server's
+- **`chat.rs` uses hand-crafted HTTP, not `async-openai`** — Lemonade Server's
   chat endpoint deviates from the OpenAI spec at the thinking/reasoning parameter.
   OpenAI uses a `reasoning` object (or `reasoning_effort` string); Lemonade uses a
   flat `enable_thinking: bool` field at the request body root.  `async-openai`'s
-  typed `CreateChatCompletionRequest` has no way to inject this field, so the crate
-  cannot be used to drive the chat endpoint when thinking must be controlled.
-  The other Lemonade endpoints (embeddings, TTS, STT) remain genuinely OpenAI-compatible
-  and continue to use `async-openai` via `make_lemonade_openai_client`.
-  Files that must change when `chat.rs` is migrated to direct `reqwest` calls:
-  `src/lemonade/chat.rs` (replace `Client<OpenAIConfig>` + builder API with a
-  `LemonadeHttpClient` + hand-rolled request/response structs, swap
-  `ReasoningEffort` for `enable_thinking: Option<bool>`),
-  `src/lemonade/mod.rs` (drop the `ChatReasoningEffort` re-export).
-  `Cargo.toml` retains the `async-openai` dependency for the remaining three
-  endpoints.
+  typed `CreateChatCompletionRequest` has no way to inject this field.
+  `LemonadeChatProvider` uses `LemonadeHttpClient` with hand-rolled request/response
+  structs and an SSE stream parser. The other Lemonade endpoints (embeddings, TTS, STT)
+  remain genuinely OpenAI-compatible and continue to use `async-openai` via
+  `make_lemonade_openai_client`.
 
 - **`embedding_manager` not in `KnowledgeGraph`** — embedding is now a caller
   concern. This simplifies the core struct but means callers must manage the

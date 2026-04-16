@@ -16,9 +16,9 @@ use u_forge_core::{
 };
 use u_forge_graph_view::GraphSnapshot;
 
+use crate::chat_panel::{AvailableModel, ChatPanel};
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
-use crate::right_panel::RightPanel;
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
 use crate::tree_panel::TreePanel;
@@ -93,7 +93,7 @@ pub struct AppView {
     pub(crate) tree_panel: Entity<TreePanel>,
     pub(crate) search_panel: Entity<SearchPanel>,
     pub(crate) node_editor: Entity<NodeEditorPanel>,
-    pub(crate) right_panel: Entity<RightPanel>,
+    pub(crate) chat_panel: Entity<ChatPanel>,
     #[allow(dead_code)]
     pub(crate) selection: Entity<SelectionModel>,
     pub(crate) snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -161,14 +161,21 @@ impl AppView {
                 cx,
             )
         });
-        let right_panel = cx.new(|_| RightPanel::new());
+        let chat_panel = cx.new(|cx| {
+            ChatPanel::new(
+                app_config.chat.system_prompt.clone(),
+                app_config.chat.max_history_turns,
+                tokio_rt.clone(),
+                cx,
+            )
+        });
 
         let mut view = Self {
             graph_canvas,
             tree_panel,
             search_panel,
             node_editor,
-            right_panel,
+            chat_panel,
             selection,
             snapshot: snapshot_arc,
             graph,
@@ -199,6 +206,7 @@ impl AppView {
         match u_forge_graph_view::build_snapshot(&self.graph) {
             Ok(snap) => {
                 *self.snapshot.write() = snap;
+                self.tree_panel.update(cx, |panel, cx| panel.refresh_groups(cx));
                 cx.notify();
             }
             Err(e) => {
@@ -294,7 +302,7 @@ impl AppView {
         cx.notify();
     }
 
-    /// Asynchronously discover Lemonade Server and build the InferenceQueue.
+    /// Asynchronously discover Lemonade Server and build the InferenceQueue + ChatProvider.
     /// FTS5 search works immediately even if this fails.
     pub(crate) fn do_init_lemonade(&mut self, cx: &mut Context<Self>) {
         let app_config = self.app_config.clone();
@@ -378,14 +386,31 @@ impl AppView {
                         // Build optional HQ embedding queue.
                         let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
 
-                        Ok((queue, hq_queue))
+                        // Select LLM models and build a chat provider for the first one.
+                        let llm_models = selector.select_llm_models();
+                        let llm_available: Vec<AvailableModel> =
+                            llm_models.iter().map(AvailableModel::from).collect();
+                        let chat_provider = llm_models.first().map(|sel| {
+                            let gpu = match sel.recipe.as_str() {
+                                "llamacpp" => match sel.backend.as_deref() {
+                                    Some("rocm") | Some("vulkan") | Some("metal") => {
+                                        Some(Arc::clone(&gpu_mgr))
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
+                        });
+
+                        Ok((queue, hq_queue, chat_provider, llm_available))
                     })
                 })
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
-                    Ok((queue, hq_queue)) => {
+                    Ok((queue, hq_queue, chat_provider, llm_models)) => {
                         eprintln!("Lemonade connected — embedding queue ready");
                         view.inference_queue = Some(queue.clone());
                         view.hq_queue = hq_queue.clone();
@@ -394,6 +419,13 @@ impl AppView {
                         view.search_panel.update(cx, |panel, _cx| {
                             panel.set_queues(Some(queue), hq_queue);
                         });
+
+                        // Push chat provider to chat panel.
+                        if let Some(provider) = chat_provider {
+                            view.chat_panel.update(cx, |panel, _cx| {
+                                panel.set_provider(provider, llm_models);
+                            });
+                        }
 
                         // Trigger bulk embedding for any unembedded chunks.
                         view.do_embed_all(cx);

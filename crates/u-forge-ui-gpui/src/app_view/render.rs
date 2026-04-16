@@ -337,7 +337,7 @@ impl Render for AppView {
                                 .h_full()
                                 .min_h_0()
                                 .overflow_hidden()
-                                .child(self.right_panel.clone()),
+                                .child(self.chat_panel.clone()),
                         );
                 }
 

@@ -57,9 +57,7 @@ impl FieldSpec {
         match self.field_kind {
             FieldKind::Boolean => FIELD_H_SINGLE,
             FieldKind::Array => FIELD_H_MULTI,
-            // Text fields use FIELD_H_SINGLE for layout estimation — actual height
-            // is dynamic (the TextFieldView grows with content up to TEXT_FIELD_MAX_H).
-            _ => FIELD_H_SINGLE,
+            _ => if self.multiline { FIELD_H_MULTI } else { FIELD_H_SINGLE },
         }
     }
 }
@@ -146,9 +144,8 @@ impl EditorTab {
             for key in required_keys.iter().chain(optional_keys.iter()) {
                 if let Some(prop) = schema.properties.get(*key) {
                     let (kind, multiline) = match &prop.property_type {
-                        PropertyType::Text => (FieldKind::Text, true),
-                        PropertyType::String | PropertyType::Reference(_) => {
-                            (FieldKind::Text, false)
+                        PropertyType::Text | PropertyType::String | PropertyType::Reference(_) => {
+                            (FieldKind::Text, true)
                         }
                         PropertyType::Number => (FieldKind::Number, false),
                         PropertyType::Boolean => (FieldKind::Boolean, false),
@@ -179,11 +176,12 @@ impl EditorTab {
                     .get(key)
                     .map(field_kind_from_value)
                     .unwrap_or(FieldKind::Text);
+                let multiline = matches!(kind, FieldKind::Text);
                 specs.push(FieldSpec {
                     key: key.clone(),
                     label: key.replace('_', " "),
                     required: false,
-                    multiline: false,
+                    multiline,
                     field_kind: kind,
                 });
             }
@@ -201,11 +199,12 @@ impl EditorTab {
                     .get(key)
                     .map(field_kind_from_value)
                     .unwrap_or(FieldKind::Text);
+                let multiline = matches!(kind, FieldKind::Text);
                 specs.push(FieldSpec {
                     key: key.clone(),
                     label: key.replace('_', " "),
                     required: false,
-                    multiline: false,
+                    multiline,
                     field_kind: kind,
                 });
             }

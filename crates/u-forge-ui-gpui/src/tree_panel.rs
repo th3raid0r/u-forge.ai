@@ -21,6 +21,7 @@ struct TypeGroup {
 /// Sidebar tree view listing all nodes grouped by type, alphabetically.
 pub(crate) struct TreePanel {
     selection: Entity<SelectionModel>,
+    snapshot: Arc<RwLock<GraphSnapshot>>,
     /// Pre-sorted groups, rebuilt when the snapshot changes.
     groups: Vec<TypeGroup>,
     /// Which type groups are collapsed (by type_name).
@@ -38,9 +39,16 @@ impl TreePanel {
             groups.iter().map(|g| g.type_name.clone()).collect();
         Self {
             selection,
+            snapshot,
             groups,
             collapsed,
         }
+    }
+
+    /// Rebuild groups from the current snapshot. Call this after `refresh_snapshot()`.
+    pub(crate) fn refresh_groups(&mut self, cx: &mut gpui::Context<Self>) {
+        self.groups = Self::build_groups(&self.snapshot.read());
+        cx.notify();
     }
 
     fn build_groups(snap: &GraphSnapshot) -> Vec<TypeGroup> {
