@@ -295,8 +295,27 @@ pub struct ChatConfig {
     pub system_prompt: String,
 
     /// Maximum number of prior turns (user + assistant pairs) kept in context.
+    ///
+    /// Used as a coarse fallback when token counting is unavailable (e.g. the
+    /// direct streaming path). Prefer `max_context_tokens` for the agent path.
     #[serde(default = "ChatConfig::default_max_history_turns")]
     pub max_history_turns: usize,
+
+    /// Total context-window budget in tokens.
+    ///
+    /// History is trimmed to the most-recent messages that fit inside
+    /// `max_context_tokens - response_reserve` tokens (see `response_reserve`).
+    /// Set this to match your model's actual context window (e.g. 8192 for an
+    /// 8 k model). Defaults to 4096 — conservative enough for most local models.
+    #[serde(default = "ChatConfig::default_max_context_tokens")]
+    pub max_context_tokens: usize,
+
+    /// Number of tokens reserved for the model's response.
+    ///
+    /// Deducted from `max_context_tokens` when computing how much history fits.
+    /// Defaults to 1024.
+    #[serde(default = "ChatConfig::default_response_reserve")]
+    pub response_reserve: usize,
 
     /// Hybrid-search balance: 0.0 = FTS5-only, 1.0 = semantic-only.
     #[serde(default = "ChatConfig::default_alpha")]
@@ -337,6 +356,14 @@ impl ChatConfig {
         10
     }
 
+    fn default_max_context_tokens() -> usize {
+        4096
+    }
+
+    fn default_response_reserve() -> usize {
+        1024
+    }
+
     fn default_alpha() -> f32 {
         0.5
     }
@@ -359,6 +386,8 @@ impl Default for ChatConfig {
             cpu: ChatDeviceConfig::default(),
             system_prompt: Self::default_system_prompt(),
             max_history_turns: Self::default_max_history_turns(),
+            max_context_tokens: Self::default_max_context_tokens(),
+            response_reserve: Self::default_response_reserve(),
             alpha: Self::default_alpha(),
             search_limit: Self::default_search_limit(),
             hq_semantic_boost: Self::default_hq_semantic_boost(),

@@ -4,7 +4,7 @@ use gpui::{
     div, prelude::*, px, rgb, rgba, relative, Context, Entity, MouseButton, MouseDownEvent,
     ScrollHandle, Window,
 };
-use u_forge_agent::GraphAgent;
+use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
     lemonade::{LemonadeChatProvider, SelectedModel},
     ChatMessage, ChatRequest, StreamToken,
@@ -88,8 +88,10 @@ pub(crate) struct ChatPanel {
     agent: Option<Arc<GraphAgent>>,
     /// System prompt from config.
     system_prompt: String,
-    /// Max history turns to keep in context.
-    max_history_turns: usize,
+    /// Total context-window token budget (from `[chat] max_context_tokens`).
+    max_context_tokens: usize,
+    /// Tokens reserved for the model's response (from `[chat] response_reserve`).
+    response_reserve: usize,
     /// Tokio runtime for async chat calls.
     tokio_rt: Arc<tokio::runtime::Runtime>,
     /// Subscription for the Enter-submit event from the input field.
@@ -120,7 +122,8 @@ impl From<&SelectedModel> for AvailableModel {
 impl ChatPanel {
     pub(crate) fn new(
         system_prompt: String,
-        max_history_turns: usize,
+        max_context_tokens: usize,
+        response_reserve: usize,
         tokio_rt: Arc<tokio::runtime::Runtime>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -145,7 +148,8 @@ impl ChatPanel {
             chat_provider: None,
             agent: None,
             system_prompt,
-            max_history_turns,
+            max_context_tokens,
+            response_reserve,
             tokio_rt,
             submit_sub,
             scroll_handle: ScrollHandle::new(),
@@ -196,12 +200,31 @@ impl ChatPanel {
             };
             let tokio_rt = self.tokio_rt.clone();
 
+            // Build token-windowed history from prior User/Assistant turns.
+            let raw_history: Vec<HistoryMessage> = self.messages.iter()
+                .filter(|e| matches!(e.role, ChatRole::User | ChatRole::Assistant))
+                .map(|e| HistoryMessage {
+                    role: match e.role {
+                        ChatRole::User => "user".to_string(),
+                        _ => "assistant".to_string(),
+                    },
+                    content: e.text.clone(),
+                })
+                .collect();
+            let history = select_history_window(
+                &raw_history,
+                &self.system_prompt,
+                &text,
+                self.max_context_tokens,
+                self.response_reserve,
+            );
+
             cx.spawn(async move |this, cx| {
                 // Get the mpsc::Receiver on the background executor.
                 let mut rx = cx
                     .background_executor()
                     .spawn(async move {
-                        tokio_rt.block_on(agent.prompt_stream(&model_id, &text, 10))
+                        tokio_rt.block_on(agent.prompt_stream(&model_id, &text, &history, 10))
                     })
                     .await;
 
@@ -328,22 +351,28 @@ impl ChatPanel {
             api_messages.push(ChatMessage::system(&self.system_prompt));
         }
 
-        // Include recent history (respecting max_history_turns).
-        let history_entries: Vec<&ChatEntry> = self
-            .messages
-            .iter()
+        // Include token-windowed history (most-recent messages that fit in budget).
+        let raw_history: Vec<HistoryMessage> = self.messages.iter()
             .filter(|e| matches!(e.role, ChatRole::User | ChatRole::Assistant))
+            .map(|e| HistoryMessage {
+                role: match e.role {
+                    ChatRole::User => "user".to_string(),
+                    _ => "assistant".to_string(),
+                },
+                content: e.text.clone(),
+            })
             .collect();
-        let skip = if history_entries.len() > self.max_history_turns * 2 {
-            history_entries.len() - self.max_history_turns * 2
-        } else {
-            0
-        };
-        for entry in history_entries.into_iter().skip(skip) {
-            match entry.role {
-                ChatRole::User => api_messages.push(ChatMessage::user(&entry.text)),
-                ChatRole::Assistant => api_messages.push(ChatMessage::assistant(&entry.text)),
-                _ => {}
+        let windowed = select_history_window(
+            &raw_history,
+            &self.system_prompt,
+            &text,
+            self.max_context_tokens,
+            self.response_reserve,
+        );
+        for msg in &windowed {
+            match msg.role.as_str() {
+                "user" => api_messages.push(ChatMessage::user(&msg.content)),
+                _ => api_messages.push(ChatMessage::assistant(&msg.content)),
             }
         }
 

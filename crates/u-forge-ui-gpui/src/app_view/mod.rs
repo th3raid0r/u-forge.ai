@@ -165,7 +165,8 @@ impl AppView {
         let chat_panel = cx.new(|cx| {
             ChatPanel::new(
                 app_config.chat.system_prompt.clone(),
-                app_config.chat.max_history_turns,
+                app_config.chat.max_context_tokens,
+                app_config.chat.response_reserve,
                 tokio_rt.clone(),
                 cx,
             )

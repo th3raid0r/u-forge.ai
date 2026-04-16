@@ -20,6 +20,70 @@ use serde::Deserialize;
 use u_forge_core::search::{search_hybrid, HybridSearchConfig, NodeSearchResult};
 use u_forge_core::{queue::InferenceQueue, types::ObjectId, KnowledgeGraph};
 
+// ── History and token counting ────────────────────────────────────────────────
+
+/// A single prior conversation turn for context injection.
+///
+/// `role` is `"user"` or `"assistant"`.
+#[derive(Debug, Clone)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Token overhead added per message in the OpenAI chat format
+/// (role markers + separator bytes).
+const TOKENS_PER_MESSAGE: usize = 4;
+
+/// Count BPE tokens in `text` using the cl100k_base encoding.
+///
+/// cl100k_base is used by GPT-4, GPT-3.5-turbo, and is a close approximation
+/// for Llama-family models. Close enough for context-window budgeting.
+pub fn count_tokens(text: &str) -> usize {
+    tiktoken_rs::cl100k_base()
+        .expect("cl100k_base is always available")
+        .encode_with_special_tokens(text)
+        .len()
+}
+
+/// Return the subset of `history` that fits inside the available token budget.
+///
+/// Budget is computed as:
+/// ```text
+/// max_context_tokens - response_reserve - tokens(system_prompt) - tokens(current_msg) - 3
+/// ```
+/// (The trailing 3 accounts for the assistant reply-priming tokens in OpenAI format.)
+///
+/// Messages are evaluated newest-first; the returned `Vec` is in chronological
+/// order (oldest first), ready to pass directly to `with_history()`.
+pub fn select_history_window(
+    history: &[HistoryMessage],
+    system_prompt: &str,
+    current_msg: &str,
+    max_context_tokens: usize,
+    response_reserve: usize,
+) -> Vec<HistoryMessage> {
+    let fixed = count_tokens(system_prompt) + TOKENS_PER_MESSAGE
+        + count_tokens(current_msg) + TOKENS_PER_MESSAGE
+        + 3; // reply-priming
+    let budget = max_context_tokens
+        .saturating_sub(response_reserve)
+        .saturating_sub(fixed);
+
+    let mut selected: Vec<&HistoryMessage> = Vec::new();
+    let mut used = 0usize;
+    for msg in history.iter().rev() {
+        let cost = count_tokens(&msg.content) + TOKENS_PER_MESSAGE;
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        selected.push(msg);
+    }
+
+    selected.into_iter().rev().cloned().collect()
+}
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Error returned by all search tools.
@@ -517,6 +581,7 @@ impl GraphAgent {
         &self,
         model_id: &str,
         user_message: &str,
+        history: &[HistoryMessage],
         max_turns: usize,
     ) -> mpsc::Receiver<AgentStreamEvent> {
         let (tx, rx) = mpsc::channel(64);
@@ -537,10 +602,22 @@ impl GraphAgent {
             .build();
 
         let user_message = user_message.to_string();
+        // Convert HistoryMessage → rig::completion::message::Message.
+        let rig_history: Vec<rig::completion::message::Message> = history
+            .iter()
+            .map(|m| {
+                if m.role == "assistant" {
+                    rig::completion::message::Message::assistant(&m.content)
+                } else {
+                    rig::completion::message::Message::user(&m.content)
+                }
+            })
+            .collect();
 
         tokio::spawn(async move {
             let mut stream = agent
                 .stream_prompt(&user_message)
+                .with_history(rig_history)
                 .multi_turn(max_turns)
                 .await;
 
@@ -643,6 +720,7 @@ impl GraphAgent {
         &self,
         model_id: &str,
         user_message: &str,
+        history: &[HistoryMessage],
         max_turns: usize,
     ) -> Result<String, String> {
         let agent = self
@@ -659,8 +737,19 @@ impl GraphAgent {
                 self.queue.clone(),
             ))
             .build();
+        let rig_history: Vec<rig::completion::message::Message> = history
+            .iter()
+            .map(|m| {
+                if m.role == "assistant" {
+                    rig::completion::message::Message::assistant(&m.content)
+                } else {
+                    rig::completion::message::Message::user(&m.content)
+                }
+            })
+            .collect();
         agent
             .prompt(user_message)
+            .with_history(rig_history)
             .max_turns(max_turns)
             .await
             .map_err(|e: PromptError| e.to_string())
