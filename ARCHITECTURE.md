@@ -87,7 +87,7 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 |---|---|---|
 | `src/lib.rs` | All rendering contracts + `generate_draw_commands()` | `DrawCommand`, `Viewport`, `GraphRenderer`, `generate_draw_commands()` |
 
-`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment → `DrawCommand` list. `u-forge-ui-gpui` consumes this list — it never touches `GraphSnapshot` directly. Colors are assigned by `pub fn node_color_for_type(name: &str) -> [u8; 4]`: FNV-1a hashes the type name, scatters it across the hue wheel via the golden angle (137.5°), and fixes saturation/lightness to match Catppuccin Mocha accent values. Any type name — including future ones — gets a stable, distinct color with no code changes. The tree panel header colors and graph canvas legend both call the same function.
+`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment → `DrawCommand` list. `u-forge-ui-gpui` consumes this list — it never touches `GraphSnapshot` directly. Colors are assigned by `pub fn node_color_for_type(name: &str) -> [u8; 4]`: FNV-1a hashes the type name, scatters it across the hue wheel via the golden angle (137.5°), and fixes saturation/lightness to match Catppuccin Mocha accent values. Any type name — including future ones — gets a stable, distinct color with no code changes. The node panel header colors and graph canvas legend both call the same function.
 
 ## Module Map (u-forge-agent)
 
@@ -121,9 +121,9 @@ All paths below are relative to `crates/u-forge-agent/`.
 |---|---|
 | `src/main.rs` | Binary entry point: tokio runtime, config, `KnowledgeGraph` init, schema pre-load, GPUI `Application` setup |
 | `src/lib.rs` | Module declarations, `actions!()` macro, re-exports (`AppView`, action types) |
-| `src/selection_model.rs` | `SelectionModel` — shared selection state observed by `TreePanel`, `GraphCanvas`, `NodeEditorPanel`, and `SearchPanel` |
+| `src/selection_model.rs` | `SelectionModel` — shared selection state observed by `NodePanel`, `GraphCanvas`, `NodeEditorPanel`, and `SearchPanel` |
 | `src/text_field.rs` | `TextFieldView` — canvas-based text input (`EntityInputHandler`, cursor, IME, blink, scroll, `submit_on_enter` flag) |
-| `src/tree_panel.rs` | `TreePanel` — collapsible node-by-type sidebar |
+| `src/node_panel.rs` | `NodePanel` — collapsible node-by-type sidebar |
 | `src/search_panel.rs` | `SearchPanel` — FTS5 / Semantic / Hybrid search modes, query field, results list |
 | `src/chat_panel.rs` | `ChatPanel` — streaming LLM chat: model selector dropdown, enter-to-submit toggle, message history with thinking/content separation and collapsible tool call entries; routes through `GraphAgent` when available |
 | `src/graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
@@ -133,7 +133,7 @@ All paths below are relative to `crates/u-forge-agent/`.
 | `src/app_view/mod.rs` | `AppView` struct + data/AI operations (`do_save`, `do_import_data`, `do_clear_data`, `do_init_lemonade`, `do_embed_all`, `refresh_snapshot`) |
 | `src/app_view/render.rs` | `impl Render for AppView` — menu bar, 3-panel resizable body layout, status bar |
 
-`AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SearchPanel>`, `Entity<NodeEditorPanel>`, `Entity<ChatPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. Layout: 28 px menu bar + horizontal body (optional left sidebar showing TreePanel or SearchPanel + vertical workspace with NodeEditorPanel / GraphCanvas 30/70 split + optional ChatPanel) + 24 px status bar. All panel boundaries are user-resizable via drag handles.
+`AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<NodePanel>`, `Entity<SearchPanel>`, `Entity<NodeEditorPanel>`, `Entity<ChatPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. Layout: 28 px menu bar + horizontal body (optional left sidebar showing NodePanel or SearchPanel + vertical workspace with NodeEditorPanel / GraphCanvas 30/70 split + optional ChatPanel) + 24 px status bar. All panel boundaries are user-resizable via drag handles.
 
 `ChatPanel` provides two message paths: when a `GraphAgent` is set (the normal path after Lemonade init), messages route through `GraphAgent::prompt_stream()` which drives the rig multi-turn tool loop; when no agent is configured, it falls back to direct `LemonadeChatProvider::complete_stream()`. Message history has color-coded roles: User (blue), Assistant (green), Thinking (yellow/dimmed), ToolCall (purple accent). Tool call entries are collapsible — collapsed by default, click to reveal JSON args and tool result. Reasoning tokens stream into the Thinking entry from both paths.
 

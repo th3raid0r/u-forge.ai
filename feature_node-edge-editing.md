@@ -3,7 +3,7 @@
 ## Status: ✅ Complete
 
 ## Completed in this session
-- Tree panel create (+) and delete (✕) buttons for nodes
+- Node panel create (+) and delete (✕) buttons for nodes
 - Node editor edge editing section with filterable node-selector dropdowns
 - Empty-node cleanup on save (new nodes with blank names are discarded)
 - Edge diff/merge on save (deleted edges removed, new edges added)
@@ -19,7 +19,7 @@
 - `KnowledgeGraph::delete_edge(from, to, edge_type)` — removes a single edge (idempotent)
 - Used by both UI and agent edge deletion workflows
 
-### Tree Panel (`u-forge-ui-gpui/src/tree_panel.rs`)
+### Node Panel (`u-forge-ui-gpui/src/node_panel.rs`)
 - Emits `CreateNodeRequest(object_type)` when "+" button clicked on type header
 - Emits `DeleteNodeRequest(ObjectId)` when "✕" button clicked on node entry
 - Layout restructured to `justify_between` so buttons align right
@@ -34,7 +34,7 @@
   - `edited_edges: Vec<EditableEdge>` — edges as user is editing them
   - `original_edges: Vec<Edge>` — edges as they were when tab opened
   - `edge_type_entities: Vec<Entity<TextFieldView>>` — text field for each edge type
-  - `is_new: bool` — true when created via tree "+" button (empty-node cleanup flag)
+  - `is_new: bool` — true when created via node panel "+" button (empty-node cleanup flag)
 - **`recompute_dirty()`** — now includes edge diff check (order-independent set comparison)
   - New tabs always dirty so they participate in save
 
@@ -72,14 +72,14 @@
   - "+ Add Edge" button at bottom
 
 ### App View (`u-forge-ui-gpui/src/app_view/mod.rs`)
-- Subscribes to `CreateNodeRequest` and `DeleteNodeRequest` from tree panel
+- Subscribes to `CreateNodeRequest` and `DeleteNodeRequest` from node panel
 - **`create_node(object_type, cx)`** — create empty node, persist, refresh, open in editor marked `is_new`
 - **`delete_node_by_id(node_id, cx)`** — close tab, clean stale edges in other tabs, delete from DB (cascades), refresh
 - **`do_save(cx)`** — updated:
   - Calls `save_dirty_tabs(cx)` which returns `(saved, saved_ids, discarded_ids)`
   - Handles discarded nodes separately (full refresh)
   - Removed dead in-memory snapshot patching (was immediately overwritten)
-  - Full `refresh_snapshot()` after any changes to ensure tree + canvas sync
+  - Full `refresh_snapshot()` after any changes to ensure node panel + canvas sync
 
 ## Bug Fixes Applied
 1. Tab replacement no longer silently drops dirty unpinned tabs
@@ -92,7 +92,7 @@
 
 ## UI/UX Details
 
-### Tree Panel
+### Node Panel
 - Type group headers show count: `Character (3)`
 - "+" button green, hover effect
 - "✕" button red with muted hover, only visible on hover over node entry
@@ -137,11 +137,11 @@
 ## Files Modified
 - `crates/u-forge-core/src/graph/edges.rs` — added `delete_edge()`
 - `crates/u-forge-core/src/lib.rs` — exposed `delete_edge()` on facade
-- `crates/u-forge-ui-gpui/src/tree_panel.rs` — added +/delete buttons + events
+- `crates/u-forge-ui-gpui/src/node_panel.rs` — added +/delete buttons + events
 - `crates/u-forge-ui-gpui/src/node_editor/field_spec.rs` — `EditableEdge`, extended `EditorTab`
 - `crates/u-forge-ui-gpui/src/node_editor/mod.rs` — edge lifecycle + dropdown + fixes
 - `crates/u-forge-ui-gpui/src/node_editor/render.rs` — edge editing section + dropdown UI
-- `crates/u-forge-ui-gpui/src/app_view/mod.rs` — tree event wiring + node create/delete
+- `crates/u-forge-ui-gpui/src/app_view/mod.rs` — node panel event wiring + node create/delete
 
 ## Verification
 ```bash

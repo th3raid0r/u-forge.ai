@@ -181,7 +181,7 @@ pub(crate) struct EditorTab {
     pub(crate) edge_type_entities: Vec<Entity<TextFieldView>>,
 
     // ── New-node lifecycle ────────────────────────────────────────────────
-    /// `true` when this tab was created via the tree-panel "+" button and has
+    /// `true` when this tab was created via the node-panel "+" button and has
     /// not yet been saved with a non-empty name.  On save, tabs that are still
     /// `is_new` **and** have an empty name are discarded and the DB record is
     /// deleted.

@@ -5,7 +5,7 @@ pub mod node_editor;
 pub mod search_panel;
 pub mod selection_model;
 pub mod text_field;
-pub mod tree_panel;
+pub mod node_panel;
 
 pub use app_view::AppView;
 

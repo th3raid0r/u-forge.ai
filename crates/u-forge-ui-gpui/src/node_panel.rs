@@ -11,7 +11,7 @@ use u_forge_ui_traits::node_color_for_type;
 
 use crate::selection_model::SelectionModel;
 
-// ── Events emitted by TreePanel ─────────────────────────────────────────────
+// ── Events emitted by NodePanel ─────────────────────────────────────────────
 
 /// Emitted when the user clicks the "+" button on a type group header.
 /// Payload is the `object_type` string for the new node.
@@ -21,21 +21,21 @@ pub(crate) struct CreateNodeRequest(pub String);
 /// Payload is the `ObjectId` of the node to delete.
 pub(crate) struct DeleteNodeRequest(pub ObjectId);
 
-// ── Tree panel ──────────────────────────────────────────────────────────────
+// ── Node panel ──────────────────────────────────────────────────────────────
 
-/// A group of nodes sharing the same object_type, for the tree panel.
+/// A group of nodes sharing the same object_type, for the node panel.
 struct TypeGroup {
     type_name: String,
     /// (index into snapshot.nodes, display name, ObjectId)
     entries: Vec<(usize, String, ObjectId)>,
 }
 
-/// Sidebar tree view listing all nodes grouped by type, alphabetically.
+/// Sidebar node view listing all nodes grouped by type, alphabetically.
 ///
 /// Emits [`CreateNodeRequest`] and [`DeleteNodeRequest`] events that the
 /// parent `AppView` subscribes to in order to perform DB mutations and
 /// refresh the snapshot.
-pub(crate) struct TreePanel {
+pub(crate) struct NodePanel {
     selection: Entity<SelectionModel>,
     snapshot: Arc<RwLock<GraphSnapshot>>,
     /// Pre-sorted groups, rebuilt when the snapshot changes.
@@ -44,16 +44,16 @@ pub(crate) struct TreePanel {
     collapsed: std::collections::HashSet<String>,
 }
 
-impl gpui::EventEmitter<CreateNodeRequest> for TreePanel {}
-impl gpui::EventEmitter<DeleteNodeRequest> for TreePanel {}
+impl gpui::EventEmitter<CreateNodeRequest> for NodePanel {}
+impl gpui::EventEmitter<DeleteNodeRequest> for NodePanel {}
 
-impl TreePanel {
+impl NodePanel {
     pub(crate) fn new(
         snapshot: Arc<RwLock<GraphSnapshot>>,
         selection: Entity<SelectionModel>,
     ) -> Self {
         let groups = Self::build_groups(&snapshot.read());
-        // Start with all groups collapsed so the tree fits on screen.
+        // Start with all groups collapsed so the panel fits on screen.
         let collapsed: std::collections::HashSet<String> =
             groups.iter().map(|g| g.type_name.clone()).collect();
         Self {
@@ -92,19 +92,19 @@ impl TreePanel {
     }
 }
 
-/// Color for a type header in the tree panel — delegates to the shared palette.
-fn tree_type_color(object_type: &str) -> u32 {
+/// Color for a type header in the node panel — delegates to the shared palette.
+fn node_type_color(object_type: &str) -> u32 {
     let [r, g, b, _] = node_color_for_type(object_type);
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-impl Render for TreePanel {
+impl Render for NodePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_id = self.selection.read(cx).selected_node_id;
 
         // Outer shell: fixed width, fills parent height, does not grow vertically.
         let mut panel = div()
-            .id("tree-panel")
+            .id("node-panel")
             .flex()
             .flex_col()
             .flex_none()
@@ -118,7 +118,7 @@ impl Render for TreePanel {
         // Fixed header
         panel = panel.child(
             div()
-                .id("tree-header")
+                .id("node-header")
                 .flex()
                 .items_center()
                 .h(px(28.0))
@@ -133,7 +133,7 @@ impl Render for TreePanel {
 
         // Scrollable content area that fills remaining height.
         let mut scroll_area = div()
-            .id("tree-scroll")
+            .id("node-scroll")
             .flex()
             .flex_col()
             .overflow_y_scroll()
@@ -146,7 +146,7 @@ impl Render for TreePanel {
         for (group_idx, group) in self.groups.iter().enumerate() {
             let type_name = group.type_name.clone();
             let is_collapsed = self.collapsed.contains(&type_name);
-            let type_color = tree_type_color(&type_name);
+            let type_color = node_type_color(&type_name);
             let count = group.entries.len();
             let collapse_label = format!(
                 "{} {} ({})",

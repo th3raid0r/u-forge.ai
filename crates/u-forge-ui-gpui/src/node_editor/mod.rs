@@ -119,7 +119,7 @@ impl NodeEditorPanel {
         self.open_tab_for_metadata(meta, false, cx);
     }
 
-    /// Open a tab for a **newly created** node (from the tree panel "+" button).
+    /// Open a tab for a **newly created** node (from the node panel "+" button).
     ///
     /// The tab is marked `is_new = true` so that on save, if the name is still
     /// empty, the DB record is deleted and the tab discarded.

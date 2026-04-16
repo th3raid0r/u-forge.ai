@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use u_forge_core::ObjectId;
 use u_forge_graph_view::GraphSnapshot;
 
-/// Shared selection state observed by both TreePanel and GraphCanvas.
+/// Shared selection state observed by both NodePanel and GraphCanvas.
 /// When either side changes the selection, it calls `cx.notify()` so
 /// observers re-render.
 pub(crate) struct SelectionModel {
@@ -33,7 +33,7 @@ impl SelectionModel {
         cx.notify();
     }
 
-    /// Select a node by ObjectId. Called from tree panel clicks.
+    /// Select a node by ObjectId. Called from node panel clicks.
     /// Returns the node index if found.
     pub(crate) fn select_by_id(
         &mut self,

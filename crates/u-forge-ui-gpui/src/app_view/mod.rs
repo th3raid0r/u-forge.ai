@@ -23,7 +23,7 @@ use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
-use crate::tree_panel::{CreateNodeRequest, DeleteNodeRequest, TreePanel};
+use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -86,13 +86,13 @@ impl Render for ResizeRightPanel {
 /// Which panel is currently shown in the left sidebar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum SidebarTab {
-    Tree,
+    Nodes,
     Search,
 }
 
 pub struct AppView {
     pub(crate) graph_canvas: Entity<GraphCanvas>,
-    pub(crate) tree_panel: Entity<TreePanel>,
+    pub(crate) node_panel: Entity<NodePanel>,
     pub(crate) search_panel: Entity<SearchPanel>,
     pub(crate) node_editor: Entity<NodeEditorPanel>,
     pub(crate) chat_panel: Entity<ChatPanel>,
@@ -125,8 +125,8 @@ pub struct AppView {
     pub(crate) inference_queue: Option<InferenceQueue>,
     /// High-quality embedding queue (None when HQ embedding is disabled or unavailable).
     pub(crate) hq_queue: Option<InferenceQueue>,
-    /// Subscriptions to tree panel create/delete events — kept alive so handlers fire.
-    _tree_subs: Vec<Subscription>,
+    /// Subscriptions to node panel create/delete events — kept alive so handlers fire.
+    _node_subs: Vec<Subscription>,
 }
 
 impl AppView {
@@ -144,18 +144,18 @@ impl AppView {
         let selection = cx.new(|_cx| SelectionModel::new(snapshot_arc.clone()));
         let graph_canvas = cx
             .new(|cx| GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx));
-        let tree_panel = cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
+        let node_panel = cx.new(|_cx| NodePanel::new(snapshot_arc.clone(), selection.clone()));
 
-        // Subscribe to tree panel create/delete events.
-        let tree_sub_create = cx.subscribe(
-            &tree_panel,
-            |this: &mut Self, _tree, event: &CreateNodeRequest, cx| {
+        // Subscribe to node panel create/delete events.
+        let node_sub_create = cx.subscribe(
+            &node_panel,
+            |this: &mut Self, _panel, event: &CreateNodeRequest, cx| {
                 this.create_node(&event.0, cx);
             },
         );
-        let tree_sub_delete = cx.subscribe(
-            &tree_panel,
-            |this: &mut Self, _tree, event: &DeleteNodeRequest, cx| {
+        let node_sub_delete = cx.subscribe(
+            &node_panel,
+            |this: &mut Self, _panel, event: &DeleteNodeRequest, cx| {
                 this.delete_node_by_id(event.0, cx);
             },
         );
@@ -189,7 +189,7 @@ impl AppView {
 
         let mut view = Self {
             graph_canvas,
-            tree_panel,
+            node_panel,
             search_panel,
             node_editor,
             chat_panel,
@@ -201,7 +201,7 @@ impl AppView {
             file_menu_open: false,
             view_menu_open: false,
             sidebar_open: false,
-            sidebar_tab: SidebarTab::Tree,
+            sidebar_tab: SidebarTab::Nodes,
             right_panel_open: false,
             sidebar_width: DEFAULT_SIDEBAR_W,
             editor_ratio: DEFAULT_EDITOR_RATIO,
@@ -212,7 +212,7 @@ impl AppView {
             tokio_rt,
             inference_queue: None,
             hq_queue: None,
-            _tree_subs: vec![tree_sub_create, tree_sub_delete],
+            _node_subs: vec![node_sub_create, node_sub_delete],
         };
 
         view.do_init_lemonade(cx);
@@ -224,7 +224,7 @@ impl AppView {
         match u_forge_graph_view::build_snapshot(&self.graph) {
             Ok(snap) => {
                 *self.snapshot.write() = snap;
-                self.tree_panel
+                self.node_panel
                     .update(cx, |panel, cx| panel.refresh_groups(cx));
                 cx.notify();
             }
@@ -315,7 +315,7 @@ impl AppView {
         cx.notify();
     }
 
-    // ── Node create / delete (driven by tree panel events) ────────────────
+    // ── Node create / delete (driven by node panel events) ────────────────
 
     /// Create a new empty node of the given type, persist it, refresh the
     /// snapshot, and navigate to it in the editor (marked as `is_new`).
@@ -325,7 +325,7 @@ impl AppView {
 
         match self.graph.add_object(meta) {
             Ok(_id) => {
-                // Refresh snapshot so the tree panel and canvas see the new node.
+                // Refresh snapshot so the node panel and canvas see the new node.
                 self.refresh_snapshot(cx);
 
                 // Select the new node — this triggers the editor's observer,
@@ -338,10 +338,10 @@ impl AppView {
                     editor.open_new_node_tab(node_id, cx);
                 });
 
-                // Ensure the sidebar is open on the tree tab so the user sees
+                // Ensure the sidebar is open on the nodes tab so the user sees
                 // the newly created node.
                 self.sidebar_open = true;
-                self.sidebar_tab = SidebarTab::Tree;
+                self.sidebar_tab = SidebarTab::Nodes;
             }
             Err(e) => {
                 self.data_status = Some(format!("Failed to create node: {e}"));
