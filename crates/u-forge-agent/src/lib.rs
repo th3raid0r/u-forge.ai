@@ -133,10 +133,11 @@ fn fts5_sanitize(query: &str) -> Option<String> {
 fn format_node_result(result: &NodeSearchResult, index: usize) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "[{}] {} ({}) — score: {:.4} {}\n",
+        "[{}] {} ({}) [id: {}] — score: {:.4} {}\n",
         index + 1,
         result.node.name,
         result.node.object_type,
+        result.node.id,
         result.score,
         result.sources.label()
     ));
@@ -278,10 +279,11 @@ impl Tool for FtsSearchTool {
             {
                 Some(meta) => {
                     output.push_str(&format!(
-                        "[{}] {} ({})\n",
+                        "[{}] {} ({}) [id: {}]\n",
                         i + 1,
                         meta.name,
-                        meta.object_type
+                        meta.object_type,
+                        obj_id
                     ));
                     for chunk in chunks.iter().take(3) {
                         output.push_str(&format!("  • {chunk}\n"));
@@ -395,10 +397,11 @@ impl Tool for SemanticSearchTool {
             {
                 Some(meta) => {
                     output.push_str(&format!(
-                        "[{}] {} ({}) — distance: {:.4}\n",
+                        "[{}] {} ({}) [id: {}] — distance: {:.4}\n",
                         i + 1,
                         meta.name,
                         meta.object_type,
+                        obj_id,
                         best_dist
                     ));
                     for (chunk, _dist) in chunks.iter().take(3) {
@@ -512,14 +515,17 @@ pub struct UpsertNodeArgs {
     pub node_id: Option<String>,
     /// Human-readable name for the node.
     pub name: String,
-    /// Object type (e.g. "character", "location", "item").
+    /// Object type (e.g. "npc", "location", "faction").
     pub object_type: String,
-    /// Optional prose description.
-    pub description: Option<String>,
-    /// Optional key-value properties as a flat JSON object.
+    /// Schema-defined fields for this node type as a flat JSON object.
+    ///
+    /// Well-known keys handled specially:
+    /// - `"description"`: string — narrative prose for the node.
+    /// - `"tags"`: array of strings — free-form labels.
+    ///
+    /// All other keys are stored as typed properties on the node.
+    /// Example: `{"description": "A frontier world", "tags": ["planet"], "role": "Mathematician"}`
     pub properties: Option<serde_json::Value>,
-    /// Optional list of tags.
-    pub tags: Option<Vec<String>>,
 }
 
 /// Rig tool: create or update a node in the knowledge graph.
@@ -561,7 +567,10 @@ impl Tool for UpsertNodeTool {
             name: Self::NAME.to_string(),
             description:
                 "Create or update a node in the knowledge graph. \
-                 Provide a node_id to update an existing node, or omit it to create a new one. \
+                 Provide node_id to update an existing node, or omit it to create a new one. \
+                 All fields — including description and tags — go inside the `properties` object. \
+                 Special keys: \"description\" (string) and \"tags\" (array of strings) are \
+                 promoted to top-level node fields; all other keys are stored as typed properties. \
                  After saving, the node is automatically re-indexed for full-text and semantic search."
                     .to_string(),
             parameters: serde_json::to_value(schema_for!(UpsertNodeArgs))
@@ -590,16 +599,23 @@ impl Tool for UpsertNodeTool {
         // Apply caller-provided fields.
         meta.name = args.name;
         meta.object_type = args.object_type;
-        if let Some(desc) = args.description {
-            meta.description = if desc.is_empty() { None } else { Some(desc) };
-        }
-        if let Some(props) = args.properties {
+
+        // Extract description and tags from properties, mirroring the JSONL ingest pipeline.
+        if let Some(mut props) = args.properties {
+            if let Some(obj) = props.as_object_mut() {
+                if let Some(serde_json::Value::String(desc)) = obj.remove("description") {
+                    meta.description = if desc.is_empty() { None } else { Some(desc) };
+                }
+                if let Some(serde_json::Value::Array(tag_arr)) = obj.remove("tags") {
+                    meta.tags = tag_arr
+                        .into_iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect();
+                }
+            }
             if props.is_object() {
                 meta.properties = props;
             }
-        }
-        if let Some(tags) = args.tags {
-            meta.tags = tags;
         }
 
         // Persist the node.
@@ -621,8 +637,12 @@ impl Tool for UpsertNodeTool {
 
         let action = if is_update { "Updated" } else { "Created" };
         Ok(format!(
-            "{action} node: {} ({}) [id: {object_id}] — {chunks} chunk(s) embedded.",
-            meta.name, meta.object_type,
+            "{action} node \"{name}\" ({object_type}).\n\
+             node_id: {object_id}\n\
+             chunks_embedded: {chunks}\n\
+             To edit this node later, pass node_id: \"{object_id}\" to upsert_node.",
+            name = meta.name,
+            object_type = meta.object_type,
         ))
     }
 }
