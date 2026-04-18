@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use gpui::{
@@ -10,6 +11,7 @@ use u_forge_core::{
     ChatMessage, ChatRequest, StreamToken,
 };
 
+use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredMessage};
 use crate::text_field::{TextFieldView, TextSubmit};
 
 // ── Chat message types ──────────────────────────────────────────────────────
@@ -99,6 +101,14 @@ pub(crate) struct ChatPanel {
     submit_sub: gpui::Subscription,
     /// Scroll handle for the message area.
     scroll_handle: ScrollHandle,
+    /// Chat history persistence store (None if DB couldn't be opened).
+    history_store: Option<ChatHistoryStore>,
+    /// ID of the currently active chat session.
+    current_session_id: Option<String>,
+    /// Cached list of session summaries for the dropdown.
+    session_list: Vec<ChatSessionSummary>,
+    /// Whether the history selector dropdown is open.
+    history_dropdown_open: bool,
 }
 
 /// A simplified model entry for the UI dropdown.
@@ -124,6 +134,7 @@ impl ChatPanel {
         system_prompt: String,
         max_context_tokens: usize,
         response_reserve: usize,
+        db_path: &Path,
         tokio_rt: Arc<tokio::runtime::Runtime>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -137,10 +148,36 @@ impl ChatPanel {
             this.do_send(cx);
         });
 
+        // Open chat history store (non-fatal if it fails).
+        let history_store = match ChatHistoryStore::open(db_path) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                eprintln!("Warning: chat history unavailable: {e}");
+                None
+            }
+        };
+
+        // Load the session list and resume the most recent session if one exists.
+        let session_list = history_store
+            .as_ref()
+            .and_then(|s| s.list_sessions().ok())
+            .unwrap_or_default();
+
+        let (current_session_id, messages) = if let Some(first) = session_list.first() {
+            let msgs = history_store
+                .as_ref()
+                .and_then(|s| s.load_messages(&first.id).ok())
+                .unwrap_or_default();
+            let entries = msgs.into_iter().map(stored_to_entry).collect();
+            (Some(first.id.clone()), entries)
+        } else {
+            (None, Vec::new())
+        };
+
         Self {
             input_field,
             enter_to_submit: true,
-            messages: Vec::new(),
+            messages,
             streaming: false,
             available_models: Vec::new(),
             selected_model_idx: 0,
@@ -153,6 +190,10 @@ impl ChatPanel {
             tokio_rt,
             submit_sub,
             scroll_handle: ScrollHandle::new(),
+            history_store,
+            current_session_id,
+            session_list,
+            history_dropdown_open: false,
         }
     }
 
@@ -161,10 +202,11 @@ impl ChatPanel {
         &mut self,
         provider: LemonadeChatProvider,
         models: Vec<AvailableModel>,
+        preferred_idx: usize,
     ) {
         self.chat_provider = Some(provider);
         self.available_models = models;
-        self.selected_model_idx = 0;
+        self.selected_model_idx = preferred_idx;
     }
 
     /// Called from AppView once the graph, inference queue, and Lemonade URL
@@ -251,6 +293,7 @@ impl ChatPanel {
                             // Channel closed without Done — treat as finished.
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 view.streaming = false;
+                                view.save_current_session();
                                 cx.notify();
                             })
                             .ok();
@@ -306,6 +349,7 @@ impl ChatPanel {
                                     _ => true,
                                 });
                                 view.streaming = false;
+                                view.save_current_session();
                                 cx.notify();
                             })
                             .ok();
@@ -319,6 +363,7 @@ impl ChatPanel {
                                     entry.text.push_str(&format!("\n[Agent error: {e}]"));
                                 }
                                 view.streaming = false;
+                                view.save_current_session();
                                 cx.notify();
                             })
                             .ok();
@@ -461,6 +506,7 @@ impl ChatPanel {
                                 entry.text.push_str(&format!("\n[Error: {e}]"));
                             }
                             view.streaming = false;
+                            view.save_current_session();
                             cx.notify();
                         })
                         .ok();
@@ -474,6 +520,7 @@ impl ChatPanel {
                                 !matches!(e.role, ChatRole::Thinking) || !e.text.is_empty()
                             });
                             view.streaming = false;
+                            view.save_current_session();
                             cx.notify();
                         })
                         .ok();
@@ -505,6 +552,173 @@ impl ChatPanel {
             format!("{} ({})", m.model_id, device)
         }
     }
+
+    // ── Chat history methods ────────────────────────────────────────────────
+
+    /// Title for the current session (for the header dropdown button).
+    fn session_title(&self) -> String {
+        if let Some(sid) = &self.current_session_id {
+            self.session_list
+                .iter()
+                .find(|s| s.id == *sid)
+                .map(|s| s.title.clone())
+                .unwrap_or_else(|| "Chat".to_string())
+        } else {
+            "New Chat".to_string()
+        }
+    }
+
+    /// Save the current messages to the active session (creating one if needed).
+    fn save_current_session(&mut self) {
+        let store = match &self.history_store {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Derive a title from the first user message.
+        let title = self
+            .messages
+            .iter()
+            .find(|e| matches!(e.role, ChatRole::User))
+            .map(|e| {
+                let t = e.text.trim();
+                if t.len() > 60 {
+                    format!("{}…", &t[..60])
+                } else {
+                    t.to_string()
+                }
+            })
+            .unwrap_or_else(|| "New Chat".to_string());
+
+        // Ensure we have a session ID.
+        let session_id = match &self.current_session_id {
+            Some(id) => id.clone(),
+            None => {
+                match store.create_session(&title) {
+                    Ok(id) => {
+                        self.current_session_id = Some(id.clone());
+                        id
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create chat session: {e}");
+                        return;
+                    }
+                }
+            }
+        };
+
+        let stored: Vec<StoredMessage> = self.messages.iter().map(entry_to_stored).collect();
+        if let Err(e) = store.save_session(&session_id, &title, &stored) {
+            eprintln!("Failed to save chat session: {e}");
+        }
+
+        // Refresh the cached session list.
+        self.session_list = store.list_sessions().unwrap_or_default();
+    }
+
+    /// Start a new empty chat session.
+    fn new_session(&mut self, cx: &mut Context<Self>) {
+        // Save current session before switching.
+        if !self.messages.is_empty() {
+            self.save_current_session();
+        }
+
+        self.messages.clear();
+        self.current_session_id = None;
+        self.history_dropdown_open = false;
+        cx.notify();
+    }
+
+    /// Switch to an existing session by ID.
+    fn load_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        // Save current session before switching.
+        if !self.messages.is_empty() {
+            self.save_current_session();
+        }
+
+        let store = match &self.history_store {
+            Some(s) => s,
+            None => return,
+        };
+
+        match store.load_messages(session_id) {
+            Ok(msgs) => {
+                self.messages = msgs.into_iter().map(stored_to_entry).collect();
+                self.current_session_id = Some(session_id.to_string());
+                self.history_dropdown_open = false;
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("Failed to load chat session: {e}");
+            }
+        }
+    }
+
+    /// Delete a session from history. If it's the current session, clear the chat.
+    fn delete_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let store = match &self.history_store {
+            Some(s) => s,
+            None => return,
+        };
+
+        if let Err(e) = store.delete_session(session_id) {
+            eprintln!("Failed to delete chat session: {e}");
+            return;
+        }
+
+        // If we just deleted the active session, clear the chat.
+        if self.current_session_id.as_deref() == Some(session_id) {
+            self.messages.clear();
+            self.current_session_id = None;
+        }
+
+        // Refresh the cached session list.
+        self.session_list = store.list_sessions().unwrap_or_default();
+        cx.notify();
+    }
+}
+
+// ── Conversion helpers ──────────────────────────────────────────────────────
+
+fn role_to_str(role: &ChatRole) -> &'static str {
+    match role {
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Thinking => "thinking",
+        ChatRole::ToolCall => "tool_call",
+    }
+}
+
+fn str_to_role(s: &str) -> ChatRole {
+    match s {
+        "user" => ChatRole::User,
+        "assistant" => ChatRole::Assistant,
+        "thinking" => ChatRole::Thinking,
+        "tool_call" => ChatRole::ToolCall,
+        _ => ChatRole::Assistant,
+    }
+}
+
+fn entry_to_stored(entry: &ChatEntry) -> StoredMessage {
+    StoredMessage {
+        role: role_to_str(&entry.role).to_string(),
+        text: entry.text.clone(),
+        tool_args: entry.tool_args.clone(),
+        tool_result: entry.tool_result.clone(),
+        tool_internal_id: entry.tool_internal_id.clone(),
+        collapsed: entry.collapsed,
+    }
+}
+
+fn stored_to_entry(msg: StoredMessage) -> ChatEntry {
+    ChatEntry {
+        role: str_to_role(&msg.role),
+        text: msg.text,
+        tool_args: msg.tool_args,
+        tool_result: msg.tool_result,
+        tool_internal_id: msg.tool_internal_id,
+        collapsed: msg.collapsed,
+    }
 }
 
 impl Render for ChatPanel {
@@ -514,6 +728,82 @@ impl Render for ChatPanel {
         let model_dropdown_open = self.model_dropdown_open;
         let has_provider = self.chat_provider.is_some();
         let model_label = self.selected_model_label();
+        let history_dropdown_open = self.history_dropdown_open;
+        let history_label = self.session_title();
+
+        // Build history dropdown items.
+        let history_items: Vec<_> = if history_dropdown_open {
+            self.session_list
+                .iter()
+                .enumerate()
+                .map(|(idx, session)| {
+                    let is_current = self.current_session_id.as_deref() == Some(&session.id);
+                    let title = session.title.clone();
+                    let sid_load = session.id.clone();
+                    let sid_del = session.id.clone();
+                    div()
+                        .id(gpui::ElementId::Name(format!("hist-{idx}").into()))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(px(24.0))
+                        .px_2()
+                        .when(is_current, |el| el.bg(rgba(0x45475a88)))
+                        .hover(|s| s.bg(rgba(0x45475a66)))
+                        // Title (clickable to load)
+                        .child({
+                            let mut title_el = div()
+                                .id(gpui::ElementId::Name(format!("hist-title-{idx}").into()))
+                                .flex()
+                                .items_center()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(if is_current {
+                                    rgba(0xcdd6f4ff)
+                                } else {
+                                    rgba(0xa6adc8ff)
+                                })
+                                .cursor_pointer()
+                                .overflow_x_hidden()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                        this.load_session(&sid_load, cx);
+                                    }),
+                                )
+                                .child(title);
+                            title_el.style().flex_grow = Some(1.0);
+                            title_el.style().flex_shrink = Some(1.0);
+                            title_el
+                        })
+                        // Delete button
+                        .child(
+                            div()
+                                .id(gpui::ElementId::Name(format!("hist-del-{idx}").into()))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .rounded(px(2.0))
+                                .text_xs()
+                                .text_color(rgba(0x6c708688))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                        this.delete_session(&sid_del, cx);
+                                    }),
+                                )
+                                .child("✕"),
+                        )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Build message elements.
         let message_elements: Vec<_> = self
@@ -743,7 +1033,7 @@ impl Render for ChatPanel {
             .bg(rgb(0x181825))
             .border_l_1()
             .border_color(rgb(0x313244))
-            // ── Header: model selector ───────────────────────────────────────
+            // ── Header: chat history selector ────────────────────────────────
             .child(
                 div()
                     .id("chat-header")
@@ -755,23 +1045,17 @@ impl Render for ChatPanel {
                     .border_color(rgb(0x313244))
                     .px_2()
                     .py_1()
-                    // Model selector row
+                    // Chat history selector row
                     .child(
                         div()
-                            .id("model-selector-row")
+                            .id("history-selector-row")
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(4.0))
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(rgba(0x6c7086ff))
-                                    .child("Model:"),
-                            )
-                            .child(
-                                div()
-                                    .id("model-selector-btn")
+                                    .id("history-selector-btn")
                                     .flex()
                                     .items_center()
                                     .px_2()
@@ -781,31 +1065,56 @@ impl Render for ChatPanel {
                                     .border_color(rgb(0x45475a))
                                     .rounded(px(3.0))
                                     .text_xs()
-                                    .text_color(if has_provider {
-                                        rgba(0xcdd6f4ff)
-                                    } else {
-                                        rgba(0x6c7086ff)
-                                    })
+                                    .text_color(rgba(0xcdd6f4ff))
                                     .cursor_pointer()
                                     .overflow_x_hidden()
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
                                             |this, _: &MouseDownEvent, _window, cx| {
-                                                this.model_dropdown_open =
-                                                    !this.model_dropdown_open;
+                                                this.history_dropdown_open =
+                                                    !this.history_dropdown_open;
                                                 cx.notify();
                                             },
                                         ),
                                     )
-                                    .child(model_label),
+                                    .child(history_label),
+                            )
+                            .child({
+                                let mut spacer = div();
+                                spacer.style().flex_grow = Some(1.0);
+                                spacer
+                            })
+                            .child(
+                                div()
+                                    .id("new-chat-btn")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .px_2()
+                                    .h(px(22.0))
+                                    .bg(rgb(0xa6e3a1))
+                                    .rounded(px(3.0))
+                                    .text_xs()
+                                    .text_color(rgba(0x1e1e2eff))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            |this, _: &MouseDownEvent, _window, cx| {
+                                                this.new_session(cx);
+                                            },
+                                        ),
+                                    )
+                                    .child("New"),
                             ),
                     )
-                    // Model dropdown (conditional)
-                    .when(model_dropdown_open, |header| {
+                    // History dropdown (conditional)
+                    .when(history_dropdown_open, |header| {
                         header.child(
                             div()
-                                .id("model-dropdown")
+                                .id("history-dropdown")
                                 .flex()
                                 .flex_col()
                                 .w_full()
@@ -816,7 +1125,7 @@ impl Render for ChatPanel {
                                 .mt_1()
                                 .max_h(px(200.0))
                                 .overflow_y_scroll()
-                                .children(model_items),
+                                .children(history_items),
                         )
                     }),
             )
@@ -829,6 +1138,16 @@ impl Render for ChatPanel {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            if this.history_dropdown_open || this.model_dropdown_open {
+                                this.history_dropdown_open = false;
+                                this.model_dropdown_open = false;
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .children(message_elements);
                 if let Some(indicator) = streaming_indicator {
                     msg_area = msg_area.child(indicator);
@@ -847,6 +1166,15 @@ impl Render for ChatPanel {
                     .flex_none()
                     .w_full()
                     .border_t_1()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            if this.history_dropdown_open {
+                                this.history_dropdown_open = false;
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .border_color(rgb(0x313244))
                     .px_2()
                     .py_1()
@@ -945,6 +1273,76 @@ impl Render for ChatPanel {
                                     )
                                     .child("Send"),
                             ),
+                    )
+                    // Model selector row (below input)
+                    .child(
+                        div()
+                            .id("model-selector-row")
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgba(0x6c7086ff))
+                                            .child("Model:"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("model-selector-btn")
+                                            .flex()
+                                            .items_center()
+                                            .px_2()
+                                            .h(px(22.0))
+                                            .bg(rgb(0x313244))
+                                            .border_1()
+                                            .border_color(rgb(0x45475a))
+                                            .rounded(px(3.0))
+                                            .text_xs()
+                                            .text_color(if has_provider {
+                                                rgba(0xcdd6f4ff)
+                                            } else {
+                                                rgba(0x6c7086ff)
+                                            })
+                                            .cursor_pointer()
+                                            .overflow_x_hidden()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, _: &MouseDownEvent, _window, cx| {
+                                                        this.model_dropdown_open =
+                                                            !this.model_dropdown_open;
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                            .child(model_label),
+                                    ),
+                            )
+                            // Model dropdown (conditional, opens upward)
+                            .when(model_dropdown_open, |container| {
+                                container.child(
+                                    div()
+                                        .id("model-dropdown")
+                                        .flex()
+                                        .flex_col()
+                                        .w_full()
+                                        .bg(rgb(0x313244))
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .rounded(px(3.0))
+                                        .mt_1()
+                                        .max_h(px(200.0))
+                                        .overflow_y_scroll()
+                                        .children(model_items),
+                                )
+                            }),
                     ),
             )
     }

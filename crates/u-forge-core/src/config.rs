@@ -663,8 +663,8 @@ fn default_stt_model_preferences() -> Vec<String> {
 
 fn default_llm_model_preferences() -> Vec<String> {
     vec![
-        "qwen3.5-4B-FLM".to_string(),
         "Gemma-4-26B-A4B-it-GGUF".to_string(),
+        "qwen3.5-4B-FLM".to_string(),
     ]
 }
 

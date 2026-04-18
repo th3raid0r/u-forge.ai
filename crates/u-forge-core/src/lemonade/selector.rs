@@ -270,6 +270,40 @@ impl<'a> ModelSelector<'a> {
         result
     }
 
+    /// Returns **all** downloaded LLM-capable models, without the one-per-device-slot
+    /// deduplication applied by [`select_llm_models`]. Preference ordering is still
+    /// applied. Intended for the chat UI model picker where the user should see
+    /// every available model.
+    pub fn select_all_llm_models(&self) -> Vec<SelectedModel> {
+        let candidates: Vec<&CatalogModel> = self
+            .catalog
+            .models
+            .iter()
+            .filter(|m| {
+                m.downloaded
+                    && (m.recipe == "llamacpp" || m.recipe == "flm")
+                    && !m.labels.contains("embeddings")
+                    && !m.labels.contains("reranking")
+                    && !m.labels.contains("audio")
+                    && !m.labels.contains("transcription")
+                    && !m.labels.contains("tts")
+            })
+            .collect();
+
+        let ordered = self.apply_preference_order(&candidates, &self.config.llm_model_preferences);
+
+        ordered
+            .into_iter()
+            .map(|m| SelectedModel {
+                model_id: m.id.clone(),
+                recipe: m.recipe.clone(),
+                backend: self.resolve_llamacpp_backend(&m.recipe),
+                load_opts: self.config.load_options_for(&m.id),
+                quality_tier: QualityTier::NotApplicable,
+            })
+            .collect()
+    }
+
     /// Returns the TTS model (recipe `"kokoro"` or label `"tts"`).
     ///
     /// TTS has no backend parameter — the kokoro recipe is always CPU.
@@ -723,13 +757,13 @@ mod tests {
             ],
             vec![],
         );
-        let cfg = ModelConfig::default(); // default prefs: qwen3.5-4B-FLM first
+        let cfg = ModelConfig::default(); // default prefs: Gemma (GPU) first
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         let results = selector.select_llm_models();
-        assert_eq!(results[0].model_id, "qwen3.5-4B-FLM");
-        assert_eq!(results[1].model_id, "Gemma-4-26B-A4B-it-GGUF");
+        assert_eq!(results[0].model_id, "Gemma-4-26B-A4B-it-GGUF");
+        assert_eq!(results[1].model_id, "qwen3.5-4B-FLM");
     }
 
     #[test]

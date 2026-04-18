@@ -177,11 +177,13 @@ impl AppView {
                 cx,
             )
         });
+        let db_path = app_config.storage.db_path.clone();
         let chat_panel = cx.new(|cx| {
             ChatPanel::new(
                 app_config.chat.system_prompt.clone(),
                 app_config.chat.max_context_tokens,
                 app_config.chat.response_reserve,
+                &db_path,
                 tokio_rt.clone(),
                 cx,
             )
@@ -535,11 +537,32 @@ impl AppView {
                         // Build optional HQ embedding queue.
                         let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
 
-                        // Select LLM models and build a chat provider for the first one.
-                        let llm_models = selector.select_llm_models();
+                        // Select ALL LLM models for the UI picker (no device-slot dedup).
+                        let all_llm = selector.select_all_llm_models();
                         let llm_available: Vec<AvailableModel> =
-                            llm_models.iter().map(AvailableModel::from).collect();
-                        let chat_provider = llm_models.first().map(|sel| {
+                            all_llm.iter().map(AvailableModel::from).collect();
+
+                        // Determine the preferred model for initial connection.
+                        // Use the active device config's explicit model override,
+                        // falling back to the first GPU model, then the first model.
+                        let preferred_model_id = app_config
+                            .chat
+                            .active_device_config()
+                            .model
+                            .clone();
+
+                        let preferred_idx = preferred_model_id
+                            .as_ref()
+                            .and_then(|pref| all_llm.iter().position(|m| m.model_id == *pref))
+                            .or_else(|| {
+                                // Fallback: first GPU-backed model in the list.
+                                all_llm.iter().position(|m| {
+                                    matches!(m.backend.as_deref(), Some("rocm") | Some("vulkan") | Some("metal"))
+                                })
+                            })
+                            .unwrap_or(0);
+
+                        let chat_provider = all_llm.get(preferred_idx).map(|sel| {
                             let gpu = match sel.recipe.as_str() {
                                 "llamacpp" => match sel.backend.as_deref() {
                                     Some("rocm") | Some("vulkan") | Some("metal") => {
@@ -552,14 +575,14 @@ impl AppView {
                             u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
                         });
 
-                        Ok((url, queue, hq_queue, chat_provider, llm_available))
+                        Ok((url, queue, hq_queue, chat_provider, llm_available, preferred_idx))
                     })
                 })
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
-                    Ok((lemonade_url, queue, hq_queue, chat_provider, llm_models)) => {
+                    Ok((lemonade_url, queue, hq_queue, chat_provider, llm_models, preferred_idx)) => {
                         eprintln!("Lemonade connected — embedding queue ready");
                         view.inference_queue = Some(queue.clone());
                         view.hq_queue = hq_queue.clone();
@@ -609,7 +632,7 @@ impl AppView {
                         // Push chat provider to chat panel (model list + direct streaming fallback).
                         if let Some(provider) = chat_provider {
                             view.chat_panel.update(cx, |panel, _cx| {
-                                panel.set_provider(provider, llm_models);
+                                panel.set_provider(provider, llm_models, preferred_idx);
                             });
                         }
 
