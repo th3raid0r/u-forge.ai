@@ -49,7 +49,9 @@ impl SchemaDefinition {
     /// Generate a compact, LLM-readable summary of this schema.
     ///
     /// Intended for injection into a system prompt so the model knows which
-    /// node types and properties exist, and which edge types can connect them.
+    /// node types and properties exist.  Edge types are intentionally omitted
+    /// because they are freeform — the model should use natural language labels
+    /// like "led_by" or "located_in" rather than picking from a fixed list.
     pub fn prompt_summary(&self) -> String {
         let mut out = String::new();
         out.push_str("## Knowledge Graph Schema\n\n");
@@ -75,33 +77,6 @@ impl SchemaDefinition {
                     ps.property_type.name(),
                     req,
                     ps.description
-                ));
-            }
-            if !ots.allowed_edges.is_empty() {
-                out.push_str(&format!(
-                    "  Allowed edges: {}\n",
-                    ots.allowed_edges.join(", ")
-                ));
-            }
-        }
-
-        // --- Edge types -------------------------------------------------
-        out.push_str("\n### Edge Types\n");
-        let mut edge_types: Vec<(&String, &EdgeTypeSchema)> =
-            self.edge_types.iter().collect();
-        edge_types.sort_by_key(|(k, _)| k.as_str());
-        for (edge_name, ets) in &edge_types {
-            let bidir = if ets.bidirectional { " (bidirectional)" } else { "" };
-            out.push_str(&format!("- **{}**{}: {}\n", edge_name, bidir, ets.description));
-            if !ets.allowed_source_types.is_empty() {
-                out.push_str(&format!(
-                    "  From: {} → To: {}\n",
-                    ets.allowed_source_types.join(", "),
-                    if ets.allowed_target_types.is_empty() {
-                        "any".to_string()
-                    } else {
-                        ets.allowed_target_types.join(", ")
-                    }
                 ));
             }
         }
