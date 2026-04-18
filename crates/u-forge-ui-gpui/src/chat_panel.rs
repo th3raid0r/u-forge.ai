@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, relative, Context, Entity, MouseButton, MouseDownEvent,
-    ScrollHandle, Window,
+    div, list, prelude::*, px, rgb, rgba, relative, App, Context, Entity, ListAlignment, ListState,
+    MouseButton, MouseDownEvent, Window,
 };
 use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
@@ -12,58 +13,8 @@ use u_forge_core::{
 };
 
 use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredMessage};
+use crate::chat_message::{ChatMessageRole, ChatMessageView};
 use crate::text_field::{TextFieldView, TextSubmit};
-
-// ── Chat message types ──────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-enum ChatRole {
-    User,
-    Assistant,
-    /// Model thinking/reasoning — rendered separately from content.
-    Thinking,
-    /// A tool call made by the agent during the response loop.
-    ToolCall,
-}
-
-#[derive(Debug, Clone)]
-struct ChatEntry {
-    role: ChatRole,
-    /// Main text content (or tool name for `ToolCall` entries).
-    text: String,
-    /// For `ToolCall` entries: the pretty-printed JSON arguments.
-    tool_args: Option<String>,
-    /// For `ToolCall` entries: the tool result text (filled in when available).
-    tool_result: Option<String>,
-    /// Stable ID correlating a `ToolCall` entry with its result event.
-    tool_internal_id: Option<String>,
-    /// Whether the tool call body is collapsed (default true).
-    collapsed: bool,
-}
-
-impl ChatEntry {
-    fn text(role: ChatRole, text: String) -> Self {
-        Self {
-            role,
-            text,
-            tool_args: None,
-            tool_result: None,
-            tool_internal_id: None,
-            collapsed: false,
-        }
-    }
-
-    fn tool_call(internal_id: String, name: String, args: String) -> Self {
-        Self {
-            role: ChatRole::ToolCall,
-            text: name,
-            tool_args: Some(args),
-            tool_result: None,
-            tool_internal_id: Some(internal_id),
-            collapsed: true,
-        }
-    }
-}
 
 // ── ChatPanel ───────────────────────────────────────────────────────────────
 
@@ -73,10 +24,21 @@ pub(crate) struct ChatPanel {
     /// When true, pressing Enter submits; Shift+Enter inserts a newline.
     /// When false, Enter inserts a newline; Shift+Enter (or button) submits.
     enter_to_submit: bool,
-    /// Chat message history.
-    messages: Vec<ChatEntry>,
+    /// Chat message entities. Each message owns its own rendering state so
+    /// streaming token deltas only invalidate the target entity, not the panel.
+    messages: Vec<Entity<ChatMessageView>>,
     /// Whether a response is currently streaming.
     streaming: bool,
+    /// During streaming: handle to the Thinking message entity being appended to
+    /// (lazily created on the first ReasoningDelta / Thinking token).
+    streaming_thinking: Option<Entity<ChatMessageView>>,
+    /// During streaming: handle to the current Assistant message entity being
+    /// appended to (lazily created on the first TextDelta / Content token; reset
+    /// after each tool call so the next text creates a new message).
+    streaming_assistant: Option<Entity<ChatMessageView>>,
+    /// During streaming: tool-call entities indexed by their internal_id, so
+    /// `ToolResult` events can target the right entry directly.
+    streaming_tool_calls: HashMap<String, Entity<ChatMessageView>>,
     /// Available LLM models (populated after Lemonade init).
     available_models: Vec<AvailableModel>,
     /// Index into `available_models` for the currently selected model.
@@ -99,8 +61,8 @@ pub(crate) struct ChatPanel {
     /// Subscription for the Enter-submit event from the input field.
     #[allow(dead_code)]
     submit_sub: gpui::Subscription,
-    /// Scroll handle for the message area.
-    scroll_handle: ScrollHandle,
+    /// Virtualized list state for the message area (only renders visible items).
+    list_state: ListState,
     /// Chat history persistence store (None if DB couldn't be opened).
     history_store: Option<ChatHistoryStore>,
     /// ID of the currently active chat session.
@@ -163,22 +125,30 @@ impl ChatPanel {
             .and_then(|s| s.list_sessions().ok())
             .unwrap_or_default();
 
-        let (current_session_id, messages) = if let Some(first) = session_list.first() {
-            let msgs = history_store
-                .as_ref()
-                .and_then(|s| s.load_messages(&first.id).ok())
-                .unwrap_or_default();
-            let entries = msgs.into_iter().map(stored_to_entry).collect();
-            (Some(first.id.clone()), entries)
-        } else {
-            (None, Vec::new())
-        };
+        let (current_session_id, messages): (Option<String>, Vec<Entity<ChatMessageView>>) =
+            if let Some(first) = session_list.first() {
+                let msgs = history_store
+                    .as_ref()
+                    .and_then(|s| s.load_messages(&first.id).ok())
+                    .unwrap_or_default();
+                let entities = msgs
+                    .into_iter()
+                    .map(|m| cx.new(|_cx| ChatMessageView::from_stored(m)))
+                    .collect();
+                (Some(first.id.clone()), entities)
+            } else {
+                (None, Vec::new())
+            };
+        let msg_count = messages.len();
 
         Self {
             input_field,
             enter_to_submit: true,
             messages,
             streaming: false,
+            streaming_thinking: None,
+            streaming_assistant: None,
+            streaming_tool_calls: HashMap::new(),
             available_models: Vec::new(),
             selected_model_idx: 0,
             model_dropdown_open: false,
@@ -189,7 +159,7 @@ impl ChatPanel {
             response_reserve,
             tokio_rt,
             submit_sub,
-            scroll_handle: ScrollHandle::new(),
+            list_state: ListState::new(msg_count, ListAlignment::Bottom, px(200.0)),
             history_store,
             current_session_id,
             session_list,
@@ -215,6 +185,49 @@ impl ChatPanel {
         self.agent = Some(Arc::new(agent));
     }
 
+    /// Reset the virtualized list state to match the current message count.
+    /// Call this whenever messages are added, removed, or the list is replaced.
+    fn sync_list_state(&self) {
+        self.list_state.reset(self.messages.len());
+    }
+
+    /// Push a plain text message (User/Assistant/Thinking) and return its handle.
+    fn push_text_message(
+        &mut self,
+        role: ChatMessageRole,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Entity<ChatMessageView> {
+        let msg = cx.new(|_cx| ChatMessageView::new_text(role, text));
+        self.messages.push(msg.clone());
+        self.sync_list_state();
+        msg
+    }
+
+    /// Push a tool-call message and return its handle.
+    fn push_tool_call_message(
+        &mut self,
+        internal_id: String,
+        name: String,
+        args: String,
+        cx: &mut Context<Self>,
+    ) -> Entity<ChatMessageView> {
+        let msg = cx.new(|_cx| ChatMessageView::new_tool_call(internal_id, name, args));
+        self.messages.push(msg.clone());
+        self.sync_list_state();
+        msg
+    }
+
+    /// Finalize streaming state and persist the session.
+    fn finalize_stream(&mut self, cx: &mut Context<Self>) {
+        self.streaming = false;
+        self.streaming_thinking = None;
+        self.streaming_assistant = None;
+        self.streaming_tool_calls.clear();
+        self.save_current_session(cx);
+        cx.notify();
+    }
+
     /// Send the current input. Routes to the agent loop when an agent is
     /// available, otherwise falls back to direct LLM streaming.
     fn do_send(&mut self, cx: &mut Context<Self>) {
@@ -227,9 +240,37 @@ impl ChatPanel {
         self.input_field.update(cx, |field, cx| {
             field.set_content("", cx);
         });
-        self.messages.push(ChatEntry::text(ChatRole::User, text.clone()));
+        self.push_text_message(ChatMessageRole::User, text.clone(), cx);
         self.streaming = true;
         cx.notify();
+
+        // Build token-windowed history from prior User/Assistant turns. Reads
+        // each message entity once up-front so we don't need cx access later.
+        let raw_history: Vec<HistoryMessage> = self
+            .messages
+            .iter()
+            .filter_map(|h| {
+                let m = h.read(cx);
+                match m.role {
+                    ChatMessageRole::User => Some(HistoryMessage {
+                        role: "user".to_string(),
+                        content: m.text().to_string(),
+                    }),
+                    ChatMessageRole::Assistant => Some(HistoryMessage {
+                        role: "assistant".to_string(),
+                        content: m.text().to_string(),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+        let history = select_history_window(
+            &raw_history,
+            &self.system_prompt,
+            &text,
+            self.max_context_tokens,
+            self.response_reserve,
+        );
 
         // ── Agent path ────────────────────────────────────────────────────────
         // When a GraphAgent is wired up, route through the tool-calling loop
@@ -242,25 +283,6 @@ impl ChatPanel {
             };
             let tokio_rt = self.tokio_rt.clone();
 
-            // Build token-windowed history from prior User/Assistant turns.
-            let raw_history: Vec<HistoryMessage> = self.messages.iter()
-                .filter(|e| matches!(e.role, ChatRole::User | ChatRole::Assistant))
-                .map(|e| HistoryMessage {
-                    role: match e.role {
-                        ChatRole::User => "user".to_string(),
-                        _ => "assistant".to_string(),
-                    },
-                    content: e.text.clone(),
-                })
-                .collect();
-            let history = select_history_window(
-                &raw_history,
-                &self.system_prompt,
-                &text,
-                self.max_context_tokens,
-                self.response_reserve,
-            );
-
             cx.spawn(async move |this, cx| {
                 // Get the mpsc::Receiver on the background executor.
                 let mut rx = cx
@@ -269,14 +291,6 @@ impl ChatPanel {
                         tokio_rt.block_on(agent.prompt_stream(&model_id, &text, &history))
                     })
                     .await;
-
-                // Add placeholder entries for thinking and response text.
-                this.update(cx, |view: &mut ChatPanel, cx| {
-                    view.messages.push(ChatEntry::text(ChatRole::Thinking, String::new()));
-                    view.messages.push(ChatEntry::text(ChatRole::Assistant, String::new()));
-                    cx.notify();
-                })
-                .ok();
 
                 use u_forge_agent::AgentStreamEvent;
                 loop {
@@ -292,79 +306,87 @@ impl ChatPanel {
                         None => {
                             // Channel closed without Done — treat as finished.
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                view.streaming = false;
-                                view.save_current_session();
-                                cx.notify();
+                                view.finalize_stream(cx);
                             })
                             .ok();
                             break;
                         }
                         Some(AgentStreamEvent::ReasoningDelta(delta)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                if let Some(entry) = view.messages.iter_mut().rev()
-                                    .find(|e| matches!(e.role, ChatRole::Thinking))
-                                {
-                                    entry.text.push_str(&delta);
-                                }
-                                cx.notify();
+                                let msg = view.streaming_thinking.clone().unwrap_or_else(|| {
+                                    let m = view.push_text_message(
+                                        ChatMessageRole::Thinking,
+                                        String::new(),
+                                        cx,
+                                    );
+                                    view.streaming_thinking = Some(m.clone());
+                                    m
+                                });
+                                msg.update(cx, |m, cx| m.append_text(&delta, cx));
                             })
                             .ok();
                         }
                         Some(AgentStreamEvent::TextDelta(delta)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                if let Some(entry) = view.messages.iter_mut().rev()
-                                    .find(|e| matches!(e.role, ChatRole::Assistant))
-                                {
-                                    entry.text.push_str(&delta);
-                                }
-                                cx.notify();
+                                let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
+                                    let m = view.push_text_message(
+                                        ChatMessageRole::Assistant,
+                                        String::new(),
+                                        cx,
+                                    );
+                                    view.streaming_assistant = Some(m.clone());
+                                    m
+                                });
+                                msg.update(cx, |m, cx| m.append_text(&delta, cx));
                             })
                             .ok();
                         }
                         Some(AgentStreamEvent::ToolCallStart { internal_id, name, args_display }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                view.messages.push(ChatEntry::tool_call(internal_id, name, args_display));
-                                // Ensure there's a fresh assistant entry after the tool call.
-                                view.messages.push(ChatEntry::text(ChatRole::Assistant, String::new()));
+                                let msg = view.push_tool_call_message(
+                                    internal_id.clone(),
+                                    name,
+                                    args_display,
+                                    cx,
+                                );
+                                view.streaming_tool_calls.insert(internal_id, msg);
+                                // Reset the current assistant so the next text
+                                // delta creates a fresh message after the tool.
+                                view.streaming_assistant = None;
                                 cx.notify();
                             })
                             .ok();
                         }
                         Some(AgentStreamEvent::ToolResult { internal_id, content }) => {
-                            this.update(cx, |view: &mut ChatPanel, cx| {
-                                if let Some(entry) = view.messages.iter_mut()
-                                    .find(|e| e.tool_internal_id.as_deref() == Some(&internal_id))
-                                {
-                                    entry.tool_result = Some(content);
+                            this.update(cx, |view: &mut ChatPanel, _cx| {
+                                if let Some(msg) = view.streaming_tool_calls.get(&internal_id).cloned() {
+                                    msg.update(_cx, |m, cx| m.set_tool_result(content, cx));
                                 }
-                                cx.notify();
                             })
                             .ok();
                         }
                         Some(AgentStreamEvent::Done(_)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                // Drop empty thinking and assistant placeholders.
-                                view.messages.retain(|e| match e.role {
-                                    ChatRole::Thinking | ChatRole::Assistant => !e.text.is_empty(),
-                                    _ => true,
-                                });
-                                view.streaming = false;
-                                view.save_current_session();
-                                cx.notify();
+                                view.finalize_stream(cx);
                             })
                             .ok();
                             break;
                         }
                         Some(AgentStreamEvent::Error(e)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                if let Some(entry) = view.messages.iter_mut().rev()
-                                    .find(|e| matches!(e.role, ChatRole::Assistant))
-                                {
-                                    entry.text.push_str(&format!("\n[Agent error: {e}]"));
-                                }
-                                view.streaming = false;
-                                view.save_current_session();
-                                cx.notify();
+                                let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
+                                    let m = view.push_text_message(
+                                        ChatMessageRole::Assistant,
+                                        String::new(),
+                                        cx,
+                                    );
+                                    view.streaming_assistant = Some(m.clone());
+                                    m
+                                });
+                                msg.update(cx, |m, cx| {
+                                    m.append_error(&format!("\n[Agent error: {e}]"), cx)
+                                });
+                                view.finalize_stream(cx);
                             })
                             .ok();
                             break;
@@ -380,41 +402,23 @@ impl ChatPanel {
         let provider = match &self.chat_provider {
             Some(p) => p.clone(),
             None => {
-                self.messages.push(ChatEntry::text(
-                    ChatRole::Assistant,
+                self.push_text_message(
+                    ChatMessageRole::Assistant,
                     "Chat unavailable — Lemonade Server not connected.".to_string(),
-                ));
+                    cx,
+                );
                 self.streaming = false;
                 cx.notify();
                 return;
             }
         };
 
-        // Build the message list for the API.
+        // Build the message list for the API (system prompt + windowed history).
         let mut api_messages = Vec::new();
         if !self.system_prompt.is_empty() {
             api_messages.push(ChatMessage::system(&self.system_prompt));
         }
-
-        // Include token-windowed history (most-recent messages that fit in budget).
-        let raw_history: Vec<HistoryMessage> = self.messages.iter()
-            .filter(|e| matches!(e.role, ChatRole::User | ChatRole::Assistant))
-            .map(|e| HistoryMessage {
-                role: match e.role {
-                    ChatRole::User => "user".to_string(),
-                    _ => "assistant".to_string(),
-                },
-                content: e.text.clone(),
-            })
-            .collect();
-        let windowed = select_history_window(
-            &raw_history,
-            &self.system_prompt,
-            &text,
-            self.max_context_tokens,
-            self.response_reserve,
-        );
-        for msg in &windowed {
+        for msg in &history {
             match msg.role.as_str() {
                 "user" => api_messages.push(ChatMessage::user(&msg.content)),
                 _ => api_messages.push(ChatMessage::assistant(&msg.content)),
@@ -444,18 +448,9 @@ impl ChatPanel {
                 })
                 .await;
 
-            // Add placeholder entries for thinking and content.
-            this.update(cx, |view: &mut ChatPanel, cx| {
-                view.messages.push(ChatEntry::text(ChatRole::Thinking, String::new()));
-                view.messages.push(ChatEntry::text(ChatRole::Assistant, String::new()));
-                cx.notify();
-            })
-            .ok();
-
             // Consume tokens from the stream.
             let mut rx = rx;
             loop {
-                // Poll the receiver on the background executor so the main thread stays free.
                 let token = cx
                     .background_executor()
                     .spawn(async move {
@@ -469,45 +464,47 @@ impl ChatPanel {
                 match result {
                     Some(Ok(StreamToken::Content(text))) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
-                            if let Some(entry) = view
-                                .messages
-                                .iter_mut()
-                                .rev()
-                                .find(|e| matches!(e.role, ChatRole::Assistant))
-                            {
-                                entry.text.push_str(&text);
-                            }
-                            cx.notify();
+                            let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
+                                let m = view.push_text_message(
+                                    ChatMessageRole::Assistant,
+                                    String::new(),
+                                    cx,
+                                );
+                                view.streaming_assistant = Some(m.clone());
+                                m
+                            });
+                            msg.update(cx, |m, cx| m.append_text(&text, cx));
                         })
                         .ok();
                     }
                     Some(Ok(StreamToken::Thinking(text))) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
-                            if let Some(entry) = view
-                                .messages
-                                .iter_mut()
-                                .rev()
-                                .find(|e| matches!(e.role, ChatRole::Thinking))
-                            {
-                                entry.text.push_str(&text);
-                            }
-                            cx.notify();
+                            let msg = view.streaming_thinking.clone().unwrap_or_else(|| {
+                                let m = view.push_text_message(
+                                    ChatMessageRole::Thinking,
+                                    String::new(),
+                                    cx,
+                                );
+                                view.streaming_thinking = Some(m.clone());
+                                m
+                            });
+                            msg.update(cx, |m, cx| m.append_text(&text, cx));
                         })
                         .ok();
                     }
                     Some(Err(e)) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
-                            if let Some(entry) = view
-                                .messages
-                                .iter_mut()
-                                .rev()
-                                .find(|e| matches!(e.role, ChatRole::Assistant))
-                            {
-                                entry.text.push_str(&format!("\n[Error: {e}]"));
-                            }
-                            view.streaming = false;
-                            view.save_current_session();
-                            cx.notify();
+                            let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
+                                let m = view.push_text_message(
+                                    ChatMessageRole::Assistant,
+                                    String::new(),
+                                    cx,
+                                );
+                                view.streaming_assistant = Some(m.clone());
+                                m
+                            });
+                            msg.update(cx, |m, cx| m.append_error(&format!("\n[Error: {e}]"), cx));
+                            view.finalize_stream(cx);
                         })
                         .ok();
                         break;
@@ -515,13 +512,7 @@ impl ChatPanel {
                     None => {
                         // Stream finished.
                         this.update(cx, |view: &mut ChatPanel, cx| {
-                            // Remove empty thinking entry if model didn't produce any.
-                            view.messages.retain(|e| {
-                                !matches!(e.role, ChatRole::Thinking) || !e.text.is_empty()
-                            });
-                            view.streaming = false;
-                            view.save_current_session();
-                            cx.notify();
+                            view.finalize_stream(cx);
                         })
                         .ok();
                         break;
@@ -569,9 +560,9 @@ impl ChatPanel {
     }
 
     /// Save the current messages to the active session (creating one if needed).
-    fn save_current_session(&mut self) {
+    fn save_current_session(&mut self, cx: &mut Context<Self>) {
         let store = match &self.history_store {
-            Some(s) => s,
+            Some(s) => s.clone(),
             None => return,
         };
 
@@ -579,9 +570,16 @@ impl ChatPanel {
         let title = self
             .messages
             .iter()
-            .find(|e| matches!(e.role, ChatRole::User))
-            .map(|e| {
-                let t = e.text.trim();
+            .find_map(|h| {
+                let m = h.read(cx);
+                if matches!(m.role, ChatMessageRole::User) {
+                    Some(m.text().to_string())
+                } else {
+                    None
+                }
+            })
+            .map(|t| {
+                let t = t.trim();
                 if t.len() > 60 {
                     format!("{}…", &t[..60])
                 } else {
@@ -593,21 +591,23 @@ impl ChatPanel {
         // Ensure we have a session ID.
         let session_id = match &self.current_session_id {
             Some(id) => id.clone(),
-            None => {
-                match store.create_session(&title) {
-                    Ok(id) => {
-                        self.current_session_id = Some(id.clone());
-                        id
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to create chat session: {e}");
-                        return;
-                    }
+            None => match store.create_session(&title) {
+                Ok(id) => {
+                    self.current_session_id = Some(id.clone());
+                    id
                 }
-            }
+                Err(e) => {
+                    eprintln!("Failed to create chat session: {e}");
+                    return;
+                }
+            },
         };
 
-        let stored: Vec<StoredMessage> = self.messages.iter().map(entry_to_stored).collect();
+        let stored: Vec<StoredMessage> = self
+            .messages
+            .iter()
+            .map(|h| h.read(cx).to_stored())
+            .collect();
         if let Err(e) = store.save_session(&session_id, &title, &stored) {
             eprintln!("Failed to save chat session: {e}");
         }
@@ -620,12 +620,13 @@ impl ChatPanel {
     fn new_session(&mut self, cx: &mut Context<Self>) {
         // Save current session before switching.
         if !self.messages.is_empty() {
-            self.save_current_session();
+            self.save_current_session(cx);
         }
 
         self.messages.clear();
         self.current_session_id = None;
         self.history_dropdown_open = false;
+        self.sync_list_state();
         cx.notify();
     }
 
@@ -633,19 +634,23 @@ impl ChatPanel {
     fn load_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
         // Save current session before switching.
         if !self.messages.is_empty() {
-            self.save_current_session();
+            self.save_current_session(cx);
         }
 
         let store = match &self.history_store {
-            Some(s) => s,
+            Some(s) => s.clone(),
             None => return,
         };
 
         match store.load_messages(session_id) {
             Ok(msgs) => {
-                self.messages = msgs.into_iter().map(stored_to_entry).collect();
+                self.messages = msgs
+                    .into_iter()
+                    .map(|m| cx.new(|_cx| ChatMessageView::from_stored(m)))
+                    .collect();
                 self.current_session_id = Some(session_id.to_string());
                 self.history_dropdown_open = false;
+                self.sync_list_state();
                 cx.notify();
             }
             Err(e) => {
@@ -657,7 +662,7 @@ impl ChatPanel {
     /// Delete a session from history. If it's the current session, clear the chat.
     fn delete_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
         let store = match &self.history_store {
-            Some(s) => s,
+            Some(s) => s.clone(),
             None => return,
         };
 
@@ -670,54 +675,12 @@ impl ChatPanel {
         if self.current_session_id.as_deref() == Some(session_id) {
             self.messages.clear();
             self.current_session_id = None;
+            self.sync_list_state();
         }
 
         // Refresh the cached session list.
         self.session_list = store.list_sessions().unwrap_or_default();
         cx.notify();
-    }
-}
-
-// ── Conversion helpers ──────────────────────────────────────────────────────
-
-fn role_to_str(role: &ChatRole) -> &'static str {
-    match role {
-        ChatRole::User => "user",
-        ChatRole::Assistant => "assistant",
-        ChatRole::Thinking => "thinking",
-        ChatRole::ToolCall => "tool_call",
-    }
-}
-
-fn str_to_role(s: &str) -> ChatRole {
-    match s {
-        "user" => ChatRole::User,
-        "assistant" => ChatRole::Assistant,
-        "thinking" => ChatRole::Thinking,
-        "tool_call" => ChatRole::ToolCall,
-        _ => ChatRole::Assistant,
-    }
-}
-
-fn entry_to_stored(entry: &ChatEntry) -> StoredMessage {
-    StoredMessage {
-        role: role_to_str(&entry.role).to_string(),
-        text: entry.text.clone(),
-        tool_args: entry.tool_args.clone(),
-        tool_result: entry.tool_result.clone(),
-        tool_internal_id: entry.tool_internal_id.clone(),
-        collapsed: entry.collapsed,
-    }
-}
-
-fn stored_to_entry(msg: StoredMessage) -> ChatEntry {
-    ChatEntry {
-        role: str_to_role(&msg.role),
-        text: msg.text,
-        tool_args: msg.tool_args,
-        tool_result: msg.tool_result,
-        tool_internal_id: msg.tool_internal_id,
-        collapsed: msg.collapsed,
     }
 }
 
@@ -742,7 +705,7 @@ impl Render for ChatPanel {
                     let sid_load = session.id.clone();
                     let sid_del = session.id.clone();
                     div()
-                        .id(gpui::ElementId::Name(format!("hist-{idx}").into()))
+                        .id(("hist", idx))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -750,10 +713,9 @@ impl Render for ChatPanel {
                         .px_2()
                         .when(is_current, |el| el.bg(rgba(0x45475a88)))
                         .hover(|s| s.bg(rgba(0x45475a66)))
-                        // Title (clickable to load)
                         .child({
                             let mut title_el = div()
-                                .id(gpui::ElementId::Name(format!("hist-title-{idx}").into()))
+                                .id(("hist-title", idx))
                                 .flex()
                                 .items_center()
                                 .min_w_0()
@@ -776,10 +738,9 @@ impl Render for ChatPanel {
                             title_el.style().flex_shrink = Some(1.0);
                             title_el
                         })
-                        // Delete button
                         .child(
                             div()
-                                .id(gpui::ElementId::Name(format!("hist-del-{idx}").into()))
+                                .id(("hist-del", idx))
                                 .flex()
                                 .flex_none()
                                 .items_center()
@@ -805,177 +766,21 @@ impl Render for ChatPanel {
             Vec::new()
         };
 
-        // Build message elements.
-        let message_elements: Vec<_> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| !e.text.is_empty())
-            .map(|(i, entry)| {
-                match entry.role {
-                    ChatRole::ToolCall => {
-                        // ── Tool call entry (collapsible) ────────────────────
-                        let collapsed = entry.collapsed;
-                        let tool_name = entry.text.clone();
-                        let tool_args = entry.tool_args.clone().unwrap_or_default();
-                        let tool_result = entry.tool_result.clone();
-                        let chevron = if collapsed { "▶" } else { "▼" };
-                        let header_label = format!("{chevron} ⚙ {tool_name}");
-
-                        let mut el = div()
-                            .id(gpui::ElementId::Name(format!("msg-{i}").into()))
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(0x1e1e2e))
-                            .border_l_1()
-                            .border_color(rgba(0xcba6f7aa)) // purple accent
-                            .child(
-                                div()
-                                    .id(gpui::ElementId::Name(format!("tc-hdr-{i}").into()))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(4.0))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |view, _: &MouseDownEvent, _window, cx| {
-                                            if let Some(entry) = view.messages.get_mut(i) {
-                                                entry.collapsed = !entry.collapsed;
-                                            }
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgba(0xcba6f7ff)) // purple
-                                            .child(header_label),
-                                    )
-                                    .when(tool_result.is_some(), |row| {
-                                        row.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgba(0xa6e3a188))
-                                                .child("✓"),
-                                        )
-                                    }),
-                            );
-
-                        if !collapsed {
-                            el = el
-                                .child(
-                                    div()
-                                        .mt_1()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x181825))
-                                        .rounded(px(3.0))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgba(0x6c7086ff))
-                                                .child("Args:"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgba(0xcdd6f4cc))
-                                                .child(tool_args),
-                                        ),
-                                );
-                            if let Some(result) = tool_result {
-                                el = el.child(
-                                    div()
-                                        .mt_1()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x181825))
-                                        .rounded(px(3.0))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgba(0x6c7086ff))
-                                                .child("Result:"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgba(0xa6e3a1cc))
-                                                .child(result),
-                                        ),
-                                );
-                            }
-                        }
-                        el
-                    }
-                    _ => {
-                        // ── Regular text entry ───────────────────────────────
-                        let (bg, label_color, label, text_color) = match entry.role {
-                            ChatRole::User => (
-                                rgb(0x313244),
-                                rgba(0x89b4faff), // blue
-                                "You",
-                                rgba(0xcdd6f4ff),
-                            ),
-                            ChatRole::Assistant => (
-                                rgb(0x1e1e2e),
-                                rgba(0xa6e3a1ff), // green
-                                "Assistant",
-                                rgba(0xcdd6f4ff),
-                            ),
-                            ChatRole::Thinking => (
-                                rgb(0x181825),
-                                rgba(0xf9e2afff), // yellow
-                                "Thinking",
-                                rgba(0x6c7086ff), // dimmed
-                            ),
-                            ChatRole::ToolCall => unreachable!(),
-                        };
-
-                        div()
-                            .id(gpui::ElementId::Name(format!("msg-{i}").into()))
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .px_2()
-                            .py_1()
-                            .bg(bg)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(label_color)
-                                    .pb(px(2.0))
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(text_color)
-                                    .child(entry.text.clone()),
-                            )
-                    }
+        // Build the virtualized message list. Only visible items (+ overdraw
+        // buffer) are rendered, so long chat histories don't slow down layout.
+        // Each item is its own `Entity<ChatMessageView>` — streaming token
+        // deltas only invalidate the target entity, not this panel.
+        let list_entity = cx.entity().clone();
+        let list_el = list(
+            self.list_state.clone(),
+            move |ix, _window, cx: &mut App| {
+                let panel = list_entity.read(cx);
+                match panel.messages.get(ix) {
+                    Some(msg) => msg.clone().into_any_element(),
+                    None => div().into_any_element(),
                 }
-            })
-            .collect();
-
-        // Streaming indicator.
-        let streaming_indicator = if streaming {
-            Some(
-                div()
-                    .id("streaming-indicator")
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgba(0xf9e2afff))
-                    .child("Generating…"),
-            )
-        } else {
-            None
-        };
+            },
+        );
 
         // Model dropdown items.
         let model_items: Vec<_> = if model_dropdown_open {
@@ -994,7 +799,7 @@ impl Render for ChatPanel {
                     };
                     let label = format!("{}{}", m.model_id, device);
                     div()
-                        .id(gpui::ElementId::Name(format!("model-{idx}").into()))
+                        .id(("model", idx))
                         .flex()
                         .items_center()
                         .h(px(24.0))
@@ -1045,7 +850,6 @@ impl Render for ChatPanel {
                     .border_color(rgb(0x313244))
                     .px_2()
                     .py_1()
-                    // Chat history selector row
                     .child(
                         div()
                             .id("history-selector-row")
@@ -1110,7 +914,6 @@ impl Render for ChatPanel {
                                     .child("New"),
                             ),
                     )
-                    // History dropdown (conditional)
                     .when(history_dropdown_open, |header| {
                         header.child(
                             div()
@@ -1129,15 +932,13 @@ impl Render for ChatPanel {
                         )
                     }),
             )
-            // ── Message area ─────────────────────────────────────────────────
+            // ── Message area (virtualized list) ──────────────────────────────
             .child({
                 let mut msg_area = div()
                     .id("chat-messages")
                     .flex()
                     .flex_col()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -1148,9 +949,24 @@ impl Render for ChatPanel {
                             }
                         }),
                     )
-                    .children(message_elements);
-                if let Some(indicator) = streaming_indicator {
-                    msg_area = msg_area.child(indicator);
+                    .child({
+                        let mut el = list_el;
+                        el.style().flex_grow = Some(1.0);
+                        el.style().flex_shrink = Some(1.0);
+                        el.style().flex_basis = Some(relative(0.).into());
+                        el
+                    });
+                if streaming {
+                    msg_area = msg_area.child(
+                        div()
+                            .id("streaming-indicator")
+                            .flex_none()
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(rgba(0xf9e2afff))
+                            .child("Generating…"),
+                    );
                 }
                 msg_area.style().flex_grow = Some(1.0);
                 msg_area.style().flex_shrink = Some(1.0);
@@ -1179,7 +995,6 @@ impl Render for ChatPanel {
                     .px_2()
                     .py_1()
                     .gap(px(4.0))
-                    // Enter-to-submit toggle row
                     .child(
                         div()
                             .id("submit-toggle-row")
@@ -1222,7 +1037,6 @@ impl Render for ChatPanel {
                                     .child("Enter to submit"),
                             ),
                     )
-                    // Input field + send button
                     .child(
                         div()
                             .id("input-row")
@@ -1274,7 +1088,6 @@ impl Render for ChatPanel {
                                     .child("Send"),
                             ),
                     )
-                    // Model selector row (below input)
                     .child(
                         div()
                             .id("model-selector-row")
@@ -1325,7 +1138,6 @@ impl Render for ChatPanel {
                                             .child(model_label),
                                     ),
                             )
-                            // Model dropdown (conditional, opens upward)
                             .when(model_dropdown_open, |container| {
                                 container.child(
                                     div()
