@@ -497,6 +497,37 @@ impl KnowledgeGraph {
     pub fn list_schemas(&self) -> Result<Vec<String>> {
         self.schema_manager.list_schemas()
     }
+
+    /// Return a compact, LLM-readable summary of **all** persisted schemas,
+    /// merged into a single prompt block.  Node/edge types from every schema
+    /// are combined and deduplicated (later schemas win on conflicts).
+    pub fn schema_prompt_summary_all(&self) -> String {
+        let names = match self.storage.list_schemas() {
+            Ok(n) => n,
+            Err(_) => return String::new(),
+        };
+        if names.is_empty() {
+            return String::new();
+        }
+
+        // Merge all schemas into one virtual SchemaDefinition for the summary.
+        let mut merged = crate::schema::SchemaDefinition::new(
+            "merged".to_string(),
+            "0.0.0".to_string(),
+            String::new(),
+        );
+        for name in &names {
+            if let Ok(Some(schema)) = self.storage.get_schema(name) {
+                for (k, v) in schema.object_types {
+                    merged.object_types.insert(k, v);
+                }
+                for (k, v) in schema.edge_types {
+                    merged.edge_types.insert(k, v);
+                }
+            }
+        }
+        merged.prompt_summary()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

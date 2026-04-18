@@ -265,8 +265,40 @@ pub struct ChatDeviceConfig {
     /// Token ceiling for generation requests on this device.
     pub max_tokens: Option<u32>,
 
-    /// Sampling temperature for this device (0.0 = deterministic, 1.0 = creative).
+    /// Sampling temperature (0.0 = deterministic, 2.0 = very creative).
+    /// Lower values make tool calls more reliable.
     pub temperature: Option<f32>,
+
+    /// Nucleus sampling: only consider tokens whose cumulative probability
+    /// exceeds this threshold (0.0–1.0). Lower = more focused.
+    pub top_p: Option<f32>,
+
+    /// Top-k sampling: only consider the k most likely tokens.
+    /// Supported by llama.cpp backends. 0 = disabled.
+    pub top_k: Option<u32>,
+
+    /// Min-p sampling: discard tokens with probability below
+    /// `min_p * max_token_probability`. Supported by llama.cpp backends.
+    pub min_p: Option<f32>,
+
+    /// Penalise tokens that have already appeared in the output,
+    /// scaled by how often they appeared (-2.0 to 2.0). Reduces repetition.
+    pub frequency_penalty: Option<f32>,
+
+    /// Penalise tokens that have appeared at all in the output (-2.0 to 2.0).
+    /// Encourages topic diversity.
+    pub presence_penalty: Option<f32>,
+
+    /// Repetition penalty (llama.cpp style, typically 1.0–1.5).
+    /// Values > 1.0 discourage repeating previous tokens.
+    pub repetition_penalty: Option<f32>,
+
+    /// RNG seed for reproducible generation. Same seed + same prompt
+    /// should yield the same output (backend-dependent).
+    pub seed: Option<u64>,
+
+    /// Stop sequences: generation halts when any of these strings is emitted.
+    pub stop: Option<Vec<String>>,
 }
 
 /// Global chat / RAG settings.
@@ -330,6 +362,14 @@ pub struct ChatConfig {
     /// See [`HybridSearchConfig::hq_semantic_boost`] for full semantics.
     #[serde(default = "ChatConfig::default_hq_semantic_boost")]
     pub hq_semantic_boost: f32,
+
+    /// Maximum tool-call round-trips the agent may make per user message.
+    ///
+    /// Each "turn" is one LLM call that may invoke tools; the agent loop
+    /// stops after this many turns even if the model wants to call more.
+    /// Defaults to 5.
+    #[serde(default = "ChatConfig::default_max_tool_turns")]
+    pub max_tool_turns: usize,
 }
 
 impl ChatConfig {
@@ -375,6 +415,10 @@ impl ChatConfig {
     fn default_hq_semantic_boost() -> f32 {
         3.0
     }
+
+    fn default_max_tool_turns() -> usize {
+        5
+    }
 }
 
 impl Default for ChatConfig {
@@ -391,6 +435,7 @@ impl Default for ChatConfig {
             alpha: Self::default_alpha(),
             search_limit: Self::default_search_limit(),
             hq_semantic_boost: Self::default_hq_semantic_boost(),
+            max_tool_turns: Self::default_max_tool_turns(),
         }
     }
 }

@@ -517,20 +517,15 @@ impl Tool for HybridSearchTool {
 /// Arguments for [`UpsertNodeTool`].
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpsertNodeArgs {
-    /// UUID of an existing node to update. Omit to create a new node.
+    /// UUID of an existing node to update. Omit when creating.
     pub node_id: Option<String>,
-    /// Human-readable name for the node.
+    /// Display name, e.g. "Gandalf" or "Neverwinter".
     pub name: String,
-    /// Object type (e.g. "npc", "location", "faction").
+    /// Must be a type from the schema (see system prompt). Examples: "character", "location", "faction", "item", "event", "session".
     pub object_type: String,
-    /// Schema-defined fields for this node type as a flat JSON object.
-    ///
-    /// Well-known keys handled specially:
-    /// - `"description"`: string — narrative prose for the node.
-    /// - `"tags"`: array of strings — free-form labels.
-    ///
-    /// All other keys are stored as typed properties on the node.
-    /// Example: `{"description": "A frontier world", "tags": ["planet"], "role": "Mathematician"}`
+    /// Flat JSON object of properties for this node type — see the system prompt for valid keys per object_type.
+    /// Example for a character: {"description": "An ancient wizard", "tags": ["wizard", "NPC"], "species": "Human", "age": "342"}.
+    /// On update: omitted/null keys are kept, "" deletes a key.
     pub properties: Option<serde_json::Value>,
 }
 
@@ -572,12 +567,9 @@ impl Tool for UpsertNodeTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description:
-                "Create or update a node in the knowledge graph. \
-                 Provide node_id to update an existing node, or omit it to create a new one. \
-                 All fields — including description and tags — go inside the `properties` object. \
-                 Special keys: \"description\" (string) and \"tags\" (array of strings) are \
-                 promoted to top-level node fields; all other keys are stored as typed properties. \
-                 After saving, the node is automatically re-indexed for full-text and semantic search."
+                "Create or update a knowledge graph node. Always search first to avoid duplicates. \
+                 Populate name, object_type, and all known properties in one call. \
+                 On update (node_id set), only changed keys are needed — omitted keys are kept."
                     .to_string(),
             parameters: serde_json::to_value(schema_for!(UpsertNodeArgs))
                 .expect("UpsertNodeArgs schema is always valid JSON"),
@@ -602,12 +594,35 @@ impl Tool for UpsertNodeTool {
             (oid, false, new_meta)
         };
 
+        // Validate object_type against schema.
+        let schema_mgr = self.graph.get_schema_manager();
+        if !schema_mgr.is_valid_object_type(&args.object_type) {
+            let valid = schema_mgr.all_object_type_names().join(", ");
+            return Err(ToolError(format!(
+                "Unknown object_type \"{}\". Valid types: {valid}",
+                args.object_type
+            )));
+        }
+
         // Apply caller-provided fields.
         meta.name = args.name;
         meta.object_type = args.object_type;
         if let Some(props) = args.properties {
-            if props.is_object() {
-                meta.properties = props;
+            if let (serde_json::Value::Object(incoming), serde_json::Value::Object(ref mut existing)) =
+                (props, &mut meta.properties)
+            {
+                // Merge: caller-supplied keys win; null/omitted keys are preserved.
+                // An empty string removes the key.
+                for (k, v) in incoming {
+                    if v.is_null() {
+                        // null means "keep existing" — skip.
+                        continue;
+                    } else if v == serde_json::Value::String(String::new()) {
+                        existing.remove(&k);
+                    } else {
+                        existing.insert(k, v);
+                    }
+                }
             }
         }
 
@@ -630,10 +645,7 @@ impl Tool for UpsertNodeTool {
 
         let action = if is_update { "Updated" } else { "Created" };
         Ok(format!(
-            "{action} node \"{name}\" ({object_type}).\n\
-             node_id: {object_id}\n\
-             chunks_embedded: {chunks}\n\
-             To edit this node later, pass node_id: \"{object_id}\" to upsert_node.",
+            "{action} node \"{name}\" ({object_type}). node_id: {object_id}. chunks_embedded: {chunks}.",
             name = meta.name,
             object_type = meta.object_type,
         ))
@@ -645,11 +657,11 @@ impl Tool for UpsertNodeTool {
 /// Arguments for [`UpsertEdgeTool`].
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpsertEdgeArgs {
-    /// Name or UUID of the source node.
+    /// Exact name or UUID of the source node.
     pub source: String,
-    /// Name or UUID of the target node.
+    /// Exact name or UUID of the target node.
     pub target: String,
-    /// Relationship label (e.g. "led_by", "located_in").
+    /// Freeform relationship label, e.g. "led_by", "located_in", "member_of".
     pub edge_type: String,
     /// Optional weight (0.0–1.0). Defaults to 1.0.
     pub weight: Option<f32>,
@@ -817,6 +829,52 @@ pub enum AgentStreamEvent {
     Error(String),
 }
 
+/// Sampling and generation parameters for the agent, built from
+/// [`ChatDeviceConfig`] + [`ChatConfig`].
+#[derive(Debug, Clone)]
+pub struct AgentParams {
+    /// Sampling temperature (default 0.3 for reliable tool use).
+    pub temperature: f64,
+    /// Maximum generation tokens.
+    pub max_tokens: Option<u64>,
+    /// Nucleus sampling threshold (0.0–1.0).
+    pub top_p: Option<f64>,
+    /// Top-k sampling (llama.cpp).
+    pub top_k: Option<u32>,
+    /// Min-p sampling (llama.cpp).
+    pub min_p: Option<f64>,
+    /// Penalise repeated tokens by frequency (-2.0–2.0).
+    pub frequency_penalty: Option<f64>,
+    /// Penalise tokens that appeared at all (-2.0–2.0).
+    pub presence_penalty: Option<f64>,
+    /// Repetition penalty (llama.cpp, typically 1.0–1.5).
+    pub repetition_penalty: Option<f64>,
+    /// RNG seed for reproducible generation.
+    pub seed: Option<u64>,
+    /// Stop sequences.
+    pub stop: Option<Vec<String>>,
+    /// Maximum tool-call round-trips per user message.
+    pub max_tool_turns: usize,
+}
+
+impl Default for AgentParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.3,
+            max_tokens: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            seed: None,
+            stop: None,
+            max_tool_turns: 5,
+        }
+    }
+}
+
 /// A configured agent backed by the three graph search tools.
 ///
 /// Wraps a rig `CompletionsClient` pointed at Lemonade's OpenAI-compatible
@@ -831,6 +889,7 @@ pub struct GraphAgent {
     queue: Arc<InferenceQueue>,
     hq_queue: Option<Arc<InferenceQueue>>,
     system_prompt: String,
+    params: AgentParams,
 }
 
 impl GraphAgent {
@@ -842,39 +901,97 @@ impl GraphAgent {
         queue: Arc<InferenceQueue>,
         hq_queue: Option<Arc<InferenceQueue>>,
         system_prompt: impl Into<String>,
+        params: AgentParams,
     ) -> anyhow::Result<Self> {
         let client = CompletionsClient::builder()
             .api_key("lemonade")
             .base_url(lemonade_url)
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build rig client: {e}"))?;
+        let base_prompt: String = system_prompt.into();
+        let schema_summary = graph.schema_prompt_summary_all();
+
+        let tool_guidance = "\
+## Tool-use guidelines
+
+1. **Search before writing.** Before creating a node, search to check it doesn't already exist.
+2. **One call per node.** Include name, object_type, and all known properties in a single \
+   upsert_node call. Never create a blank node and fill properties afterwards.
+3. **Refer to the schema below** for valid object_type values and their properties. \
+   Use the property names and types exactly as listed.
+4. **Stop when done.** After a successful tool call, report the result to the user. \
+   Do not re-call a tool for the same node unless asked.";
+
+        let full_prompt = if schema_summary.is_empty() {
+            format!("{base_prompt}\n\n{tool_guidance}")
+        } else {
+            format!("{base_prompt}\n\n{tool_guidance}\n\n{schema_summary}")
+        };
+
         Ok(Self {
             client,
             graph,
             queue,
             hq_queue,
-            system_prompt: system_prompt.into(),
+            system_prompt: full_prompt,
+            params,
         })
     }
 
-    /// Run the agent loop with streaming output.
+    /// Build `additional_params` JSON from the non-standard sampling knobs.
     ///
-    /// Returns a [`mpsc::Receiver`] that yields [`AgentStreamEvent`]s as the
-    /// agent streams text, calls tools, and receives tool results. The channel
-    /// closes after a [`AgentStreamEvent::Done`] or [`AgentStreamEvent::Error`].
-    pub async fn prompt_stream(
-        &self,
-        model_id: &str,
-        user_message: &str,
-        history: &[HistoryMessage],
-        max_turns: usize,
-    ) -> mpsc::Receiver<AgentStreamEvent> {
-        let (tx, rx) = mpsc::channel(64);
+    /// Rig's OpenAI provider flattens this into the request body, so keys like
+    /// `frequency_penalty`, `top_p`, `seed`, etc. end up as top-level fields
+    /// in the OpenAI-compatible `/chat/completions` request.
+    fn additional_params(&self) -> Option<serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        if let Some(v) = self.params.top_p {
+            map.insert("top_p".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.params.top_k {
+            map.insert("top_k".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.params.min_p {
+            map.insert("min_p".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.params.frequency_penalty {
+            map.insert("frequency_penalty".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.params.presence_penalty {
+            map.insert("presence_penalty".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.params.repetition_penalty {
+            map.insert("repetition_penalty".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.params.seed {
+            map.insert("seed".into(), serde_json::json!(v));
+        }
+        if let Some(ref v) = self.params.stop {
+            map.insert("stop".into(), serde_json::json!(v));
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(map))
+        }
+    }
 
-        let agent = self
+    /// Build a rig agent configured with all sampling params and tools.
+    fn build_agent(&self, model_id: &str) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
+        let mut builder = self
             .client
             .agent(model_id)
             .preamble(&self.system_prompt)
+            .temperature(self.params.temperature);
+
+        if let Some(max_tokens) = self.params.max_tokens {
+            builder = builder.max_tokens(max_tokens);
+        }
+        if let Some(additional) = self.additional_params() {
+            builder = builder.additional_params(additional);
+        }
+
+        builder
             .tool(HybridSearchTool::new(
                 self.graph.clone(),
                 self.queue.clone(),
@@ -894,7 +1011,24 @@ impl GraphAgent {
                 self.queue.clone(),
                 self.hq_queue.clone(),
             ))
-            .build();
+            .build()
+    }
+
+    /// Run the agent loop with streaming output.
+    ///
+    /// Returns a [`mpsc::Receiver`] that yields [`AgentStreamEvent`]s as the
+    /// agent streams text, calls tools, and receives tool results. The channel
+    /// closes after a [`AgentStreamEvent::Done`] or [`AgentStreamEvent::Error`].
+    pub async fn prompt_stream(
+        &self,
+        model_id: &str,
+        user_message: &str,
+        history: &[HistoryMessage],
+    ) -> mpsc::Receiver<AgentStreamEvent> {
+        let (tx, rx) = mpsc::channel(64);
+
+        let agent = self.build_agent(model_id);
+        let max_turns = self.params.max_tool_turns;
 
         let user_message = user_message.to_string();
         // Convert HistoryMessage → rig::completion::message::Message.
@@ -1010,43 +1144,16 @@ impl GraphAgent {
         rx
     }
 
-    /// Run the agent tool loop for a single user message.
+    /// Run the agent tool loop for a single user message (non-streaming).
     ///
-    /// Builds an agent with [`HybridSearchTool`], [`FtsSearchTool`],
-    /// [`SemanticSearchTool`], [`UpsertNodeTool`], and [`UpsertEdgeTool`],
-    /// then calls the LLM using `model_id` up to `max_turns` times (each
-    /// turn may trigger tool calls). Returns the model's final text response.
+    /// Uses the same tools and sampling parameters as [`prompt_stream`].
     pub async fn prompt(
         &self,
         model_id: &str,
         user_message: &str,
         history: &[HistoryMessage],
-        max_turns: usize,
     ) -> Result<String, String> {
-        let agent = self
-            .client
-            .agent(model_id)
-            .preamble(&self.system_prompt)
-            .tool(HybridSearchTool::new(
-                self.graph.clone(),
-                self.queue.clone(),
-            ))
-            .tool(FtsSearchTool::new(self.graph.clone()))
-            .tool(SemanticSearchTool::new(
-                self.graph.clone(),
-                self.queue.clone(),
-            ))
-            .tool(UpsertNodeTool::new(
-                self.graph.clone(),
-                self.queue.clone(),
-                self.hq_queue.clone(),
-            ))
-            .tool(UpsertEdgeTool::new(
-                self.graph.clone(),
-                self.queue.clone(),
-                self.hq_queue.clone(),
-            ))
-            .build();
+        let agent = self.build_agent(model_id);
         let rig_history: Vec<rig::completion::message::Message> = history
             .iter()
             .map(|m| {
@@ -1060,7 +1167,7 @@ impl GraphAgent {
         agent
             .prompt(user_message)
             .with_history(rig_history)
-            .max_turns(max_turns)
+            .max_turns(self.params.max_tool_turns)
             .await
             .map_err(|e: PromptError| e.to_string())
     }

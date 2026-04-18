@@ -46,6 +46,69 @@ impl SchemaDefinition {
         self.updated_at = chrono::Utc::now();
     }
 
+    /// Generate a compact, LLM-readable summary of this schema.
+    ///
+    /// Intended for injection into a system prompt so the model knows which
+    /// node types and properties exist, and which edge types can connect them.
+    pub fn prompt_summary(&self) -> String {
+        let mut out = String::new();
+        out.push_str("## Knowledge Graph Schema\n\n");
+
+        // --- Node types -------------------------------------------------
+        out.push_str("### Node Types\n");
+        let mut node_types: Vec<(&String, &ObjectTypeSchema)> =
+            self.object_types.iter().collect();
+        node_types.sort_by_key(|(k, _)| k.as_str());
+        for (type_name, ots) in &node_types {
+            out.push_str(&format!("- **{}**: {}\n", type_name, ots.description));
+            let mut props: Vec<(&String, &PropertySchema)> = ots.properties.iter().collect();
+            props.sort_by_key(|(k, _)| k.as_str());
+            for (prop_name, ps) in &props {
+                let req = if ots.required_properties.contains(prop_name) {
+                    " (required)"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "  - `{}` ({}){}: {}\n",
+                    prop_name,
+                    ps.property_type.name(),
+                    req,
+                    ps.description
+                ));
+            }
+            if !ots.allowed_edges.is_empty() {
+                out.push_str(&format!(
+                    "  Allowed edges: {}\n",
+                    ots.allowed_edges.join(", ")
+                ));
+            }
+        }
+
+        // --- Edge types -------------------------------------------------
+        out.push_str("\n### Edge Types\n");
+        let mut edge_types: Vec<(&String, &EdgeTypeSchema)> =
+            self.edge_types.iter().collect();
+        edge_types.sort_by_key(|(k, _)| k.as_str());
+        for (edge_name, ets) in &edge_types {
+            let bidir = if ets.bidirectional { " (bidirectional)" } else { "" };
+            out.push_str(&format!("- **{}**{}: {}\n", edge_name, bidir, ets.description));
+            if !ets.allowed_source_types.is_empty() {
+                out.push_str(&format!(
+                    "  From: {} → To: {}\n",
+                    ets.allowed_source_types.join(", "),
+                    if ets.allowed_target_types.is_empty() {
+                        "any".to_string()
+                    } else {
+                        ets.allowed_target_types.join(", ")
+                    }
+                ));
+            }
+        }
+
+        out
+    }
+
     /// Create a default D&D 5e-style schema based on current hardcoded types
     pub fn create_default() -> Self {
         let mut schema = Self::new(

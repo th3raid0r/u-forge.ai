@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use gpui::{prelude::*, Context, Empty, Entity, Subscription};
 use parking_lot::RwLock;
-use u_forge_agent::GraphAgent;
+use u_forge_agent::{AgentParams, GraphAgent};
 use u_forge_core::{
     embed_all_chunks,
     ingest::{build_hq_embed_queue, rechunk_and_embed},
@@ -575,12 +575,26 @@ impl AppView {
                         // Build the graph agent and wire it to the chat panel.
                         let graph = view.graph.clone();
                         let system_prompt = view.app_config.chat.system_prompt.clone();
+                        let dev = view.app_config.chat.active_device_config();
+                        let mut agent_params = AgentParams::default();
+                        if let Some(v) = dev.temperature { agent_params.temperature = v as f64; }
+                        if let Some(v) = dev.max_tokens { agent_params.max_tokens = Some(v as u64); }
+                        if let Some(v) = dev.top_p { agent_params.top_p = Some(v as f64); }
+                        if let Some(v) = dev.top_k { agent_params.top_k = Some(v); }
+                        if let Some(v) = dev.min_p { agent_params.min_p = Some(v as f64); }
+                        if let Some(v) = dev.frequency_penalty { agent_params.frequency_penalty = Some(v as f64); }
+                        if let Some(v) = dev.presence_penalty { agent_params.presence_penalty = Some(v as f64); }
+                        if let Some(v) = dev.repetition_penalty { agent_params.repetition_penalty = Some(v as f64); }
+                        if let Some(v) = dev.seed { agent_params.seed = Some(v); }
+                        if dev.stop.is_some() { agent_params.stop = dev.stop.clone(); }
+                        agent_params.max_tool_turns = view.app_config.chat.max_tool_turns;
                         match GraphAgent::new(
                             &lemonade_url,
                             graph,
                             Arc::new(queue),
                             hq_arc,
                             system_prompt,
+                            agent_params,
                         ) {
                             Ok(agent) => {
                                 view.chat_panel.update(cx, |panel, _cx| {

@@ -33,21 +33,32 @@ system_prompt = "You are a knowledgeable assistant for a TTRPG worldbuilding too
 max_history_turns = 10
 alpha = 0.5                     # 0.0 = FTS5-only, 1.0 = semantic-only
 search_limit = 3
-hq_semantic_boost = 3        # RRF weight multiplier for the 4096-dim HQ semantic path (vs 1.0 for 768-dim)
+hq_semantic_boost = 3           # RRF weight multiplier for the 4096-dim HQ semantic path (vs 1.0 for 768-dim)
+max_tool_turns = 5              # max tool-call round-trips per user message
 
 [chat.gpu]
 #model = "Qwen3.5-27B-GGUF"
 model = "Gemma-4-26B-A4B-it-GGUF"
 # model = "Qwen3.5-122B-A10B-GGUF"
 max_tokens = 262144
-temperature = 0.7
+temperature = 0.3               # low for reliable tool calling
+top_p = 0.9                     # nucleus sampling — mild focus
+frequency_penalty = 0.3         # discourage repetitive tool-call loops
+# top_k = 40                    # top-k sampling (llama.cpp only)
+# min_p = 0.05                  # min-p sampling (llama.cpp only)
+# presence_penalty = 0.0        # encourage topic diversity
+# repetition_penalty = 1.1      # llama.cpp style (1.0 = off, 1.1–1.3 typical)
+# seed = 42                     # reproducible output (backend-dependent)
+# stop = ["<|end|>"]            # custom stop sequences
 
 [chat.npu]
 model = "qwen3.5-4b-FLM"
 max_tokens = 32768
-temperature = 0.7
+temperature = 0.3
+top_p = 0.9
+frequency_penalty = 0.3
 
 # [chat.cpu]
 # model = "some-cpu-model-GGUF"
 # max_tokens = 256
-# temperature = 0.5
+# temperature = 0.3
