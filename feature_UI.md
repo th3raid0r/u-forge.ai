@@ -307,29 +307,26 @@ The GPUI canvas saves positions **on explicit save** (Ctrl+S or File > Save) rat
 
 ## Known performance issues — chat panel
 
-Open, unresolved. Read this before touching the chat panel for perf.
+Partially resolved. Read this before touching the chat panel for perf.
 
-**Symptoms observed (as of 14d):**
-- **Launch pause.** First render of the chat panel stalls the main thread noticeably, independent of how many persisted messages are loaded.
-- **Window-resize pause.** Resizing the window hitches while the chat panel relayouts. Resizing with the chat panel closed is smooth.
-- **Message-boundary pause (new after 14d).** Every time the streaming loop creates a new `ChatMessageView` entity — first reasoning delta, first text delta, each `ToolCallStart`, each post-tool-call assistant resume — the UI stalls for a visible beat. Between those boundaries, token append is visibly smooth; the pauses are at the structural transitions.
-- **Streaming is not noticeably smoother than pre-14d.** The hypothesis that the cost was full-panel `cx.notify()` per token was wrong, or at least incomplete. Per-token paint cost is not the dominant factor on this machine / GPUI version.
+**Current state (after splice fix):**
+- ✅ **Message-boundary pause — fixed.** Reasoning/text/tool-call transitions no longer stall.
+- ✅ **Streaming — no longer a regression, and overall render time ~halved vs pre-14d.** Tolerable, not yet *performant*.
+- ⚠️ **Launch pause — still present.** First render of the chat panel stalls the main thread noticeably, independent of persisted message count. Predates 14d.
+- ⚠️ **Window/panel-resize pause — still present.** Resizing hitches while the chat panel relayouts. Smooth with the panel closed. Predates 14d.
 
-**What we've tried:**
-- Scoping `cx.notify()` to per-message child entities so token deltas don't invalidate the header, dropdowns, input field, or sibling messages (item 14d). Correct in principle, net-neutral-to-negative in practice.
+**The splice fix (what worked).** `ChatPanel::sync_list_state()` used to call `ListState::reset(len)` on every structural change. `reset` invalidates **every** cached item measurement, forcing every visible message to re-render + re-lay-out on the next paint. Replaced with `ListState::splice(prev_len..prev_len, 1)` for appends — only the newly-added item's measurement is invalidated; prior items keep their cached heights. `reset_list_state()` is retained for wholesale replacement (session switch, load, delete). See `chat_panel.rs::splice_appended` and `reset_list_state`.
 
-**What we haven't tried (worth investigating, roughly in order):**
-1. **Actually profile.** We've been guessing. Enable a frame-time overlay or use `tracing` spans around paint, layout, and text shaping. Without a real profile we don't know whether the cost is in text shaping, in `ListState` re-measurement, in blade-graphics upload, or in `Window::refresh` fan-out.
-2. **`ListState` reset cost.** `sync_list_state()` calls `ListState::reset(len)` on every structural change. In the 14d flow this now fires mid-stream at each lazy-creation boundary — that aligns suspiciously well with the observed pauses. Options: preallocate the thinking/assistant entities at stream start (revert the "lazy creation" aspect of 14d while keeping the per-message entities), or see whether `ListState::splice` is cheaper than `reset`.
-3. **Message height instability.** GPUI's `list()` docs say visible items may change height freely, but items *outside* the viewport must not. During streaming the growing message pushes older messages out of the viewport while their height is still changing. This may be forcing re-measurement of the entire list on each structural change. Pinning to `ListAlignment::Bottom` may amplify this.
-4. **Swap `list` for `uniform_list` or a hand-rolled scroll area.** `uniform_list` caches a single row height and is much cheaper, but requires uniform message sizes — not possible for variable-length chat content. A hand-rolled approach could render only the visible slice with no virtualization cache, which might be cheaper for small N.
-5. **Text shaping cost per paint.** Each `div().child(SharedString)` re-shapes the text every frame. For long streaming messages this grows linearly. Caching a `ShapedLine`/`WrappedLine` inside `ChatMessageView` and repainting from the cache (the pattern `TextFieldView` already uses — see "TextFieldView — canvas-based text rendering" above) is the targeted fix if shaping is the bottleneck.
-6. **blade-graphics frame-pacing on GPUI 0.2.2.** The crates.io release is known to have rougher frame pacing than Zed's current `gpui_wgpu`. Rule this in or out by measuring, not by upgrading — upgrading to a `gpui_*` git dep is a separate, bigger project.
-7. **Revisit launch and resize paths separately.** Those pauses predate 14d and are not streaming-specific; they likely have different root causes (initial layout, `ListState` bulk measurement on resize). They should be debugged independently.
+**What we tried and reverted: paint-time shape cache.** Moving text rendering into a `canvas` with a cross-frame `WrappedLine` cache (keyed by `text_len` + `wrap_width`) seemed like the right next step but **regressed launch, resize, and streaming**. The architectural mistake: `shape_text` ran in the **paint** phase, not `request_layout`. When the measured height differed from the pre-paint guess, `cx.notify()` forced a second layout + paint pass — every streaming token, every resize frame, every first-paint of a loaded session paid double. The stock `div().child(SharedString)` shapes once in the correct phase (`request_layout`), just without cross-frame caching. A paint-phase cache cannot beat a layout-phase non-cache unless it avoids the notify cascade.
+
+**What to try next, if we revisit perf (ordered):**
+1. **Actually profile.** We've been guessing. Enable a frame-time overlay or use `tracing` spans around paint, layout, and text shaping. Launch and resize pauses may not live in the chat render path at all — font cache cold-start, glyph texture upload, session DB load, embedding-index open are all plausible culprits. Measure before you fix.
+2. **Cached text Element done correctly.** A proper `impl Element` (not a canvas) that shapes in `request_layout`, caches keyed by `(text_len, wrap_width)` on the Entity, and paints from cache. Lives in the right phase — no notify cascade. This is the architecturally correct version of what the reverted canvas attempt tried to do. Targets launch (cold session load) and resize (width change reshape) without hurting streaming.
+3. **Message height instability during streaming.** GPUI's `list()` docs say visible items may change height freely, but items *outside* the viewport must not. Streaming grows a message while older messages scroll out with their height still in flux. `ListAlignment::Bottom` may amplify this.
+4. **Swap `list` for `uniform_list` or a hand-rolled scroll area.** `uniform_list` caches a single row height and is much cheaper, but requires uniform message sizes — not possible for variable-length chat content. A hand-rolled visible-slice renderer could be cheaper for small N.
+5. **blade-graphics frame-pacing on GPUI 0.2.2.** The crates.io release is known to have rougher frame pacing than Zed's current `gpui_wgpu`. Rule this in or out by measuring, not by upgrading — upgrading to a `gpui_*` git dep is a separate, bigger project.
 
 **Do not port more of Zed's agent UI without profiling first.** Zed's `thread_view.rs` is ~9k lines and depends on `Entity<Markdown>` (coupled to theme/language/settings crates — not portable here). Pulling more of that structure over without understanding which piece actually buys us frame time is how we got 14d.
-
-**Rollback option.** 14d is contained in `chat_message.rs` (new) + `chat_panel.rs` (refactor). If the message-boundary pauses are worse than the pre-14d streaming cost in practice, `git revert` the 14d commit — `chat_history.rs` schema is unchanged, saved sessions remain compatible.
 
 ---
 

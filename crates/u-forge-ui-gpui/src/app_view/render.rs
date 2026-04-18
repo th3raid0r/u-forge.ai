@@ -124,6 +124,17 @@ impl Render for AppView {
                     .flex_row()
                     .min_h_0()
                     .overflow_hidden()
+                    // Dismiss open menu dropdowns on any click in the body area.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            if this.file_menu_open || this.view_menu_open {
+                                this.file_menu_open = false;
+                                this.view_menu_open = false;
+                                cx.notify();
+                            }
+                        }),
+                    )
                     // Handle sidebar resize drags
                     .on_drag_move::<ResizeSidebar>(move |event, _window, cx: &mut App| {
                         let mouse_x = f32::from(event.event.position.x);

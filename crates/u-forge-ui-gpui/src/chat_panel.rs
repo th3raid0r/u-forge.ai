@@ -185,10 +185,26 @@ impl ChatPanel {
         self.agent = Some(Arc::new(agent));
     }
 
-    /// Reset the virtualized list state to match the current message count.
-    /// Call this whenever messages are added, removed, or the list is replaced.
-    fn sync_list_state(&self) {
+    /// Full rebuild of the virtualized list state — invalidates all cached
+    /// item measurements. Use only when messages are replaced wholesale
+    /// (session switch, session delete, initial load).
+    fn reset_list_state(&self) {
         self.list_state.reset(self.messages.len());
+    }
+
+    /// Append-only splice at the end of the list. Unlike `reset`, this only
+    /// invalidates the measurement of the newly appended item — prior items
+    /// keep their cached heights. Call after pushing one message onto
+    /// `self.messages`.
+    ///
+    /// This is the critical difference between the pre-14d full-panel
+    /// re-render pattern and a per-message cache: `reset(len)` blows away
+    /// every prior item's measurement, forcing every visible message to
+    /// re-render + re-lay-out on the next paint. `splice(end..end, 1)`
+    /// preserves prior measurements, which is what actually keeps streaming
+    /// and message-boundary transitions smooth.
+    fn splice_appended(&self, prev_len: usize) {
+        self.list_state.splice(prev_len..prev_len, 1);
     }
 
     /// Push a plain text message (User/Assistant/Thinking) and return its handle.
@@ -199,8 +215,9 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) -> Entity<ChatMessageView> {
         let msg = cx.new(|_cx| ChatMessageView::new_text(role, text));
+        let prev_len = self.messages.len();
         self.messages.push(msg.clone());
-        self.sync_list_state();
+        self.splice_appended(prev_len);
         msg
     }
 
@@ -213,8 +230,9 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) -> Entity<ChatMessageView> {
         let msg = cx.new(|_cx| ChatMessageView::new_tool_call(internal_id, name, args));
+        let prev_len = self.messages.len();
         self.messages.push(msg.clone());
-        self.sync_list_state();
+        self.splice_appended(prev_len);
         msg
     }
 
@@ -626,7 +644,7 @@ impl ChatPanel {
         self.messages.clear();
         self.current_session_id = None;
         self.history_dropdown_open = false;
-        self.sync_list_state();
+        self.reset_list_state();
         cx.notify();
     }
 
@@ -650,7 +668,7 @@ impl ChatPanel {
                     .collect();
                 self.current_session_id = Some(session_id.to_string());
                 self.history_dropdown_open = false;
-                self.sync_list_state();
+                self.reset_list_state();
                 cx.notify();
             }
             Err(e) => {
@@ -675,7 +693,7 @@ impl ChatPanel {
         if self.current_session_id.as_deref() == Some(session_id) {
             self.messages.clear();
             self.current_session_id = None;
-            self.sync_list_state();
+            self.reset_list_state();
         }
 
         // Refresh the cached session list.
