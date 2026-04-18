@@ -225,7 +225,7 @@ impl SearchPanel {
     }
 }
 
-// ── Type color helper (same as tree panel) ────────────────────────────────────
+// ── Type color helper (same as node panel) ────────────────────────────────────
 
 fn result_type_color(object_type: &str) -> u32 {
     let [r, g, b, _] = node_color_for_type(object_type);

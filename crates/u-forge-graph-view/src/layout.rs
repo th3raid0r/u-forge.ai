@@ -145,9 +145,7 @@ mod tests {
             id: ObjectId::new_v4(),
             name: name.to_string(),
             object_type: "test".to_string(),
-            description: None,
             position: Vec2::ZERO,
-            tags: vec![],
             properties: serde_json::Value::Object(Default::default()),
         }
     }

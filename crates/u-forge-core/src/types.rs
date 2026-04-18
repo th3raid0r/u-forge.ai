@@ -111,18 +111,22 @@ impl Edge {
     }
 }
 
-/// Core object metadata stored in the knowledge graph
+/// Core object metadata stored in the knowledge graph.
+///
+/// All schema-defined fields — including `"description"` and `"tags"` — live
+/// inside `properties`. Use [`ObjectMetadata::get_property`] /
+/// [`ObjectMetadata::get_json_property`] to read them, or write directly into
+/// `properties` for mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMetadata {
     pub id: ObjectId,
-    pub object_type: String, // Changed from enum to string for dynamic types
-    pub schema_name: Option<String>, // Optional schema reference
+    pub object_type: String,
+    pub schema_name: Option<String>,
     pub name: String,
-    pub description: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
-    pub tags: Vec<String>,
-    pub properties: serde_json::Value, // Changed from HashMap<String, String> to JSON
+    /// All schema-defined properties, stored as a JSON object.
+    pub properties: serde_json::Value,
 }
 
 impl ObjectMetadata {
@@ -133,16 +137,21 @@ impl ObjectMetadata {
             object_type,
             schema_name: None,
             name,
-            description: None,
             created_at: now,
             updated_at: now,
-            tags: Vec::new(),
             properties: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 
+    /// Convenience: set `properties["description"]`.
     pub fn with_description(mut self, description: String) -> Self {
-        self.description = Some(description);
+        if let Some(obj) = self.properties.as_object_mut() {
+            if description.is_empty() {
+                obj.remove("description");
+            } else {
+                obj.insert("description".to_string(), serde_json::Value::String(description));
+            }
+        }
         self
     }
 
@@ -197,9 +206,18 @@ impl ObjectMetadata {
         self.touch();
     }
 
+    /// Convenience: append to `properties["tags"]`, creating the array if absent.
     pub fn add_tag(&mut self, tag: String) {
-        if !self.tags.contains(&tag) {
-            self.tags.push(tag);
+        if let Some(obj) = self.properties.as_object_mut() {
+            let tags = obj
+                .entry("tags")
+                .or_insert_with(|| serde_json::Value::Array(vec![]));
+            if let serde_json::Value::Array(arr) = tags {
+                let val = serde_json::Value::String(tag);
+                if !arr.contains(&val) {
+                    arr.push(val);
+                }
+            }
         }
     }
 
@@ -210,8 +228,9 @@ impl ObjectMetadata {
     /// Flatten all node metadata into a single string for embedding and reranking.
     ///
     /// Produces a structured key-value representation that includes the name,
-    /// type, description, all properties, tags, and any pre-formatted edge lines.
-    /// Pass `edge_lines` as `&[]` when edges are not available.
+    /// type, all properties (including description and tags), and any
+    /// pre-formatted edge lines. Pass `edge_lines` as `&[]` when edges are
+    /// not available.
     ///
     /// Internal properties whose keys begin with `_` (e.g. `_source_id`) are
     /// excluded — they are system bookkeeping fields with no semantic meaning.
@@ -220,12 +239,6 @@ impl ObjectMetadata {
 
         parts.push(format!("Name: {}", self.name));
         parts.push(format!("Type: {}", self.object_type));
-
-        if let Some(desc) = &self.description {
-            if !desc.is_empty() {
-                parts.push(format!("Description: {}", desc));
-            }
-        }
 
         if let Some(props) = self.properties.as_object() {
             for (key, val) in props {
@@ -247,10 +260,6 @@ impl ObjectMetadata {
                 };
                 parts.push(format!("{}: {}", key, val_str));
             }
-        }
-
-        if !self.tags.is_empty() {
-            parts.push(format!("Tags: {}", self.tags.join(", ")));
         }
 
         if !edge_lines.is_empty() {
@@ -289,11 +298,7 @@ pub enum ChunkType {
 
 impl TextChunk {
     pub fn new(object_id: ObjectId, content: String, chunk_type: ChunkType) -> Self {
-        let token_count = tiktoken_rs::o200k_harmony()
-            .expect("o200k_harmony is always available")
-            .encode_with_special_tokens(&content)
-            .len()
-            .max(1);
+        let token_count = crate::text::count_tokens(&content).max(1);
         Self {
             id: ChunkId::new_v4(),
             object_id,
@@ -363,13 +368,14 @@ mod tests {
 
         assert_eq!(obj.name, "Gandalf");
         assert_eq!(obj.object_type, "character");
-        assert_eq!(obj.description, Some("A wise wizard".to_string()));
+        assert_eq!(obj.get_property("description"), Some("A wise wizard".to_string()));
         assert_eq!(obj.get_property("race"), Some("Maiar".to_string()));
 
         obj.add_tag("wizard".to_string());
         obj.add_tag("wizard".to_string()); // Should not duplicate
-        assert_eq!(obj.tags.len(), 1);
-        assert_eq!(obj.tags[0], "wizard");
+        let tags = obj.get_json_property("tags").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].as_str(), Some("wizard"));
     }
 
     #[test]

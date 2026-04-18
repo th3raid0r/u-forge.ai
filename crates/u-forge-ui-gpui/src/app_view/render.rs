@@ -168,7 +168,7 @@ impl Render for AppView {
                 body.style().flex_shrink = Some(1.0);
                 body.style().flex_basis = Some(relative(0.).into());
 
-                // Left sidebar (tree panel) + resize handle
+                // Left sidebar (node panel) + resize handle
                 if sidebar_open {
                     let handle_reset = handle.clone();
                     body = body
@@ -183,8 +183,8 @@ impl Render for AppView {
                                 .min_h_0()
                                 .overflow_hidden()
                                 .child(match sidebar_tab {
-                                    SidebarTab::Tree => {
-                                        self.tree_panel.clone().into_any_element()
+                                    SidebarTab::Nodes => {
+                                        self.node_panel.clone().into_any_element()
                                     }
                                     SidebarTab::Search => {
                                         self.search_panel.clone().into_any_element()
@@ -377,29 +377,29 @@ impl Render for AppView {
                                     .h(px(STATUS_BAR_H - 4.0))
                                     .cursor_pointer()
                                     .text_color(
-                                        if sidebar_open && sidebar_tab == SidebarTab::Tree {
+                                        if sidebar_open && sidebar_tab == SidebarTab::Nodes {
                                             rgba(0xcdd6f4ff)
                                         } else {
                                             rgba(0x6c7086ff)
                                         },
                                     )
                                     .when(
-                                        sidebar_open && sidebar_tab == SidebarTab::Tree,
+                                        sidebar_open && sidebar_tab == SidebarTab::Nodes,
                                         |el| el.bg(rgba(0x45475a88)),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            if this.sidebar_open && this.sidebar_tab == SidebarTab::Tree {
+                                            if this.sidebar_open && this.sidebar_tab == SidebarTab::Nodes {
                                                 this.sidebar_open = false;
                                             } else {
                                                 this.sidebar_open = true;
-                                                this.sidebar_tab = SidebarTab::Tree;
+                                                this.sidebar_tab = SidebarTab::Nodes;
                                             }
                                             cx.notify();
                                         }),
                                     )
-                                    .child("Tree"),
+                                    .child("Nodes"),
                             )
                             // Search button
                             .child(

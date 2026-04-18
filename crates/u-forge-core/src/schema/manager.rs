@@ -234,6 +234,42 @@ impl SchemaManager {
             .and_then(|s| s.object_types.get(type_name).cloned())
     }
 
+    /// Check whether `type_name` is a valid object type in any cached schema.
+    pub fn is_valid_object_type(&self, type_name: &str) -> bool {
+        let cache = self.schema_cache.read();
+        cache.values().any(|s| s.object_types.contains_key(type_name))
+    }
+
+    /// Check whether `edge_name` is a valid edge type in any cached schema.
+    pub fn is_valid_edge_type(&self, edge_name: &str) -> bool {
+        let cache = self.schema_cache.read();
+        cache.values().any(|s| s.edge_types.contains_key(edge_name))
+    }
+
+    /// Return a sorted list of all object type names across every cached schema.
+    pub fn all_object_type_names(&self) -> Vec<String> {
+        let cache = self.schema_cache.read();
+        let mut names: Vec<String> = cache
+            .values()
+            .flat_map(|s| s.object_types.keys().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Return a sorted list of all edge type names across every cached schema.
+    pub fn all_edge_type_names(&self) -> Vec<String> {
+        let cache = self.schema_cache.read();
+        let mut names: Vec<String> = cache
+            .values()
+            .flat_map(|s| s.edge_types.keys().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// List all available schemas
     pub fn list_schemas(&self) -> Result<Vec<String>> {
         self.storage.list_schemas()

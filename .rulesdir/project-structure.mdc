@@ -22,7 +22,7 @@ The project is a Cargo workspace. All crates live under `crates/`:
 | `u-forge-graph-view` | lib | Complete | Graph view model + layout engine (see `feature_UI.md`) |
 | `u-forge-ui-traits` | lib | Complete | Framework-agnostic rendering contracts (see `feature_UI.md`) |
 | `u-forge-ui-gpui` | lib + bin | Alpha | GPUI native desktop app — graph canvas, node editor, search, chat (see `feature_UI.md`) |
-| `u-forge-agent` | lib | Complete | Rig-based LLM agent: `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `GraphAgent` with `prompt_stream()` (see `ARCHITECTURE.md`) |
+| `u-forge-agent` | lib | Complete | Rig-based LLM agent: `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `UpsertNodeTool`, `UpsertEdgeTool`, `GraphAgent` with `prompt_stream()` (see `ARCHITECTURE.md`) |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
 `defaults/` (schemas + sample data) lives at the **workspace root**, not inside any crate. `cli_demo.rs` resolves it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
@@ -121,18 +121,18 @@ export LEMONADE_URL=http://localhost:13305/api/v1
 - [crates/u-forge-ui-traits/src/lib.rs](mdc:crates/u-forge-ui-traits/src/lib.rs) — `DrawCommand`, `Viewport`, `generate_draw_commands()` rendering pipeline.
 - [crates/u-forge-ui-gpui/src/main.rs](mdc:crates/u-forge-ui-gpui/src/main.rs) — Binary entry point only: tokio runtime, config, `KnowledgeGraph` init, schema pre-load, GPUI `Application` setup. All types live in the library target.
 - [crates/u-forge-ui-gpui/src/lib.rs](mdc:crates/u-forge-ui-gpui/src/lib.rs) — Library root: `mod` declarations (includes `chat_panel`, `search_panel`), `actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ImportData])`, `pub use app_view::AppView`.
-- [crates/u-forge-ui-gpui/src/app_view/mod.rs](mdc:crates/u-forge-ui-gpui/src/app_view/mod.rs) — `AppView` struct + constructor + data/AI operations (`refresh_snapshot`, `do_import_data`, `do_clear_data`, `do_save`, `do_init_lemonade`, `do_embed_all`). Holds persistent `Arc<tokio::runtime::Runtime>`, `Arc<AppConfig>`, `Option<InferenceQueue>` (std + HQ), `SidebarTab` enum (Tree/Search), and `embedding_status`. `do_init_lemonade()` also selects LLM models, builds `LemonadeChatProvider`, and pushes it to `ChatPanel`.
+- [crates/u-forge-ui-gpui/src/app_view/mod.rs](mdc:crates/u-forge-ui-gpui/src/app_view/mod.rs) — `AppView` struct + constructor + data/AI operations (`refresh_snapshot`, `do_import_data`, `do_clear_data`, `do_save`, `do_rechunk_and_embed`, `do_init_lemonade`, `do_embed_all`). Holds persistent `Arc<tokio::runtime::Runtime>`, `Arc<AppConfig>`, `Option<InferenceQueue>` (std + HQ), `SidebarTab` enum (Tree/Search), and `embedding_status`. `do_save()` persists dirty tabs then triggers `do_rechunk_and_embed()` so semantic search stays current. `do_init_lemonade()` also selects LLM models, builds `LemonadeChatProvider` and a `GraphAgent` (with HQ queue), and pushes both to `ChatPanel`.
 - [crates/u-forge-ui-gpui/src/app_view/render.rs](mdc:crates/u-forge-ui-gpui/src/app_view/render.rs) — `impl Render for AppView`: menu bar, 3-panel resizable body layout (drag handles between all boundaries), sidebar tab switching (Tree/Search), embedding status in status bar center, dropdown overlays.
 - [crates/u-forge-ui-gpui/src/chat_panel.rs](mdc:crates/u-forge-ui-gpui/src/chat_panel.rs) — `ChatPanel` entity: when `GraphAgent` is set, routes through `GraphAgent::prompt_stream()` (tool-calling loop with collapsible tool call entries and streaming reasoning); falls back to direct `LemonadeChatProvider::complete_stream()` when no agent. `set_provider()` and `set_agent()` called from `AppView` after Lemonade init. `ChatRole` variants: `User`, `Assistant`, `Thinking`, `ToolCall`.
-- [crates/u-forge-agent/src/lib.rs](mdc:crates/u-forge-agent/src/lib.rs) — `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool` (all `rig::tool::Tool` impls); `GraphAgent` with `prompt()` and `prompt_stream()`; `AgentStreamEvent` enum.
+- [crates/u-forge-agent/src/lib.rs](mdc:crates/u-forge-agent/src/lib.rs) — Five `rig::tool::Tool` impls: `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool` (read), `UpsertNodeTool`, `UpsertEdgeTool` (write — re-chunk + embed before returning); `GraphAgent` with `prompt()` and `prompt_stream()`; `AgentStreamEvent` enum; `ToolError`.
 - [crates/u-forge-ui-gpui/src/search_panel.rs](mdc:crates/u-forge-ui-gpui/src/search_panel.rs) — `SearchPanel` entity: `SearchMode` (Fts5/Semantic/Hybrid), single-line `TextFieldView` query input, `do_search()` dispatcher, results list. `set_queues()` called from `AppView` after Lemonade init. Semantic mode uses HQ queue (4096-dim) when available; falls back to standard 768-dim. Hybrid uses `search_hybrid()` from `u-forge-core`.
 - [crates/u-forge-ui-gpui/src/graph_canvas.rs](mdc:crates/u-forge-ui-gpui/src/graph_canvas.rs) — `GraphCanvas`: pan/zoom canvas, LOD edge batching, viewport culling, `save_layout()`.
-- [crates/u-forge-ui-gpui/src/node_editor/mod.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/mod.rs) — `NodeEditorPanel` struct + tab management (`open_or_focus_tab`, `close_tab`, `save_dirty_tabs`).
+- [crates/u-forge-ui-gpui/src/node_editor/mod.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/mod.rs) — `NodeEditorPanel` struct + tab management (`open_or_focus_tab`, `close_tab`, `save_dirty_tabs` → returns `(count, Vec<ObjectId>)` for re-embedding).
 - [crates/u-forge-ui-gpui/src/node_editor/field_spec.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/field_spec.rs) — `FieldKind`, `FieldSpec`, `EditorTab`, layout constants.
 - [crates/u-forge-ui-gpui/src/node_editor/render.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/render.rs) — `impl Render for NodeEditorPanel`: tab bar, schema-driven multi-column form, pagination.
-- [crates/u-forge-ui-gpui/src/tree_panel.rs](mdc:crates/u-forge-ui-gpui/src/tree_panel.rs) — `TreePanel`: collapsible type-grouped node list sidebar; uses `w_full()`, parent container controls width.
+- [crates/u-forge-ui-gpui/src/node_panel.rs](mdc:crates/u-forge-ui-gpui/src/node_panel.rs) — `NodePanel`: collapsible type-grouped node list sidebar; uses `w_full()`, parent container controls width.
 - [crates/u-forge-ui-gpui/src/text_field.rs](mdc:crates/u-forge-ui-gpui/src/text_field.rs) — `TextFieldView`: canvas-based text input with pixel-exact cursor, IME, blink timer. Multiline: vertical scroll (`scroll_offset`), `wrap_width = Some(inner_w)`, grows to 120 px cap. Single-line: horizontal scroll (`h_scroll_offset`, `visible_width`), `wrap_width = None`, fixed `TEXT_FIELD_MIN_H`. `submit_on_enter: bool` — when true on multiline fields, Enter emits `TextSubmit` and Shift+Enter inserts a newline (used by `ChatPanel`). Mouse and IME click-to-cursor both compensate for the active scroll offset.
-- [crates/u-forge-ui-gpui/src/selection_model.rs](mdc:crates/u-forge-ui-gpui/src/selection_model.rs) — `SelectionModel`: shared GPUI entity observed by `TreePanel`, `GraphCanvas`, and `NodeEditorPanel`.
+- [crates/u-forge-ui-gpui/src/selection_model.rs](mdc:crates/u-forge-ui-gpui/src/selection_model.rs) — `SelectionModel`: shared GPUI entity observed by `NodePanel`, `GraphCanvas`, and `NodeEditorPanel`.
 
 ## Module Map (u-forge-core)
 
@@ -174,6 +174,8 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/search/sanitize.rs` | FTS5 query sanitisation | `fts5_sanitize` |
 | `src/schema/` | Schema definition, load/validate/cache, ingestion | `SchemaDefinition`, `SchemaManager`, `SchemaIngestion` |
 | `src/ingest/data.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
+| `src/ingest/embedding.rs` | Batch + per-node embedding | `embed_all_chunks`, `rechunk_and_embed`, `build_hq_embed_queue`, `EmbeddingTarget`, `EmbeddingResult` |
+| `src/ingest/pipeline.rs` | High-level ingestion orchestration | `setup_and_index`, `SetupResult` |
 
 ## ModelSelector Device Slots
 

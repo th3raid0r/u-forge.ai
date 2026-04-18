@@ -79,6 +79,8 @@ If input/output paths are omitted, stdin/stdout are used.
 
 Two-pass: collect all nodes → create objects with name→ID map → resolve edge names → create edges.
 
+**Property handling:** All `properties` keys are stored uniformly in the node's JSON blob. There is no special promotion of `"description"` or `"tags"` — they are schema properties like any other (`"role"`, `"skills"`, etc.). `ObjectMetadata` has no separate `description`/`tags` fields.
+
 **Deduplication:** Before inserting a node, `DataIngestion::create_objects` calls `graph.find_by_name(object_type, name)`. If a matching object already exists, the insert is skipped and the existing ID is recorded in the session map. Re-importing the same JSONL file is safe.
 
 **Cross-session edge resolution:** `resolve_node_id` checks the in-session `name_to_id` map first (O(1)), then falls back to `graph.find_by_name_only(name)` — a storage scan against `idx_nodes_name_only` (O(log N)). Edges referencing nodes from prior import sessions resolve correctly.

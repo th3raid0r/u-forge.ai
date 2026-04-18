@@ -1022,7 +1022,12 @@ async fn main() -> Result<()> {
         "   Created : {} [{}]",
         retrieved.name, retrieved.object_type
     );
-    println!("   Tags    : {}", retrieved.tags.join(", "));
+    let tags: Vec<&str> = retrieved
+        .get_json_property("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    println!("   Tags    : {}", tags.join(", "));
     println!(
         "   Property: affiliation = {}",
         retrieved.get_property("affiliation").unwrap_or_default()
@@ -1099,15 +1104,13 @@ fn embedding_weight(sel: &SelectedModel, cfg: &EmbeddingDeviceConfig) -> u32 {
 /// Print the full metadata for a node: description, properties, tags, and edges.
 /// `indent` is prepended to every output line.
 fn print_node_full(node: &ObjectMetadata, graph: &KnowledgeGraph, indent: &str) {
-    if let Some(desc) = &node.description {
-        if !desc.is_empty() {
-            println!("{indent}Description: {desc}");
-        }
-    }
     if let Some(props) = node.properties.as_object() {
         let mut pairs: Vec<(&String, &serde_json::Value)> = props.iter().collect();
         pairs.sort_by_key(|(k, _)| k.as_str());
         for (key, val) in pairs {
+            if key.starts_with('_') {
+                continue;
+            }
             let display = match val {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -1116,9 +1119,6 @@ fn print_node_full(node: &ObjectMetadata, graph: &KnowledgeGraph, indent: &str) 
                 println!("{indent}{key}: {display}");
             }
         }
-    }
-    if !node.tags.is_empty() {
-        println!("{indent}Tags: {}", node.tags.join(", "));
     }
     for line in graph.edge_display_lines(node) {
         println!("{indent}{line}");

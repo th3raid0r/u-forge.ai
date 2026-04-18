@@ -23,6 +23,9 @@ pub(crate) struct TextChanged(pub(crate) String);
 #[allow(dead_code)]
 pub(crate) struct TextSubmit(pub(crate) String);
 
+/// Event emitted by `TextFieldView` when the Up (`false`) or Down (`true`) arrow key is pressed.
+pub(crate) struct TextArrowKey(pub(crate) bool);
+
 /// Cached shaped text layout from the most recent paint, used for click-to-cursor mapping.
 /// One WrappedLine per explicit '\n'-delimited line, paired with the byte offset where
 /// that line starts in the content string. All fields use wrapped text for dynamic sizing.
@@ -338,6 +341,7 @@ impl Focusable for TextFieldView {
 
 impl gpui::EventEmitter<TextChanged> for TextFieldView {}
 impl gpui::EventEmitter<TextSubmit> for TextFieldView {}
+impl gpui::EventEmitter<TextArrowKey> for TextFieldView {}
 
 impl EntityInputHandler for TextFieldView {
     fn text_for_range(
@@ -819,6 +823,12 @@ impl Render for TextFieldView {
                         this.scroll_to_cursor();
                         this.reset_blink(cx);
                         cx.notify();
+                    }
+                    "up" => {
+                        cx.emit(TextArrowKey(false));
+                    }
+                    "down" => {
+                        cx.emit(TextArrowKey(true));
                     }
                     "enter" => {
                         let shift = event.keystroke.modifiers.shift;

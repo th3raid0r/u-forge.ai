@@ -46,6 +46,44 @@ impl SchemaDefinition {
         self.updated_at = chrono::Utc::now();
     }
 
+    /// Generate a compact, LLM-readable summary of this schema.
+    ///
+    /// Intended for injection into a system prompt so the model knows which
+    /// node types and properties exist.  Edge types are intentionally omitted
+    /// because they are freeform — the model should use natural language labels
+    /// like "led_by" or "located_in" rather than picking from a fixed list.
+    pub fn prompt_summary(&self) -> String {
+        let mut out = String::new();
+        out.push_str("## Knowledge Graph Schema\n\n");
+
+        // --- Node types -------------------------------------------------
+        out.push_str("### Node Types\n");
+        let mut node_types: Vec<(&String, &ObjectTypeSchema)> =
+            self.object_types.iter().collect();
+        node_types.sort_by_key(|(k, _)| k.as_str());
+        for (type_name, ots) in &node_types {
+            out.push_str(&format!("- **{}**: {}\n", type_name, ots.description));
+            let mut props: Vec<(&String, &PropertySchema)> = ots.properties.iter().collect();
+            props.sort_by_key(|(k, _)| k.as_str());
+            for (prop_name, ps) in &props {
+                let req = if ots.required_properties.contains(prop_name) {
+                    " (required)"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "  - `{}` ({}){}: {}\n",
+                    prop_name,
+                    ps.property_type.name(),
+                    req,
+                    ps.description
+                ));
+            }
+        }
+
+        out
+    }
+
     /// Create a default D&D 5e-style schema based on current hardcoded types
     pub fn create_default() -> Self {
         let mut schema = Self::new(

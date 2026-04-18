@@ -26,10 +26,8 @@ pub struct NodeView {
     pub id: ObjectId,
     pub name: String,
     pub object_type: String,
-    pub description: Option<String>,
     pub position: Vec2,
-    pub tags: Vec<String>,
-    /// Additional schema-defined properties stored as JSON (e.g. abilities, affiliations).
+    /// All schema-defined properties, including `"description"` and `"tags"`.
     pub properties: JsonValue,
 }
 
@@ -166,9 +164,7 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
             id: obj.id,
             name: obj.name,
             object_type: obj.object_type,
-            description: obj.description,
             position: Vec2::ZERO,
-            tags: obj.tags,
             properties: obj.properties,
         })
         .collect();

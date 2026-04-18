@@ -87,7 +87,7 @@ All paths below are relative to `crates/u-forge-ui-traits/`.
 |---|---|---|
 | `src/lib.rs` | All rendering contracts + `generate_draw_commands()` | `DrawCommand`, `Viewport`, `GraphRenderer`, `generate_draw_commands()` |
 
-`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment → `DrawCommand` list. `u-forge-ui-gpui` consumes this list — it never touches `GraphSnapshot` directly. Colors are assigned by `pub fn node_color_for_type(name: &str) -> [u8; 4]`: FNV-1a hashes the type name, scatters it across the hue wheel via the golden angle (137.5°), and fixes saturation/lightness to match Catppuccin Mocha accent values. Any type name — including future ones — gets a stable, distinct color with no code changes. The tree panel header colors and graph canvas legend both call the same function.
+`DrawCommand` is a `Circle / Line / Text` primitive with screen-space positions and `[u8; 4]` RGBA colors. `Viewport` carries `center: Vec2`, `size: Vec2`, `zoom: f32` and provides `world_to_screen()`, `screen_to_world()`, `world_rect()`, and `lod_level()`. `generate_draw_commands(snapshot, viewport)` is the main rendering pipeline: R-tree culling → LOD selection → type-based color assignment → `DrawCommand` list. `u-forge-ui-gpui` consumes this list — it never touches `GraphSnapshot` directly. Colors are assigned by `pub fn node_color_for_type(name: &str) -> [u8; 4]`: FNV-1a hashes the type name, scatters it across the hue wheel via the golden angle (137.5°), and fixes saturation/lightness to match Catppuccin Mocha accent values. Any type name — including future ones — gets a stable, distinct color with no code changes. The node panel header colors and graph canvas legend both call the same function.
 
 ## Module Map (u-forge-agent)
 
@@ -95,21 +95,27 @@ All paths below are relative to `crates/u-forge-agent/`.
 
 | File | Role | Key Types |
 |---|---|---|
-| `src/lib.rs` | All agent types, tools, and stream events | `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `GraphAgent`, `AgentStreamEvent` |
+| `src/lib.rs` | All agent types, tools, and stream events | `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `UpsertNodeTool`, `UpsertEdgeTool`, `GraphAgent`, `AgentParams`, `AgentStreamEvent`, `ToolError` |
 
 **Tools** (all implement `rig::tool::Tool`):
 - `FtsSearchTool` — wraps `KnowledgeGraph::search_chunks_fts()`; groups results by node. Args: `FtsSearchArgs { query, limit }`.
 - `SemanticSearchTool` — embeds the query via `InferenceQueue::embed()`, runs `search_chunks_semantic()`; groups by node with distances. Args: `SemanticSearchArgs { query, limit }`.
 - `HybridSearchTool` — calls `search::search_hybrid()`; returns fully hydrated `NodeSearchResult` entries including edges and content. Args: `HybridSearchArgs { query, limit, alpha, rerank }`.
+- `UpsertNodeTool` — creates or updates a node; re-chunks and embeds (standard + HQ) before returning. Args: `UpsertNodeArgs { node_id, name, object_type, properties }`. All schema fields — including `"description"` and `"tags"` — go inside `properties`; search results include the node UUID so the agent can upsert by ID. **Property merge semantics:** on update, caller-supplied keys are merged key-by-key into the existing properties blob — null/omitted keys preserve existing values, `""` deletes a key, any other value overwrites. `object_type` is validated against the schema; an error listing valid types is returned on mismatch so the model can self-correct.
+- `UpsertEdgeTool` — creates or updates an edge; re-embeds both endpoint nodes. Resolves nodes by UUID or exact name via `resolve_node()` helper. Args: `UpsertEdgeArgs { source, target, edge_type, weight }`. `edge_type` is freeform (no schema validation) — natural language labels like `"led_by"` or `"located_in"` are idiomatic.
 
-**`GraphAgent`** wraps a `rig::providers::openai::CompletionsClient` pointed at Lemonade's `/api/v1` endpoint. Built via `GraphAgent::new(url, graph, queue, system_prompt)`. Each call constructs a fresh rig agent with all three tools registered.
+**`AgentParams`** — all LLM sampling knobs in one struct: `temperature`, `max_tokens`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `seed`, `stop`, `max_tool_turns`. Built from `ChatDeviceConfig` + `ChatConfig.max_tool_turns` in `AppView`. Non-standard knobs are forwarded via rig's `additional_params` flatten mechanism.
 
-- `prompt(model_id, msg, max_turns)` — blocking multi-turn tool loop; returns final response string.
-- `prompt_stream(model_id, msg, max_turns)` — returns `mpsc::Receiver<AgentStreamEvent>`; spawns a tokio task that drives `agent.stream_prompt(&msg).multi_turn(n).await` and forwards events.
+**`GraphAgent`** wraps a `rig::providers::openai::CompletionsClient` pointed at Lemonade's `/api/v1` endpoint. Built via `GraphAgent::new(url, graph, queue, hq_queue, system_prompt, params)`. The constructor appends tool-use guidelines and a merged schema summary (`KnowledgeGraph::schema_prompt_summary_all()`) to the base system prompt so the model sees all available types and properties. A private `build_agent(model_id)` helper deduplicates agent construction between `prompt` and `prompt_stream`.
+
+- `prompt(model_id, msg, history)` — blocking multi-turn tool loop; returns final response string. Turn limit from `params.max_tool_turns`.
+- `prompt_stream(model_id, msg, history)` — returns `mpsc::Receiver<AgentStreamEvent>`; spawns a tokio task that drives `agent.stream_prompt(&msg).multi_turn(n).await` and forwards events. Turn limit from `params.max_tool_turns`.
 
 **`AgentStreamEvent`** variants: `ReasoningDelta(String)`, `TextDelta(String)`, `ToolCallStart { internal_id, name, args_display }`, `ToolResult { internal_id, content }`, `Done(String)`, `Error(String)`.
 
 **Note on `fts5_sanitize`:** `u-forge-core::search::sanitize::fts5_sanitize` is `pub(super)` and not re-exported; `u-forge-agent` inlines the same logic (keep only alphanumeric + spaces, collapse whitespace).
+
+**`ToolError`** (renamed from `SearchToolError`) is the shared error type for all five tools: wraps an `anyhow::Error` as a `String`.
 
 ## Module Map (u-forge-ui-gpui)
 
@@ -117,9 +123,9 @@ All paths below are relative to `crates/u-forge-agent/`.
 |---|---|
 | `src/main.rs` | Binary entry point: tokio runtime, config, `KnowledgeGraph` init, schema pre-load, GPUI `Application` setup |
 | `src/lib.rs` | Module declarations, `actions!()` macro, re-exports (`AppView`, action types) |
-| `src/selection_model.rs` | `SelectionModel` — shared selection state observed by `TreePanel`, `GraphCanvas`, `NodeEditorPanel`, and `SearchPanel` |
+| `src/selection_model.rs` | `SelectionModel` — shared selection state observed by `NodePanel`, `GraphCanvas`, `NodeEditorPanel`, and `SearchPanel` |
 | `src/text_field.rs` | `TextFieldView` — canvas-based text input (`EntityInputHandler`, cursor, IME, blink, scroll, `submit_on_enter` flag) |
-| `src/tree_panel.rs` | `TreePanel` — collapsible node-by-type sidebar |
+| `src/node_panel.rs` | `NodePanel` — collapsible node-by-type sidebar |
 | `src/search_panel.rs` | `SearchPanel` — FTS5 / Semantic / Hybrid search modes, query field, results list |
 | `src/chat_panel.rs` | `ChatPanel` — streaming LLM chat: model selector dropdown, enter-to-submit toggle, message history with thinking/content separation and collapsible tool call entries; routes through `GraphAgent` when available |
 | `src/graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
@@ -129,7 +135,7 @@ All paths below are relative to `crates/u-forge-agent/`.
 | `src/app_view/mod.rs` | `AppView` struct + data/AI operations (`do_save`, `do_import_data`, `do_clear_data`, `do_init_lemonade`, `do_embed_all`, `refresh_snapshot`) |
 | `src/app_view/render.rs` | `impl Render for AppView` — menu bar, 3-panel resizable body layout, status bar |
 
-`AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<TreePanel>`, `Entity<SearchPanel>`, `Entity<NodeEditorPanel>`, `Entity<ChatPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. Layout: 28 px menu bar + horizontal body (optional left sidebar showing TreePanel or SearchPanel + vertical workspace with NodeEditorPanel / GraphCanvas 30/70 split + optional ChatPanel) + 24 px status bar. All panel boundaries are user-resizable via drag handles.
+`AppView` is the root GPUI view. It owns `Entity<GraphCanvas>`, `Entity<NodePanel>`, `Entity<SearchPanel>`, `Entity<NodeEditorPanel>`, `Entity<ChatPanel>`, `Entity<SelectionModel>`, and the shared `Arc<RwLock<GraphSnapshot>>`. Layout: 28 px menu bar + horizontal body (optional left sidebar showing NodePanel or SearchPanel + vertical workspace with NodeEditorPanel / GraphCanvas 30/70 split + optional ChatPanel) + 24 px status bar. All panel boundaries are user-resizable via drag handles.
 
 `ChatPanel` provides two message paths: when a `GraphAgent` is set (the normal path after Lemonade init), messages route through `GraphAgent::prompt_stream()` which drives the rig multi-turn tool loop; when no agent is configured, it falls back to direct `LemonadeChatProvider::complete_stream()`. Message history has color-coded roles: User (blue), Assistant (green), Thinking (yellow/dimmed), ToolCall (purple accent). Tool call entries are collapsible — collapsed by default, click to reveal JSON args and tool result. Reasoning tokens stream into the Thinking entry from both paths.
 
@@ -199,9 +205,7 @@ id          TEXT PRIMARY KEY,
 object_type TEXT NOT NULL,
 schema_name TEXT,
 name        TEXT NOT NULL,
-description TEXT,
-tags        TEXT NOT NULL DEFAULT '[]',   -- JSON array
-properties  TEXT NOT NULL DEFAULT '{}',   -- JSON object
+properties  TEXT NOT NULL DEFAULT '{}',   -- JSON object; all schema fields including "description" and "tags"
 created_at  TEXT NOT NULL,
 updated_at  TEXT NOT NULL
 ```
@@ -290,8 +294,7 @@ Read on startup by `build_snapshot()` to restore the last user-arranged layout.
   automatically via indexed FK scans. O(log N) instead of O(N).
 - Edge uniqueness (`UNIQUE(source_id, target_id, edge_type)`) replaces the old
   manual adjacency-list deduplication.
-- `tags` and `properties` are stored as JSON text and deserialized via `serde_json`
-  at the Rust layer. No JSON1 extension queries are needed for current operations.
+- `properties` is stored as JSON text and deserialized via `serde_json` at the Rust layer. All schema-defined fields — including `"description"` and `"tags"` — live uniformly inside this blob. There are no separate `description`/`tags` columns. Atomic single-property updates use SQLite's `json_set()` via `KnowledgeGraphStorage::set_node_property()`.
 - `GET COUNT(*)` and `SUM(token_count)` queries replace the old full-scan
   `get_stats` implementation.
 - The old `AdjacencyList` struct (with separate `outgoing`/`incoming` `Vec<Edge>`
@@ -429,9 +432,23 @@ pub struct ModelConfig {
     pub tts_model_preferences: Vec<String>,
 }
 
+pub struct ChatDeviceConfig {
+    pub model: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,      // default: None (falls back to AgentParams::default = 0.3)
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub seed: Option<u64>,
+    pub stop: Option<Vec<String>>,
+}
+
 pub struct ChatConfig {
     pub preferred_device: ChatDevice,   // Auto | Gpu | Npu | Cpu
-    pub gpu: ChatDeviceConfig,          // { model, max_tokens, temperature }
+    pub gpu: ChatDeviceConfig,
     pub npu: ChatDeviceConfig,
     pub cpu: ChatDeviceConfig,
     pub system_prompt: String,
@@ -439,6 +456,7 @@ pub struct ChatConfig {
     pub alpha: f32,                     // 0.0 = FTS5-only, 1.0 = semantic-only
     pub search_limit: usize,            // default: 3
     pub hq_semantic_boost: f32,         // RRF weight multiplier for 4096-dim path
+    pub max_tool_turns: usize,          // default: 5 — max agent tool-call round-trips per message
 }
 ```
 
@@ -768,9 +786,9 @@ no Lemonade Server required (`MockEmbeddingProvider` + `TempDir`).
 
 ## Schema System (`src/schema/`)
 
-- `SchemaDefinition` → named maps of `ObjectTypeSchema` and `EdgeTypeSchema`.
-- `SchemaManager` caches schemas in `DashMap`, validates properties (type, regex,
-  enums, min/max), persists to the `schemas` SQLite table.
+- `SchemaDefinition` → named maps of `ObjectTypeSchema` and `EdgeTypeSchema`. `prompt_summary()` generates a compact markdown block (node types with property names/types/required flags, edge types with directionality) suitable for injection into a system prompt.
+- `SchemaManager` caches schemas in `parking_lot::RwLock<HashMap>`, validates properties (type, regex, enums, min/max), persists to the `schemas` SQLite table. Validation helpers: `is_valid_object_type(name)`, `is_valid_edge_type(name)`, `all_object_type_names()`, `all_edge_type_names()` — all read from the in-memory cache without touching SQLite.
+- `KnowledgeGraph::schema_prompt_summary_all()` merges all persisted schemas into a single virtual `SchemaDefinition` and returns `prompt_summary()` output. Used by `GraphAgent::new` to inject schema context into the system prompt.
 - `SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_`
   prefix from names (MCP naming convention), and adds 24 common TTRPG edge types
   automatically.
@@ -790,6 +808,20 @@ tool for migrating legacy MemoryMesh exports.
 type and name already exists, the existing ID is reused (no duplicates).
 `resolve_node_id` calls `KnowledgeGraph::find_by_name_only` as a storage fallback
 before failing, allowing edges to reference nodes from prior import sessions.
+
+### Per-Node Re-Chunking (`src/ingest/embedding.rs`)
+
+`rechunk_and_embed(graph, queue, hq_queue, object_id)` is the per-node analogue of `embed_all_chunks`:
+1. Load node metadata and resolve edge display lines.
+2. Delete existing chunks (triggers clean up FTS5 + vector indexes).
+3. Flatten via `ObjectMetadata::flatten_for_embedding()`.
+4. Create new chunks via `add_text_chunk()`.
+5. Embed each chunk with the standard queue (768-dim).
+6. If `hq_queue` is provided, embed each chunk at high quality (4096-dim).
+
+The function blocks until all embeddings are stored, so callers (agent tools, UI save) can guarantee the node is immediately searchable after the call returns.
+
+`KnowledgeGraph::delete_chunks_for_node(object_id)` (added in `graph/chunks.rs`) runs `DELETE FROM chunks WHERE object_id = ?1` — the existing triggers on `chunks` automatically clean up FTS5 and both vector-index tables.
 
 ---
 
@@ -836,10 +868,7 @@ before failing, allowing edges to reference nodes from prior import sessions.
   MCP tool actions. `SchemaIngestion` strips the `add_` prefix, but the file names
   still leak an external convention.
 - **`save_schema` is `async` but contains no `.await`** — `list_schemas` and `delete_schema` have been made sync. `save_schema` remains `async` because it is called with `.await` by `load_schema`, `register_object_type`, and `register_edge_type`; making it sync would require updating all those callers. Minor, but misleading.
-- **`tags` and `properties` as JSON text** — stored as opaque strings, not as
-  SQLite JSON1 columns. Filtering or querying inside these fields requires
-  deserializing at the Rust layer. Acceptable for now; revisit if query patterns
-  demand it.
+- **`properties` as JSON text** — stored as an opaque string, not as a SQLite JSON1 column. Filtering or querying inside the blob requires deserializing at the Rust layer, or using `json_set`/`json_extract` for targeted mutations. Acceptable for now; revisit if query patterns demand indexed property access.
 - **`inheritance` in `ObjectTypeSchema` is never acted on** — still present as a
   schema field, still ignored at runtime.
 

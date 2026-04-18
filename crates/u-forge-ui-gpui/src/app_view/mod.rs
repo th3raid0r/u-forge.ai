@@ -2,18 +2,19 @@ mod render;
 
 use std::sync::Arc;
 
-use gpui::{prelude::*, Context, Empty, Entity};
+use gpui::{prelude::*, Context, Empty, Entity, Subscription};
 use parking_lot::RwLock;
-use u_forge_agent::GraphAgent;
+use u_forge_agent::{AgentParams, GraphAgent};
 use u_forge_core::{
-    AppConfig, EmbeddingTarget, KnowledgeGraph, SchemaManager,
     embed_all_chunks,
+    ingest::{build_hq_embed_queue, rechunk_and_embed},
     lemonade::{
-        Capability, GpuResourceManager, LemonadeServerCatalog, ProviderFactory,
-        resolve_lemonade_url, ModelSelector, QualityTier,
+        resolve_lemonade_url, Capability, GpuResourceManager, LemonadeServerCatalog, ModelSelector,
+        ProviderFactory, QualityTier,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
-    ingest::build_hq_embed_queue,
+    types::ObjectId,
+    AppConfig, EmbeddingTarget, KnowledgeGraph, ObjectMetadata, SchemaManager,
 };
 use u_forge_graph_view::GraphSnapshot;
 
@@ -22,7 +23,7 @@ use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
-use crate::tree_panel::TreePanel;
+use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -85,13 +86,13 @@ impl Render for ResizeRightPanel {
 /// Which panel is currently shown in the left sidebar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum SidebarTab {
-    Tree,
+    Nodes,
     Search,
 }
 
 pub struct AppView {
     pub(crate) graph_canvas: Entity<GraphCanvas>,
-    pub(crate) tree_panel: Entity<TreePanel>,
+    pub(crate) node_panel: Entity<NodePanel>,
     pub(crate) search_panel: Entity<SearchPanel>,
     pub(crate) node_editor: Entity<NodeEditorPanel>,
     pub(crate) chat_panel: Entity<ChatPanel>,
@@ -124,6 +125,8 @@ pub struct AppView {
     pub(crate) inference_queue: Option<InferenceQueue>,
     /// High-quality embedding queue (None when HQ embedding is disabled or unavailable).
     pub(crate) hq_queue: Option<InferenceQueue>,
+    /// Subscriptions to node panel create/delete events — kept alive so handlers fire.
+    _node_subs: Vec<Subscription>,
 }
 
 impl AppView {
@@ -139,11 +142,23 @@ impl AppView {
     ) -> Self {
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
         let selection = cx.new(|_cx| SelectionModel::new(snapshot_arc.clone()));
-        let graph_canvas = cx.new(|cx| {
-            GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx)
-        });
-        let tree_panel =
-            cx.new(|_cx| TreePanel::new(snapshot_arc.clone(), selection.clone()));
+        let graph_canvas = cx
+            .new(|cx| GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx));
+        let node_panel = cx.new(|_cx| NodePanel::new(snapshot_arc.clone(), selection.clone()));
+
+        // Subscribe to node panel create/delete events.
+        let node_sub_create = cx.subscribe(
+            &node_panel,
+            |this: &mut Self, _panel, event: &CreateNodeRequest, cx| {
+                this.create_node(&event.0, cx);
+            },
+        );
+        let node_sub_delete = cx.subscribe(
+            &node_panel,
+            |this: &mut Self, _panel, event: &DeleteNodeRequest, cx| {
+                this.delete_node_by_id(event.0, cx);
+            },
+        );
         let search_panel = cx.new(|cx| {
             SearchPanel::new(
                 selection.clone(),
@@ -174,7 +189,7 @@ impl AppView {
 
         let mut view = Self {
             graph_canvas,
-            tree_panel,
+            node_panel,
             search_panel,
             node_editor,
             chat_panel,
@@ -186,7 +201,7 @@ impl AppView {
             file_menu_open: false,
             view_menu_open: false,
             sidebar_open: false,
-            sidebar_tab: SidebarTab::Tree,
+            sidebar_tab: SidebarTab::Nodes,
             right_panel_open: false,
             sidebar_width: DEFAULT_SIDEBAR_W,
             editor_ratio: DEFAULT_EDITOR_RATIO,
@@ -197,6 +212,7 @@ impl AppView {
             tokio_rt,
             inference_queue: None,
             hq_queue: None,
+            _node_subs: vec![node_sub_create, node_sub_delete],
         };
 
         view.do_init_lemonade(cx);
@@ -208,7 +224,8 @@ impl AppView {
         match u_forge_graph_view::build_snapshot(&self.graph) {
             Ok(snap) => {
                 *self.snapshot.write() = snap;
-                self.tree_panel.update(cx, |panel, cx| panel.refresh_groups(cx));
+                self.node_panel
+                    .update(cx, |panel, cx| panel.refresh_groups(cx));
                 cx.notify();
             }
             Err(e) => {
@@ -272,36 +289,164 @@ impl AppView {
         // 1. Save layout positions.
         self.graph_canvas.read(cx).save_layout();
 
-        // 2. Save all dirty editor tabs.
-        let saved = self
+        // 2. Save all dirty editor tabs (also discards empty new nodes).
+        let (saved, saved_ids, discarded_ids) = self
             .node_editor
-            .update(cx, |editor, _cx| editor.save_dirty_tabs());
+            .update(cx, |editor, cx| editor.save_dirty_tabs(cx));
+
+        // If any nodes were discarded, refresh the full snapshot.
+        if !discarded_ids.is_empty() {
+            eprintln!("Discarded {} empty new node(s).", discarded_ids.len());
+            self.refresh_snapshot(cx);
+        }
 
         if saved > 0 {
-            // Update the snapshot so tree panel and canvas reflect edits.
-            let editor = self.node_editor.read(cx);
-            let mut snap = self.snapshot.write();
-            for tab in &editor.tabs {
-                if let Some(node) = snap.nodes.iter_mut().find(|n| n.id == tab.node_id) {
-                    node.name = tab.name.clone();
-                    if let Some(desc) = tab
-                        .edited_values
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                    {
-                        node.description = if desc.is_empty() {
-                            None
-                        } else {
-                            Some(desc.to_string())
-                        };
-                    }
-                }
-            }
-            drop(snap);
             eprintln!("Saved {} node(s).", saved);
+
+            // Refresh snapshot fully when edges may have changed.
+            self.refresh_snapshot(cx);
+
+            // 3. Re-chunk and embed every saved node so semantic search stays current.
+            if !saved_ids.is_empty() {
+                self.do_rechunk_and_embed(saved_ids, cx);
+            }
         }
 
         cx.notify();
+    }
+
+    // ── Node create / delete (driven by node panel events) ────────────────
+
+    /// Create a new empty node of the given type, persist it, refresh the
+    /// snapshot, and navigate to it in the editor (marked as `is_new`).
+    fn create_node(&mut self, object_type: &str, cx: &mut Context<Self>) {
+        let meta = ObjectMetadata::new(object_type.to_string(), String::new());
+        let node_id = meta.id;
+
+        match self.graph.add_object(meta) {
+            Ok(_id) => {
+                // Refresh snapshot so the node panel and canvas see the new node.
+                self.refresh_snapshot(cx);
+
+                // Select the new node — this triggers the editor's observer,
+                // but we use `open_new_node_tab` directly so the `is_new` flag
+                // is set correctly.
+                self.selection.update(cx, |sel, cx| {
+                    sel.select_by_id(Some(node_id), cx);
+                });
+                self.node_editor.update(cx, |editor, cx| {
+                    editor.open_new_node_tab(node_id, cx);
+                });
+
+                // Ensure the sidebar is open on the nodes tab so the user sees
+                // the newly created node.
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Nodes;
+            }
+            Err(e) => {
+                self.data_status = Some(format!("Failed to create node: {e}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Delete a node by its `ObjectId`, close any open editor tab for it,
+    /// and refresh the snapshot.
+    fn delete_node_by_id(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
+        // Close the editor tab for this node if one is open.
+        self.node_editor.update(cx, |editor, cx| {
+            if let Some(idx) = editor.tabs.iter().position(|t| t.node_id == node_id) {
+                editor.close_tab(idx, cx);
+            }
+            cx.notify();
+        });
+
+        // Remove stale edge references in other open tabs before deleting.
+        self.node_editor.update(cx, |editor, _cx| {
+            editor.remove_stale_edge_refs(node_id);
+        });
+
+        // Clear the selection if it pointed to this node.
+        let selected = self.selection.read(cx).selected_node_id;
+        if selected == Some(node_id) {
+            self.selection.update(cx, |sel, cx| sel.clear(cx));
+        }
+
+        // Delete from DB (cascades to edges, chunks, etc.).
+        match self.graph.delete_object(node_id) {
+            Ok(()) => {
+                self.refresh_snapshot(cx);
+            }
+            Err(e) => {
+                self.data_status = Some(format!("Delete failed: {e}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Asynchronously re-chunk and embed a set of nodes (standard + optional HQ).
+    ///
+    /// Used by [`do_save`] to keep embeddings in sync with edited node content.
+    /// Each node's old chunks are deleted, fresh chunks are created from the
+    /// flattened metadata, and embeddings are computed before the task completes.
+    fn do_rechunk_and_embed(&mut self, node_ids: Vec<ObjectId>, cx: &mut Context<Self>) {
+        let queue = match self.inference_queue.clone() {
+            Some(q) => q,
+            None => return, // No embedding queue yet — nothing to do.
+        };
+        let hq_queue = self.hq_queue.clone();
+        let graph = self.graph.clone();
+        let tokio_rt = self.tokio_rt.clone();
+        let count = node_ids.len();
+
+        self.embedding_status = Some(format!("Re-embedding {count} node(s)…"));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(async {
+                        let hq_ref = hq_queue.as_ref();
+                        let mut total_chunks = 0usize;
+                        let mut errors = 0usize;
+                        for oid in &node_ids {
+                            match rechunk_and_embed(&graph, &queue, hq_ref, *oid).await {
+                                Ok(n) => total_chunks += n,
+                                Err(e) => {
+                                    eprintln!("rechunk_and_embed({oid}): {e:#}");
+                                    errors += 1;
+                                }
+                            }
+                        }
+                        Ok::<_, anyhow::Error>((total_chunks, errors))
+                    })
+                })
+                .await;
+
+            this.update(cx, |view: &mut AppView, cx| {
+                match result {
+                    Ok((chunks, 0)) if chunks > 0 => {
+                        view.embedding_status = Some(format!("Re-embedded {chunks} chunk(s)"));
+                    }
+                    Ok((chunks, errs)) if errs > 0 => {
+                        view.embedding_status = Some(format!(
+                            "Re-embedded {chunks} chunk(s), {errs} node(s) failed"
+                        ));
+                    }
+                    Ok(_) => {
+                        view.embedding_status = None;
+                    }
+                    Err(e) => {
+                        eprintln!("Re-embed failed: {e}");
+                        view.embedding_status = Some(format!("Re-embed failed: {e}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Asynchronously discover Lemonade Server and build the InferenceQueue + ChatProvider.
@@ -328,12 +473,18 @@ impl AppView {
                         let embed_models = selector.select_embedding_models();
                         let reranker_sel = selector.select_reranker();
 
-                        let already_loaded: Vec<String> =
-                            catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
+                        let already_loaded: Vec<String> = catalog
+                            .loaded
+                            .iter()
+                            .map(|m| m.model_name.clone())
+                            .collect();
 
                         // Build provider specs for embedding + optional reranker.
                         let mut build_futs = Vec::new();
-                        for sel in embed_models.iter().filter(|s| s.quality_tier == QualityTier::Standard) {
+                        for sel in embed_models
+                            .iter()
+                            .filter(|s| s.quality_tier == QualityTier::Standard)
+                        {
                             let weight = match sel.recipe.as_str() {
                                 "flm" => app_config.embedding.npu_weight,
                                 "llamacpp" => match sel.backend.as_deref() {
@@ -344,11 +495,7 @@ impl AppView {
                                 },
                                 _ => app_config.embedding.cpu_weight,
                             };
-                            build_futs.push((
-                                sel.clone(),
-                                Capability::Embedding,
-                                weight,
-                            ));
+                            build_futs.push((sel.clone(), Capability::Embedding, weight));
                         }
                         if let Some(r_sel) = reranker_sel {
                             build_futs.push((r_sel, Capability::Reranking, 100));
@@ -417,6 +564,9 @@ impl AppView {
                         view.inference_queue = Some(queue.clone());
                         view.hq_queue = hq_queue.clone();
 
+                        // Wrap HQ queue in Arc before it's consumed below.
+                        let hq_arc = hq_queue.clone().map(Arc::new);
+
                         // Push queues to search panel.
                         view.search_panel.update(cx, |panel, _cx| {
                             panel.set_queues(Some(queue.clone()), hq_queue);
@@ -425,7 +575,27 @@ impl AppView {
                         // Build the graph agent and wire it to the chat panel.
                         let graph = view.graph.clone();
                         let system_prompt = view.app_config.chat.system_prompt.clone();
-                        match GraphAgent::new(&lemonade_url, graph, Arc::new(queue), system_prompt) {
+                        let dev = view.app_config.chat.active_device_config();
+                        let mut agent_params = AgentParams::default();
+                        if let Some(v) = dev.temperature { agent_params.temperature = v as f64; }
+                        if let Some(v) = dev.max_tokens { agent_params.max_tokens = Some(v as u64); }
+                        if let Some(v) = dev.top_p { agent_params.top_p = Some(v as f64); }
+                        if let Some(v) = dev.top_k { agent_params.top_k = Some(v); }
+                        if let Some(v) = dev.min_p { agent_params.min_p = Some(v as f64); }
+                        if let Some(v) = dev.frequency_penalty { agent_params.frequency_penalty = Some(v as f64); }
+                        if let Some(v) = dev.presence_penalty { agent_params.presence_penalty = Some(v as f64); }
+                        if let Some(v) = dev.repetition_penalty { agent_params.repetition_penalty = Some(v as f64); }
+                        if let Some(v) = dev.seed { agent_params.seed = Some(v); }
+                        if dev.stop.is_some() { agent_params.stop = dev.stop.clone(); }
+                        agent_params.max_tool_turns = view.app_config.chat.max_tool_turns;
+                        match GraphAgent::new(
+                            &lemonade_url,
+                            graph,
+                            Arc::new(queue),
+                            hq_arc,
+                            system_prompt,
+                            agent_params,
+                        ) {
                             Ok(agent) => {
                                 view.chat_panel.update(cx, |panel, _cx| {
                                     panel.set_agent(agent);
@@ -479,7 +649,8 @@ impl AppView {
                             embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard).await?;
 
                         let hq_result = if let Some(hq) = &hq_queue {
-                            let r = embed_all_chunks(&graph, hq, EmbeddingTarget::HighQuality).await?;
+                            let r =
+                                embed_all_chunks(&graph, hq, EmbeddingTarget::HighQuality).await?;
                             Some(r)
                         } else {
                             None

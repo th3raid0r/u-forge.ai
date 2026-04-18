@@ -337,26 +337,11 @@ impl<'a> DataIngestion<'a> {
             if key == "name" {
                 continue;
             }
-
+            // All schema properties — including "description" and "tags" — are
+            // stored uniformly in the properties JSON blob.
             match value {
-                Value::String(s) => {
-                    if key.eq_ignore_ascii_case("description") {
-                        builder = builder.with_description(s.clone());
-                    } else {
-                        builder = builder.with_property(key.clone(), s.clone());
-                    }
-                }
-                Value::Array(arr) if key.eq_ignore_ascii_case("tags") => {
-                    for item in arr {
-                        if let Value::String(tag) = item {
-                            builder = builder.with_tag(tag.clone());
-                        }
-                    }
-                }
-                // Arrays and any other typed value (number, bool, nested object)
-                other => {
-                    builder = builder.with_json_property(key.clone(), other.clone());
-                }
+                Value::String(s) => builder = builder.with_property(key.clone(), s.clone()),
+                other => builder = builder.with_json_property(key.clone(), other.clone()),
             }
         }
         builder
@@ -413,9 +398,10 @@ mod tests {
         let builder = ingestion.add_properties_to_builder(builder, &props);
         let object = builder.build();
 
-        assert!(object.tags.contains(&"tag1".to_string()));
-        assert!(object.tags.contains(&"tag2".to_string()));
-        assert_eq!(object.description.as_deref(), Some("A test location"));
+        let tags = object.get_json_property("tags").and_then(|v| v.as_array()).unwrap();
+        assert!(tags.iter().any(|v| v.as_str() == Some("tag1")));
+        assert!(tags.iter().any(|v| v.as_str() == Some("tag2")));
+        assert_eq!(object.get_property("description").as_deref(), Some("A test location"));
         assert_eq!(
             object.properties.get("status").and_then(|v| v.as_str()),
             Some("Active")

@@ -224,7 +224,7 @@ impl ChatPanel {
                 let mut rx = cx
                     .background_executor()
                     .spawn(async move {
-                        tokio_rt.block_on(agent.prompt_stream(&model_id, &text, &history, 10))
+                        tokio_rt.block_on(agent.prompt_stream(&model_id, &text, &history))
                     })
                     .await;
 
