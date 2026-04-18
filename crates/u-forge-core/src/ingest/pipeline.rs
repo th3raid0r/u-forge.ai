@@ -62,10 +62,13 @@ pub async fn setup_and_index(
         Ok(schema_def) => {
             let mgr = graph.get_schema_manager();
             match mgr.save_schema(&schema_def).await {
-                Ok(()) => info!(
-                    count = schema_def.object_types.len(),
-                    "Schema types loaded"
-                ),
+                Ok(()) => {
+                    info!(count = schema_def.object_types.len(), "Schema types loaded");
+                    // Remove the hardcoded "default" placeholder (character, location…)
+                    // so it doesn't pollute the agent's schema summary alongside the
+                    // real imported types (npc, player_character…).
+                    let _ = mgr.delete_schema("default");
+                }
                 Err(e) => warn!(%e, "Could not save schemas"),
             }
         }

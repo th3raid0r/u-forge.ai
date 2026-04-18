@@ -25,6 +25,26 @@ fn main() {
 
             let stats = graph.get_stats().expect("failed to get stats");
             if stats.node_count == 0 {
+                // Import schemas first so they're present before data.
+                if std::path::Path::new(&schema_dir).exists() {
+                    match u_forge_core::SchemaIngestion::load_schemas_from_directory(
+                        &schema_dir,
+                        "imported_schemas",
+                        "1.0.0",
+                    ) {
+                        Ok(schema_def) => {
+                            let mgr = graph.get_schema_manager();
+                            if let Err(e) = mgr.save_schema(&schema_def).await {
+                                eprintln!("Warning: could not save schemas: {e}");
+                            } else {
+                                // Clean up any stale default placeholder.
+                                let _ = mgr.delete_schema("default");
+                            }
+                        }
+                        Err(e) => eprintln!("Warning: could not load schemas: {e}"),
+                    }
+                }
+
                 if data_file.exists() {
                     let mut ingestion = u_forge_core::DataIngestion::new(&graph);
                     ingestion
@@ -51,13 +71,35 @@ fn main() {
                 );
             }
 
-            // Pre-load schemas so they're available synchronously in the UI.
+            // Pre-load schemas into the synchronous cache so the node editor
+            // can call get_object_type_schema() without async.
+            //
+            // Strategy:
+            // - If real schemas exist (anything other than "default"), load them
+            //   and delete the stale "default" placeholder so the agent never
+            //   sees the hardcoded character/location types alongside npc/player_character.
+            // - If the DB has no schemas at all (brand-new or cleared), bootstrap
+            //   "default" as a minimal fallback until the user imports.
             let schema_mgr = graph.get_schema_manager();
-            if let Err(e) = schema_mgr.load_schema("default").await {
-                eprintln!("Warning: could not load default schema: {e}");
-            }
-            if let Err(e) = schema_mgr.load_schema("imported_schemas").await {
-                eprintln!("Warning: could not load imported schemas: {e}");
+            let schema_names = schema_mgr.list_schemas().unwrap_or_default();
+            let has_real_schemas = schema_names.iter().any(|n| n != "default");
+            if schema_names.is_empty() {
+                // Fresh DB — bootstrap placeholder so the node editor isn't empty.
+                if let Err(e) = schema_mgr.load_schema("default").await {
+                    eprintln!("Warning: could not create default schema: {e}");
+                }
+            } else {
+                for name in &schema_names {
+                    if name == "default" && has_real_schemas {
+                        // Stale placeholder — remove it so the agent only sees
+                        // the imported types.
+                        let _ = schema_mgr.delete_schema("default");
+                        continue;
+                    }
+                    if let Err(e) = schema_mgr.load_schema(name).await {
+                        eprintln!("Warning: could not load schema '{name}': {e}");
+                    }
+                }
             }
 
             let snapshot = build_snapshot(&graph).expect("failed to build snapshot");
