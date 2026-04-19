@@ -7,15 +7,15 @@ use gpui::{prelude::*, Context, Empty, Entity, Subscription};
 use parking_lot::RwLock;
 use u_forge_agent::{AgentParams, GraphAgent};
 use u_forge_core::{
-    embed_all_chunks,
-    ingest::{build_hq_embed_queue, rechunk_and_embed},
+    ingest::build_hq_embed_queue,
     lemonade::{
         resolve_lemonade_url, Capability, GpuResourceManager, LemonadeServerCatalog, ModelSelector,
         ProviderFactory, QualityTier,
     },
     queue::{InferenceQueue, InferenceQueueBuilder},
     types::ObjectId,
-    AppConfig, EmbeddingTarget, KnowledgeGraph, ObjectMetadata, SchemaManager,
+    AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, KnowledgeGraph, ObjectMetadata,
+    SchemaManager,
 };
 use u_forge_graph_view::GraphSnapshot;
 
@@ -188,9 +188,9 @@ pub struct AppView {
     /// per frame to compute `avg_ms`. Fixed array avoids any per-frame
     /// allocation from the prior `VecDeque`.
     pub(crate) frame_times_us: FrameTimeRing,
-    /// Epoch for the embedding-status sampler. Bumping cancels any in-flight
-    /// sampler timers so stale ticks don't overwrite a fresh status string.
-    pub(crate) embedding_sampler_epoch: usize,
+    /// Epoch for the embedding-plan status poller. Bumping cancels any
+    /// in-flight poller timer so stale ticks don't overwrite a fresh status.
+    pub(crate) embedding_plan_epoch: usize,
 }
 
 impl AppView {
@@ -283,7 +283,7 @@ impl AppView {
             perf_enabled: false,
             last_frame_cost_us: 0,
             frame_times_us: FrameTimeRing::default(),
-            embedding_sampler_epoch: 0,
+            embedding_plan_epoch: 0,
         };
 
         view.do_init_lemonade(cx);
@@ -343,7 +343,7 @@ impl AppView {
                         ));
                         view.refresh_snapshot(cx);
                         // Trigger embedding after successful import.
-                        view.do_embed_all(cx);
+                        view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
                     }
                     Err(e) => {
                         view.data_status = Some(format!("Import failed: {e}"));
@@ -379,7 +379,7 @@ impl AppView {
 
             // 3. Re-chunk and embed every saved node so semantic search stays current.
             if !saved_ids.is_empty() {
-                self.do_rechunk_and_embed(saved_ids, cx);
+                self.run_embedding_plan(EmbeddingPlan::rechunk(saved_ids), cx);
             }
         }
 
@@ -455,42 +455,72 @@ impl AppView {
         cx.notify();
     }
 
-    /// Start (or restart) a periodic sampler that appends the current queue
-    /// pending-embedding count to `self.embedding_status`. Bumping
-    /// `embedding_sampler_epoch` implicitly cancels any prior sampler.
-    ///
-    /// The sampler polls `InferenceQueue::stats()` every 500 ms and rewrites
-    /// `embedding_status` to `"{base_status} ({N} pending)"` when N > 0.
-    /// It stops when the epoch changes (i.e. another embedding operation
-    /// starts, or `stop_embedding_sampler` is called on completion).
-    fn spawn_embedding_sampler(&mut self, base_status: String, cx: &mut Context<Self>) {
-        self.embedding_sampler_epoch = self.embedding_sampler_epoch.wrapping_add(1);
-        let epoch = self.embedding_sampler_epoch;
-        let queue = self.inference_queue.clone();
-        let hq_queue = self.hq_queue.clone();
+    /// Format the `embedding_status` string from a completed [`EmbeddingOutcome`].
+    /// Returns `None` when nothing was actually embedded (total == 0).
+    fn format_embedding_outcome(outcome: &EmbeddingOutcome) -> Option<String> {
+        if outcome.stored == 0 && outcome.skipped == 0 {
+            return None;
+        }
+        let hq_suffix = if outcome.hq_stored > 0 {
+            format!(" (+{} HQ)", outcome.hq_stored)
+        } else {
+            String::new()
+        };
+        if outcome.skipped > 0 {
+            Some(format!(
+                "Embedded {}{hq_suffix} chunk(s), {} failed",
+                outcome.stored, outcome.skipped
+            ))
+        } else {
+            Some(format!("Embedded {}{hq_suffix} chunk(s)", outcome.stored))
+        }
+    }
 
+    /// Run an [`EmbeddingPlan`] asynchronously, updating `embedding_status`
+    /// from progress events as work proceeds.
+    ///
+    /// Replaces the former `do_rechunk_and_embed` / `do_embed_all` /
+    /// `spawn_embedding_sampler` / `stop_embedding_sampler` quartet.
+    /// Any previously running plan is implicitly cancelled via epoch bump.
+    pub(crate) fn run_embedding_plan(&mut self, plan: EmbeddingPlan, cx: &mut Context<Self>) {
+        let queue = match self.inference_queue.clone() {
+            Some(q) => q,
+            None => return,
+        };
+        let hq_queue = self.hq_queue.clone();
+        let graph = self.graph.clone();
+        let tokio_rt = self.tokio_rt.clone();
+
+        self.embedding_status = Some(plan.label());
+        cx.notify();
+
+        // Bump epoch to cancel any previously running poller.
+        self.embedding_plan_epoch = self.embedding_plan_epoch.wrapping_add(1);
+        let epoch = self.embedding_plan_epoch;
+
+        // Shared progress state written by the tokio worker, read by the poller.
+        let progress_state: Arc<parking_lot::Mutex<Option<EmbeddingProgress>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let progress_write = Arc::clone(&progress_state);
+
+        // Poller: reads shared progress every 500 ms and refreshes the status bar.
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
                     .await;
                 let Some(this) = this.upgrade() else { return };
-                let pending = queue.as_ref().map(|q| q.stats().pending_embeddings).unwrap_or(0)
-                    + hq_queue
-                        .as_ref()
-                        .map(|q| q.stats().pending_embeddings)
-                        .unwrap_or(0);
+                let snap = progress_state.lock().clone();
                 let keep_running = this
                     .update(cx, |view: &mut AppView, cx| {
-                        if view.embedding_sampler_epoch != epoch {
+                        if view.embedding_plan_epoch != epoch {
                             return false;
                         }
-                        view.embedding_status = if pending > 0 {
-                            Some(format!("{base_status} ({pending} pending)"))
-                        } else {
-                            Some(base_status.clone())
-                        };
-                        cx.notify();
+                        if let Some(EmbeddingProgress::Rechunking { done, total }) = snap {
+                            view.embedding_status =
+                                Some(format!("Re-embedding… ({done}/{total})"));
+                            cx.notify();
+                        }
                         true
                     })
                     .ok();
@@ -500,75 +530,28 @@ impl AppView {
             }
         })
         .detach();
-    }
 
-    /// Cancel the embedding-status sampler by bumping its epoch.
-    /// Callers then write the final status string directly.
-    fn stop_embedding_sampler(&mut self) {
-        self.embedding_sampler_epoch = self.embedding_sampler_epoch.wrapping_add(1);
-    }
-
-    /// Asynchronously re-chunk and embed a set of nodes (standard + optional HQ).
-    ///
-    /// Used by [`do_save`] to keep embeddings in sync with edited node content.
-    /// Each node's old chunks are deleted, fresh chunks are created from the
-    /// flattened metadata, and embeddings are computed before the task completes.
-    fn do_rechunk_and_embed(&mut self, node_ids: Vec<ObjectId>, cx: &mut Context<Self>) {
-        let queue = match self.inference_queue.clone() {
-            Some(q) => q,
-            None => return, // No embedding queue yet — nothing to do.
-        };
-        let hq_queue = self.hq_queue.clone();
-        let graph = self.graph.clone();
-        let tokio_rt = self.tokio_rt.clone();
-        let count = node_ids.len();
-
-        let base_status = format!("Re-embedding {count} node(s)…");
-        self.embedding_status = Some(base_status.clone());
-        cx.notify();
-        self.spawn_embedding_sampler(base_status, cx);
-
+        // Worker: runs the plan on the tokio runtime and reports outcome.
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    tokio_rt.block_on(async {
-                        let hq_ref = hq_queue.as_ref();
-                        let mut total_chunks = 0usize;
-                        let mut errors = 0usize;
-                        for oid in &node_ids {
-                            match rechunk_and_embed(&graph, &queue, hq_ref, *oid).await {
-                                Ok(n) => total_chunks += n,
-                                Err(e) => {
-                                    eprintln!("rechunk_and_embed({oid}): {e:#}");
-                                    errors += 1;
-                                }
-                            }
-                        }
-                        Ok::<_, anyhow::Error>((total_chunks, errors))
+                    tokio_rt.block_on(async move {
+                        plan.execute(
+                            &graph,
+                            &queue,
+                            hq_queue.as_ref(),
+                            move |p| *progress_write.lock() = Some(p),
+                        )
+                        .await
                     })
                 })
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
-                view.stop_embedding_sampler();
-                match result {
-                    Ok((chunks, 0)) if chunks > 0 => {
-                        view.embedding_status = Some(format!("Re-embedded {chunks} chunk(s)"));
-                    }
-                    Ok((chunks, errs)) if errs > 0 => {
-                        view.embedding_status = Some(format!(
-                            "Re-embedded {chunks} chunk(s), {errs} node(s) failed"
-                        ));
-                    }
-                    Ok(_) => {
-                        view.embedding_status = None;
-                    }
-                    Err(e) => {
-                        eprintln!("Re-embed failed: {e}");
-                        view.embedding_status = Some(format!("Re-embed failed: {e}"));
-                    }
-                }
+                // Stop the poller by advancing the epoch.
+                view.embedding_plan_epoch = view.embedding_plan_epoch.wrapping_add(1);
+                view.embedding_status = Self::format_embedding_outcome(&outcome);
                 cx.notify();
             })
             .ok();
@@ -763,7 +746,7 @@ impl AppView {
                         }
 
                         // Trigger bulk embedding for any unembedded chunks.
-                        view.do_embed_all(cx);
+                        view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
                     }
                     Err(e) => {
                         eprintln!("Lemonade init skipped: {e}");
@@ -865,73 +848,4 @@ impl AppView {
         .detach();
     }
 
-    /// Trigger bulk embedding of all unembedded chunks (standard + optional HQ).
-    pub(crate) fn do_embed_all(&mut self, cx: &mut Context<Self>) {
-        let queue = match self.inference_queue.clone() {
-            Some(q) => q,
-            None => return,
-        };
-        let hq_queue = self.hq_queue.clone();
-        let graph = self.graph.clone();
-        let tokio_rt = self.tokio_rt.clone();
-
-        let base_status = "Embedding…".to_string();
-        self.embedding_status = Some(base_status.clone());
-        cx.notify();
-        self.spawn_embedding_sampler(base_status, cx);
-
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    tokio_rt.block_on(async move {
-                        let std_result =
-                            embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard).await?;
-
-                        let hq_result = if let Some(hq) = &hq_queue {
-                            let r =
-                                embed_all_chunks(&graph, hq, EmbeddingTarget::HighQuality).await?;
-                            Some(r)
-                        } else {
-                            None
-                        };
-
-                        Ok::<_, anyhow::Error>((std_result, hq_result))
-                    })
-                })
-                .await;
-
-            this.update(cx, |view: &mut AppView, cx| {
-                view.stop_embedding_sampler();
-                match result {
-                    Ok((std_r, hq_r)) => {
-                        // Only report if something was actually embedded.
-                        // total == 0 means no unembedded chunks existed — nothing to do.
-                        view.embedding_status = if std_r.total == 0 {
-                            None
-                        } else if std_r.stored > 0 {
-                            let hq_suffix = hq_r
-                                .filter(|hq| hq.stored > 0)
-                                .map(|hq| format!(" (+{} HQ)", hq.stored))
-                                .unwrap_or_default();
-                            Some(format!("Embedded {}{} chunks", std_r.stored, hq_suffix))
-                        } else {
-                            // Had candidates but none stored (all failed).
-                            Some(format!(
-                                "Embedding: {}/{} failed",
-                                std_r.skipped, std_r.total
-                            ))
-                        };
-                    }
-                    Err(e) => {
-                        eprintln!("Embedding failed: {e}");
-                        view.embedding_status = Some(format!("Embedding failed: {e}"));
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
 }

@@ -354,7 +354,7 @@ emits `tracing::warn!` for the same classes. Unknown properties are
 accepted silently at both boundaries. `PropertyIssue` is re-exported from
 `u-forge-core`.
 
-### 4.2 🔎 Declarative embedding pipeline
+### ~~4.2 🔎 Declarative embedding pipeline~~
 
 **Where:** `crates/u-forge-core/src/ingest/embedding.rs`
 (`rechunk_and_embed`, `embed_all_chunks`) and the UI wrappers at
@@ -371,11 +371,17 @@ the whole flow.
 typing" or "batch re-embed with progress events" require understanding and
 rewriting every orchestration site.
 
-**Untangling.** Model the pipeline as a state machine:
-`EmbeddingPlan { node_ids, targets }` → `.build()` → `.execute(&graph,
-&queue) -> Stream<Progress>`. Status updates become properties of
-`Progress`, not loose fields in `AppView`. The state machine encodes the
-invariants ("HQ embedding only after chunks exist").
+**Landed.** `EmbeddingPlan` added to `u-forge-core::ingest::embedding` with
+two constructors: `EmbeddingPlan::rechunk(ids)` (per-node re-chunk + embed,
+emits `EmbeddingProgress::Rechunking { done, total }` events) and
+`EmbeddingPlan::embed_all()` (bulk unembedded sweep). `EmbeddingOutcome`
+carries stored/skipped/hq_stored. `AppView::run_embedding_plan(plan, cx)` is
+the single UI entry point — status formatting centralized in
+`format_embedding_outcome`, live per-node progress via a shared
+`Arc<Mutex<Option<EmbeddingProgress>>>` polled every 500 ms. Four former
+methods (`do_rechunk_and_embed`, `do_embed_all`, `spawn_embedding_sampler`,
+`stop_embedding_sampler`) removed; three call sites updated. Net: -70 lines
+in the UI crate, schema-migration pairing explicitly deferred (not needed).
 
 ### 4.3 🔎 Split `AppState` from `AppView`
 

@@ -46,7 +46,8 @@ pub use graph::{
 };
 pub use ingest::{
     build_hq_embed_queue, embed_all_chunks, rechunk_and_embed, setup_and_index, DataIngestion,
-    EmbeddingResult, EmbeddingTarget, IngestionStats, SetupResult,
+    EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, EmbeddingResult, EmbeddingTarget,
+    IngestionStats, SetupResult,
 };
 pub use lemonade::{
     load_model, ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage,

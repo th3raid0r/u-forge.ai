@@ -15,6 +15,7 @@ pub mod pipeline;
 
 pub use data::{DataIngestion, IngestionStats, JsonEntry};
 pub use embedding::{
-    build_hq_embed_queue, embed_all_chunks, rechunk_and_embed, EmbeddingResult, EmbeddingTarget,
+    build_hq_embed_queue, embed_all_chunks, rechunk_and_embed, EmbeddingOutcome, EmbeddingPlan,
+    EmbeddingProgress, EmbeddingResult, EmbeddingTarget,
 };
 pub use pipeline::{setup_and_index, SetupResult};
