@@ -138,30 +138,33 @@ measurable drop in allocator pressure.
 
 ### 2.2 ✅ Force-directed layout runs even when all positions are saved
 
-**Where:** `crates/u-forge-graph-view/src/snapshot.rs:191-202`.
+**Where:** `crates/u-forge-graph-view/src/snapshot.rs` (`build_snapshot`).
+
+**What was wrong.** `force_directed_layout` ran unconditionally on every
+snapshot rebuild, then its results were immediately overwritten for every
+node that had a saved position.  For an established graph (the common case)
+every rebuild ran O(iterations × N) layout work that was thrown away.
+
+**Fix applied.** Added an `all_saved` check before the layout call:
 
 ```rust
-force_directed_layout(&mut nodes, &edges);
-for node in &mut nodes {
-    if let Some(&(x, y)) = saved_positions.get(&node.id) {
-        node.position = Vec2::new(x, y);
-    }
+let all_saved = nodes.iter().all(|n| saved_positions.contains_key(&n.id));
+if !all_saved {
+    force_directed_layout(&mut nodes, &edges);
 }
 ```
 
-Layout is always run, then overwritten for known nodes. When every node
-already has a saved position (the common case for an established graph),
-the layout pass is pure waste.
+Layout still runs when at least one node is new (no saved position), so
+newly added nodes get a valid initial position.  When all nodes are already
+positioned, the layout pass is skipped entirely.
 
-**Fix.** Before running the layout, check whether every node id is in
-`saved_positions`. If so, skip layout entirely and just copy positions
-in. If some nodes are new, run layout only on the unknown subset — or,
-as a first pass, keep running layout globally but only when at least one
-node is missing a saved position.
+**Test added.** `snapshot::tests::build_snapshot_skips_layout_when_all_positions_saved`
+saves positions after the first build and asserts the second build restores
+them exactly (not clobbered by a layout re-run).
 
-**Verification.** Load a graph with saved positions. Toggle the perf
-overlay. Reproduce a snapshot rebuild (e.g. via agent edge add). Confirm
-`force_directed_layout` no longer dominates the rebuild timing.
+**Verification.** Load a graph with saved positions. Toggle the perf overlay
+(`Ctrl+Shift+P`). Reproduce a snapshot rebuild (e.g. via agent edge add).
+`force_directed_layout` should no longer appear in the rebuild timing.
 
 ### 2.3 🔎 `canvas_bounds` `Arc<RwLock<Bounds<Pixels>>>` on hot input path
 

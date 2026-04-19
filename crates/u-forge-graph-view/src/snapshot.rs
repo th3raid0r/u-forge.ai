@@ -188,12 +188,17 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         })
         .collect();
 
-    // Run layout so every node gets a valid initial position.
-    // Nodes with saved positions will have those overwritten in the next step,
-    // but new nodes (not yet in node_positions) keep the layout-computed value.
-    force_directed_layout(&mut nodes, &edges);
+    // If every node already has a saved position (the common case for an
+    // established graph), skip force-directed layout entirely — it would just
+    // be overwritten immediately and wastes O(iterations * N) work.
+    // Only run layout when at least one node is missing a saved position
+    // (new node added, first run, or layout was reset).
+    let all_saved = nodes.iter().all(|n| saved_positions.contains_key(&n.id));
+    if !all_saved {
+        force_directed_layout(&mut nodes, &edges);
+    }
 
-    // Apply saved positions, overriding the layout result for known nodes.
+    // Apply saved positions for all known nodes.
     for node in &mut nodes {
         if let Some(&(x, y)) = saved_positions.get(&node.id) {
             node.position = Vec2::new(x, y);
@@ -279,6 +284,39 @@ mod tests {
         let a_pos = snap.nodes[edge.source_idx].position;
         let b_pos = snap.nodes[edge.target_idx].position;
         assert_ne!(a_pos, b_pos, "connected nodes should not overlap");
+    }
+
+    #[test]
+    fn build_snapshot_skips_layout_when_all_positions_saved() {
+        let (_dir, graph) = test_graph();
+
+        let id_a = ObjectBuilder::character("Alice".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        let id_b = ObjectBuilder::character("Bob".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph
+            .connect_objects(id_a, id_b, EdgeType::new("knows"))
+            .unwrap();
+
+        // First build assigns layout-computed positions.
+        let snap1 = build_snapshot(&graph).unwrap();
+        let pos_a = snap1.nodes.iter().find(|n| n.id == id_a).unwrap().position;
+        let pos_b = snap1.nodes.iter().find(|n| n.id == id_b).unwrap().position;
+
+        // Save those positions — simulates a user who has arranged the graph.
+        graph
+            .save_layout(&[(id_a, pos_a.x, pos_a.y), (id_b, pos_b.x, pos_b.y)])
+            .unwrap();
+
+        // Second build must skip layout and use the saved positions exactly.
+        let snap2 = build_snapshot(&graph).unwrap();
+        let p2_a = snap2.nodes.iter().find(|n| n.id == id_a).unwrap().position;
+        let p2_b = snap2.nodes.iter().find(|n| n.id == id_b).unwrap().position;
+
+        assert_eq!(p2_a, pos_a, "saved position for Alice must be restored exactly");
+        assert_eq!(p2_b, pos_b, "saved position for Bob must be restored exactly");
     }
 
     #[test]
