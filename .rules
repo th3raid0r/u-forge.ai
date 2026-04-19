@@ -12,7 +12,7 @@ cycles and produces PRs that must be reverted.
 
 ### 1. Code defaults first — env vars are overrides, not requirements
 
-A user must be able to clone this repo and run `cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo` with
+A user must be able to clone this repo and run `cargo run -p u-forge-ui-gpui` with
 **no environment variables set** and have it work (degrading gracefully when no
 Lemonade Server is present). Env vars like `LEMONADE_URL` exist only to override
 a non-standard location or port.
@@ -33,7 +33,7 @@ a non-standard location or port.
 Before assuming what models or hardware are available, **fetch the actual server
 state**. `SystemInfo::fetch(url)` and `LemonadeServerCatalog::discover(url)` exist
 for exactly this reason — use them. From the catalog, build a `ModelSelector` to
-pick the best available models for each capability. The `cli_demo` pattern (fetch →
+pick the best available models for each capability. `AppView::do_init_lemonade()` (fetch →
 select → build providers → degrade gracefully) is the canonical example. Do not
 hardcode model IDs, device presence, or capability flags without a live catalog
 check to back them up.
@@ -89,9 +89,9 @@ navigational aids.
 Alpha desktop UI available. Multi-crate Cargo workspace under `crates/`. SQLite + FTS5 storage,
 sqlite-vec ANN search, catalog-driven provider selection, unified inference queue
 (`InferenceQueue`), hybrid search pipeline, bulk graph access (`get_all_edges`,
-`get_nodes_paginated`). Interactive RAG chat REPL (`cli_chat`). Native GPUI desktop app
-with graph canvas, schema-driven node editor, FTS5/semantic/hybrid search panel, and
-streaming LLM chat panel with rig-based agent tool loop (collapsible tool calls, streaming reasoning). No active bugs.
+`get_nodes_paginated`). Native GPUI desktop app with graph canvas, schema-driven node editor,
+FTS5/semantic/hybrid search panel, and streaming LLM chat panel with rig-based agent tool loop
+(collapsible tool calls, streaming reasoning). No active bugs.
 
 UI crates (see `feature_UI.md`):
 - `u-forge-graph-view` — `GraphSnapshot` + `build_snapshot()`, force-directed layout (grid-cell bucketed O(N) repulsion), R-tree spatial index, viewport culling, `rebuild_spatial_index()`.
@@ -101,7 +101,7 @@ UI crates (see `feature_UI.md`):
 - `u-forge-core` — `node_positions` table added to SQLite schema; `KnowledgeGraph::save_layout()` / `load_layout()` persist and restore canvas positions. `build_snapshot()` applies saved positions after force-directed layout, so new nodes get computed positions and known nodes restore their last user-placed position. `SchemaManager::get_object_type_schema()` provides sync cache-based lookup for UI use (async `load_schema` must be called first to populate cache). `rechunk_and_embed(graph, queue, hq_queue, object_id)` is the per-node analogue of `embed_all_chunks` — deletes old chunks, flattens metadata + edges, creates new chunks, embeds all (standard + HQ), and blocks until complete. `delete_chunks_for_node(object_id)` added to `KnowledgeGraph` for chunk replacement. `PropertyType` now re-exported from `lib.rs`. Canonical data format: `defaults/data/memory.jsonl` — `entitytype`/`nodetype`/`properties` with typed JSON values (native arrays, not comma-separated strings). Legacy MemoryMesh format can be converted via `cargo run --example convert_memorymesh`.
 
 Recent quality improvements:
-- `load_model()` now accepts `already_loaded: &[String]` — if the model ID is in the slice the HTTP round-trip to `/api/v1/load` is skipped entirely. Callers extract these IDs from `catalog.loaded` (already fetched by `LemonadeServerCatalog::discover`). `ProviderFactory::build` threads this parameter through all capability branches. Both CLI demos extract the loaded-model list from the catalog and fire all provider builds concurrently via `futures::future::join_all` / `tokio::join!`, eliminating sequential load waits on warm servers.
+- `load_model()` now accepts `already_loaded: &[String]` — if the model ID is in the slice the HTTP round-trip to `/api/v1/load` is skipped entirely. Callers extract these IDs from `catalog.loaded` (already fetched by `LemonadeServerCatalog::discover`). `ProviderFactory::build` threads this parameter through all capability branches. `do_init_lemonade()` extracts the loaded-model list from the catalog and fires all provider builds concurrently via `futures::future::join_all`, eliminating sequential load waits on warm servers.
 - `embed_all_chunks` is now incremental — uses `get_unembedded_chunks` / `get_unembedded_chunks_hq` (LEFT JOIN on `chunks_vec`) instead of re-scanning all objects.
 - Hybrid search diagnostic blocks demoted from `info!` to `debug!` — no more log spam in production; `RUST_LOG=u_forge_core::search=debug` reveals full pipeline state.
 - `KnowledgeGraphStorage` now uses `parking_lot::Mutex` — all 24 `.lock().unwrap()` calls removed.

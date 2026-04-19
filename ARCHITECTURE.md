@@ -13,7 +13,7 @@ The project is a Cargo workspace. All source lives under `crates/`:
 | `u-forge-agent` | lib | Complete | Rig-based LLM agent with FTS5/Semantic/Hybrid graph search tools and streaming event loop |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
-`defaults/` (schemas + sample data) stays at the workspace root. Both example entry points and `examples/common/mod.rs` resolve it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
+`defaults/` (schemas + sample data) stays at the workspace root.
 
 ## Module Map (u-forge-core)
 
@@ -58,9 +58,6 @@ All paths below are relative to `crates/u-forge-core/`.
 | `src/ingest/data.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
 | `src/ingest/pipeline.rs` | Schema + data loading + FTS5 indexing | `setup_and_index()`, `SetupResult` |
 | `src/ingest/embedding.rs` | Batch chunk embedding (standard & HQ) | `embed_all_chunks()`, `build_hq_embed_queue()`, `EmbeddingTarget`, `EmbeddingResult` |
-| `examples/common/mod.rs` | Demo-specific helpers (config, CLI args) | `DatabaseConfig`, `DemoArgs`, `resolve_demo_args()`, `load_toml_config()` |
-| `examples/cli_demo.rs` | Demo: hardware caps, FTS5, semantic, rerank, hybrid search (includes `common` via `#[path]`) | — |
-| `examples/cli_chat.rs` | Interactive RAG chat REPL (includes `common` via `#[path]`) | — |
 
 ## Module Map (u-forge-graph-view)
 
@@ -182,7 +179,7 @@ API surface: CRUD for objects (`add_object`, `get_object`, `update_object`,
 **Other notable methods:**
 - `search_chunks_fts(query: &str, limit: usize) -> Result<Vec<(ChunkId, ObjectId, String)>>` — wraps SQLite FTS5 full-text search over the `chunks_fts` virtual table.
 - `find_by_name_only(name: &str) -> Result<Option<ObjectId>>` — name lookup independent of object type; used by `DataIngestion` to resolve cross-session edge references.
-- `get_stats() -> Result<GraphStats>` — returns `GraphStats { node_count, edge_count, chunk_count, total_tokens, embedded_count, embedded_hq_count }`. Queries are O(1) via indexed counts. `embedded_count` tracks chunks with 768-dim vectors, `embedded_hq_count` tracks chunks with 4096-dim vectors. Used to detect whether embedding work needs to be done (e.g., in `cli_demo`).
+- `get_stats() -> Result<GraphStats>` — returns `GraphStats { node_count, edge_count, chunk_count, total_tokens, embedded_count, embedded_hq_count }`. Queries are O(1) via indexed counts. `embedded_count` tracks chunks with 768-dim vectors, `embedded_hq_count` tracks chunks with 4096-dim vectors. Used to detect whether embedding work needs to be done.
 - `clear_all() -> Result<()>` — delete all nodes (cascades to edges/chunks), schemas, and vector indexes. Leaves the database schema intact. Useful for resetting between demo runs.
 - `search_chunks_ann(query_embedding: &[f32], limit: usize) -> Result<Vec<(ChunkId, ObjectId, String, f32)>>` — ANN search on `chunks_vec` (or `chunks_vec_hq` if calling `search_chunks_ann_hq`). Returns results ordered by ascending cosine distance. Only chunks indexed via `upsert_chunk_embedding()` are candidates.
 
@@ -641,7 +638,7 @@ The `hardware/` abstraction layer has been replaced by a catalog-driven flow:
    - `select_stt_models()` → `Vec<SelectedModel>`, ≤1 per device slot.
    - `select_reranker()` → `Option<SelectedModel>`.
    - `select_tts()` → `Option<SelectedModel>`.
-   - `model_by_id(id, quality_tier)` → `Option<SelectedModel>` — exact catalog lookup, ignores preference lists. Used by `cli_chat` to honour `[chat.gpu]`/`[chat.npu]` model overrides.
+   - `model_by_id(id, quality_tier)` → `Option<SelectedModel>` — exact catalog lookup, ignores preference lists. Used by `do_init_lemonade` to honour `[chat.gpu]`/`[chat.npu]` model overrides.
 
 3. **`ProviderFactory::build(sel, capability, url, queue_depth, gpu_mgr)`** — constructs a live provider from a `SelectedModel`. Branches on `capability` and `sel.recipe`/`sel.backend` to build the right type; loads the model via `POST /api/v1/load` with the configured `ModelLoadOptions`; returns `BuiltProvider { slot, capability, weight }`.
 

@@ -6,7 +6,7 @@ alwaysApply: true
 
 Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs. Built in Rust.
 
-**Status:** Working prototype. CLI demo. Multi-crate Cargo workspace under `crates/`.
+**Status:** Alpha desktop app. Multi-crate Cargo workspace under `crates/`.
 
 ## Architecture Overview
 
@@ -25,7 +25,7 @@ The project is a Cargo workspace. All crates live under `crates/`:
 | `u-forge-agent` | lib | Complete | Rig-based LLM agent: `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `UpsertNodeTool`, `UpsertEdgeTool`, `GraphAgent` with `prompt_stream()` (see `ARCHITECTURE.md`) |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
 
-`defaults/` (schemas + sample data) lives at the **workspace root**, not inside any crate. `cli_demo.rs` resolves it via `env!("CARGO_MANIFEST_DIR") + "/../../defaults/"`.
+`defaults/` (schemas + sample data) lives at the **workspace root**, not inside any crate.
 
 ## Current Architecture (u-forge-core)
 
@@ -111,9 +111,6 @@ export LEMONADE_URL=http://localhost:13305/api/v1
 - [env.sh](mdc:env.sh) — Optional. Sets `UFORGE_*` path variables. **No longer required for compilation**.
 - [dev.sh](mdc:dev.sh) — Development runner. Automatically sets `--test-threads=1` when `LEMONADE_URL` is present.
 - [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work. Contains current module map, SQLite schema, hardware architecture, inference queue design, resolved bugs.
-- [crates/u-forge-core/examples/common/mod.rs](mdc:crates/u-forge-core/examples/common/mod.rs) — Shared helpers for both examples: config loading, arg parsing, KG setup + ingestion + FTS indexing, HQ embed queue construction, chunk embedding. Included via `#[path = "common/mod.rs"] mod common;`.
-- [crates/u-forge-core/examples/cli_demo.rs](mdc:crates/u-forge-core/examples/cli_demo.rs) — Demo entry point: hardware caps, FTS5, semantic, rerank, and hybrid search. Resolves `defaults/` via `CARGO_MANIFEST_DIR`.
-- [crates/u-forge-core/examples/cli_chat.rs](mdc:crates/u-forge-core/examples/cli_chat.rs) — Interactive RAG chat REPL. Resolves `defaults/` via `CARGO_MANIFEST_DIR`.
 - [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files (workspace root).
 - [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data (~220 nodes, ~312 edges).
 - [crates/u-forge-graph-view/src/snapshot.rs](mdc:crates/u-forge-graph-view/src/snapshot.rs) — `GraphSnapshot`, `NodeView`, `EdgeView`, `LodLevel`, `build_snapshot()`.
@@ -185,4 +182,4 @@ All paths below are relative to `crates/u-forge-core/`.
 - `llamacpp` + cpu or no backend → slot `"cpu"`
 - other recipes (e.g. `whispercpp`, `kokoro`) → slot = recipe name
 
-At most one provider is built per slot per quality tier (for embeddings) or per slot (for LLM/STT). `model_by_id(id, quality_tier)` bypasses preference lists for exact-ID lookups (used by `cli_chat` to honour `[chat.gpu]`/`[chat.npu]` config overrides).
+At most one provider is built per slot per quality tier (for embeddings) or per slot (for LLM/STT). `model_by_id(id, quality_tier)` bypasses preference lists for exact-ID lookups (used by `do_init_lemonade` to honour `[chat.gpu]`/`[chat.npu]` config overrides).

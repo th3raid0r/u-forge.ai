@@ -69,10 +69,6 @@ tempfile = "3.20"
 tempfile = "3.20"
 
 [[example]]
-name = "cli_demo"
-path = "examples/cli_demo.rs"
-
-[[example]]
 name = "convert_memorymesh"
 path = "examples/convert_memorymesh.rs"
 

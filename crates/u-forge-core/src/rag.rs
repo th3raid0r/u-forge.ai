@@ -1,10 +1,9 @@
 //! RAG (Retrieval-Augmented Generation) utilities.
 //!
 //! Shared helpers for assembling LLM-ready context from knowledge graph search
-//! results.  Both the [`cli_chat`](../../examples/cli_chat.rs) demo and the
-//! future TypeScript agentic sandbox (`u-forge-ts-runtime`) consume this module
-//! — the Rust implementation serves as the reference design for the `.d.ts`
-//! contract.
+//! results. The `ChatPanel` and the future TypeScript agentic sandbox
+//! (`u-forge-ts-runtime`) consume this module — the Rust implementation serves
+//! as the reference design for the `.d.ts` contract.
 //!
 //! # Pattern
 //!

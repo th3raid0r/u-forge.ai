@@ -242,7 +242,6 @@ cargo fmt --check
 cargo clippy --workspace -- -D warnings
 cargo test --workspace -- --test-threads=1
 cargo doc --no-deps --workspace
-cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 ```
 
 No `source env.sh` required. No model downloads. All commands work offline.

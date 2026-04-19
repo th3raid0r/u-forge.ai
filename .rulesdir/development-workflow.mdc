@@ -9,8 +9,7 @@ description: Development workflow and setup guide
 ```bash
 cargo build --workspace                                        # Build all crates
 cargo test --workspace -- --test-threads=1                     # Run all tests (always single-threaded)
-cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo   # Run CLI demo
-cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo ./data.json ./schemas/  # Custom data
+cargo run -p u-forge-ui-gpui                                   # Run the desktop app
 ```
 
 > **No `source env.sh` required.** Bundled SQLite compiles with any standard C compiler on PATH.
@@ -34,9 +33,9 @@ cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo ./da
    cargo test --workspace -- --test-threads=1   # All 220+ tests pass with no server required
    ```
 
-4. **Run the CLI demo:**
+4. **Run the desktop app:**
    ```bash
-   cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
+   cargo run -p u-forge-ui-gpui
    ```
 
 ---
@@ -114,7 +113,7 @@ impl EmbeddingProvider for MyProvider {
 ### Adding a new schema type
 
 1. Create `{type}.schema.json` in `defaults/schemas/`.
-2. Test with: `cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo`
+2. Test with: `cargo run -p u-forge-ui-gpui`
 3. Schema is auto-loaded by `SchemaIngestion::load_schemas_from_directory`.
 
 ### Working with SQLite storage
@@ -163,7 +162,7 @@ curl http://localhost:13305/api/v1/health
 
 # Pull models
 lemonade-server pull embed-gemma-300m-FLM        # embeddings (NPU, 0.62 GB) — default
-lemonade-server pull bge-reranker-v2-m3-GGUF     # reranking (GPU/CPU) — used by cli_demo
+lemonade-server pull bge-reranker-v2-m3-GGUF     # reranking (GPU/CPU)
 lemonade-server pull whisper-v3-turbo-FLM        # transcription (NPU, 1.55 GB)
 
 # Point u-forge.ai at it (optional — localhost:13305 is auto-discovered)
@@ -238,7 +237,6 @@ cargo fmt --check
 cargo clippy --workspace -- -D warnings
 cargo test --workspace -- --test-threads=1
 cargo doc --no-deps --workspace
-cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo
 ```
 
 ---
