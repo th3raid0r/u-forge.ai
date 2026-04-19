@@ -4,498 +4,202 @@ globs: crates/**/*.rs,crates/**/examples/*.rs
 
 # Rust Code Patterns for u-forge.ai
 
+Design decisions and hard-won rules. Source files are thoroughly commented — read
+them for the mechanics. This file exists so the *why* can be intuited without
+re-reading the code.
+
+---
+
 ## Error Handling
 
-Use `anyhow::Result` for application-level errors throughout the codebase.
+- **`anyhow::Result`** for internal fallible operations throughout the codebase.
+  `.context()` wraps lower-level errors; `anyhow!(...)` constructs formatted
+  errors.
+- **`thiserror::Error`** for typed error enums at system boundaries (e.g. HTTP
+  handler responses, where consumers need to discriminate variants). `thiserror`
+  generates `Display`/`From`/`std::error::Error` — do not hand-write them.
 
-For typed error enums at system boundaries (e.g. HTTP handler responses), use
-`#[derive(thiserror::Error)]` instead of hand-writing `Display` and `From` impls.
-`thiserror = "2.0"` is already in `Cargo.toml`.
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum AppError {
-    #[error("Not found: {0}")]
-    NotFound(String),
-    #[error("Internal error: {0}")]
-    Internal(#[from] anyhow::Error),  // generates From<anyhow::Error> + std::error::Error
-}
-```
-
-For internal fallible operations, keep using `anyhow`:
-
-```rust
-use anyhow::{anyhow, Context, Result};
-
-pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-    let resp = self.client
-        .post(format!("{}/embeddings", self.base_url))
-        .header("Authorization", "Bearer lemonade")
-        .json(&body)
-        .send().await
-        .map_err(|e| anyhow!("Lemonade request failed: {}", e))?
-        .json::<serde_json::Value>().await
-        .context("Failed to parse Lemonade response")?;
-    // ...
-}
-```
-
-Use `.context()` for wrapping lower-level errors (e.g. SQLite, I/O).
-Use `anyhow!(...)` for constructing new errors with formatting.
+Rule of thumb: if a caller will pattern-match on the error, use `thiserror`;
+otherwise `anyhow` with `.context()`.
 
 ---
 
-## Key Trait: EmbeddingProvider
+## `EmbeddingProvider` trait
 
-This is the central abstraction for all AI embedding work. **All new AI providers
-must implement this trait.** Do not bypass it by calling HTTP clients or model APIs
-directly from business logic.
+Central abstraction for all AI embedding work. Lives in
+`crates/u-forge-core/src/ai/embeddings.rs`. **All new embedding providers must
+implement this trait. Do not call HTTP clients or model APIs directly from
+business logic.**
 
-```rust
-use crate::embeddings::EmbeddingModelInfo;
+Why: the queue, search, and ingest pipelines consume the trait object. Bypassing
+it means each call site re-invents batching, error handling, and dimension
+checks. `LemonadeProvider` (`lemonade/embedding.rs`) is the only current impl;
+FastEmbed and ONNX were removed.
 
-#[async_trait]
-pub trait EmbeddingProvider: Send + Sync {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
-    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>>;
-    fn dimensions(&self) -> Result<usize>;
-    fn max_tokens(&self) -> Result<usize>;
-    fn provider_type(&self) -> EmbeddingProviderType;
-    /// Returns our own EmbeddingModelInfo type — NOT fastembed's ModelInfo.
-    fn model_info(&self) -> Option<EmbeddingModelInfo>;
-}
-```
-
-**Current implementations:**
-- `LemonadeProvider` — HTTP to Lemonade Server (`POST /api/v1/embeddings`). The only
-  active embedding implementation. FastEmbed/ONNX have been removed.
-
-**Pattern for adding a new HTTP-based provider:**
-```rust
-pub struct MyProvider {
-    client: reqwest::Client,
-    base_url: String,
-    model: String,
-    dimensions: usize,  // probe on construction
-}
-
-#[async_trait]
-impl EmbeddingProvider for MyProvider {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let resp: serde_json::Value = self.client
-            .post(format!("{}/embeddings", self.base_url))
-            .header("Authorization", "Bearer token")
-            .json(&serde_json::json!({ "model": self.model, "input": [text] }))
-            .send().await?
-            .json().await?;
-        let embedding = resp["data"][0]["embedding"]
-            .as_array()
-            .ok_or_else(|| anyhow!("No embedding in response"))?
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
-        Ok(embedding)
-    }
-
-    fn model_info(&self) -> Option<EmbeddingModelInfo> {
-        Some(EmbeddingModelInfo {
-            name: self.model.clone(),
-            dimensions: self.dimensions,
-            description: None,
-        })
-    }
-    // ... other methods
-}
-```
+`model_info()` returns our own `EmbeddingModelInfo` — **not** fastembed's
+`ModelInfo`. The two were easy to confuse when fastembed was still in-tree.
 
 ---
 
-## TranscriptionProvider
+## `TranscriptionProvider` trait
 
-`TranscriptionProvider` trait lives in `crates/u-forge-core/src/ai/transcription.rs`:
+Same shape as `EmbeddingProvider`. Two concrete impls with a deliberate design
+split:
 
-```rust
-#[async_trait]
-pub trait TranscriptionProvider: Send + Sync {
-    /// Transcribe raw audio bytes (WAV, MP3, OGG, …) to text.
-    /// `filename` is used as the multipart filename hint for MIME detection.
-    async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> Result<String>;
+- `LemonadeTranscriptionProvider` — simple, no GPU lock. Use for NPU FLM whisper
+  and standalone cases.
+- `LemonadeSttProvider` — shares `Arc<GpuResourceManager>` with the LLM chat
+  provider. Use whenever STT may contend with LLM on the same GPU.
 
-    /// The model name this provider is configured to use.
-    fn model_name(&self) -> &str;
-}
-```
-
-`transcribe` returns the server's response text trimmed of leading/trailing whitespace.
-MIME type is inferred from the filename extension:
-- `.mp3` → `audio/mpeg`
-- `.ogg` → `audio/ogg`
-- anything else → `audio/wav`
-
-### LemonadeTranscriptionProvider
-
-Concrete implementation against `POST {base_url}/audio/transcriptions`. Construction
-is synchronous — no probe at construction time.
-
-**Key difference from `LemonadeSttProvider`:** no `GpuResourceManager` — intentionally
-simple and standalone. `LemonadeSttProvider` (via `ProviderFactory`) is used when LLM
-inference and STT may contend for the same GPU.
-
-There is no `TranscriptionManager`. Construct `LemonadeTranscriptionProvider` directly,
-or use `ProviderFactory::build` with `Capability::Transcription` to build a managed
-provider for the `InferenceQueue`.
+Construct directly — there is no `TranscriptionManager`. To wire into the queue,
+go through `ProviderFactory::build` with `Capability::Transcription`.
 
 ---
 
-## KnowledgeGraph
+## `KnowledgeGraph` invariants
 
-`KnowledgeGraph::new` is **synchronous** and takes **one argument** (the database
-directory path). No embedding cache dir, no async, no server required.
+- `::new(db_path: &Path)` is **synchronous** and takes **one argument**. Creates
+  `<db_path>/knowledge.db` automatically. No async, no server needed.
+- Holds `Arc<KnowledgeGraphStorage>` and `Arc<SchemaManager>` — no embedding
+  field, no `InferenceQueue`, no Lemonade dependency.
 
-```rust
-// Correct
-let graph = KnowledgeGraph::new("./data/my_world")?;
+Why: storage and schema operations must work in tests and in the UI with zero
+external services. AI is opt-in at the caller. Do not regress this by adding an
+embedding field to `KnowledgeGraph`.
 
-// Also correct with a TempDir (tests)
-let temp = tempfile::TempDir::new()?;
-let graph = KnowledgeGraph::new(temp.path())?;
-```
-
-The database file is created at `<db_path>/knowledge.db`. The directory is created
-automatically if it does not exist.
-
-**`KnowledgeGraph` does NOT have:**
-- `embedding_manager` field
-- `get_embedding_provider()` method
-- `embedding_cache_dir` constructor parameter
-- Any dependency on Lemonade Server being available
+Removed in earlier refactors — **these do not exist, do not reference them:**
+`embedding_manager` field, `get_embedding_provider()` method,
+`embedding_cache_dir` constructor arg, `FastEmbedProvider`,
+`try_new_local_default`, `FASTEMBED_CACHE_PATH`, `EmbeddingManager`,
+`TranscriptionManager`, the `DeviceWorker` trait, the `hardware/` module.
 
 ---
 
-## ObjectBuilder Pattern
+## ObjectBuilder
 
-Fluent API for constructing graph objects:
-
-```rust
-let id = ObjectBuilder::character("Gandalf".to_string())
-    .with_description("A wise wizard".to_string())
-    .with_property("race".to_string(), "Maiar".to_string())
-    .with_json_property("level".to_string(), serde_json::json!(20))
-    .with_tag("wizard".to_string())
-    .add_to_graph(&graph)?;
-```
-
-Convenience constructors: `character`, `location`, `faction`, `item`, `event`,
-`session`, `custom(type, name)`.
+Fluent API for node construction in `src/builder.rs`. Convenience constructors:
+`character`, `location`, `faction`, `item`, `event`, `session`,
+`custom(type, name)`. Prefer these over constructing `ObjectMetadata` by hand.
 
 ---
 
-## String-Based Edge Types
+## Edge types are strings
 
-Always use descriptive string literals for relationships. The deprecated enum
-variants (`Contains`, `OwnedBy`, `LocatedIn`, `MemberOf`) exist only for backward
-compatibility — never use them in new code.
+Always descriptive string literals (`"located_in"`, `"controls"`, `"offers"`).
+`EdgeType` is a transparent newtype `struct EdgeType(pub String)` — not an enum.
 
-```rust
-// Correct
-graph.connect_objects_str(character_id, location_id, "located_in")?;
-graph.connect_objects_str(faction_id, territory_id, "controls")?;
-graph.connect_objects_str(npc_id, quest_id, "offers")?;
-graph.connect_objects_weighted_str(sauron_id, frodo_id, "enemy_of", 0.9)?;
-```
+The deprecated enum variants (`Contains`, `OwnedBy`, `LocatedIn`, `MemberOf`)
+exist only for backward compatibility. **Never use them in new code.** TTRPG
+worldbuilding needs open-ended relationship labels; a fixed enum loses that.
 
 ---
 
-## Storage Patterns (SQLite — current)
+## SQLite storage (`src/graph/storage.rs`)
 
-Storage is `KnowledgeGraphStorage` in `crates/u-forge-core/src/graph/storage.rs`, backed by SQLite via
-`rusqlite` with bundled SQLite. Thread safety: `Arc<Mutex<Connection>>`.
+Backed by `rusqlite` with the `bundled` feature. Thread safety:
+`Arc<Mutex<Connection>>` (`parking_lot`, not `std` — never held across `.await`).
+Always use `params![]` for parameterised inserts.
 
-```rust
-// Parameterised inserts — always use params![] macro
-conn.execute(
-    "INSERT OR REPLACE INTO nodes
-     (id, object_type, name, properties, created_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    params![
-        id.to_string(),
-        object_type,
-        name,
-        serde_json::to_string(&properties)?,
-        created_at.to_rfc3339(),
-        updated_at.to_rfc3339(),
-    ],
-)?;
+### Non-obvious design decisions
 
-// Optional query row
-let result: Option<String> = conn.query_row(
-    "SELECT definition FROM schemas WHERE name = ?1",
-    params![name],
-    |row| row.get(0),
-).optional()?;
+- **`INSERT OR REPLACE` on `nodes`** — safe because nodes have no cascading
+  rowid dependencies. Chunks and edges reference nodes by UUID (TEXT), not rowid.
+- **`ON CONFLICT DO UPDATE` on `chunks`** — required, not stylistic. The
+  implicit SQLite `rowid` is what `chunks_fts` and `chunks_vec` reference. Using
+  `INSERT OR REPLACE` here would change the rowid and silently break FTS and
+  vector index lookups.
+- **`ON DELETE CASCADE` on `edges` and `chunks`** — node deletion becomes a
+  single statement; the DB removes dependents. O(log N), not O(N).
+- **Edge uniqueness: `UNIQUE(source_id, target_id, edge_type)`** — replaces the
+  old manual adjacency-list dedup code.
+- **Complex fields as JSON text**: tags, properties, metadata. UUIDs as
+  hyphenated TEXT (not BLOB). Datetimes as RFC 3339 TEXT. Easy to inspect with
+  `sqlite3 .dump`; no binary format lock-in.
+- **Atomic single-property updates** use SQLite's `json_set()` via
+  `set_node_property()` — avoids read-modify-write on the full blob.
 
-// Collecting multiple rows
-let mut stmt = conn.prepare("SELECT * FROM nodes WHERE object_type = ?1")?;
-let rows = stmt.query_map(params![object_type], row_to_object_metadata)?;
-let objects: Vec<ObjectMetadata> = rows.collect::<Result<_, _>>()?;
-```
+### Removed, do not reintroduce
 
-**Key design decisions in the current schema:**
-- `INSERT OR REPLACE` on `nodes` — OK because nodes have no cascading rowid
-  dependencies that must be preserved.
-- `ON CONFLICT DO UPDATE` on `chunks` — required to preserve the implicit SQLite
-  `rowid` that `chunks_fts` references.
-- `ON DELETE CASCADE` on `edges` and `chunks` — node deletion is O(log N), not O(N).
-- Edge uniqueness: `UNIQUE(source_id, target_id, edge_type)`.
-- All complex fields (tags, properties, metadata) are stored as JSON text.
-- UUIDs stored as hyphenated text strings (not BLOB).
-- Datetimes stored as RFC 3339 text.
-
-**Removed patterns (do not use):**
-```rust
-// ❌ RocksDB — removed in Phase 2
-let cf = self.get_cf(CF_NODES)?;
-let mut batch = WriteBatch::default();
-batch.put_cf(&cf, key, bincode::serialize(&value)?);
-db.write(batch)?;
-
-// ❌ bincode — removed; use serde_json for all serialisation
-bincode::serialize(&adjacency_list)?
-```
+- RocksDB (dropped in Phase 2 — column families, `WriteBatch`, etc.)
+- `bincode` — use `serde_json` for all serialisation
 
 ---
 
-## Full-Text Search
+## FTS5 invariants
 
-FTS5 is built into SQLite. Search chunks via `KnowledgeGraph::search_chunks_fts`:
+`chunks_fts` is a virtual table mirroring `chunks(content)`. Kept in sync by
+three DML triggers defined in `SQL_SCHEMA` (storage.rs).
 
-```rust
-// Returns Vec<(ChunkId, ObjectId, content_text)> ordered by relevance rank
-let results = graph.search_chunks_fts("psychohistory", 10)?;
+**Never manually `INSERT` into `chunks_fts`.** Always go through `upsert_chunk`.
+The triggers handle insert/update/delete — bypassing them leaves the FTS index
+out of sync with the chunks table, producing phantom or missing search hits.
 
-for (chunk_id, obj_id, content) in results {
-    if let Some(obj) = graph.get_object(obj_id)? {
-        println!("{}: {}", obj.name, content);
-    }
-}
-```
-
-FTS5 query syntax supports: phrase (`"hari seldon"`), prefix (`found*`), boolean
-(`empire AND foundation`), and column filters. See SQLite FTS5 docs for full syntax.
-
-**The `chunks_fts` virtual table is kept in sync automatically** by three DML
-triggers defined in `SQL_SCHEMA` in `storage.rs`. Never manually INSERT into
-`chunks_fts` — always go through `upsert_chunk`.
+Query syntax supported by the `search_chunks_fts` wrapper: phrase (`"hari
+seldon"`), prefix (`found*`), boolean (`empire AND foundation`), column filters.
+Illegal characters must be stripped first — see `src/search/sanitize.rs`
+(`fts5_sanitize`). The original query is still passed verbatim to `embed()` and
+`rerank()`, where punctuation is meaningful.
 
 ---
 
-## Semantic Search via ANN (sqlite-vec)
+## ANN vector search (sqlite-vec)
 
-Both standard (768-dim) and high-quality (4096-dim) embedding vectors are stored in SQLite via
-the `vec0` virtual table from the `sqlite-vec` extension:
-- `chunks_vec` — standard 768-dim embeddings (populated by any standard embedding model like embed-gemma-300m-FLM)
-- `chunks_vec_hq` — high-quality 4096-dim embeddings (populated only when Qwen3-Embedding-8B-GGUF or similar HQ model is available)
+Two vector tables, both cosine distance:
+- `chunks_vec` — 768-dim (standard embeddings, any compatible model)
+- `chunks_vec_hq` — 4096-dim (only when an HQ model like
+  `Qwen3-Embedding-8B-GGUF` is configured)
 
-Both indexes support **cosine distance** similarity search. A chunk must be explicitly indexed
-before it becomes searchable via ANN:
+The two vector spaces are **fixed and incompatible**. Never mix models from
+incompatible dimension spaces in the same index.
 
-```rust
-// After generating a 768-dim embedding vector
-let vec = provider.embed("Some text").await?;
-graph.upsert_chunk_embedding(chunk_id, &vec)?;  // adds to chunks_vec
+Same sync contract as FTS: DML triggers keep both indexes consistent; chunk
+deletion cascades to vectors. **Never manually manage `chunks_vec` /
+`chunks_vec_hq`** — always go through `upsert_chunk_embedding` /
+`upsert_chunk_embedding_hq`.
 
-// Or for high-quality embeddings (if available)
-graph.upsert_chunk_embedding_hq(chunk_id, &vec)?;  // adds to chunks_vec_hq
-```
-
-Search via `KnowledgeGraph::search_chunks_ann`:
-
-```rust
-// Returns Vec<(ChunkId, ObjectId, content_text, distance)> ordered by cosine distance
-let results = graph.search_chunks_ann(&query_vector, 10)?;
-
-for (chunk_id, obj_id, content, distance) in results {
-    println!("Distance: {:.4} — {}", distance, content);
-}
-```
-
-Both vector indexes are **kept in sync automatically** via DML triggers (see `SQL_SCHEMA`);
-deleting a chunk cascades to its vectors. Never manually manage `chunks_vec` or
-`chunks_vec_hq` — always go through `upsert_chunk_embedding` / `upsert_chunk_embedding_hq`.
-
-**Incremental embedding workflow:**
-1. `do_embed_all()` checks if embeddings already exist (via `GraphStats.embedded_count`).
-2. If embeddings exist for all chunks, re-embedding is skipped.
-3. Embedding workers are built only if Lemonade Server is reachable.
-4. The reusable vector index means startup builds embeddings once; subsequent starts skip the work.
+A chunk must be explicitly indexed before it becomes searchable via ANN. The
+incremental embedding workflow (`do_embed_all`) checks `GraphStats.embedded_count`
+and skips work when the index is already populated — startup builds embeddings
+once; subsequent starts are fast.
 
 ---
 
-## Async Patterns
+## Async anti-patterns
 
-### Correct: fully async HTTP provider (no thread blocking)
-```rust
-async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-    let resp = self.client.post(&url).json(&body).send().await?.json().await?;
-    Ok(parse_embedding(resp)?)
-}
-```
+### BUG-5: never hold a `std::sync::Mutex` across `.await`
 
-### When wrapping sync work in async context
-Use `tokio::task::spawn_blocking` — do not call blocking code directly in an async fn:
+Locking `std::sync::Mutex` inside an async fn blocks the Tokio executor thread
+— not just the current task. This was the actual BUG-5 root cause and cost
+significant wall time to diagnose.
 
-```rust
-let text = text.to_string();
-let result = tokio::task::spawn_blocking(move || {
-    // CPU-bound or blocking sync work here
-    do_sync_work(&text)
-}).await??;
-```
-
-**Anti-pattern removed (was BUG-5):**
-```rust
-// ❌ DON'T — locks a std::sync::Mutex inside an async fn, blocking the Tokio thread
-async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-    let model = self.model.lock().unwrap();  // blocks executor thread!
-    model.embed(vec![text], None)
-}
-```
+- For HTTP providers: keep them fully async via `reqwest` (no mutex needed).
+- For unavoidable CPU-bound or blocking sync work: use
+  `tokio::task::spawn_blocking`.
+- `parking_lot::Mutex` inside storage is fine **because the lock is never held
+  across `.await`** — the pattern is `let _guard = m.lock(); do_sync_work(); drop(guard); …await…`.
 
 ---
 
-## Testing Patterns
+## Testing
 
-### Isolated tests with TempDir (standard pattern)
+All tests use `TempDir` for isolation. See
+[testing-debugging.mdc](mdc:.rulesdir/testing-debugging.mdc) for the mock
+provider impls (`MockEmbeddingProvider`, `MockTranscriptionProvider`), the
+`make_silence_wav` audio helper, and the `require_integration_url!()` skip
+guard.
 
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn create_test_graph() -> (KnowledgeGraph, TempDir) {
-        let temp = TempDir::new().unwrap();
-        // KnowledgeGraph::new takes ONE argument — the db directory path
-        let graph = KnowledgeGraph::new(temp.path()).unwrap();
-        (graph, temp)
-    }
-
-    #[test]
-    fn test_something() {
-        let (graph, _tmp) = create_test_graph();
-        // _tmp must stay alive — TempDir deletes on drop
-        // ...
-    }
-}
-```
-
-### Audio test helper: `make_silence_wav`
-
-The `embeddings` test module contains a private `make_silence_wav(duration_secs: f32) -> Vec<u8>`
-helper that builds a valid mono 16-bit 16 kHz PCM WAV file entirely in memory with no
-external dependencies. Copy this pattern into any test module that needs real audio bytes
-without shipping a binary fixture file:
-
-```rust
-fn make_silence_wav(duration_secs: f32) -> Vec<u8> {
-    let sample_rate: u32 = 16_000;
-    let num_channels: u16 = 1;
-    let bits_per_sample: u16 = 16;
-    let num_samples = (sample_rate as f32 * duration_secs) as u32;
-    let data_size = num_samples * (bits_per_sample as u32 / 8) * num_channels as u32;
-    let riff_size: u32 = 4 + 8 + 16 + 8 + data_size;
-
-    let mut buf: Vec<u8> = Vec::with_capacity((8 + riff_size) as usize);
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&riff_size.to_le_bytes());
-    buf.extend_from_slice(b"WAVE");
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    buf.extend_from_slice(&num_channels.to_le_bytes());
-    buf.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate: u32 = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
-    buf.extend_from_slice(&byte_rate.to_le_bytes());
-    let block_align: u16 = num_channels * bits_per_sample / 8;
-    buf.extend_from_slice(&block_align.to_le_bytes());
-    buf.extend_from_slice(&bits_per_sample.to_le_bytes());
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&data_size.to_le_bytes());
-    buf.extend(std::iter::repeat(0u8).take(data_size as usize));
-    buf
-}
-```
-
-### Mock embedding provider (for queue / search tests — no server required)
-
-```rust
-struct MockEmbeddingProvider { dimensions: usize }
-
-#[async_trait]
-impl EmbeddingProvider for MockEmbeddingProvider {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        // Deterministic fake: varies by text length so results differ
-        Ok((0..self.dimensions)
-            .map(|i| (text.len() as f32 + i as f32) / 1000.0)
-            .collect())
-    }
-    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        let mut out = Vec::new();
-        for t in &texts { out.push(self.embed(t).await?); }
-        Ok(out)
-    }
-    fn dimensions(&self) -> Result<usize> { Ok(self.dimensions) }
-    fn max_tokens(&self) -> Result<usize> { Ok(512) }
-    fn provider_type(&self) -> EmbeddingProviderType { EmbeddingProviderType::Lemonade }
-    fn model_info(&self) -> Option<EmbeddingModelInfo> { None }
-}
-```
-
-### Lemonade integration tests (skipped when server not available)
-
-Gate all live-server tests on the `LEMONADE_URL` environment variable so they
-silently skip in CI environments where no server is running:
-
-```rust
-fn lemonade_url() -> Option<String> {
-    std::env::var("LEMONADE_URL").ok()
-}
-
-// ── Embedding integration test ────────────────────────────────────────────────
-#[tokio::test]
-async fn test_real_embedding() {
-    let Some(url) = lemonade_url() else {
-        eprintln!("Skipping: LEMONADE_URL not set");
-        return;
-    };
-    let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM").await.unwrap();
-    let vec = provider.embed("test").await.unwrap();
-    assert_eq!(vec.len(), provider.dimensions().unwrap());
-}
-
-// ── Transcription integration test ───────────────────────────────────────────
-#[tokio::test]
-async fn test_real_transcription() {
-    let Some(url) = lemonade_url() else {
-        eprintln!("Skipping: LEMONADE_URL not set");
-        return;
-    };
-    let provider = LemonadeTranscriptionProvider::new(&url, "whisper-v3-turbo-FLM");
-    let wav = make_silence_wav(1.0);
-    let result = provider.transcribe(wav, "silence.wav").await;
-    assert!(result.is_ok(), "transcription failed: {:?}", result.err());
-}
-```
+**Never share a `KnowledgeGraph` between tests** — always construct a fresh one
+in a fresh `TempDir`. The `_tmp` binding must outlive the graph (TempDir deletes
+on drop).
 
 ---
 
-## Performance Instrumentation
+## Performance instrumentation
+
+Use structured `tracing` fields (`key = value`), not format strings. Logs are
+machine-parseable and grep-friendly by field.
 
 ```rust
-use std::time::Instant;
-
-let start = Instant::now();
-let result = operation()?;
 tracing::debug!(
     operation = "fts_search",
     query = %query,
@@ -505,5 +209,4 @@ tracing::debug!(
 );
 ```
 
-Use structured fields (`key = value`) rather than format strings so logs are
-machine-parseable. The `%` sigil calls `Display`; `?` calls `Debug`.
+`%` calls `Display`, `?` calls `Debug`.

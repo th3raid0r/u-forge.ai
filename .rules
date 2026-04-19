@@ -1,159 +1,41 @@
 # u-forge.ai — LLM Rules Entrypoint
 
-Routing guide and standing bulletin board. Read this file first for every task.
-Rule files live in `.rulesdir/` — read only the ones that apply to your task.
+Routing guide and behavior constraints. Read this file first for every task.
+Rule files in `.rulesdir/` cover specific topics — read only those that apply.
 
 ---
 
-## ⚠️ Anti-Patterns — Read Before Writing Anything
+## Anti-Patterns — Read Before Writing Anything
 
-These are active failure modes observed in this codebase. Violating them wastes
-cycles and produces PRs that must be reverted.
+These are active failure modes observed in this codebase. Violating them produces work that must be reverted.
 
-### 1. Code defaults first — env vars are overrides, not requirements
+### 1. Env vars are overrides, not requirements
 
-A user must be able to clone this repo and run `cargo run -p u-forge-ui-gpui` with
-**no environment variables set** and have it work (degrading gracefully when no
-Lemonade Server is present). Env vars like `LEMONADE_URL` exist only to override
-a non-standard location or port.
+`cargo run -p u-forge-ui-gpui` must work with **zero environment variables set**, degrading gracefully when no Lemonade Server is present. `LEMONADE_URL` exists only to override a non-standard location or port.
 
-- In code, always try a **sensible default first** (e.g. `http://localhost:13305/api/v1`),
-  then fall back to the env var if the default is unreachable or unset.
-  `EmbeddingManager::try_new_auto` and `lemonade::resolve_lemonade_url()` already
-  implement this pattern — follow them, never bypass them.
-- Never write application code that calls `env::var(...).unwrap()` or
-  `.expect("set LEMONADE_URL")` at the top level. An unset env var must never
-  be a hard error for core functionality.
-- The same applies to tests: `cargo test -- --test-threads=1` must pass with zero
-  env vars. Use `crate::test_helpers::lemonade_url().await` (probes localhost first,
-  then `LEMONADE_URL`) and silently skip — never fail — when no server is reachable.
+- Always try the sensible default first (`http://localhost:13305/api/v1`). `lemonade::resolve_lemonade_url()` implements this — follow it, never bypass it.
+- Never call `env::var(...).unwrap()` or `.expect("set LEMONADE_URL")` at the top level. An unset env var must never be a hard error for core functionality.
+- Tests: `cargo test -- --test-threads=1` must pass with zero env vars. Use `crate::test_helpers::lemonade_url().await` and silently skip — never fail — when no server is reachable.
 
-### 2. Check the live Lemonade API before making capability decisions
+### 2. Fetch live state before making capability decisions
 
-Before assuming what models or hardware are available, **fetch the actual server
-state**. `SystemInfo::fetch(url)` and `LemonadeServerCatalog::discover(url)` exist
-for exactly this reason — use them. From the catalog, build a `ModelSelector` to
-pick the best available models for each capability. `AppView::do_init_lemonade()` (fetch →
-select → build providers → degrade gracefully) is the canonical example. Do not
-hardcode model IDs, device presence, or capability flags without a live catalog
-check to back them up.
+Before assuming available models or hardware, fetch actual server state. `SystemInfo::fetch(url)` and `LemonadeServerCatalog::discover(url)` exist for exactly this reason — use them. Build a `ModelSelector` from the catalog to pick the best available model per capability. `AppView::do_init_lemonade()` (fetch → select → build providers → degrade gracefully) is the canonical example. Do not hardcode model IDs, device presence, or capability flags without a live catalog check.
 
 ### 3. Prescriptive plans belong in feature or bug files — not in shared docs
 
-Implementation plans, step-by-step task lists, phased roadmaps, PR checklists, and
-any other prescriptive or future-state content must live **only** in a `feature_*.md`
-or `bug_*.md` file at the workspace root. These files are purpose-built for driving
-active development and are expected to be prescriptive.
+`.rules`, `.rulesdir/*.mdc`, `ARCHITECTURE.md`, `CLAUDE.md`, and `README.md` must remain descriptive — they describe what **is**, not what **will be**. Implementation plans, step-by-step tasks, phased roadmaps, and `TODO:` sections belong only in `feature_*.md` or `bug_*.md` files.
 
-`.rules`, `.rulesdir/*.mdc`, `ARCHITECTURE.md`, `CLAUDE.md`, and `README.md` must
-remain descriptive — they describe what **is**, not what **will be** or **should be
-done next**. If you find yourself writing a plan, a TODO list, a phase checklist, or
-a "remaining work" section in any of those files, stop and put it in the appropriate
-`feature_*.md` or `bug_*.md` instead.
+### 4. GPUI: measure first, then apply known patterns
 
-**What counts as prescriptive (belongs in feature/bug files):**
-- Ordered implementation steps or phases
-- "Next:" / "Remaining:" / "TODO:" sections
-- PR descriptions or checklists
-- Anything with ✅/⏳ progress tracking
-- Architectural decisions not yet reflected in the code
+Before guessing at a UI slowdown, enable the perf overlay (`Ctrl+Shift+P`) and watch `frame:<ms>` while reproducing. `render()` call frequency is **not** frame cost — only the 1×1 timing canvas in `app_view/render.rs` captures it honestly.
 
-**What belongs in shared docs:**
-- How the code currently works
-- Where to find things
-- Invariants and constraints the code already enforces
+→ **`.rulesdir/gpui-patterns.mdc`** — caching patterns, always-mounted panel, canvas coords, TextFieldView.
 
-### 4. GPUI perf — measure, then apply the known patterns
-
-Before guessing at a UI slowdown, enable the perf overlay (`Ctrl+Shift+P` in the GPUI app) and watch `frame:<ms>` while reproducing. `render()` call frequency is **not** frame cost — only the 1×1 canvas paint closure in `app_view/render.rs` captures it honestly.
-
-Two reusable patterns live in `feature_UI.md` under "GPUI view-level caching" and "Always-mounted panel pattern":
-- Heavy sub-views that re-lay-out when a parent notifies should be wrapped with `AnyView::from(entity).cached(StyleRefinement::default().size_full())`.
-- Panels that should survive toggles without cold-layout cost must stay mounted with a two-layer wrapper (outer variable-width `overflow_hidden`, inner fixed-width absolute-positioned) so the cached view's bounds stay stable.
-
-Common pitfall: calling `cx.notify()` from inside a `canvas` paint closure (or from `paint`) schedules a redraw and doubles the work every frame. Size-affecting work belongs in `request_layout`, not `paint`.
+Key pitfall: calling `cx.notify()` from inside a `canvas` paint closure schedules a redraw and doubles work every frame. Size-affecting work belongs in `request_layout`, not `paint`.
 
 ### 5. Source code is the source of truth — docs are indexes, not mirrors
 
-Every `.rs` file in `src/` and `examples/` is thoroughly commented. `.md` files
-and `.mdc` rules exist to tell you **where to look and why it matters**, not to
-repeat what the code already says. If you find yourself writing a code example or
-struct definition in a doc that already exists verbatim in source, replace it with
-a pointer (`see src/lemonade/rerank.rs — LemonadeRerankProvider`). Keep docs as
-navigational aids.
-
----
-
-## Current Project State (snapshot)
-
-Alpha desktop UI available. Multi-crate Cargo workspace under `crates/`. SQLite + FTS5 storage,
-sqlite-vec ANN search, catalog-driven provider selection, unified inference queue
-(`InferenceQueue`), hybrid search pipeline, bulk graph access (`get_all_edges`,
-`get_nodes_paginated`). Native GPUI desktop app with graph canvas, schema-driven node editor,
-FTS5/semantic/hybrid search panel, and streaming LLM chat panel with rig-based agent tool loop
-(collapsible tool calls, streaming reasoning). No active bugs.
-
-UI crates (see `feature_UI.md`):
-- `u-forge-graph-view` — `GraphSnapshot` + `build_snapshot()`, force-directed layout (grid-cell bucketed O(N) repulsion), R-tree spatial index, viewport culling, `rebuild_spatial_index()`.
-- `u-forge-ui-traits` — `DrawCommands { nodes, edges, labels }` / `Viewport` / `generate_draw_commands()` rendering pipeline (culling, LOD, type-color). Typed primitive vecs (`NodeCmd`, `LineCmd`, `TextCmd`) keep the paint hot path out of enum-discriminant filter passes. Framework-agnostic. `pub fn node_color_for_type(name: &str) -> [u8; 4]` assigns stable, distinct colors via FNV-1a hash + golden-angle hue scatter — any type name gets a color with no code changes.
-- `u-forge-agent` — Rig-based LLM agent crate. Five `rig::tool::Tool` impls: `FtsSearchTool` (FTS5 keyword), `SemanticSearchTool` (ANN embedding via `InferenceQueue`), `HybridSearchTool` (RRF + reranking), `UpsertNodeTool` (create/update nodes with immediate re-chunking + embedding), `UpsertEdgeTool` (create/update edges with endpoint re-embedding). Write tools block until DB + all embeddings (standard + HQ) are stored. `GraphAgent` wraps a `CompletionsClient` pointed at Lemonade's OpenAI-compatible endpoint; holds `hq_queue: Option<Arc<InferenceQueue>>` so write tools can trigger HQ embedding. `prompt_stream()` drives rig's multi-turn tool loop with all five tools and emits `AgentStreamEvent` variants over `mpsc::channel`: `ReasoningDelta`, `TextDelta`, `ToolCallStart`, `ToolResult`, `Done`, `Error`. `fts5_sanitize` logic is inlined (not re-exported from `u-forge-core`). `ToolError` (renamed from `SearchToolError`) is the shared error type for all five tools.
-- `u-forge-ui-gpui` — GPUI 0.2.2 canvas app. Modular crate: `main.rs` is the binary entry point only; all types live in a library target. Modules: `selection_model` (shared selection state), `text_field` (`TextFieldView` custom input implementing `EntityInputHandler`; single-line horizontal scroll, multiline vertical scroll), `tree_panel` (resizable sidebar, uses `w_full()`), `search_panel` (`SearchPanel` entity with FTS5/Semantic/Hybrid modes, inline query field, results list), `chat_history` (`ChatHistoryStore` — SQLite-backed session persistence at `<db_path>/chat_history.db`; `chat_sessions` + `chat_messages` tables; `create_session`, `list_sessions`, `load_messages`, `save_session`, `delete_session`), `chat_panel` (`ChatPanel` entity — streaming LLM chat; **header**: chat history session selector dropdown (title button + "New" button; delete ✕ per row; dismisses on click outside); **input area**: multiline text field + Send button + enter-to-submit toggle + model selector dropdown below input; all downloaded LLM models shown (uses `select_all_llm_models()`), defaults to preferred device model from `[chat.gpu/npu/cpu].model`; session auto-saves on stream completion; resumes most-recent session on startup; when `GraphAgent` is set routes through agent tool loop; `ChatRole::ToolCall` entries are collapsible with purple accent; thinking/reasoning shown for both paths), `graph_canvas` (pan/zoom canvas), `node_editor/` (3 files: struct+methods, field specs, render impl), `app_view/` (2 files: data ops + marker types, render impl). See `feature_UI.md` → "Module structure" table for the full breakdown. `AppView` root view: 28 px menu bar + horizontal body (`overflow_hidden()` flex row): optional left sidebar (default 220 px, user-resizable) showing either `TreePanel` or `SearchPanel` based on `SidebarTab` enum + vertical workspace (`NodeEditorPanel` / graph canvas, default 30/70 split, user-resizable) + optional `ChatPanel` (default 280 px, user-resizable). Status bar "Tree" / "Search" buttons toggle sidebar tab; clicking active tab closes sidebar. `AppView` holds `Arc<tokio::runtime::Runtime>`, `Arc<AppConfig>`, `Option<InferenceQueue>` (standard + HQ); `do_init_lemonade()` discovers Lemonade asynchronously on startup, builds a `LemonadeChatProvider` and a `GraphAgent` (passing `hq_queue` so write tools can trigger HQ embedding), pushes both to `ChatPanel`, and triggers bulk embedding. Embedding progress shown in amber in the status bar center. `SelectionModel` entity shared by `TreePanel`, `SearchPanel`, `GraphCanvas`, and `NodeEditorPanel`; `cx.observe()` keeps all in sync — tree/search clicks pan the canvas and open editor tabs. `NodeEditorPanel` provides browser-style tabs (pin/unpin/close), schema-driven form rendering — field kinds (Text, Array, Boolean, Enum, Number) driven by schema type; runtime-type fallback for fields not in the schema. Dirty-state tracking (orange tab indicator), multi-column layout with pagination, save-all (Ctrl+S persists dirty tabs + layout + triggers per-node `rechunk_and_embed` for all saved nodes so semantic search stays current). `GraphCanvas` holds `canvas_bounds: Arc<RwLock<Bounds<Pixels>>>` updated each paint frame; all `window.paint_*` calls add `bounds.origin` offset and `overflow_hidden()` clips output to the pane. **Graph legend and `TreePanel` type-header colors both call `node_color_for_type` — they are always in sync with the canvas node colors.** Run: `cargo run -p u-forge-ui-gpui`. **`TextFieldView` renders text via `shape_line`/`shape_text` + `paint()` on a canvas (NOT as a div `SharedString` child) — cursor uses `x_for_index`/`position_for_index`, clicks use `closest_index_for_x`/`closest_index_for_position` on the cached `TextFieldLayout`. Line height = `font_size * 1.618` (GPUI's `phi()` default). Never place text as div child if pixel-exact cursor overlay is needed.**
-- `u-forge-core` — `node_positions` table added to SQLite schema; `KnowledgeGraph::save_layout()` / `load_layout()` persist and restore canvas positions. `build_snapshot()` applies saved positions after force-directed layout, so new nodes get computed positions and known nodes restore their last user-placed position. `SchemaManager::get_object_type_schema()` provides sync cache-based lookup for UI use (async `load_schema` must be called first to populate cache). `rechunk_and_embed(graph, queue, hq_queue, object_id)` is the per-node analogue of `embed_all_chunks` — deletes old chunks, flattens metadata + edges, creates new chunks, embeds all (standard + HQ), and blocks until complete. `delete_chunks_for_node(object_id)` added to `KnowledgeGraph` for chunk replacement. `PropertyType` now re-exported from `lib.rs`. Canonical data format: `defaults/data/memory.jsonl` — `entitytype`/`nodetype`/`properties` with typed JSON values (native arrays, not comma-separated strings). Legacy MemoryMesh format can be converted via `cargo run --example convert_memorymesh`.
-
-Recent quality improvements:
-- `load_model()` now accepts `already_loaded: &[String]` — if the model ID is in the slice the HTTP round-trip to `/api/v1/load` is skipped entirely. Callers extract these IDs from `catalog.loaded` (already fetched by `LemonadeServerCatalog::discover`). `ProviderFactory::build` threads this parameter through all capability branches. `do_init_lemonade()` extracts the loaded-model list from the catalog and fires all provider builds concurrently via `futures::future::join_all`, eliminating sequential load waits on warm servers.
-- `embed_all_chunks` is now incremental — uses `get_unembedded_chunks` / `get_unembedded_chunks_hq` (LEFT JOIN on `chunks_vec`) instead of re-scanning all objects.
-- Hybrid search diagnostic blocks demoted from `info!` to `debug!` — no more log spam in production; `RUST_LOG=u_forge_core::search=debug` reveals full pipeline state.
-- `KnowledgeGraphStorage` now uses `parking_lot::Mutex` — all 24 `.lock().unwrap()` calls removed.
-- `ObjectType` enum deleted from `types.rs` — it was dead code; `ObjectMetadata.object_type` is `String` throughout, and `ObjectBuilder` already embeds correct string literals.
-- `WeightedEmbedDispatcher::worker_count()` removed — `InferenceQueue` exposes `embedding_worker_count()` for callers. `WeightedWorkerSlot::name` and `idle` fields annotated with intent comments (retained for future diagnostics).
-- HTTP timeouts added to all Lemonade HTTP clients — `LemonadeHttpClient::new()` sets 30s request / 5s connect; lightweight discovery clients (`system_info`, `catalog`) use 5s / 2s. Prevents indefinite blocking when Lemonade Server hangs.
-- Token estimation changed from `len / 4` to `len.div_ceil(3)` — conservative 3-char/token ratio better matches dense TTRPG prose. `split_text()` in `text.rs` uses the same ratio (`MAX_CHUNK_TOKENS * 3` chars per chunk).
-- `EdgeType` collapsed from single-variant enum (`Custom(String)`) to transparent newtype struct. Use `EdgeType::new(s)` everywhere — `Custom(s)` no longer exists.
-- `ObjectId` and `ChunkId` promoted from type aliases to newtype structs (`#[serde(transparent)]`). The compiler now rejects passing a `ChunkId` where an `ObjectId` is expected. Construct with `::new_v4()`; parse with `::parse_str(s)`.
-- 9 clippy warnings resolved: `while let` loop, boxed large enum variant (`ProviderSlot::Tts`), `#[derive(Default)]` on `KokoroVoice`, transmute type annotation for sqlite-vec FFI, doc formatting. Edge metadata JSON parse failures now emit `debug!()` instead of silently swallowing errors.
-- BPE tokenizer cached via `LazyLock<CoreBPE>` in `text.rs` and `u-forge-agent/lib.rs` — `tiktoken_rs::o200k_harmony()` was constructing a ~200k-entry vocabulary on every `count_tokens()` call, causing `split_text()` to hang on long inputs. `TextChunk::new` also uses the cached tokenizer.
-- `UpsertEdgeTool::call` no longer silently drops endpoint re-embed failures — per-endpoint errors are collected as `[warning]` lines and appended to the tool output so the agent and user both see which side failed. DB edge insert still succeeds independently.
-- `ChatPanel::new_session` / `load_session` / `delete_session` refuse to act while a stream is in progress (`self.streaming == true`). Prevents incoming `TextDelta`/`ReasoningDelta` frames from bleeding into a freshly-loaded session's message buffer. `delete_session` only guards when the active session is the one being deleted.
-- `GraphAgent::prompt_stream` background task now exits its event loop the moment the receiver is dropped — the `while let` is labeled `'stream:` and every `tx.send()` checks the result, breaking on the first `Err`. Closing the chat panel mid-stream no longer leaves rig's multi-turn loop running in the background.
-- Embedding status bar now shows a live pending-count suffix (e.g. `Embedding 150 objects (42 pending)`). `AppView` spawns a 500 ms sampler via `cx.background_executor().timer(Duration)` using the epoch-cancellation pattern from `text_field.rs`. Sampler auto-stops when `embedding_sampler_epoch` is bumped or the `WeakEntity` upgrade fails.
-- Graph legend type list is now precomputed in `build_snapshot()` as `GraphSnapshot.legend_types` — rebuilt only when the snapshot is rebuilt, so `GraphCanvas` paint no longer walks every node into a `BTreeSet` per frame.
-- `generate_draw_commands()` returns a typed `DrawCommands { nodes, edges, labels }` struct instead of a mixed `Vec<DrawCommand>`. The GPUI canvas iterates each typed vec once — no more three filter passes over the same Vec with enum discriminant branches on the paint hot path.
-- Chat history dropdown is virtualized via a second `ListState` on `ChatPanel`. Only visible rows allocate and render, so accumulating 100+ sessions no longer spikes the frame while the dropdown is open. State is reset whenever `session_list` is refreshed.
-- Perf-overlay frame-cost window moved from `VecDeque<u64>` to a fixed `FrameTimeRing` (`[u64; 60]` circular buffer). Average and sampling are both gated on `perf_enabled`, so a disabled overlay does zero work beyond the enable check.
-- `SelectionModel` no longer carries `selected_node_idx` — `selected_node_id: Option<ObjectId>` is the sole source of truth. Callers that need an index (e.g. `generate_draw_commands`) compute it on demand via `nodes.iter().position(...)` inside the snapshot read. Eliminates the stale-index hazard on snapshot rebuilds.
-- `AgentParams.temperature` changed from `f64` (unconditional `0.3` override) to `Option<f64>` — `None` defers to the server/model default. Restores symmetry with `top_p`/`top_k`/`min_p` which were already optional.
-- Chat persistence layer now has typed `StoredRole` enum and `StoredToolCall` struct. `StoredMessage` renamed to `StoredChatMessage`. UI layer (`ChatMessageView`) converts to/from `StoredChatMessage` at the persistence boundary only — no more stringly-typed role strings or loose tool call fields leaking into the domain model.
-- 11 pre-existing clippy lints in `u-forge-core` and `u-forge-ui-gpui` resolved: `map_or(false, …)` → `is_some_and`, `repeat().take()` → `repeat_n`, `single_match` → `if let`, `field_reassign_with_default`, `len() > 0` → `!is_empty()`, `collapsible_if`, `manual_clamp`, `useless_conversion`.
-- `SchemaManager::validate_and_coerce_properties(object_type, &mut props)` added — sync, cache-based. Coerces `String("42")` → `Number` and `String("true"/"false")` → `Bool` in-place when schema declares those types; returns `Vec<PropertyIssue>` for type mismatches and invalid enum values. `KnowledgeGraph` exposes a thin wrapper. `UpsertNodeTool` calls it after property merge and appends `[warning]` lines to the tool output for `TypeMismatch`/`InvalidEnum` issues so the LLM can self-correct. `NodeEditorView::save_dirty_tabs` calls it before `update_object` and emits `tracing::warn!` for the same issue classes. Unknown properties are silently accepted at both boundaries (extra fields are common in practice). `PropertyIssue` is re-exported from `u-forge-core`.
-- Embedding pipeline unified under `EmbeddingPlan` in `u-forge-core::ingest::embedding`. `EmbeddingPlan::rechunk(ids)` (per-node re-chunk + embed) and `EmbeddingPlan::embed_all()` (bulk unembedded sweep) replace the former scattered procedural paths. `AppView::run_embedding_plan(plan, cx)` is the single entry point in the UI — it owns status formatting, epoch-based poller cancellation, and the background tokio task. Four former methods (`do_rechunk_and_embed`, `do_embed_all`, `spawn_embedding_sampler`, `stop_embedding_sampler`) are deleted. Status strings come from `format_embedding_outcome` (centralized), with live node-count progress during rechunk (`Re-embedding… (N/M)`).
-- `AppState` split from `AppView` — all non-render, non-GPUI fields (graph, snapshot, queues, config, tokio runtime, status strings, embedding epoch) live in `app_view/state.rs` with no GPUI imports. `AppView` retains GPUI entity handles, layout state, and perf-overlay fields only. Render reads `self.state.*`; async callbacks update `view.state.*` via the existing `WeakEntity` pattern.
-- `ChatPanel::last_render_us` is zeroed at all three `right_panel_open` toggle sites in `app_view/render.rs` when the panel transitions from open to closed — perf overlay `chat_ms` no longer shows a stale value after the panel is hidden.
-
-The core library has been fully refactored (hardware abstraction layer removed):
-- `hardware/` directory deleted — `NpuDevice`, `GpuDevice`, `CpuDevice`, `DeviceWorker`
-  trait, and `HardwareBackend` enum no longer exist.
-- `lemonade/device_factory.rs`, `lemonade/model_limits.rs`, `lemonade/registry.rs`,
-  `lemonade/stack.rs` deleted. `LemonadeModelRegistry`, `ModelRole`, `LemonadeStack`,
-  `EmbeddingManager`, and `TranscriptionManager` no longer exist.
-- Replaced by: `lemonade/catalog.rs` (`LemonadeServerCatalog`), `lemonade/selector.rs`
-  (`ModelSelector`, `SelectedModel`, `QualityTier`), `lemonade/duplicate_guard.rs`
-  (`DuplicateGuard`), `lemonade/provider_factory.rs` (`ProviderFactory`, `Capability`,
-  `BuiltProvider`).
-- `ai/embeddings.rs` and `ai/transcription.rs` are trait-only files; implementations
-  live in `lemonade/embedding.rs` and `lemonade/transcription.rs`.
-- `InferenceQueueBuilder` now wires providers via `.with_provider(BuiltProvider)` /
-  `.with_providers(Vec<BuiltProvider>)`. `ProviderFactory::build()` constructs them.
-- `AppConfig` includes `[chat]` with per-device model overrides (`[chat.gpu]`, `[chat.npu]`) and `[storage]` with `db_path` (default `./data/db`). `ModelConfig.load_params` replaces the old `context_limits: HashMap`.
-
----
-
-## Always Read First
-
-> **`.rulesdir/project-structure.mdc`**
-
-Read for every task. Module map, current architecture, migration status, key
-integration points, hardware capability table.
+Every `.rs` file is thoroughly commented. `.md` and `.mdc` files tell you **where to look and why it matters** — not what the code already says. If you find yourself writing a struct definition or code example that already exists verbatim in source, replace it with a pointer (`see src/lemonade/rerank.rs — LemonadeRerankProvider`).
 
 ---
 
@@ -163,70 +45,32 @@ integration points, hardware capability table.
 → **`.rulesdir/environment-config.mdc`**
 → **`.rulesdir/development-workflow.mdc`**
 
-`env.sh` is **optional** — no longer required for compilation. `cargo build` and
-`cargo test` work with no env vars. See these files for Lemonade Server setup and
-the `LEMONADE_URL` auto-discovery order.
+`env.sh` is optional — no longer required for compilation. `cargo build` and `cargo test` work with no env vars.
 
----
-
-### Writing or modifying Rust source (`src/**/*.rs`, `examples/*.rs`)
+### Writing or modifying Rust source (`crates/**/*.rs`)
 → **`.rulesdir/rust-patterns.mdc`**
 
-Error handling (`anyhow`), `EmbeddingProvider` trait (do NOT bypass it),
-`TranscriptionProvider` trait, `InferenceQueue` usage, `ObjectBuilder`, async
-anti-patterns, storage patterns, tracing instrumentation.
-
----
+Error handling (`anyhow`), `EmbeddingProvider` trait (do NOT bypass it), `TranscriptionProvider` trait, `InferenceQueue` usage, `ObjectBuilder`, async anti-patterns, storage patterns.
 
 ### Adding or wiring a new AI capability (embedding, reranking, TTS, STT, LLM)
-→ **`.rulesdir/rust-patterns.mdc`** (EmbeddingProvider / trait sections)
+→ **`.rulesdir/rust-patterns.mdc`** (trait sections)
 → **`.rulesdir/development-workflow.mdc`** (provider addition workflow)
 
-New providers implement the relevant trait (`EmbeddingProvider` or
-`TranscriptionProvider`). For queue-dispatched work, build via `ProviderFactory` and
-register with `InferenceQueueBuilder::with_provider`. Do NOT call provider HTTP
-clients directly from business logic. Do NOT use `Mutex<T>` in async paths.
-There is no `DeviceWorker` trait — that abstraction was removed in the hardware
-refactor.
-
----
+Implement the relevant trait. Build via `ProviderFactory`, register with `InferenceQueueBuilder::with_provider`. Do NOT call provider HTTP clients directly from business logic. There is no `DeviceWorker` trait — that abstraction was removed in the hardware refactor.
 
 ### Writing, running, or debugging tests
 → **`.rulesdir/testing-debugging.mdc`**
 → **`.rulesdir/rust-patterns.mdc`** (testing patterns section)
 
-Re-read anti-pattern §1 above before writing any test. Every test gets its own
-`TempDir`. Mock providers for unit tests; `lemonade_url().await` skip-guard for
-integration tests.
-
----
+Every test gets its own `TempDir`. Mock providers for unit tests; `lemonade_url().await` skip-guard for integration tests.
 
 ### Schema files (`defaults/schemas/*.schema.json`)
 → **`.rulesdir/schema-system.mdc`**
 → **`.rulesdir/json-data-formats.mdc`**
 
-`add_` prefix convention, `SchemaIngestion` stripping, property types, the 13
-built-in TTRPG types.
-
----
-
-### Data files (`defaults/data/*.json`) or the import pipeline
+### Data files (`defaults/data/*.jsonl`) or the import pipeline
 → **`.rulesdir/json-data-formats.mdc`**
 
-JSONL node/edge format, two-pass import, deduplication, edge resolution.
-
----
-
-
-## Quick Reference: File → Topic
-
-| File | Primary Topics |
-|---|---|
-| `project-structure.mdc` | Architecture, module map, migration status, integration points |
-| `development-workflow.mdc` | Build/run commands, provider addition, Lemonade setup |
-| `environment-config.mdc` | Env vars, auto-discovery order, optional `env.sh` |
-| `rust-patterns.mdc` | Error handling, traits, async, storage, ObjectBuilder |
-| `schema-system.mdc` | Schema format, validation, property types |
-| `json-data-formats.mdc` | JSONL import format, two-pass pipeline |
-| `testing-debugging.mdc` | TempDir setup, mock providers, skip guards, CI commands |
-| `ARCHITECTURE.md` | Full module map, SQLite schema, hardware design, design decisions |
+### UI work (`crates/u-forge-ui-gpui/`, `crates/u-forge-graph-view/`, `crates/u-forge-ui-traits/`)
+→ **`.rulesdir/project-structure.mdc`** (integration points, cross-cutting constraints)
+→ **`.rulesdir/gpui-patterns.mdc`** (caching, panel patterns, canvas coords, TextFieldView)

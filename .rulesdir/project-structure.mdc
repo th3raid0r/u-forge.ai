@@ -4,182 +4,102 @@ alwaysApply: true
 
 # u-forge.ai Project Structure Guide
 
-Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs. Built in Rust.
+Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs.
 
-**Status:** Alpha desktop app. Multi-crate Cargo workspace under `crates/`.
+Full workspace layout, SQLite schema, inference architecture, and design
+decisions live in [ARCHITECTURE.md](mdc:ARCHITECTURE.md). Source files are
+thoroughly commented — read them for file-level detail. This guide covers
+cross-cutting integration rules that aren't obvious from any single file.
 
-## Architecture Overview
-
-Read [ARCHITECTURE.md](mdc:ARCHITECTURE.md) for full details (module map, SQLite schema, resolved bugs, design decisions).
-
-## Workspace Layout
-
-The project is a Cargo workspace. All crates live under `crates/`:
-
-| Crate | Kind | Status | Purpose |
-|-------|------|--------|---------|
-| `u-forge-core` | lib | Complete | All current source (storage, AI, hardware, queue, search, schema, ingest) |
-| `u-forge-graph-view` | lib | Complete | Graph view model + layout engine (see `feature_UI.md`) |
-| `u-forge-ui-traits` | lib | Complete | Framework-agnostic rendering contracts (see `feature_UI.md`) |
-| `u-forge-ui-gpui` | lib + bin | Alpha | GPUI native desktop app — graph canvas, node editor, search, chat (see `feature_UI.md`) |
-| `u-forge-agent` | lib | Complete | Rig-based LLM agent: `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool`, `UpsertNodeTool`, `UpsertEdgeTool`, `GraphAgent` with `prompt_stream()` (see `ARCHITECTURE.md`) |
-| `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox (see `feature_TS-Agent-Sandbox.md`) |
-
-`defaults/` (schemas + sample data) lives at the **workspace root**, not inside any crate.
-
-## Current Architecture (u-forge-core)
-
-- **Facade**: [crates/u-forge-core/src/lib.rs](mdc:crates/u-forge-core/src/lib.rs) — `KnowledgeGraph` struct (owns storage + schemas). Bulk methods: `get_all_edges()`, `get_nodes_paginated(offset, limit)`.
-- **Storage**: [crates/u-forge-core/src/graph/storage.rs](mdc:crates/u-forge-core/src/graph/storage.rs) — SQLite via `rusqlite` (bundled). Tables: `nodes`, `edges`, `chunks`, `schemas` + FTS5 virtual table `chunks_fts` + sqlite-vec virtual tables `chunks_vec` (768-dim) and `chunks_vec_hq` (4096-dim). Key constants: `EMBEDDING_DIMENSIONS = 768`, `HIGH_QUALITY_EMBEDDING_DIMENSIONS = 4096`, `MAX_CHUNK_TOKENS = 350`.
-- **Embeddings**: [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) — `EmbeddingProvider` trait, `EmbeddingModelInfo`, `EmbeddingProviderType`. Implementation (`LemonadeProvider`) lives in `lemonade/embedding.rs`; re-exported here. No `EmbeddingManager`.
-- **Transcription**: [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) — `TranscriptionProvider` trait + `mime_for_filename()`. Implementation (`LemonadeTranscriptionProvider`) lives in `lemonade/transcription.rs`; re-exported here. No `TranscriptionManager`.
-- **Application Config**: [crates/u-forge-core/src/config.rs](mdc:crates/u-forge-core/src/config.rs) — `AppConfig`, `EmbeddingDeviceConfig`, `ModelConfig`, `ChatConfig`, `ChatDeviceConfig`, `ChatDevice`. TOML loading from `u-forge.toml`. `ModelConfig` holds per-model `load_params`, preference lists for model selection, `high_quality_embedding_models`. `ChatConfig` controls preferred device, per-device model overrides (`[chat.gpu]`, `[chat.npu]`), system prompt, RAG settings.
-- **Inference Queue**: [crates/u-forge-core/src/queue/](mdc:crates/u-forge-core/src/queue) — `InferenceQueue` + `InferenceQueueBuilder` + `QueueStats`. Five capability channels: `WeightedEmbedDispatcher` (for embeddings), `transcribe_queue`, `synthesize_queue`, `generate_queue`, `rerank_queue`. Register providers via `.with_provider(BuiltProvider)`. Per-job retry: up to 3 attempts with exponential backoff.
-- **Extended Lemonade Integration**: [crates/u-forge-core/src/lemonade/](mdc:crates/u-forge-core/src/lemonade) — Catalog-driven model discovery and provider construction:
-  - `lemonade/catalog.rs` — `LemonadeServerCatalog` (fetches `/models`, `/system-info`, `/health` concurrently; `CatalogModel`, `LoadedModel`, `InstalledBackend`)
-  - `lemonade/selector.rs` — `ModelSelector` (picks best downloaded model per capability/device slot; deduplicates to one worker per slot; `SelectedModel`, `QualityTier`; `model_by_id()` for exact lookup)
-  - `lemonade/provider_factory.rs` — `ProviderFactory::build()` (constructs live providers from `SelectedModel`; `Capability`, `BuiltProvider`, `ProviderSlot`)
-  - `lemonade/duplicate_guard.rs` — `DuplicateGuard` (detects duplicate llamacpp model names across backends)
-  - `lemonade/embedding.rs` — `LemonadeProvider` (re-exported via `ai/embeddings.rs`)
-  - `lemonade/transcription.rs` — `LemonadeTranscriptionProvider` (re-exported via `ai/transcription.rs`)
-  - `lemonade/gpu_manager.rs` — `GpuResourceManager`, `GpuWorkload`, `LlmGuard`, `SttGuard`
-  - `lemonade/chat.rs` — `LemonadeChatProvider`, `ChatRequest`, `ChatMessage`, `ChatCompletionResponse`
-  - `lemonade/stt.rs` — `LemonadeSttProvider`, `TranscriptionResult`
-  - `lemonade/tts.rs` — `LemonadeTtsProvider`, `KokoroVoice`
-  - `lemonade/rerank.rs` — `LemonadeRerankProvider`, `RerankDocument`
-  - `lemonade/system_info.rs` — `SystemInfo`, `SystemDeviceInfo`, `RecipeBackendInfo`
-  - `lemonade/load.rs` — `load_model()`, `ModelLoadOptions`
-  - `lemonade/health.rs` — `LemonadeHealth`, `LoadedModelEntry`
-- **Hybrid Search**: [crates/u-forge-core/src/search/](mdc:crates/u-forge-core/src/search) — `search_hybrid(graph, queue, query, config)` free async function. RRF merge of FTS5 + ANN (standard + HQ), optional rerank, graceful degradation.
-- **Schemas**: [crates/u-forge-core/src/schema/](mdc:crates/u-forge-core/src/schema)
-- **Data Import**: [crates/u-forge-core/src/ingest/data.rs](mdc:crates/u-forge-core/src/ingest/data.rs) — JSONL two-pass import.
-
-## Lemonade Integration
-
-**Standard on [Lemonade Server](https://github.com/lemonade-sdk/lemonade)** (AMD, OpenAI-compatible API) for all AI:
-- Model discovery: `GET /api/v1/models`, `GET /system-info`, `GET /health` — `LemonadeServerCatalog::discover(url)` fetches all three concurrently.
-- Model selection: `ModelSelector::new(catalog, config)` — picks best downloaded model per capability/device slot, deduplicates to one provider per slot.
-- Provider construction: `ProviderFactory::build(sel, capability, url, queue_depth, gpu_mgr, already_loaded)` — builds live providers from `SelectedModel`. Pass `catalog.loaded` IDs as `already_loaded` to skip the `/load` round-trip for models that are already running; pass `&[]` to always send the load request.
-- Embeddings: `POST /api/v1/embeddings` — `LemonadeProvider` in `lemonade/embedding.rs`; re-exported via `ai::embeddings`.
-- Transcription: `POST /api/v1/audio/transcriptions` — `LemonadeTranscriptionProvider` (simple, no GPU lock) or `LemonadeSttProvider` (GPU-managed, shares `GpuResourceManager`).
-- Reranking: `POST /api/v1/reranking` — `LemonadeRerankProvider`; wired into `InferenceQueue` via `rerank_queue`.
-- Chat/LLM: `POST /api/v1/chat/completions` — `LemonadeChatProvider`; dispatched via `generate_queue` for GPU llamacpp and NPU FLM models.
-- System info: `GET /system-info` — `SystemInfo::fetch()`; derives installed backends from recipe information.
-
-**Hardware capability mapping** (derived from `/system-info`):
-
-| Hardware | Recipes/Backends | Capabilities |
-|---|---|---|
-| AMD NPU (XDNA2) | FLM | `Embedding`, `Transcription`, `TextGeneration` |
-| AMD iGPU (ROCm/Vulkan) | llamacpp:rocm, llamacpp:vulkan, whispercpp:vulkan | `Transcription`, `TextGeneration`, `Reranking`, `Embedding` (via GGUF) |
-| CPU | kokoro, llamacpp (cpu) | `TextToSpeech`, `Embedding` (via GGUF) |
+---
 
 ## Key Integration Points
 
-The `EmbeddingProvider` trait in [crates/u-forge-core/src/ai/embeddings.rs](mdc:crates/u-forge-core/src/ai/embeddings.rs) is the primary abstraction for embedding work. The trait is dependency-free; `LemonadeProvider` (in `lemonade/embedding.rs`) is the only implementation. Do NOT bypass the trait.
+### `EmbeddingProvider` is the only abstraction for embedding work
 
-The `TranscriptionProvider` trait in [crates/u-forge-core/src/ai/transcription.rs](mdc:crates/u-forge-core/src/ai/transcription.rs) is the primary abstraction for STT work. Both `LemonadeTranscriptionProvider` (lemonade/transcription.rs — simple, no GPU lock) and `LemonadeSttProvider` (lemonade/stt.rs — GPU-managed) implement it. Do NOT bypass the trait.
+Lives in `crates/u-forge-core/src/ai/embeddings.rs`. `LemonadeProvider`
+(`lemonade/embedding.rs`) is the only impl. **Do NOT bypass the trait** by
+calling HTTP clients directly from business logic — the queue, search, and
+ingest pipelines consume the trait object.
 
-**There is no `DeviceWorker` trait.** The hardware abstraction layer (`hardware/` module) was removed in the hardware refactor. Physical device differences are handled by `ModelSelector` (picks the right recipe/backend per device slot) and `ProviderFactory` (constructs the appropriate provider type). See `lemonade/selector.rs` and `lemonade/provider_factory.rs`.
+### `TranscriptionProvider` has two impls, picked by contention
 
-For new code that needs embedding, transcription, TTS, LLM generation, or reranking: discover the catalog with `LemonadeServerCatalog::discover()`, select models with `ModelSelector`, build providers with `ProviderFactory::build()`, and register them with `InferenceQueueBuilder::with_provider()`. Do not call provider HTTP clients directly from business logic.
+- `LemonadeTranscriptionProvider` (`lemonade/transcription.rs`) — simple, no GPU
+  lock. Standalone use or NPU FLM whisper.
+- `LemonadeSttProvider` (`lemonade/stt.rs`) — GPU-managed, shares
+  `GpuResourceManager` with the chat provider. Use when STT may contend with
+  LLM on the same GPU.
 
-`LemonadeChatProvider` holds an `Option<Arc<GpuResourceManager>>`. `ProviderFactory` attaches the GPU manager automatically for llamacpp:rocm/vulkan/metal recipes and omits it for FLM (NPU) and kokoro (CPU) models.
+Both implement the trait. Do NOT bypass it.
 
-`KnowledgeGraph` does **not** hold an `InferenceQueue` or any AI provider. Storage and schema operations are fully synchronous and require no running server. All AI capabilities are opt-in — construct them separately when needed.
+### The hardware abstraction layer is gone
+
+**There is no `DeviceWorker` trait and no `hardware/` module.** Removed in the
+hardware refactor. Physical device differences are handled by `ModelSelector`
+(picks the right recipe/backend per device slot) and `ProviderFactory`
+(constructs the appropriate provider type). See `lemonade/selector.rs` and
+`lemonade/provider_factory.rs`.
+
+### New AI capability wiring
+
+The end-to-end path for embedding, transcription, TTS, LLM generation, or
+reranking is always:
+
+1. `LemonadeServerCatalog::discover(url)` — fetches `/models`, `/system-info`,
+   `/health` concurrently.
+2. `ModelSelector::new(catalog, config)` — picks best downloaded model per
+   capability + device slot; deduplicates to one provider per slot.
+3. `ProviderFactory::build(sel, capability, url, queue_depth, gpu_mgr, already_loaded)`.
+   Pass `catalog.loaded` IDs as `already_loaded` to skip `/load` round-trips
+   for models already in RAM.
+4. `InferenceQueueBuilder::with_provider(built_provider)` to register.
+
+`AppView::do_init_lemonade()` is the canonical example: fetch → select → build
+providers → degrade gracefully on any failure.
+
+### `KnowledgeGraph` has no AI dependency
+
+No `InferenceQueue`, no embedding field, no Lemonade dependency. Storage and
+schema operations are fully synchronous and work with zero running services.
+AI capabilities are opt-in — construct them separately. **Do not regress this.**
+
+### GPU manager attachment is automatic
+
+`LemonadeChatProvider` holds an `Option<Arc<GpuResourceManager>>`.
+`ProviderFactory` attaches the manager for llamacpp:rocm/vulkan/metal recipes
+and omits it for FLM (NPU) and kokoro (CPU). Do not set this field manually.
+
+---
 
 ## Integration Test Threading
 
-Integration tests hit a shared live Lemonade Server. When `LEMONADE_URL` is set,
-all modules' integration tests run concurrently by default, causing intermittent
-GPU/NPU resource contention on the server side.
+Integration tests hit a shared live Lemonade Server. When `LEMONADE_URL` is
+set, all modules' integration tests run concurrently by default, causing
+intermittent GPU/NPU resource contention on the server side.
 
-**Always run the full test suite with `--test-threads=1` when `LEMONADE_URL` is set.**
-`dev.sh` sets this flag automatically when it detects `LEMONADE_URL` in the environment.
+**Always run the full test suite with `--test-threads=1`.** `dev.sh` sets this
+flag automatically when it detects `LEMONADE_URL` in the environment.
 
 ```bash
-# Correct — single-threaded to avoid server contention
-LEMONADE_URL=http://localhost:13305/api/v1 cargo test -- --test-threads=1
-
-# dev.sh handles this automatically
-export LEMONADE_URL=http://localhost:13305/api/v1
-./dev.sh --backend-only
+cargo test --workspace -- --test-threads=1                         # always
+LEMONADE_URL=http://localhost:13305/api/v1 ./dev.sh --backend-only # dev.sh handles it
 ```
 
-## Important Files
+---
 
-- [env.sh](mdc:env.sh) — Optional. Sets `UFORGE_*` path variables. **No longer required for compilation**.
-- [dev.sh](mdc:dev.sh) — Development runner. Automatically sets `--test-threads=1` when `LEMONADE_URL` is present.
-- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — **Read this first** for any architectural work. Contains current module map, SQLite schema, hardware architecture, inference queue design, resolved bugs.
-- [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files (workspace root).
-- [defaults/data/memory.json](mdc:defaults/data/memory.json) — Foundation universe sample data (~220 nodes, ~312 edges).
-- [crates/u-forge-graph-view/src/snapshot.rs](mdc:crates/u-forge-graph-view/src/snapshot.rs) — `GraphSnapshot`, `NodeView`, `EdgeView`, `LodLevel`, `build_snapshot()`.
-- [crates/u-forge-graph-view/src/layout.rs](mdc:crates/u-forge-graph-view/src/layout.rs) — Force-directed layout with grid-cell bucketed O(N) repulsion.
-- [crates/u-forge-ui-traits/src/lib.rs](mdc:crates/u-forge-ui-traits/src/lib.rs) — `DrawCommand`, `Viewport`, `generate_draw_commands()` rendering pipeline.
-- [crates/u-forge-ui-gpui/src/main.rs](mdc:crates/u-forge-ui-gpui/src/main.rs) — Binary entry point only: tokio runtime, config, `KnowledgeGraph` init, schema pre-load, GPUI `Application` setup. All types live in the library target.
-- [crates/u-forge-ui-gpui/src/lib.rs](mdc:crates/u-forge-ui-gpui/src/lib.rs) — Library root: `mod` declarations (includes `chat_panel`, `search_panel`), `actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ImportData])`, `pub use app_view::AppView`.
-- [crates/u-forge-ui-gpui/src/app_view/mod.rs](mdc:crates/u-forge-ui-gpui/src/app_view/mod.rs) — `AppView` struct + constructor + data/AI operations (`refresh_snapshot`, `do_import_data`, `do_clear_data`, `do_save`, `do_rechunk_and_embed`, `do_init_lemonade`, `do_embed_all`). Holds persistent `Arc<tokio::runtime::Runtime>`, `Arc<AppConfig>`, `Option<InferenceQueue>` (std + HQ), `SidebarTab` enum (Tree/Search), and `embedding_status`. `do_save()` persists dirty tabs then triggers `do_rechunk_and_embed()` so semantic search stays current. `do_init_lemonade()` also selects LLM models, builds `LemonadeChatProvider` and a `GraphAgent` (with HQ queue), and pushes both to `ChatPanel`.
-- [crates/u-forge-ui-gpui/src/app_view/render.rs](mdc:crates/u-forge-ui-gpui/src/app_view/render.rs) — `impl Render for AppView`: menu bar, 3-panel resizable body layout (drag handles between all boundaries), sidebar tab switching (Tree/Search), embedding status in status bar center, dropdown overlays.
-- [crates/u-forge-ui-gpui/src/chat_panel.rs](mdc:crates/u-forge-ui-gpui/src/chat_panel.rs) — `ChatPanel` entity: when `GraphAgent` is set, routes through `GraphAgent::prompt_stream()` (tool-calling loop with collapsible tool call entries and streaming reasoning); falls back to direct `LemonadeChatProvider::complete_stream()` when no agent. `set_provider()` and `set_agent()` called from `AppView` after Lemonade init. `ChatRole` variants: `User`, `Assistant`, `Thinking`, `ToolCall`.
-- [crates/u-forge-agent/src/lib.rs](mdc:crates/u-forge-agent/src/lib.rs) — Five `rig::tool::Tool` impls: `FtsSearchTool`, `SemanticSearchTool`, `HybridSearchTool` (read), `UpsertNodeTool`, `UpsertEdgeTool` (write — re-chunk + embed before returning); `GraphAgent` with `prompt()` and `prompt_stream()`; `AgentStreamEvent` enum; `ToolError`.
-- [crates/u-forge-ui-gpui/src/search_panel.rs](mdc:crates/u-forge-ui-gpui/src/search_panel.rs) — `SearchPanel` entity: `SearchMode` (Fts5/Semantic/Hybrid), single-line `TextFieldView` query input, `do_search()` dispatcher, results list. `set_queues()` called from `AppView` after Lemonade init. Semantic mode uses HQ queue (4096-dim) when available; falls back to standard 768-dim. Hybrid uses `search_hybrid()` from `u-forge-core`.
-- [crates/u-forge-ui-gpui/src/graph_canvas.rs](mdc:crates/u-forge-ui-gpui/src/graph_canvas.rs) — `GraphCanvas`: pan/zoom canvas, LOD edge batching, viewport culling, `save_layout()`.
-- [crates/u-forge-ui-gpui/src/node_editor/mod.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/mod.rs) — `NodeEditorPanel` struct + tab management (`open_or_focus_tab`, `close_tab`, `save_dirty_tabs` → returns `(count, Vec<ObjectId>)` for re-embedding).
-- [crates/u-forge-ui-gpui/src/node_editor/field_spec.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/field_spec.rs) — `FieldKind`, `FieldSpec`, `EditorTab`, layout constants.
-- [crates/u-forge-ui-gpui/src/node_editor/render.rs](mdc:crates/u-forge-ui-gpui/src/node_editor/render.rs) — `impl Render for NodeEditorPanel`: tab bar, schema-driven multi-column form, pagination.
-- [crates/u-forge-ui-gpui/src/node_panel.rs](mdc:crates/u-forge-ui-gpui/src/node_panel.rs) — `NodePanel`: collapsible type-grouped node list sidebar; uses `w_full()`, parent container controls width.
-- [crates/u-forge-ui-gpui/src/text_field.rs](mdc:crates/u-forge-ui-gpui/src/text_field.rs) — `TextFieldView`: canvas-based text input with pixel-exact cursor, IME, blink timer. Multiline: vertical scroll (`scroll_offset`), `wrap_width = Some(inner_w)`, grows to 120 px cap. Single-line: horizontal scroll (`h_scroll_offset`, `visible_width`), `wrap_width = None`, fixed `TEXT_FIELD_MIN_H`. `submit_on_enter: bool` — when true on multiline fields, Enter emits `TextSubmit` and Shift+Enter inserts a newline (used by `ChatPanel`). Mouse and IME click-to-cursor both compensate for the active scroll offset.
-- [crates/u-forge-ui-gpui/src/selection_model.rs](mdc:crates/u-forge-ui-gpui/src/selection_model.rs) — `SelectionModel`: shared GPUI entity observed by `NodePanel`, `GraphCanvas`, and `NodeEditorPanel`.
+## Cross-cutting files worth knowing
 
-## Module Map (u-forge-core)
+- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — workspace layout, SQLite schema,
+  inference design, design decisions. **Read this first** for any architectural
+  work.
+- [env.sh](mdc:env.sh) — optional. Sets `UFORGE_*` path variables only; no
+  longer required for compilation.
+- [dev.sh](mdc:dev.sh) — development runner. Auto-sets `--test-threads=1` when
+  `LEMONADE_URL` is present.
+- [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files
+  (workspace root, not inside any crate).
+- [defaults/data/memory.jsonl](mdc:defaults/data/memory.jsonl) — Foundation
+  universe sample data (~220 nodes, ~312 edges). Canonical JSONL format.
 
-All paths below are relative to `crates/u-forge-core/`.
-
-| File | Role | Key Types |
-|---|---|---|
-| `src/lib.rs` | Facade + re-exports | `KnowledgeGraph` |
-| `src/builder.rs` | ObjectBuilder fluent API | `ObjectBuilder` |
-| `src/text.rs` | Word-boundary text splitting (pub(crate)) | `split_text` |
-| `src/lib_tests.rs` | KnowledgeGraph + ObjectBuilder integration tests | *(test-only)* |
-| `src/types.rs` | All domain types | `ObjectMetadata`, `Edge`, `EdgeType`, `TextChunk`, `QueryResult` |
-| `src/graph/storage.rs` | SQLite persistence | `KnowledgeGraphStorage`, `GraphStats`, `EMBEDDING_DIMENSIONS`, `HIGH_QUALITY_EMBEDDING_DIMENSIONS`, `MAX_CHUNK_TOKENS` |
-| `src/graph/edges.rs` | Edge CRUD + `get_all_edges()` bulk fetch | `KnowledgeGraphStorage` (impl) |
-| `src/graph/nodes.rs` | Node CRUD + `get_nodes_paginated()` | `KnowledgeGraphStorage` (impl) |
-| `src/ai/embeddings.rs` | Embedding trait + re-exports | `EmbeddingProvider` (trait), `EmbeddingModelInfo`, `EmbeddingProviderType`; re-exports `LemonadeProvider` from `lemonade/embedding.rs` |
-| `src/ai/transcription.rs` | Transcription trait + MIME helper + re-exports | `TranscriptionProvider` (trait), `mime_for_filename`; re-exports `LemonadeTranscriptionProvider` from `lemonade/transcription.rs` |
-| `src/config.rs` | Application configuration (TOML loading, weights, model prefs) | `AppConfig`, `EmbeddingDeviceConfig`, `ModelConfig`, `ModelLoadParams`, `ChatConfig`, `ChatDeviceConfig`, `ChatDevice` |
-| `src/queue/dispatch.rs` | Unified MPMC inference dispatch queue | `InferenceQueue`, `QueueStats` |
-| `src/queue/builder.rs` | Queue builder — registers `BuiltProvider` values, spawns workers | `InferenceQueueBuilder` |
-| `src/queue/jobs.rs` | Internal job types + WorkQueue primitive | `EmbedJob`, `TranscribeJob`, `WorkQueue<T>` |
-| `src/queue/weighted.rs` | Weighted embedding job dispatcher (EWMA latency + work stealing) | `WeightedEmbedDispatcher`, `WeightedWorkerSlot` |
-| `src/queue/workers.rs` | Background worker loops | `run_embed_worker`, `run_transcribe_worker`, etc. |
-| `src/lemonade/catalog.rs` | Lemonade Server catalog discovery | `LemonadeServerCatalog`, `CatalogModel`, `InstalledBackend`, `LoadedModel` |
-| `src/lemonade/selector.rs` | Catalog-driven model selection (per-capability, per-device-slot dedup) | `ModelSelector`, `SelectedModel`, `QualityTier` |
-| `src/lemonade/provider_factory.rs` | Provider construction from `SelectedModel` | `ProviderFactory`, `Capability`, `BuiltProvider`, `ProviderSlot` |
-| `src/lemonade/duplicate_guard.rs` | Detects duplicate llamacpp model names across backends | `DuplicateGuard` |
-| `src/lemonade/embedding.rs` | Embedding provider impl | `LemonadeProvider` |
-| `src/lemonade/transcription.rs` | Transcription provider impl (no GPU lock) | `LemonadeTranscriptionProvider` |
-| `src/lemonade/gpu_manager.rs` | GPU resource serialisation | `GpuResourceManager`, `GpuWorkload`, `LlmGuard`, `SttGuard` |
-| `src/lemonade/chat.rs` | LLM chat provider | `LemonadeChatProvider`, `ChatRequest`, `ChatMessage`, `ChatCompletionResponse` |
-| `src/lemonade/stt.rs` | GPU-managed STT provider | `LemonadeSttProvider`, `TranscriptionResult` |
-| `src/lemonade/tts.rs` | TTS provider | `LemonadeTtsProvider`, `KokoroVoice` |
-| `src/lemonade/rerank.rs` | Cross-encoder reranking | `LemonadeRerankProvider`, `RerankDocument` |
-| `src/lemonade/system_info.rs` | System hardware info | `SystemInfo`, `SystemDeviceInfo`, `RecipeBackendInfo` |
-| `src/lemonade/load.rs` | Model load/unload (`POST /api/v1/load`) | `load_model()`, `ModelLoadOptions` |
-| `src/lemonade/health.rs` | Server health | `LemonadeHealth`, `LoadedModelEntry` |
-| `src/search/mod.rs` | Hybrid search pipeline (FTS5 + ANN + rerank) | `search_hybrid`, `HybridSearchConfig`, `NodeSearchResult`, `SearchSources` |
-| `src/search/sanitize.rs` | FTS5 query sanitisation | `fts5_sanitize` |
-| `src/schema/` | Schema definition, load/validate/cache, ingestion | `SchemaDefinition`, `SchemaManager`, `SchemaIngestion` |
-| `src/ingest/data.rs` | JSONL import pipeline | `DataIngestion`, `JsonEntry`, `IngestionStats` |
-| `src/ingest/embedding.rs` | Batch + per-node embedding | `embed_all_chunks`, `rechunk_and_embed`, `build_hq_embed_queue`, `EmbeddingTarget`, `EmbeddingResult` |
-| `src/ingest/pipeline.rs` | High-level ingestion orchestration | `setup_and_index`, `SetupResult` |
-
-## ModelSelector Device Slots
-
-`ModelSelector` assigns each downloaded model a **device slot** that determines deduplication:
-- `flm` recipe → slot `"npu"`
-- `llamacpp` + `rocm`/`vulkan`/`metal` backend → slot `"gpu"`
-- `llamacpp` + cpu or no backend → slot `"cpu"`
-- other recipes (e.g. `whispercpp`, `kokoro`) → slot = recipe name
-
-At most one provider is built per slot per quality tier (for embeddings) or per slot (for LLM/STT). `model_by_id(id, quality_tier)` bypasses preference lists for exact-ID lookups (used by `do_init_lemonade` to honour `[chat.gpu]`/`[chat.npu]` config overrides).
+All per-file roles and types are covered by comments inside each source file.
+Browse the crate source directly rather than duplicating a file index here.
