@@ -639,7 +639,16 @@ impl ChatPanel {
     }
 
     /// Start a new empty chat session.
+    ///
+    /// No-op while streaming: swapping `self.messages` mid-stream would cause
+    /// in-flight `TextDelta` / `ReasoningDelta` events to append to the new
+    /// session and `finalize_stream` to save the polluted list under the
+    /// wrong session_id. The Send button is already gated on `streaming`.
     fn new_session(&mut self, cx: &mut Context<Self>) {
+        if self.streaming {
+            tracing::debug!("new_session suppressed: stream in progress");
+            return;
+        }
         // Save current session before switching.
         if !self.messages.is_empty() {
             self.save_current_session(cx);
@@ -653,7 +662,13 @@ impl ChatPanel {
     }
 
     /// Switch to an existing session by ID.
+    ///
+    /// No-op while streaming — see `new_session` for the race it prevents.
     fn load_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        if self.streaming {
+            tracing::debug!(%session_id, "load_session suppressed: stream in progress");
+            return;
+        }
         // Save current session before switching.
         if !self.messages.is_empty() {
             self.save_current_session(cx);
@@ -682,7 +697,15 @@ impl ChatPanel {
     }
 
     /// Delete a session from history. If it's the current session, clear the chat.
+    ///
+    /// Deleting the **active** session while streaming is suppressed (it would
+    /// clear `self.messages` out from under the in-flight stream). Deleting a
+    /// different session is always safe.
     fn delete_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        if self.streaming && self.current_session_id.as_deref() == Some(session_id) {
+            tracing::debug!(%session_id, "delete_session suppressed: active session is streaming");
+            return;
+        }
         let store = match &self.history_store {
             Some(s) => s.clone(),
             None => return,

@@ -755,14 +755,18 @@ impl Tool for UpsertEdgeTool {
 
         // Re-embed both endpoints so the new relationship appears in semantic search.
         // Deduplicate when source == target (self-loop) to avoid embedding the same node twice.
+        // Collect failures so the LLM sees partial success in the tool Output rather than
+        // believing the edge is fully indexed.
         let hq_ref = self.hq_queue.as_deref();
         let mut to_reembed = vec![source_id];
         if target_id != source_id {
             to_reembed.push(target_id);
         }
+        let mut reembed_warnings: Vec<String> = Vec::new();
         for &oid in &to_reembed {
             if let Err(e) = rechunk_and_embed(&self.graph, &self.queue, hq_ref, oid).await {
                 tracing::warn!(object_id = %oid, %e, "Re-embed after edge upsert failed");
+                reembed_warnings.push(format!("[warning] endpoint {oid} re-embed failed: {e:#}"));
             }
         }
 
@@ -782,10 +786,15 @@ impl Tool for UpsertEdgeTool {
             .map(|m| m.name)
             .unwrap_or_else(|| target_id.to_string());
 
-        Ok(format!(
+        let mut output = format!(
             "Edge created: {source_name} -[{}]-> {target_name} (weight: {weight:.2})",
             args.edge_type,
-        ))
+        );
+        for w in &reembed_warnings {
+            output.push('\n');
+            output.push_str(w);
+        }
+        Ok(output)
     }
 }
 
@@ -1052,12 +1061,18 @@ impl GraphAgent {
 
             let mut final_text = String::new();
 
-            while let Some(item) = stream.next().await {
+            // `'stream` labels the outer loop so every send-on-error can break it directly.
+            // If the receiver is dropped (user closed the chat panel, app exited) we stop
+            // driving the rig stream instead of burning LLM inference and potentially
+            // running write tools the caller will never observe.
+            'stream: while let Some(item) = stream.next().await {
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
                         StreamedAssistantContent::Text(t) => {
                             final_text.push_str(&t.text);
-                            let _ = tx.send(AgentStreamEvent::TextDelta(t.text)).await;
+                            if tx.send(AgentStreamEvent::TextDelta(t.text)).await.is_err() {
+                                break 'stream;
+                            }
                         }
                         StreamedAssistantContent::ToolCall {
                             tool_call,
@@ -1066,13 +1081,17 @@ impl GraphAgent {
                             let args_display =
                                 serde_json::to_string_pretty(&tool_call.function.arguments)
                                     .unwrap_or_else(|_| tool_call.function.arguments.to_string());
-                            let _ = tx
+                            if tx
                                 .send(AgentStreamEvent::ToolCallStart {
                                     internal_id: internal_call_id,
                                     name: tool_call.function.name,
                                     args_display,
                                 })
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                break 'stream;
+                            }
                         }
                         StreamedAssistantContent::Reasoning(r) => {
                             // Full reasoning block (some providers emit this instead of deltas).
@@ -1082,14 +1101,24 @@ impl GraphAgent {
                                     ..
                                 } = chunk
                                 {
-                                    let _ = tx
+                                    if tx
                                         .send(AgentStreamEvent::ReasoningDelta(text.clone()))
-                                        .await;
+                                        .await
+                                        .is_err()
+                                    {
+                                        break 'stream;
+                                    }
                                 }
                             }
                         }
                         StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                            let _ = tx.send(AgentStreamEvent::ReasoningDelta(reasoning)).await;
+                            if tx
+                                .send(AgentStreamEvent::ReasoningDelta(reasoning))
+                                .await
+                                .is_err()
+                            {
+                                break 'stream;
+                            }
                         }
                         // Final(R) and ToolCallDelta are ignored — text arrives via TextDelta.
                         _ => {}
@@ -1111,12 +1140,16 @@ impl GraphAgent {
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            let _ = tx
+                            if tx
                                 .send(AgentStreamEvent::ToolResult {
                                     internal_id: internal_call_id,
                                     content: result_text,
                                 })
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                break 'stream;
+                            }
                         }
                     },
                     Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
@@ -1128,14 +1161,14 @@ impl GraphAgent {
                             final_text.clone()
                         };
                         let _ = tx.send(AgentStreamEvent::Done(text)).await;
-                        break;
+                        break 'stream;
                     }
                     Ok(_) => {
                         // Non-exhaustive: ignore any new MultiTurnStreamItem variants.
                     }
                     Err(e) => {
                         let _ = tx.send(AgentStreamEvent::Error(e.to_string())).await;
-                        break;
+                        break 'stream;
                     }
                 }
             }

@@ -135,6 +135,9 @@ pub struct AppView {
     pub(crate) last_frame_cost_us: u64,
     /// Rolling window of the last 60 frame costs in microseconds.
     pub(crate) frame_times_us: VecDeque<u64>,
+    /// Epoch for the embedding-status sampler. Bumping cancels any in-flight
+    /// sampler timers so stale ticks don't overwrite a fresh status string.
+    pub(crate) embedding_sampler_epoch: usize,
 }
 
 impl AppView {
@@ -226,6 +229,7 @@ impl AppView {
             perf_enabled: false,
             last_frame_cost_us: 0,
             frame_times_us: VecDeque::new(),
+            embedding_sampler_epoch: 0,
         };
 
         view.do_init_lemonade(cx);
@@ -397,6 +401,59 @@ impl AppView {
         cx.notify();
     }
 
+    /// Start (or restart) a periodic sampler that appends the current queue
+    /// pending-embedding count to `self.embedding_status`. Bumping
+    /// `embedding_sampler_epoch` implicitly cancels any prior sampler.
+    ///
+    /// The sampler polls `InferenceQueue::stats()` every 500 ms and rewrites
+    /// `embedding_status` to `"{base_status} ({N} pending)"` when N > 0.
+    /// It stops when the epoch changes (i.e. another embedding operation
+    /// starts, or `stop_embedding_sampler` is called on completion).
+    fn spawn_embedding_sampler(&mut self, base_status: String, cx: &mut Context<Self>) {
+        self.embedding_sampler_epoch = self.embedding_sampler_epoch.wrapping_add(1);
+        let epoch = self.embedding_sampler_epoch;
+        let queue = self.inference_queue.clone();
+        let hq_queue = self.hq_queue.clone();
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let Some(this) = this.upgrade() else { return };
+                let pending = queue.as_ref().map(|q| q.stats().pending_embeddings).unwrap_or(0)
+                    + hq_queue
+                        .as_ref()
+                        .map(|q| q.stats().pending_embeddings)
+                        .unwrap_or(0);
+                let keep_running = this
+                    .update(cx, |view: &mut AppView, cx| {
+                        if view.embedding_sampler_epoch != epoch {
+                            return false;
+                        }
+                        view.embedding_status = if pending > 0 {
+                            Some(format!("{base_status} ({pending} pending)"))
+                        } else {
+                            Some(base_status.clone())
+                        };
+                        cx.notify();
+                        true
+                    })
+                    .ok();
+                if keep_running != Some(true) {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Cancel the embedding-status sampler by bumping its epoch.
+    /// Callers then write the final status string directly.
+    fn stop_embedding_sampler(&mut self) {
+        self.embedding_sampler_epoch = self.embedding_sampler_epoch.wrapping_add(1);
+    }
+
     /// Asynchronously re-chunk and embed a set of nodes (standard + optional HQ).
     ///
     /// Used by [`do_save`] to keep embeddings in sync with edited node content.
@@ -412,8 +469,10 @@ impl AppView {
         let tokio_rt = self.tokio_rt.clone();
         let count = node_ids.len();
 
-        self.embedding_status = Some(format!("Re-embedding {count} node(s)…"));
+        let base_status = format!("Re-embedding {count} node(s)…");
+        self.embedding_status = Some(base_status.clone());
         cx.notify();
+        self.spawn_embedding_sampler(base_status, cx);
 
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -438,6 +497,7 @@ impl AppView {
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
+                view.stop_embedding_sampler();
                 match result {
                     Ok((chunks, 0)) if chunks > 0 => {
                         view.embedding_status = Some(format!("Re-embedded {chunks} chunk(s)"));
@@ -760,8 +820,10 @@ impl AppView {
         let graph = self.graph.clone();
         let tokio_rt = self.tokio_rt.clone();
 
-        self.embedding_status = Some("Embedding…".to_string());
+        let base_status = "Embedding…".to_string();
+        self.embedding_status = Some(base_status.clone());
         cx.notify();
+        self.spawn_embedding_sampler(base_status, cx);
 
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -785,6 +847,7 @@ impl AppView {
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
+                view.stop_embedding_sampler();
                 match result {
                     Ok((std_r, hq_r)) => {
                         // Only report if something was actually embedded.
