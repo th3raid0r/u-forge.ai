@@ -64,6 +64,10 @@ pub(crate) struct ChatPanel {
     submit_sub: gpui::Subscription,
     /// Virtualized list state for the message area (only renders visible items).
     list_state: ListState,
+    /// Virtualized list state for the session history dropdown. Prevents
+    /// O(N) row allocation per frame when the dropdown is open and the user
+    /// has accumulated many sessions.
+    history_list_state: ListState,
     /// Chat history persistence store (None if DB couldn't be opened).
     history_store: Option<ChatHistoryStore>,
     /// ID of the currently active chat session.
@@ -163,6 +167,11 @@ impl ChatPanel {
             tokio_rt,
             submit_sub,
             list_state: ListState::new(msg_count, ListAlignment::Bottom, px(200.0)),
+            history_list_state: ListState::new(
+                session_list.len(),
+                ListAlignment::Top,
+                px(200.0),
+            ),
             history_store,
             current_session_id,
             session_list,
@@ -636,6 +645,7 @@ impl ChatPanel {
 
         // Refresh the cached session list.
         self.session_list = store.list_sessions().unwrap_or_default();
+        self.history_list_state.reset(self.session_list.len());
     }
 
     /// Start a new empty chat session.
@@ -725,6 +735,7 @@ impl ChatPanel {
 
         // Refresh the cached session list.
         self.session_list = store.list_sessions().unwrap_or_default();
+        self.history_list_state.reset(self.session_list.len());
         cx.notify();
     }
 }
@@ -740,77 +751,87 @@ impl Render for ChatPanel {
         let history_dropdown_open = self.history_dropdown_open;
         let history_label = self.session_title();
 
-        // Build history dropdown items.
-        let history_items: Vec<_> = if history_dropdown_open {
-            self.session_list
-                .iter()
-                .enumerate()
-                .map(|(idx, session)| {
-                    let is_current = self.current_session_id.as_deref() == Some(&session.id);
-                    let title = session.title.clone();
-                    let sid_load = session.id.clone();
-                    let sid_del = session.id.clone();
-                    div()
-                        .id(("hist", idx))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .h(px(24.0))
-                        .px_2()
-                        .when(is_current, |el| el.bg(rgba(0x45475a88)))
-                        .hover(|s| s.bg(rgba(0x45475a66)))
-                        .child({
-                            let mut title_el = div()
-                                .id(("hist-title", idx))
-                                .flex()
-                                .items_center()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(if is_current {
-                                    rgba(0xcdd6f4ff)
-                                } else {
-                                    rgba(0xa6adc8ff)
-                                })
-                                .cursor_pointer()
-                                .overflow_x_hidden()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+        // Virtualized history dropdown list — only renders visible rows so the
+        // dropdown stays cheap even with hundreds of accumulated sessions.
+        let history_list_entity = cx.entity().clone();
+        let history_list_el = list(
+            self.history_list_state.clone(),
+            move |ix, _window, cx: &mut App| {
+                let panel = history_list_entity.read(cx);
+                let Some(session) = panel.session_list.get(ix).cloned() else {
+                    return div().into_any_element();
+                };
+                let is_current =
+                    panel.current_session_id.as_deref() == Some(&session.id);
+                let entity_load = history_list_entity.clone();
+                let sid_load = session.id.clone();
+                let entity_del = history_list_entity.clone();
+                let sid_del = session.id.clone();
+                let title = session.title.clone();
+
+                div()
+                    .id(("hist", ix))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(24.0))
+                    .px_2()
+                    .when(is_current, |el| el.bg(rgba(0x45475a88)))
+                    .hover(|s| s.bg(rgba(0x45475a66)))
+                    .child({
+                        let mut title_el = div()
+                            .id(("hist-title", ix))
+                            .flex()
+                            .items_center()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(if is_current {
+                                rgba(0xcdd6f4ff)
+                            } else {
+                                rgba(0xa6adc8ff)
+                            })
+                            .cursor_pointer()
+                            .overflow_x_hidden()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                move |_: &MouseDownEvent, _window, cx: &mut App| {
+                                    entity_load.update(cx, |this, cx| {
                                         this.load_session(&sid_load, cx);
-                                    }),
-                                )
-                                .child(title);
-                            title_el.style().flex_grow = Some(1.0);
-                            title_el.style().flex_shrink = Some(1.0);
-                            title_el
-                        })
-                        .child(
-                            div()
-                                .id(("hist-del", idx))
-                                .flex()
-                                .flex_none()
-                                .items_center()
-                                .justify_center()
-                                .w(px(18.0))
-                                .h(px(18.0))
-                                .rounded(px(2.0))
-                                .text_xs()
-                                .text_color(rgba(0x6c708688))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                    });
+                                },
+                            )
+                            .child(title);
+                        title_el.style().flex_grow = Some(1.0);
+                        title_el.style().flex_shrink = Some(1.0);
+                        title_el
+                    })
+                    .child(
+                        div()
+                            .id(("hist-del", ix))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .rounded(px(2.0))
+                            .text_xs()
+                            .text_color(rgba(0x6c708688))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                move |_: &MouseDownEvent, _window, cx: &mut App| {
+                                    entity_del.update(cx, |this, cx| {
                                         this.delete_session(&sid_del, cx);
-                                    }),
-                                )
-                                .child("✕"),
-                        )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                                    });
+                                },
+                            )
+                            .child("✕"),
+                    )
+                    .into_any_element()
+            },
+        );
 
         // Build the virtualized message list. Only visible items (+ overdraw
         // buffer) are rendered, so long chat histories don't slow down layout.
@@ -966,15 +987,22 @@ impl Render for ChatPanel {
                                 .id("history-dropdown")
                                 .flex()
                                 .flex_col()
+                                .flex_none()
                                 .w_full()
                                 .bg(rgb(0x313244))
                                 .border_1()
                                 .border_color(rgb(0x45475a))
                                 .rounded(px(3.0))
                                 .mt_1()
-                                .max_h(px(200.0))
-                                .overflow_y_scroll()
-                                .children(history_items),
+                                .h(px(200.0))
+                                .overflow_hidden()
+                                .child({
+                                    let mut el = history_list_el;
+                                    el.style().flex_grow = Some(1.0);
+                                    el.style().flex_shrink = Some(1.0);
+                                    el.style().flex_basis = Some(relative(0.).into());
+                                    el
+                                }),
                         )
                     }),
             )

@@ -128,13 +128,17 @@ Then: `cargo check --workspace`, `cargo clippy --workspace --all-targets
 
 ---
 
-## Tier 2 — Frame-perf wins (queued, small, measurable)
+## Tier 2 — Frame-perf wins (**LANDED** on this branch)
 
-Each item is a self-contained surgical fix, typically < 50 lines. They are
-independent — any one can land alone. Measure with the built-in perf overlay
-(`Ctrl+Shift+P` in the GPUI app, `frame:<ms>` counter).
+Each item was a self-contained surgical fix, typically < 50 lines. They were
+independent — any one could have landed alone. Measure with the built-in perf
+overlay (`Ctrl+Shift+P` in the GPUI app, `frame:<ms>` counter).
 
-### 2.1 ✅ Cache legend type list in `GraphCanvas` state
+**Status:** all four items landed. Summary in `.rules` → "Recent quality
+improvements". Microbenchmarks were not run — per-item expected wins were
+small (≤ 1–3 ms/frame) and the fixes are independently correct.
+
+### ~~2.1 ✅ Cache legend type list in `GraphCanvas` state~~
 
 **Where:** `crates/u-forge-ui-gpui/src/graph_canvas.rs:246-255`.
 
@@ -150,10 +154,15 @@ scales linearly.
 when the snapshot is notified (observe the snapshot `RwLock` the same way
 the selection model does). On paint, read the cached vec.
 
+**Landed.** Precomputed on `GraphSnapshot` itself in `build_snapshot()` —
+cleaner than caching on the canvas because it reuses the existing snapshot-
+rebuild lifecycle (triggered on create/delete/save). No observation plumbing
+needed.
+
 **Measurement.** Perf overlay `frame:` before/after on a large graph.
 Expected drop: 1–3 ms/frame.
 
-### 2.2 ✅ Split `generate_draw_commands()` output into typed vecs
+### ~~2.2 ✅ Split `generate_draw_commands()` output into typed vecs~~
 
 **Where:** `crates/u-forge-ui-traits/src/lib.rs` (the function), consumed at
 `crates/u-forge-ui-gpui/src/graph_canvas.rs:258-339` (edges, nodes, labels
@@ -172,10 +181,15 @@ Vec<NodeCmd>, edges: Vec<LineCmd>, labels: Vec<TextCmd> }` (or a tuple).
 Callers iterate each vec directly. The `DrawCommand` enum can stay as a
 convenience alias, but the hot path uses the typed lists.
 
+**Landed.** Introduced `NodeCmd` / `LineCmd` / `TextCmd` newtypes and a
+`DrawCommands` container; dropped the `DrawCommand` enum (no implementations
+outside the hot path). `GraphRenderer::draw_commands` now takes
+`&DrawCommands`. The GPUI canvas iterates each typed vec once.
+
 **Measurement.** Microbench the paint closure in release or time the three
 filter sections in `graph_canvas.rs` before/after.
 
-### 2.3 🔎 Virtualize the chat history dropdown
+### ~~2.3 🔎 Virtualize the chat history dropdown~~
 
 **Where:** `crates/u-forge-ui-gpui/src/chat_panel.rs:765-798` area.
 
@@ -190,10 +204,15 @@ is open this is O(N) allocation + DOM construction.
 messages (see `ChatPanel::list_state` at line 66). Lazy-render only visible
 rows.
 
+**Landed.** `ChatPanel::history_list_state: ListState`. Per-row click
+handlers use `entity.update(cx, ...)` directly (not `cx.listener`, which
+isn't available inside the `list(...)` App-scoped child closure). Reset on
+every `session_list` refresh (save + delete paths).
+
 **Measurement.** With 100+ sessions, open the dropdown and watch the perf
 overlay. Expected drop: < 1 ms/frame with virtualization.
 
-### 2.4 🔎 Gate frame-time average on perf-overlay visibility
+### ~~2.4 🔎 Gate frame-time average on perf-overlay visibility~~
 
 **Where:** `crates/u-forge-ui-gpui/src/app_view/render.rs:44-50, 807-810`.
 
@@ -205,6 +224,11 @@ whether or not the perf overlay is being displayed.
 **Fix.** Compute the average only inside the `if perf_enabled` branch.
 Optional: replace `VecDeque<u64>` with a fixed `[u64; 60]` and a write
 index — no allocation, faster indexing.
+
+**Landed.** Added `FrameTimeRing` (`[u64; 60]` with `len` + `write` cursor)
+in `app_view/mod.rs`. Sampling is already gated via `.when(perf_enabled,
+...)` on the timing canvas; averaging is now a single method call behind
+the existing `if perf_enabled` in `perf_text`.
 
 **Measurement.** Disable perf overlay, profile; re-enable and re-profile.
 Sub-millisecond noise, cumulative on high-refresh displays.

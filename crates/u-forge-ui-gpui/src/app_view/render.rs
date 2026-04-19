@@ -42,13 +42,11 @@ impl Render for AppView {
         // start, which is the actual frame cost the user perceives.
         let perf_text: Option<String> = if perf_enabled {
             let frame_ms = self.last_frame_cost_us as f32 / 1_000.0;
-            let avg_ms = if !self.frame_times_us.is_empty() {
-                let avg_us = self.frame_times_us.iter().sum::<u64>()
-                    / self.frame_times_us.len() as u64;
-                avg_us as f32 / 1_000.0
-            } else {
-                frame_ms
-            };
+            let avg_ms = self
+                .frame_times_us
+                .average()
+                .map(|us| us as f32 / 1_000.0)
+                .unwrap_or(frame_ms);
             let chat_us = self.chat_panel.read(cx).last_render_us;
             let chat_ms = chat_us as f32 / 1_000.0;
             Some(format!(
@@ -804,10 +802,7 @@ impl Render for AppView {
                             let elapsed_us = frame_start.elapsed().as_micros() as u64;
                             timing_entity.update(cx, |this, _cx| {
                                 this.last_frame_cost_us = elapsed_us;
-                                this.frame_times_us.push_back(elapsed_us);
-                                if this.frame_times_us.len() > 60 {
-                                    this.frame_times_us.pop_front();
-                                }
+                                this.frame_times_us.push(elapsed_us);
                             });
                         },
                     )

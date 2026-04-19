@@ -1,6 +1,6 @@
 mod render;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{prelude::*, Context, Empty, Entity, Subscription};
@@ -91,6 +91,56 @@ pub(crate) enum SidebarTab {
     Search,
 }
 
+/// Number of frame-cost samples retained for the rolling perf-overlay average.
+const FRAME_TIME_WINDOW: usize = 60;
+
+/// Fixed-size ring buffer of recent frame costs in microseconds. Recording
+/// is gated on `AppView::perf_enabled`; `clear()` resets the write cursor
+/// when the overlay is toggled off so stale samples don't bleed across
+/// enable/disable cycles.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameTimeRing {
+    samples: [u64; FRAME_TIME_WINDOW],
+    /// Count of valid samples (0..=FRAME_TIME_WINDOW).
+    len: usize,
+    /// Index of the next write slot (wraps modulo FRAME_TIME_WINDOW).
+    write: usize,
+}
+
+impl Default for FrameTimeRing {
+    fn default() -> Self {
+        Self {
+            samples: [0; FRAME_TIME_WINDOW],
+            len: 0,
+            write: 0,
+        }
+    }
+}
+
+impl FrameTimeRing {
+    pub(crate) fn push(&mut self, sample: u64) {
+        self.samples[self.write] = sample;
+        self.write = (self.write + 1) % FRAME_TIME_WINDOW;
+        if self.len < FRAME_TIME_WINDOW {
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+        self.write = 0;
+    }
+
+    /// Mean of the recorded samples, or `None` when the buffer is empty.
+    pub(crate) fn average(&self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        let sum: u64 = self.samples[..self.len].iter().sum();
+        Some(sum / self.len as u64)
+    }
+}
+
 pub struct AppView {
     pub(crate) graph_canvas: Entity<GraphCanvas>,
     pub(crate) node_panel: Entity<NodePanel>,
@@ -133,8 +183,11 @@ pub struct AppView {
     /// Frame cost (µs) of the last rendered frame, measured via canvas timer
     /// (render-tree build + GPUI layout pass + paint start).
     pub(crate) last_frame_cost_us: u64,
-    /// Rolling window of the last 60 frame costs in microseconds.
-    pub(crate) frame_times_us: VecDeque<u64>,
+    /// Fixed-size ring buffer of recent frame costs (µs). Written by the
+    /// timing canvas only while the perf overlay is visible; summed once
+    /// per frame to compute `avg_ms`. Fixed array avoids any per-frame
+    /// allocation from the prior `VecDeque`.
+    pub(crate) frame_times_us: FrameTimeRing,
     /// Epoch for the embedding-status sampler. Bumping cancels any in-flight
     /// sampler timers so stale ticks don't overwrite a fresh status string.
     pub(crate) embedding_sampler_epoch: usize,
@@ -228,7 +281,7 @@ impl AppView {
             _node_subs: vec![node_sub_create, node_sub_delete],
             perf_enabled: false,
             last_frame_cost_us: 0,
-            frame_times_us: VecDeque::new(),
+            frame_times_us: FrameTimeRing::default(),
             embedding_sampler_epoch: 0,
         };
 

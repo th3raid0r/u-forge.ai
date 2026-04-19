@@ -48,6 +48,10 @@ pub struct GraphSnapshot {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<EdgeView>,
     pub spatial_index: RTree<NodeEntry>,
+    /// Unique node `object_type` values, sorted case-insensitively. Precomputed
+    /// at snapshot build time so renderers can draw the color legend without
+    /// iterating `nodes` every paint frame.
+    pub legend_types: Vec<String>,
 }
 
 impl GraphSnapshot {
@@ -207,10 +211,21 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         .collect();
     let spatial_index = RTree::bulk_load(entries);
 
+    // Precompute the sorted unique type list for the rendering legend.
+    let mut legend_types: Vec<String> = {
+        let mut seen = std::collections::BTreeSet::new();
+        for node in &nodes {
+            seen.insert(node.object_type.clone());
+        }
+        seen.into_iter().collect()
+    };
+    legend_types.sort_by_key(|a| a.to_lowercase());
+
     Ok(GraphSnapshot {
         nodes,
         edges,
         spatial_index,
+        legend_types,
     })
 }
 

@@ -9,7 +9,7 @@ use gpui::{
 use parking_lot::RwLock;
 use u_forge_core::{KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{GraphSnapshot, LodLevel};
-use u_forge_ui_traits::{generate_draw_commands, node_color_for_type, DrawCommand, Viewport, NODE_RADIUS};
+use u_forge_ui_traits::{generate_draw_commands, node_color_for_type, Viewport, NODE_RADIUS};
 
 use crate::selection_model::SelectionModel;
 
@@ -107,7 +107,7 @@ impl GraphCanvas {
     }
 }
 
-/// Convert DrawCommand color `[u8;4]` → gpui `rgb` u32 (ignores alpha).
+/// Convert draw-command color `[u8;4]` → gpui `rgb` u32 (ignores alpha).
 fn color_to_rgb(c: [u8; 4]) -> u32 {
     ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
 }
@@ -242,42 +242,35 @@ impl Render for GraphCanvas {
                         let commands =
                             generate_draw_commands(&snap, &viewport, selected_node_idx);
                         let lod = viewport.lod_level();
-                        // Collect sorted unique types for the legend before releasing the lock.
-                        let mut legend_types: Vec<String> = {
-                            let mut seen = std::collections::BTreeSet::new();
-                            for node in &snap.nodes {
-                                seen.insert(node.object_type.clone());
-                            }
-                            seen.into_iter().collect()
-                        };
-                        legend_types
-                            .sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                        // Clone the precomputed legend so we can drop the read lock.
+                        // `legend_types` is built once in `build_snapshot()` and only
+                        // changes when the snapshot is rebuilt — no per-frame scan.
+                        let legend_types = snap.legend_types.clone();
                         drop(snap);
 
                         // ── Edges (batched paths) ────────────────────────────────────
-                        let edge_commands: Vec<&DrawCommand> = commands
-                            .iter()
-                            .filter(|c| matches!(c, DrawCommand::Line { .. }))
-                            .collect();
-
-                        if !edge_commands.is_empty() {
+                        if !commands.edges.is_empty() {
                             let mut builder = PathBuilder::stroke(px(1.0));
                             let mut count = 0;
                             let edge_color = rgb(0x585b70);
 
-                            for cmd in &edge_commands {
-                                if let DrawCommand::Line { from, to, .. } = cmd {
-                                    builder.move_to(point(px(from.x + ox), px(from.y + oy)));
-                                    builder.line_to(point(px(to.x + ox), px(to.y + oy)));
-                                    count += 1;
+                            for edge in &commands.edges {
+                                builder.move_to(point(
+                                    px(edge.from.x + ox),
+                                    px(edge.from.y + oy),
+                                ));
+                                builder.line_to(point(
+                                    px(edge.to.x + ox),
+                                    px(edge.to.y + oy),
+                                ));
+                                count += 1;
 
-                                    if count >= EDGE_BATCH_SIZE {
-                                        if let Ok(path) = builder.build() {
-                                            window.paint_path(path, edge_color);
-                                        }
-                                        builder = PathBuilder::stroke(px(1.0));
-                                        count = 0;
+                                if count >= EDGE_BATCH_SIZE {
+                                    if let Ok(path) = builder.build() {
+                                        window.paint_path(path, edge_color);
                                     }
+                                    builder = PathBuilder::stroke(px(1.0));
+                                    count = 0;
                                 }
                             }
                             if count > 0 {
@@ -289,92 +282,72 @@ impl Render for GraphCanvas {
 
                         // ── Nodes (squircles) ────────────────────────────────────────
                         let use_dots = lod == LodLevel::Dot;
-                        for cmd in &commands {
-                            if let DrawCommand::Circle {
-                                center,
-                                radius,
-                                color,
-                                selected,
-                            } = cmd
-                            {
-                                let r = if use_dots {
-                                    px(3.0)
-                                } else {
-                                    px(*radius * zoom)
-                                };
-                                let c = point(px(center.x + ox), px(center.y + oy));
-                                let node_bounds = Bounds::new(
-                                    point(c.x - r, c.y - r),
-                                    size(r * 2.0, r * 2.0),
-                                );
-                                let col = color_to_rgb(*color);
+                        for node in &commands.nodes {
+                            let r = if use_dots {
+                                px(3.0)
+                            } else {
+                                px(node.radius * zoom)
+                            };
+                            let c = point(px(node.center.x + ox), px(node.center.y + oy));
+                            let node_bounds =
+                                Bounds::new(point(c.x - r, c.y - r), size(r * 2.0, r * 2.0));
+                            let col = color_to_rgb(node.color);
 
-                                if use_dots {
-                                    window.paint_quad(fill(node_bounds, rgb(col)));
-                                } else {
-                                    let sq_radii = r * 0.6;
+                            if use_dots {
+                                window.paint_quad(fill(node_bounds, rgb(col)));
+                            } else {
+                                let sq_radii = r * 0.6;
 
-                                    if *selected {
-                                        let hr = r * 1.45;
-                                        let ring_bounds = Bounds::new(
-                                            point(c.x - hr, c.y - hr),
-                                            size(hr * 2.0, hr * 2.0),
-                                        );
-                                        window.paint_quad(
-                                            fill(ring_bounds, rgb(0xffffff))
-                                                .corner_radii(hr * 0.6),
-                                        );
-                                    }
-
+                                if node.selected {
+                                    let hr = r * 1.45;
+                                    let ring_bounds = Bounds::new(
+                                        point(c.x - hr, c.y - hr),
+                                        size(hr * 2.0, hr * 2.0),
+                                    );
                                     window.paint_quad(
-                                        fill(node_bounds, rgb(col)).corner_radii(sq_radii),
+                                        fill(ring_bounds, rgb(0xffffff))
+                                            .corner_radii(hr * 0.6),
                                     );
                                 }
+
+                                window.paint_quad(
+                                    fill(node_bounds, rgb(col)).corner_radii(sq_radii),
+                                );
                             }
                         }
 
                         // ── Node labels (inside squircles) ───────────────────────────
                         let text_system = window.text_system().clone();
                         let sys_font: Font = font(".SystemUIFont");
-                        for cmd in &commands {
-                            if let DrawCommand::Text {
-                                position,
-                                content,
-                                size,
-                                color,
-                            } = cmd
-                            {
-                                if content.is_empty() {
-                                    continue;
-                                }
-                                let font_size = px(*size);
-                                let text_color = color_to_hsla(*color);
-                                let run = TextRun {
-                                    len: content.len(),
-                                    font: sys_font.clone(),
-                                    color: text_color,
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                };
-                                let shaped = text_system.shape_line(
-                                    SharedString::from(content.clone()),
-                                    font_size,
-                                    &[run],
-                                    None,
-                                );
-                                let line_height = font_size * 1.2;
-                                let tx =
-                                    position.x + ox - f32::from(shaped.width) / 2.0;
-                                let ty =
-                                    position.y + oy - f32::from(line_height) / 2.0;
-                                let _ = shaped.paint(
-                                    point(px(tx), px(ty)),
-                                    line_height,
-                                    window,
-                                    cx,
-                                );
+                        for label in &commands.labels {
+                            if label.content.is_empty() {
+                                continue;
                             }
+                            let font_size = px(label.size);
+                            let text_color = color_to_hsla(label.color);
+                            let run = TextRun {
+                                len: label.content.len(),
+                                font: sys_font.clone(),
+                                color: text_color,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let shaped = text_system.shape_line(
+                                SharedString::from(label.content.clone()),
+                                font_size,
+                                &[run],
+                                None,
+                            );
+                            let line_height = font_size * 1.2;
+                            let tx = label.position.x + ox - f32::from(shaped.width) / 2.0;
+                            let ty = label.position.y + oy - f32::from(line_height) / 2.0;
+                            let _ = shaped.paint(
+                                point(px(tx), px(ty)),
+                                line_height,
+                                window,
+                                cx,
+                            );
                         }
 
                         // ── Color legend (bottom-right of canvas pane) ───────────────
