@@ -2,7 +2,10 @@ mod render;
 mod state;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use gpui::{prelude::*, Context, Empty, Entity, Subscription};
 use parking_lot::RwLock;
@@ -503,6 +506,11 @@ impl AppView {
         self.state.embedding_status = Some(plan.label());
         cx.notify();
 
+        // Cancel any previously running pipeline (sets the old flag → tasks exit on next tick).
+        self.state.embedding_cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.state.embedding_cancel = Arc::clone(&cancel);
+
         // Bump epoch to cancel any previously running poller.
         self.state.embedding_plan_epoch = self.state.embedding_plan_epoch.wrapping_add(1);
         let epoch = self.state.embedding_plan_epoch;
@@ -512,12 +520,19 @@ impl AppView {
             Arc::new(parking_lot::Mutex::new(None));
         let progress_write = Arc::clone(&progress_state);
 
+        let cancel_poller = Arc::clone(&cancel);
         // Poller: reads shared progress every 500 ms and refreshes the status bar.
         cx.spawn(async move |this, cx| {
             loop {
+                if cancel_poller.load(Ordering::Relaxed) {
+                    return;
+                }
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
                     .await;
+                if cancel_poller.load(Ordering::Relaxed) {
+                    return;
+                }
                 let Some(this) = this.upgrade() else { return };
                 let snap = progress_state.lock().clone();
                 let keep_running = this
@@ -541,7 +556,10 @@ impl AppView {
         .detach();
 
         // Worker: runs the plan on the tokio runtime and reports outcome.
+        // `_cancel_guard` sets the cancel flag on drop (including panic), which
+        // stops the poller immediately rather than waiting for an epoch bump.
         cx.spawn(async move |this, cx| {
+            let _cancel_guard = state::CancelOnDrop(Arc::clone(&cancel));
             let outcome = cx
                 .background_executor()
                 .spawn(async move {

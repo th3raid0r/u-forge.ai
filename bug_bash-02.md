@@ -265,7 +265,7 @@ O(N log N) for the spatial index rebuild.
 
 ## Tier 3 — Resource lifecycle / correctness (deferred)
 
-### 3.1 🔎 `run_embedding_plan` detaches tasks without explicit cancellation
+### 3.1 ✅ `run_embedding_plan` detaches tasks without explicit cancellation
 
 **Where:** `crates/u-forge-ui-gpui/src/app_view/mod.rs:476, 523, 551`
 (three `.detach()` sites in the pipeline).
@@ -280,11 +280,14 @@ pipeline from bug-bash-01 Tier 4.2 and it works, but it leaves open:
 - Dropping the `AppView` entity does **not** immediately cancel the
   tasks. They may complete one more iteration and hold an `Arc<KnowledgeGraph>` reference a frame longer than expected.
 
-**Fix.** Introduce one `tokio_util::sync::CancellationToken` per
-pipeline launch. Store the token on `AppView`; cancel-and-replace it at
-the start of `run_embedding_plan`. Each task awaits either its next work
-item or `token.cancelled()`. The epoch check stays for cooperative
-work-skip, but cancellation handles abrupt teardown.
+**Fix.** Added an `Arc<AtomicBool>` cancel flag (`AppState::embedding_cancel`)
+alongside the existing epoch. On `run_embedding_plan` the old flag is set
+to `true` before a new `Arc<AtomicBool>` is created; both the poller and
+the worker receive a clone. The poller checks `is_cancelled` before
+sleeping and after waking (sub-500 ms response). The worker holds a
+`CancelOnDrop` RAII guard that sets the flag on drop — including panic —
+so the poller stops immediately rather than waiting for the epoch bump.
+The epoch check remains as the authoritative work-skip guard.
 
 **Verification.** `RUST_LOG=info` start two successive `embed_all()`
 calls with a short sleep; verify the first pipeline exits promptly
@@ -317,47 +320,47 @@ auto-migration — that's a feature, not a bash item.
 **Verification.** Create a DB with dim=768, recompile with dim=4096 in
 the source constant, reopen. Expect a clear error at open time.
 
-### 3.3 🔎 Chunk sizing heuristic can under-count tokens
+### 3.3 ✅ Chunk sizing heuristic can under-count tokens
 
-**Where:** `crates/u-forge-core/src/graph/storage.rs:154` (usage) and
-wherever the `3 chars ≈ 1 token` heuristic lives in `text.rs` /
-chunking code.
+**Where:** `crates/u-forge-core/src/text.rs` — `split_text` / hard-cut path.
 
 The embedding tokenizer was upgraded to `o200k_harmony` (commit 3ce5c14)
 so the production path uses proper tokenisation — but dense prose with
 heavy punctuation, CJK text, or code blocks can still produce chunks
 whose tokenised length exceeds the embedding model's context window.
-The current chunker has no final clamp against the model's declared
-context limit.
+The current chunker had no final clamp for whitespace-free runs.
 
-**Fix.** After chunk construction, tokenise with `o200k_harmony` and
-assert `chunk.tokens.len() <= model.context_tokens`. For any overflow,
-split at the token boundary nearest the midpoint and recurse. Add a
-counter (`tracing::info!`) when a hard-split fires — it's a useful
-signal during ingestion of non-English corpora.
+**Fix.** Added `split_oversized_word` in `text.rs`: recursively bisects
+at the character midpoint until every piece satisfies
+`count_tokens(piece) <= MAX_CHUNK_TOKENS`. The existing hard-cut path in
+`split_text` (previously `pieces.push(oversized)`) now calls
+`pieces.extend(split_oversized_word(&candidate))`. A
+`tracing::info!` fires each time a hard-split triggers — useful signal
+during ingestion of non-Latin corpora. Two new unit tests cover the
+base64/no-whitespace case and a 3× MAX_CHUNK_TOKENS CJK blob.
 
 **Verification.** Ingest a document containing a large run of CJK text
 or an XML blob. Confirm no embedding calls fail with a context-length
 error from Lemonade.
 
-### 3.4 🔎 Array-of-string property parsing loses quoted commas
+### 3.4 ✅ Array-of-string property parsing loses quoted commas
 
-**Where:** `crates/u-forge-ui-gpui/src/node_editor/field_spec.rs` —
-wherever array values are rendered/parsed back out of the text input.
+**Where:** `crates/u-forge-ui-gpui/src/node_editor/render.rs:525` and
+`crates/u-forge-ui-gpui/src/node_editor/mod.rs:527`.
 
-Properties stored in the graph are JSON; the node editor flattens arrays
-to comma-separated strings for the single-line input. Entering
-`"a, b", c` parses as three entries (`"a`, `b"`, `c`), not two.
+Properties stored in the graph are JSON; the node editor previously
+flattened arrays to comma-separated strings for a single-line input.
+Entering `"a, b", c` parsed as three entries, not two.
 
-**Fix.** Arrays deserve a list-style input (one row per entry + add
-button) or proper CSV-with-quotes parsing. The underlying storage is
-already JSON, so the simplest fix is: store/display the array as its
-raw JSON string representation (e.g. `["a, b", "c"]`) and round-trip
-through `serde_json::from_str`. Users already see JSON elsewhere in the
-tool.
+**Fix.** Already resolved by the chip UI implemented in the node editor:
+arrays render as individual item chips with remove (`x`) buttons and an
+inline `+` add field. `commit_array_add` pushes the full typed text as a
+single `serde_json::Value::String` without any comma splitting. A value
+containing a comma (e.g. `"New York, NY"`) is stored verbatim in the
+JSON array and round-trips correctly on reload.
 
-**Verification.** Enter an array containing a value with a comma,
-save, reload the node. The value must round-trip unmodified.
+**Verification.** Enter an array value containing a comma, save, reload
+the node — the value round-trips unmodified.
 
 ---
 
