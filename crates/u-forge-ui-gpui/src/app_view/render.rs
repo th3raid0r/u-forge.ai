@@ -81,6 +81,9 @@ impl Render for AppView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _window, cx| {
+                if this.right_panel_open {
+                    this.chat_panel.update(cx, |panel, _cx| panel.last_render_us = 0);
+                }
                 this.right_panel_open = !this.right_panel_open;
                 cx.notify();
             }))
@@ -575,6 +578,10 @@ impl Render for AppView {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            if this.right_panel_open {
+                                                this.chat_panel
+                                                    .update(cx, |panel, _cx| panel.last_render_us = 0);
+                                            }
                                             this.right_panel_open = !this.right_panel_open;
                                             cx.notify();
                                         }),
@@ -774,6 +781,11 @@ impl Render for AppView {
                                             MouseButton::Left,
                                             cx.listener(
                                                 |this, _: &MouseDownEvent, _window, cx| {
+                                                    if this.right_panel_open {
+                                                        this.chat_panel.update(cx, |panel, _cx| {
+                                                            panel.last_render_us = 0;
+                                                        });
+                                                    }
                                                     this.right_panel_open =
                                                         !this.right_panel_open;
                                                     this.view_menu_open = false;

@@ -424,7 +424,7 @@ snapshot stats and status strings.
 Low-priority items surfaced by the review; land whenever a nearby change
 makes them free.
 
-### 5.1 ✅ Edge metadata JSON silent fallback (pattern watch)
+### ~~5.1 ✅ Edge metadata JSON silent fallback (pattern watch)~~
 
 `.rules` says edge metadata JSON parse failures now emit `debug!()` rather
 than swallowing — confirmed recently landed. The review concern is pattern
@@ -433,14 +433,25 @@ or node-properties blob parsing. If a future reviewer finds
 `.unwrap_or_default()` on a domain-critical JSON parse, promote it to a
 `warn!` or an error path.
 
-### 5.2 🔎 `last_render_us` not reset on panel toggle
+**Audit result (no code change needed):** Both edge-metadata parse sites in
+`graph/edges.rs` already use `debug!()`. `chunks` table stores plain text
+(no JSON parse). `storage.rs:247` propagates `properties` JSON errors via
+`.with_context(...)`. No `.unwrap_or_default()` chains off any
+`serde_json::from_str` call in the codebase.
 
-**Where:** `crates/u-forge-ui-gpui/src/chat_panel.rs:76` (field) and
+### ~~5.2 ✅ `last_render_us` not reset on panel toggle~~
+
+**Where:** `crates/u-forge-ui-gpui/src/chat_panel.rs:80` (field) and
 `crates/u-forge-ui-gpui/src/app_view/render.rs:52` (consumer).
 
 When the chat panel is toggled closed, `last_render_us` keeps its last
 sampled value. Perf overlay shows a stale `chat_ms`. One-line fix: zero the
 field when `right_panel_open` transitions from true to false in `AppView`.
+
+**Landed.** Guard added at all three `right_panel_open` toggle sites in
+`app_view/render.rs` (ToggleRightPanel action, Chat tab button, view-menu
+item): `if this.right_panel_open { chat_panel.update(…last_render_us = 0) }`
+before the flip.
 
 ---
 
