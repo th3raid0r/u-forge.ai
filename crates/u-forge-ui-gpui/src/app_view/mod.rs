@@ -8,6 +8,7 @@ use std::sync::{
 };
 
 use gpui::{prelude::*, Context, Empty, Entity, Subscription};
+use tracing::Instrument;
 use parking_lot::RwLock;
 use u_forge_agent::{AgentParams, GraphAgent};
 use u_forge_core::{
@@ -503,6 +504,7 @@ impl AppView {
         let graph = self.state.graph.clone();
         let tokio_rt = self.state.tokio_rt.clone();
 
+        let plan_kind = plan.kind();
         self.state.embedding_status = Some(plan.label());
         cx.notify();
 
@@ -562,17 +564,20 @@ impl AppView {
             let _cancel_guard = state::CancelOnDrop(Arc::clone(&cancel));
             let outcome = cx
                 .background_executor()
-                .spawn(async move {
-                    tokio_rt.block_on(async move {
-                        plan.execute(
-                            &graph,
-                            &queue,
-                            hq_queue.as_ref(),
-                            move |p| *progress_write.lock() = Some(p),
-                        )
-                        .await
-                    })
-                })
+                .spawn(
+                    async move {
+                        tokio_rt.block_on(async move {
+                            plan.execute(
+                                &graph,
+                                &queue,
+                                hq_queue.as_ref(),
+                                move |p| *progress_write.lock() = Some(p),
+                            )
+                            .await
+                        })
+                    }
+                    .instrument(tracing::info_span!("embedding_plan", plan_kind)),
+                )
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
@@ -596,16 +601,23 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
+                .spawn(
+                    async move {
                     tokio_rt.block_on(async move {
                         // Discover Lemonade Server URL.
                         let url = match resolve_lemonade_url().await {
                             Some(u) => u,
                             None => return Err(anyhow::anyhow!("Lemonade Server not reachable")),
                         };
+                        tracing::debug!("milestone: discover — server reachable at {url}");
 
                         // Discover available models.
                         let catalog = LemonadeServerCatalog::discover(&url).await?;
+                        tracing::debug!(
+                            loaded = catalog.loaded.len(),
+                            models = catalog.models.len(),
+                            "milestone: select — catalog fetched"
+                        );
                         let selector =
                             ModelSelector::new(&catalog, &app_config.models, &app_config.embedding);
                         let embed_models = selector.select_embedding_models();
@@ -669,6 +681,10 @@ impl AppView {
                             .with_providers(providers)
                             .with_config((*app_config).clone())
                             .build();
+                        tracing::debug!(
+                            embedding_workers = queue.embedding_worker_count(),
+                            "milestone: build queue — providers ready"
+                        );
 
                         // Build optional HQ embedding queue.
                         let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
@@ -711,9 +727,16 @@ impl AppView {
                             u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
                         });
 
+                        tracing::debug!(
+                            llm_count = all_llm.len(),
+                            preferred_idx,
+                            "milestone: ready — init complete"
+                        );
                         Ok((url, queue, hq_queue, chat_provider, llm_available, preferred_idx))
                     })
-                })
+                }
+                .instrument(tracing::info_span!("lemonade_init")),
+                )
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {

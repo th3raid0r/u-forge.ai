@@ -471,7 +471,7 @@ construction sites. `cargo test --workspace -- --test-threads=1` clean.
 Small `tracing` additions that cost nothing at runtime when disabled but
 give critical signal during debugging.
 
-### 5.1 🔎 `InferenceQueue::embed` span lacks queue-depth + worker id
+### 5.1 ✅ `InferenceQueue::embed` span lacks queue-depth + worker id
 
 **Where:** `crates/u-forge-core/src/queue/dispatch.rs:76-116` (`embed`
 and `embed_many`).
@@ -484,7 +484,7 @@ pending jobs" from "one slow inference."
 entry), `selected_worker_id` (recorded in the dispatcher just before
 dispatch), and `duration_us` (on span exit, via a `let _guard = span.enter()` + explicit timer).
 
-### 5.2 🔎 UI async pipelines have no `#[instrument]`
+### 5.2 ✅ UI async pipelines have no `#[instrument]`
 
 **Where:** `crates/u-forge-ui-gpui/src/app_view/mod.rs` — `do_init_lemonade`, `run_embedding_plan`, search-kickoff detached tasks.
 
@@ -496,7 +496,7 @@ point, with enough fields to identify the call (`plan_kind`,
 `session_id`, `query_len`). Emit `debug!("milestone: X")` at each phase
 boundary inside init — discover, select, build queue, ready.
 
-### 5.3 🔎 Embedding pipeline has no peak-concurrency counter
+### 5.3 ✅ Embedding pipeline has no peak-concurrency counter
 
 **Where:** `crates/u-forge-core/src/ingest/embedding.rs` —
 `EmbeddingPlan::execute`.

@@ -63,9 +63,8 @@ use super::jobs::{EmbedJob, WorkQueue};
 struct WeightedWorkerSlot {
     queue: Arc<WorkQueue<EmbedJob>>,
     weight: u32,
-    /// Human-readable device name (e.g. "NPU", "GPU").  Retained for future
-    /// diagnostic output — e.g. logging which worker is idle or overloaded.
-    #[allow(dead_code)]
+    /// Human-readable device name (e.g. "NPU", "GPU").  Emitted as a span
+    /// field (`selected_worker_id`) by [`WeightedEmbedDispatcher::submit`].
     name: String,
     /// Idle flag shared with the worker task.  Retained for future work-stealing
     /// enhancements — e.g. preferring to steal *to* idle workers rather than
@@ -126,11 +125,12 @@ impl WeightedEmbedDispatcher {
 
     /// Submit a job to the worker with the lowest predicted completion time.
     ///
+    /// Returns the name of the selected worker for tracing span recording.
     /// Also fires `global_notify` so any idle worker can wake and steal if
     /// the chosen worker turns out to be slower than the idle one.
-    pub(super) fn submit(&self, job: EmbedJob) {
+    pub(super) fn submit(&self, job: EmbedJob) -> &str {
         if self.workers.is_empty() {
-            return;
+            return "";
         }
 
         let target = self
@@ -146,6 +146,7 @@ impl WeightedEmbedDispatcher {
         target.queue.push(job);
         // Wake any idle worker so it can steal if the chosen worker is slow.
         self.global_notify.notify_one();
+        &target.name
     }
 
     /// Try to steal one job from the most-loaded worker other than `my_queue`.
