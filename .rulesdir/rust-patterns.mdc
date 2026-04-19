@@ -39,6 +39,10 @@ FastEmbed and ONNX were removed.
 `model_info()` returns our own `EmbeddingModelInfo` — **not** fastembed's
 `ModelInfo`. The two were easy to confuse when fastembed was still in-tree.
 
+`EmbeddingProviderType` has a single variant: `Lemonade`. The speculative
+`Ollama` and `Cloud` variants were removed — do not re-add them without a
+concrete provider landing alongside them.
+
 ---
 
 ## `TranscriptionProvider` trait
@@ -108,6 +112,12 @@ Always use `params![]` for parameterised inserts.
   implicit SQLite `rowid` is what `chunks_fts` and `chunks_vec` reference. Using
   `INSERT OR REPLACE` here would change the rowid and silently break FTS and
   vector index lookups.
+- **`schema_metadata` dimension guard** — `check_or_init_embedding_dims` runs
+  at `KnowledgeGraphStorage::new`. It records the compiled-in embedding
+  dimensions and returns `EmbeddingDimensionMismatch` (a `thiserror` struct,
+  re-exported from `u_forge_core`) if they disagree with a stored value.
+  Changing the embedding model without re-indexing is a hard error at open time,
+  not silent index corruption.
 - **`ON DELETE CASCADE` on `edges` and `chunks`** — node deletion becomes a
   single statement; the DB removes dependents. O(log N), not O(N).
 - **Edge uniqueness: `UNIQUE(source_id, target_id, edge_type)`** — replaces the
@@ -210,3 +220,12 @@ tracing::debug!(
 ```
 
 `%` calls `Display`, `?` calls `Debug`.
+
+For async entry points, prefer `#[instrument(skip_all, fields(...))]` over bare
+`#[instrument]` — it avoids auto-capturing large structs and lets you record
+fields manually via `Span::current().record(...)` after the fact (e.g. recording
+`pending_jobs` after calling `stats()`). See `dispatch.rs::embed` for the pattern.
+
+For spawned tasks that outlive the calling frame, attach a span with
+`.instrument(tracing::info_span!("task_name"))` on the future before detaching.
+See `app_view/mod.rs::run_embedding_plan` and `do_init_lemonade`.

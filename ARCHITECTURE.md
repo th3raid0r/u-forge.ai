@@ -102,6 +102,12 @@ layout_version INTEGER DEFAULT 1
 ```
 Written by `save_layout()` after drag. Read by `build_snapshot()` to restore user-arranged positions.
 
+**`schema_metadata`** — open-time validation key/value store.
+```
+key TEXT PRIMARY KEY, value TEXT NOT NULL
+```
+Holds `chunks_vec_dims` and `chunks_vec_hq_dims`. `check_or_init_embedding_dims` runs inside `KnowledgeGraphStorage::new` — first open writes the compiled-in constants; subsequent opens compare stored vs. compiled values and return `EmbeddingDimensionMismatch` (a `thiserror` struct re-exported from `u_forge_core`) if they differ. No auto-migration: the user must re-index or pin the old model.
+
 ### Storage Design Notes
 
 - `ON DELETE CASCADE` on both `edges` and `chunks` — node deletion is a single `DELETE FROM nodes WHERE id = ?`; the database removes all dependent rows automatically. O(log N), not O(N).
@@ -203,7 +209,7 @@ Graceful degradation at every stage: missing worker → skip that stage with `in
 
 `fts5_sanitize` strips characters illegal in FTS5 query syntax before `MATCH`; the original query is passed verbatim to `embed()` and `rerank()` where punctuation is meaningful. Returns `None` for all-punctuation input (FTS stage cleanly skipped).
 
-The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not mix model families.
+The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not mix model families. Changing the embedding model without re-indexing is caught at DB open time (`EmbeddingDimensionMismatch`, re-exported from `u_forge_core`) rather than silently corrupting the vector index.
 
 ---
 
@@ -225,7 +231,7 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 
 **Per-node re-chunking** (`embedding.rs`): `rechunk_and_embed(graph, queue, hq_queue, object_id)` — delete old chunks (cascades FTS5 + vector indexes) → flatten via `flatten_for_embedding()` → create new chunks → embed standard (768-dim) → embed HQ (4096-dim) if `hq_queue` provided. Blocks until all embeddings are stored. Write tools and UI save both call this to guarantee immediate searchability after the call returns.
 
-`EmbeddingPlan` is the declarative UI entry point: `EmbeddingPlan::rechunk(ids)` for per-node re-chunk + embed, `EmbeddingPlan::embed_all()` for bulk unembedded sweep. `AppView::run_embedding_plan(plan, cx)` is the single UI call site — owns status formatting, epoch-based poller cancellation, and the background tokio task.
+`EmbeddingPlan` is the declarative UI entry point: `EmbeddingPlan::rechunk(ids)` for per-node re-chunk + embed, `EmbeddingPlan::embed_all()` for bulk unembedded sweep. `AppView::run_embedding_plan(plan, cx)` is the single UI call site — owns status formatting, epoch-based poller cancellation, and the background tokio task. The spawned future is attached to an `info_span!("embedding_plan", plan_kind)` before detaching; `do_init_lemonade` uses the same `.instrument(info_span!(...))` pattern.
 
 ---
 

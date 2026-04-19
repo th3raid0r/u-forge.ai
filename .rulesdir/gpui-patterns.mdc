@@ -78,7 +78,7 @@ Applied to `ChatPanel` in `app_view/render.rs`. Apply to any future heavy-to-lay
 
 `window.paint_*` calls take _window_ coordinates. `generate_draw_commands()` produces _canvas-local_ coordinates (origin at the canvas element's top-left).
 
-When the canvas doesn't fill the full window (it sits below a menu bar and editor pane), all paint positions must be offset by `bounds.origin`. `GraphCanvas` stores `canvas_bounds: Arc<RwLock<Bounds<Pixels>>>` updated at the top of each paint closure; mouse event handlers subtract `bounds.origin` before `screen_to_world`.
+When the canvas doesn't fill the full window (it sits below a menu bar and editor pane), all paint positions must be offset by `bounds.origin`. `GraphCanvas` stores `canvas_bounds: Rc<Cell<Bounds<Pixels>>>` — written once per paint closure via `.set(bounds)`, read in mouse handlers via `.get()`. No lock; `Rc` is safe because GPUI runs on a single thread. Mouse handlers subtract `bounds.origin` before `screen_to_world`.
 
 `overflow_hidden()` on `div#graph-root` installs a GPUI `content_mask` that clips all descendant paint ops to the pane's layout bounds. Without it, nodes near the viewport edge paint into adjacent panes.
 
