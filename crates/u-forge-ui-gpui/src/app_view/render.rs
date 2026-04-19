@@ -33,7 +33,7 @@ impl Render for AppView {
         let sidebar_width = self.sidebar_width;
         let editor_ratio = self.editor_ratio;
         let right_panel_width = self.right_panel_width;
-        let embedding_status = self.embedding_status.clone();
+        let embedding_status = self.state.embedding_status.clone();
         let perf_enabled = self.perf_enabled;
 
         // Build perf overlay text when enabled.
@@ -57,7 +57,7 @@ impl Render for AppView {
         };
 
         // Read graph stats for the status bar.
-        let snap = self.snapshot.read();
+        let snap = self.state.snapshot.read();
         let node_count = snap.nodes.len();
         let edge_count = snap.edges.len();
         drop(snap);
@@ -519,7 +519,7 @@ impl Render for AppView {
                     )
                     // ── Center: graph stats + operation status ────────────────
                     .child({
-                        let data_status = self.data_status.clone();
+                        let data_status = self.state.data_status.clone();
                         let mut center = div()
                             .id("status-center")
                             .flex()

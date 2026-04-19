@@ -383,7 +383,7 @@ methods (`do_rechunk_and_embed`, `do_embed_all`, `spawn_embedding_sampler`,
 `stop_embedding_sampler`) removed; three call sites updated. Net: -70 lines
 in the UI crate, schema-migration pairing explicitly deferred (not needed).
 
-### 4.3 🔎 Split `AppState` from `AppView`
+### ~~4.3 🔎 Split `AppState` from `AppView`~~
 
 **Where:** `crates/u-forge-ui-gpui/src/app_view/mod.rs:94-138` and
 `render.rs`.
@@ -406,6 +406,16 @@ owns the graph, queues, embedding progress, and Lemonade discovery.
 `AppView` becomes a pure render over `&AppState`. Defer until a second
 frontend actually needs it, or until it's the natural vehicle for
 adding file-picker dialogs / embedded Lemonade lifecycle management.
+
+**Landed.** `AppState` added to `app_view/state.rs` with no GPUI imports —
+the boundary is the invariant. Moved fields: `graph`, `snapshot`, `data_file`,
+`schema_dir`, `app_config`, `tokio_rt`, `inference_queue`, `hq_queue`,
+`data_status`, `embedding_status`, `embedding_plan_epoch`. `AppView` retains
+GPUI entity handles (`graph_canvas`, `node_panel`, `search_panel`, `node_editor`,
+`chat_panel`, `selection`), layout state, and perf-overlay fields. All method
+bodies access state via `self.state.*`; async callbacks use `view.state.*` via
+the existing `WeakEntity` update pattern. Render reads `self.state.*` for
+snapshot stats and status strings.
 
 ---
 

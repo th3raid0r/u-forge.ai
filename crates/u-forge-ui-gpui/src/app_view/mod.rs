@@ -1,4 +1,5 @@
 mod render;
+mod state;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,12 +13,14 @@ use u_forge_core::{
         resolve_lemonade_url, Capability, GpuResourceManager, LemonadeServerCatalog, ModelSelector,
         ProviderFactory, QualityTier,
     },
-    queue::{InferenceQueue, InferenceQueueBuilder},
+    queue::InferenceQueueBuilder,
     types::ObjectId,
     AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, KnowledgeGraph, ObjectMetadata,
     SchemaManager,
 };
 use u_forge_graph_view::GraphSnapshot;
+
+use state::AppState;
 
 use crate::chat_panel::{AvailableModel, ChatPanel};
 use crate::graph_canvas::GraphCanvas;
@@ -142,6 +145,9 @@ impl FrameTimeRing {
 }
 
 pub struct AppView {
+    // ── Non-render state (graph, queues, config, status strings) ─────────────
+    pub(crate) state: AppState,
+    // ── GPUI entity handles ───────────────────────────────────────────────────
     pub(crate) graph_canvas: Entity<GraphCanvas>,
     pub(crate) node_panel: Entity<NodePanel>,
     pub(crate) search_panel: Entity<SearchPanel>,
@@ -149,10 +155,7 @@ pub struct AppView {
     pub(crate) chat_panel: Entity<ChatPanel>,
     #[allow(dead_code)]
     pub(crate) selection: Entity<SelectionModel>,
-    pub(crate) snapshot: Arc<RwLock<GraphSnapshot>>,
-    pub(crate) graph: Arc<KnowledgeGraph>,
-    pub(crate) data_file: std::path::PathBuf,
-    pub(crate) schema_dir: std::path::PathBuf,
+    // ── UI layout state ───────────────────────────────────────────────────────
     pub(crate) file_menu_open: bool,
     pub(crate) view_menu_open: bool,
     pub(crate) sidebar_open: bool,
@@ -164,20 +167,10 @@ pub struct AppView {
     pub(crate) editor_ratio: f32,
     /// Current right panel width in pixels (user-resizable).
     pub(crate) right_panel_width: f32,
-    /// Status message displayed in the status bar during/after data operations.
-    pub(crate) data_status: Option<String>,
-    /// Embedding progress/completion message shown in the status bar.
-    pub(crate) embedding_status: Option<String>,
-    /// Shared app config.
-    pub(crate) app_config: Arc<AppConfig>,
-    /// Persistent tokio runtime for async core calls from background tasks.
-    pub(crate) tokio_rt: Arc<tokio::runtime::Runtime>,
-    /// Standard embedding + reranking queue (None until Lemonade is discovered).
-    pub(crate) inference_queue: Option<InferenceQueue>,
-    /// High-quality embedding queue (None when HQ embedding is disabled or unavailable).
-    pub(crate) hq_queue: Option<InferenceQueue>,
+    // ── GPUI bookkeeping ──────────────────────────────────────────────────────
     /// Subscriptions to node panel create/delete events — kept alive so handlers fire.
     _node_subs: Vec<Subscription>,
+    // ── Perf overlay ──────────────────────────────────────────────────────────
     /// Whether the perf overlay is visible.
     pub(crate) perf_enabled: bool,
     /// Frame cost (µs) of the last rendered frame, measured via canvas timer
@@ -188,9 +181,6 @@ pub struct AppView {
     /// per frame to compute `avg_ms`. Fixed array avoids any per-frame
     /// allocation from the prior `VecDeque`.
     pub(crate) frame_times_us: FrameTimeRing,
-    /// Epoch for the embedding-plan status poller. Bumping cancels any
-    /// in-flight poller timer so stale ticks don't overwrite a fresh status.
-    pub(crate) embedding_plan_epoch: usize,
 }
 
 impl AppView {
@@ -206,6 +196,8 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
+
+        // Build child entities — clone Arc handles before they move into AppState.
         let selection = cx.new(|_cx| SelectionModel::new(snapshot_arc.clone()));
         let graph_canvas = cx
             .new(|cx| GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx));
@@ -254,17 +246,23 @@ impl AppView {
             )
         });
 
+        let state = AppState::new(
+            graph,
+            snapshot_arc,
+            data_file,
+            schema_dir,
+            app_config,
+            tokio_rt,
+        );
+
         let mut view = Self {
+            state,
             graph_canvas,
             node_panel,
             search_panel,
             node_editor,
             chat_panel,
             selection,
-            snapshot: snapshot_arc,
-            graph,
-            data_file,
-            schema_dir,
             file_menu_open: false,
             view_menu_open: false,
             sidebar_open: false,
@@ -273,17 +271,10 @@ impl AppView {
             sidebar_width: DEFAULT_SIDEBAR_W,
             editor_ratio: DEFAULT_EDITOR_RATIO,
             right_panel_width: DEFAULT_RIGHT_PANEL_W,
-            data_status: None,
-            embedding_status: None,
-            app_config,
-            tokio_rt,
-            inference_queue: None,
-            hq_queue: None,
             _node_subs: vec![node_sub_create, node_sub_delete],
             perf_enabled: false,
             last_frame_cost_us: 0,
             frame_times_us: FrameTimeRing::default(),
-            embedding_plan_epoch: 0,
         };
 
         view.do_init_lemonade(cx);
@@ -292,9 +283,9 @@ impl AppView {
 
     /// Rebuild the in-memory snapshot from the graph and push it to all child views.
     pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
-        match u_forge_graph_view::build_snapshot(&self.graph) {
+        match u_forge_graph_view::build_snapshot(&self.state.graph) {
             Ok(snap) => {
-                *self.snapshot.write() = snap;
+                *self.state.snapshot.write() = snap;
                 self.node_panel
                     .update(cx, |panel, cx| panel.refresh_groups(cx));
                 cx.notify();
@@ -306,24 +297,24 @@ impl AppView {
     }
 
     pub(crate) fn do_clear_data(&mut self, cx: &mut Context<Self>) {
-        match self.graph.clear_all() {
+        match self.state.graph.clear_all() {
             Ok(()) => {
-                self.data_status = Some("Data cleared.".to_string());
+                self.state.data_status = Some("Data cleared.".to_string());
                 self.refresh_snapshot(cx);
             }
             Err(e) => {
-                self.data_status = Some(format!("Clear failed: {e}"));
+                self.state.data_status = Some(format!("Clear failed: {e}"));
                 cx.notify();
             }
         }
     }
 
     pub(crate) fn do_import_data(&mut self, cx: &mut Context<Self>) {
-        let graph = self.graph.clone();
-        let data_file = self.data_file.clone();
-        let schema_dir = self.schema_dir.to_string_lossy().into_owned();
+        let graph = self.state.graph.clone();
+        let data_file = self.state.data_file.clone();
+        let schema_dir = self.state.schema_dir.to_string_lossy().into_owned();
 
-        self.data_status = Some("Importing…".to_string());
+        self.state.data_status = Some("Importing…".to_string());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -337,7 +328,7 @@ impl AppView {
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
                     Ok(stats) => {
-                        view.data_status = Some(format!(
+                        view.state.data_status = Some(format!(
                             "Import done — {} nodes, {} edges",
                             stats.objects_created, stats.relationships_created
                         ));
@@ -346,7 +337,7 @@ impl AppView {
                         view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
                     }
                     Err(e) => {
-                        view.data_status = Some(format!("Import failed: {e}"));
+                        view.state.data_status = Some(format!("Import failed: {e}"));
                         cx.notify();
                     }
                 }
@@ -394,7 +385,7 @@ impl AppView {
         let meta = ObjectMetadata::new(object_type.to_string(), String::new());
         let node_id = meta.id;
 
-        match self.graph.add_object(meta) {
+        match self.state.graph.add_object(meta) {
             Ok(_id) => {
                 // Refresh snapshot so the node panel and canvas see the new node.
                 self.refresh_snapshot(cx);
@@ -415,7 +406,7 @@ impl AppView {
                 self.sidebar_tab = SidebarTab::Nodes;
             }
             Err(e) => {
-                self.data_status = Some(format!("Failed to create node: {e}"));
+                self.state.data_status = Some(format!("Failed to create node: {e}"));
             }
         }
         cx.notify();
@@ -444,12 +435,12 @@ impl AppView {
         }
 
         // Delete from DB (cascades to edges, chunks, etc.).
-        match self.graph.delete_object(node_id) {
+        match self.state.graph.delete_object(node_id) {
             Ok(()) => {
                 self.refresh_snapshot(cx);
             }
             Err(e) => {
-                self.data_status = Some(format!("Delete failed: {e}"));
+                self.state.data_status = Some(format!("Delete failed: {e}"));
             }
         }
         cx.notify();
@@ -483,20 +474,20 @@ impl AppView {
     /// `spawn_embedding_sampler` / `stop_embedding_sampler` quartet.
     /// Any previously running plan is implicitly cancelled via epoch bump.
     pub(crate) fn run_embedding_plan(&mut self, plan: EmbeddingPlan, cx: &mut Context<Self>) {
-        let queue = match self.inference_queue.clone() {
+        let queue = match self.state.inference_queue.clone() {
             Some(q) => q,
             None => return,
         };
-        let hq_queue = self.hq_queue.clone();
-        let graph = self.graph.clone();
-        let tokio_rt = self.tokio_rt.clone();
+        let hq_queue = self.state.hq_queue.clone();
+        let graph = self.state.graph.clone();
+        let tokio_rt = self.state.tokio_rt.clone();
 
-        self.embedding_status = Some(plan.label());
+        self.state.embedding_status = Some(plan.label());
         cx.notify();
 
         // Bump epoch to cancel any previously running poller.
-        self.embedding_plan_epoch = self.embedding_plan_epoch.wrapping_add(1);
-        let epoch = self.embedding_plan_epoch;
+        self.state.embedding_plan_epoch = self.state.embedding_plan_epoch.wrapping_add(1);
+        let epoch = self.state.embedding_plan_epoch;
 
         // Shared progress state written by the tokio worker, read by the poller.
         let progress_state: Arc<parking_lot::Mutex<Option<EmbeddingProgress>>> =
@@ -513,11 +504,11 @@ impl AppView {
                 let snap = progress_state.lock().clone();
                 let keep_running = this
                     .update(cx, |view: &mut AppView, cx| {
-                        if view.embedding_plan_epoch != epoch {
+                        if view.state.embedding_plan_epoch != epoch {
                             return false;
                         }
                         if let Some(EmbeddingProgress::Rechunking { done, total }) = snap {
-                            view.embedding_status =
+                            view.state.embedding_status =
                                 Some(format!("Re-embedding… ({done}/{total})"));
                             cx.notify();
                         }
@@ -550,8 +541,9 @@ impl AppView {
 
             this.update(cx, |view: &mut AppView, cx| {
                 // Stop the poller by advancing the epoch.
-                view.embedding_plan_epoch = view.embedding_plan_epoch.wrapping_add(1);
-                view.embedding_status = Self::format_embedding_outcome(&outcome);
+                view.state.embedding_plan_epoch =
+                    view.state.embedding_plan_epoch.wrapping_add(1);
+                view.state.embedding_status = Self::format_embedding_outcome(&outcome);
                 cx.notify();
             })
             .ok();
@@ -562,8 +554,8 @@ impl AppView {
     /// Asynchronously discover Lemonade Server and build the InferenceQueue + ChatProvider.
     /// FTS5 search works immediately even if this fails.
     pub(crate) fn do_init_lemonade(&mut self, cx: &mut Context<Self>) {
-        let app_config = self.app_config.clone();
-        let tokio_rt = self.tokio_rt.clone();
+        let app_config = self.state.app_config.clone();
+        let tokio_rt = self.state.tokio_rt.clone();
 
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -692,8 +684,8 @@ impl AppView {
                 match result {
                     Ok((lemonade_url, queue, hq_queue, chat_provider, llm_models, preferred_idx)) => {
                         eprintln!("Lemonade connected — embedding queue ready");
-                        view.inference_queue = Some(queue.clone());
-                        view.hq_queue = hq_queue.clone();
+                        view.state.inference_queue = Some(queue.clone());
+                        view.state.hq_queue = hq_queue.clone();
 
                         // Wrap HQ queue in Arc before it's consumed below.
                         let hq_arc = hq_queue.clone().map(Arc::new);
@@ -704,9 +696,9 @@ impl AppView {
                         });
 
                         // Build the graph agent and wire it to the chat panel.
-                        let graph = view.graph.clone();
-                        let system_prompt = view.app_config.chat.system_prompt.clone();
-                        let dev = view.app_config.chat.active_device_config();
+                        let graph = view.state.graph.clone();
+                        let system_prompt = view.state.app_config.chat.system_prompt.clone();
+                        let dev = view.state.app_config.chat.active_device_config();
                         let agent_params = AgentParams {
                             temperature: dev.temperature.map(|v| v as f64),
                             max_tokens: dev.max_tokens.map(|v| v as u64),
@@ -718,7 +710,7 @@ impl AppView {
                             repetition_penalty: dev.repetition_penalty.map(|v| v as f64),
                             seed: dev.seed,
                             stop: dev.stop.clone(),
-                            max_tool_turns: view.app_config.chat.max_tool_turns,
+                            max_tool_turns: view.state.app_config.chat.max_tool_turns,
                         };
                         match GraphAgent::new(
                             &lemonade_url,
@@ -760,10 +752,10 @@ impl AppView {
     }
 
     pub(crate) fn do_export_data(&mut self, cx: &mut Context<Self>) {
-        let graph = self.graph.clone();
-        let data_file = self.data_file.clone();
+        let graph = self.state.graph.clone();
+        let data_file = self.state.data_file.clone();
 
-        self.data_status = Some("Exporting…".to_string());
+        self.state.data_status = Some("Exporting…".to_string());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -833,12 +825,12 @@ impl AppView {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .into_owned();
-                        view.data_status = Some(format!(
+                        view.state.data_status = Some(format!(
                             "Exported {node_count} nodes, {edge_count} edges → {filename}"
                         ));
                     }
                     Err(e) => {
-                        view.data_status = Some(format!("Export failed: {e}"));
+                        view.state.data_status = Some(format!("Export failed: {e}"));
                     }
                 }
                 cx.notify();
