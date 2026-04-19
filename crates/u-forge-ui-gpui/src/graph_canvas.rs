@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::Arc,
+};
 
 use glam::Vec2;
 use gpui::{
@@ -32,7 +36,7 @@ pub(crate) struct GraphCanvas {
     last_mouse: Point<Pixels>,
     /// Canvas bounds in window coordinates, updated each paint frame.
     /// Used to convert window-space mouse positions to canvas-local coordinates.
-    canvas_bounds: Arc<RwLock<Bounds<Pixels>>>,
+    canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// When true, the next selection-model observe callback skips panning
     /// (because the selection originated from a canvas click, not the tree).
     suppress_pan: bool,
@@ -68,7 +72,7 @@ impl GraphCanvas {
             panning: false,
             dragging_node: None,
             last_mouse: point(px(0.0), px(0.0)),
-            canvas_bounds: Arc::new(RwLock::new(Bounds::default())),
+            canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             suppress_pan: false,
             _selection_sub: sel_sub,
         }
@@ -84,7 +88,7 @@ impl GraphCanvas {
 
     /// Returns (canvas_size, canvas_origin) from the last paint frame.
     fn canvas_metrics(&self) -> (Vec2, Vec2) {
-        let b = *self.canvas_bounds.read();
+        let b = self.canvas_bounds.get();
         (
             Vec2::new(f32::from(b.size.width), f32::from(b.size.height)),
             Vec2::new(f32::from(b.origin.x), f32::from(b.origin.y)),
@@ -229,7 +233,7 @@ impl Render for GraphCanvas {
                     |_bounds, _window, _cx| {},
                     move |bounds, (), window, cx| {
                         // Record bounds so event handlers can convert window → canvas coords.
-                        *canvas_bounds_arc.write() = bounds;
+                        canvas_bounds_arc.set(bounds);
 
                         window.paint_quad(fill(bounds, rgb(0x1e1e2e)));
 

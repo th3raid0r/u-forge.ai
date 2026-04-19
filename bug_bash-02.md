@@ -166,7 +166,7 @@ them exactly (not clobbered by a layout re-run).
 (`Ctrl+Shift+P`). Reproduce a snapshot rebuild (e.g. via agent edge add).
 `force_directed_layout` should no longer appear in the rebuild timing.
 
-### 2.3 🔎 `canvas_bounds` `Arc<RwLock<Bounds<Pixels>>>` on hot input path
+### 2.3 ✅ `canvas_bounds` `Arc<RwLock<Bounds<Pixels>>>` on hot input path
 
 **Where:** `crates/u-forge-ui-gpui/src/graph_canvas.rs:35, 71, 87, 129, 224`.
 
