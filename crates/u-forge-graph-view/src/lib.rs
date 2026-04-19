@@ -10,5 +10,5 @@ mod spatial;
 
 pub use layout::force_directed_layout;
 pub use observable::{GraphEvent, ObservableGraph};
-pub use snapshot::{build_snapshot, EdgeView, GraphSnapshot, LodLevel, NodeView};
+pub use snapshot::{build_snapshot, build_snapshot_incremental, EdgeView, GraphSnapshot, LodLevel, NodeView};
 pub use spatial::NodeEntry;

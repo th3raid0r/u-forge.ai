@@ -212,23 +212,54 @@ the cost of head-of-line blocking).
 (>10k chunks). Record peak RSS before/after. Expect a flat curve instead
 of a linear climb.
 
-### 2.5 ⚠️ Snapshot rebuilds rebuild `legend_types` and R-tree from scratch
+### 2.5 ✅ Snapshot rebuilds rebuild `legend_types` and R-tree from scratch
 
-**Where:** `crates/u-forge-graph-view/src/snapshot.rs:200-250` area.
+**Where:** `crates/u-forge-graph-view/src/snapshot.rs`.
 
 bug-bash-01 Tier 2 added legend cache at the *canvas* level, but the
-snapshot itself still recomputes legend-eligible types and the R-tree
-spatial index on every rebuild. When the graph is mutated by a single
-agent tool call, the full index is re-sorted and re-trained on bulk-load.
+snapshot itself still recomputed legend-eligible types and the R-tree
+spatial index on every rebuild. When the graph was mutated by a single
+agent tool call, the full index was re-sorted and rebuilt via O(N log N)
+`bulk_load`.
 
-**Fix.** Separate "rebuild snapshot" from "re-index spatial data" —
-keep the R-tree as a mutable side-structure and apply deltas (add-node /
-remove-node / move-node) to it instead of rebuilding. Defer until 2.2
-is in; the payoff is only visible once layout is skipped.
+**Fix applied.**
+
+1. `NodeEntry` (in `spatial.rs`) now stores `ObjectId` instead of a
+   `usize` index. This makes R-tree entries stable across snapshot
+   rebuilds — the entry for a given node is valid in any snapshot where
+   that node exists, regardless of index shifts caused by other adds/removes.
+   A `PartialEq` impl (by `id`) enables rstar's `remove` to locate entries
+   by identity.
+
+2. `GraphSnapshot` gained two new fields:
+   - `id_to_idx: HashMap<ObjectId, usize>` — resolves spatial-index entries
+     to `nodes` indices in `nodes_in_viewport` (O(1) lookup per hit).
+   - `type_counts: HashMap<String, usize>` — per-type node count, maintained
+     alongside `legend_types` to detect last-instance removals in O(delta).
+
+3. `build_snapshot_incremental(graph, prev)` was added alongside the
+   existing full `build_snapshot`. When all positions are saved (layout
+   is skipped, per 2.2), it:
+   - Clones `prev.spatial_index` and applies only removes (deleted nodes)
+     and inserts (new nodes), each O(log N) instead of O(N log N).
+   - Reuses `prev.legend_types` and adjusts `type_counts` in O(delta)
+     when no type is newly introduced or fully removed; falls back to
+     O(N) `build_legend` only when the type set changes.
+   - Falls back to a full `bulk_load` when layout ran (all positions
+     changed), same as before.
+
+4. `app_view::refresh_snapshot` now calls `build_snapshot_incremental`
+   when the current snapshot is non-empty; `build_snapshot` is used only
+   on the initial (empty) load or after `clear_all`.
+
+**Tests added** (`snapshot::tests`):
+- `incremental_snapshot_add_node_reuses_rtree`
+- `incremental_snapshot_remove_node_updates_rtree`
+- `incremental_snapshot_legend_reused_when_types_unchanged`
 
 **Verification.** Perf overlay on a 1k-node graph as the agent calls
 `UpsertNodeTool` in a loop. Expect a flat per-mutation cost instead of
-O(N).
+O(N log N) for the spatial index rebuild.
 
 ---
 

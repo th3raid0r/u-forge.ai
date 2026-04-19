@@ -1,11 +1,24 @@
 use rstar::{PointDistance, RTreeObject, AABB};
+use u_forge_core::ObjectId;
 
-/// Entry in the R-tree spatial index. Stores the node's index into
-/// `GraphSnapshot::nodes` and its 2D position.
+/// Entry in the R-tree spatial index. Stores the node's `ObjectId` and its
+/// 2D position.
+///
+/// Using `ObjectId` instead of a `usize` index keeps entries stable across
+/// snapshot rebuilds: when `build_snapshot_incremental` runs, existing entries
+/// remain valid and only added/deleted nodes need to be inserted/removed.
+/// The node's index into `GraphSnapshot::nodes` is resolved on demand via
+/// `GraphSnapshot::id_to_idx`.
 #[derive(Debug, Clone)]
 pub struct NodeEntry {
-    pub index: usize,
+    pub id: ObjectId,
     pub position: [f32; 2],
+}
+
+impl PartialEq for NodeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
 }
 
 impl RTreeObject for NodeEntry {

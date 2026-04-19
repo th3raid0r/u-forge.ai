@@ -282,8 +282,20 @@ impl AppView {
     }
 
     /// Rebuild the in-memory snapshot from the graph and push it to all child views.
+    ///
+    /// Uses `build_snapshot_incremental` when a previous snapshot exists so that
+    /// single-mutation events (e.g. agent `UpsertNodeTool`) apply R-tree and
+    /// legend deltas in O(delta × log N) instead of rebuilding from scratch.
     pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
-        match u_forge_graph_view::build_snapshot(&self.state.graph) {
+        let result = {
+            let prev = self.state.snapshot.read();
+            if prev.nodes.is_empty() && prev.edges.is_empty() {
+                u_forge_graph_view::build_snapshot(&self.state.graph)
+            } else {
+                u_forge_graph_view::build_snapshot_incremental(&self.state.graph, &prev)
+            }
+        };
+        match result {
             Ok(snap) => {
                 *self.state.snapshot.write() = snap;
                 self.node_panel
