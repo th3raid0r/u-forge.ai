@@ -114,7 +114,7 @@ Measure before coding each of these: enable the perf overlay
 (`Ctrl+Shift+P`), watch `frame:<ms>` while reproducing the scenario
 described. Skip any that don't show up in the trace.
 
-### 2.1 🔎 Redundant `edge_type.as_str().to_string()` in snapshot rebuild
+### 2.1 ✅ Redundant `edge_type.as_str().to_string()` in snapshot rebuild
 
 **Where:** `crates/u-forge-graph-view/src/snapshot.rs:185`.
 
@@ -183,7 +183,7 @@ the consumer is the view itself, keep bounds as a plain field on
 Expect no difference in the 95p frame, but reduced contention in
 `perf`-based lock traces.
 
-### 2.4 ⚠️ `embed_many` submits all jobs at once — no backpressure
+### 2.4 ✅ `embed_many` submits all jobs at once — no backpressure
 
 **Where:** `crates/u-forge-core/src/queue/dispatch.rs:104-116`.
 
@@ -209,7 +209,7 @@ the cost of head-of-line blocking).
 (>10k chunks). Record peak RSS before/after. Expect a flat curve instead
 of a linear climb.
 
-### 2.5 🔎 Snapshot rebuilds rebuild `legend_types` and R-tree from scratch
+### 2.5 ⚠️ Snapshot rebuilds rebuild `legend_types` and R-tree from scratch
 
 **Where:** `crates/u-forge-graph-view/src/snapshot.rs:200-250` area.
 

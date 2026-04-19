@@ -182,7 +182,7 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
             Some(EdgeView {
                 source_idx: src,
                 target_idx: tgt,
-                edge_type: e.edge_type.as_str().to_string(),
+                edge_type: e.edge_type.into_inner(),
                 weight: e.weight,
             })
         })
@@ -212,12 +212,15 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
     let spatial_index = RTree::bulk_load(entries);
 
     // Precompute the sorted unique type list for the rendering legend.
+    // HashSet dedup avoids BTreeSet's per-insert comparison overhead; one
+    // case-insensitive sort at the end produces the canonical order.
     let mut legend_types: Vec<String> = {
-        let mut seen = std::collections::BTreeSet::new();
-        for node in &nodes {
-            seen.insert(node.object_type.clone());
-        }
-        seen.into_iter().collect()
+        let mut seen = std::collections::HashSet::<&str>::new();
+        nodes
+            .iter()
+            .filter(|n| seen.insert(n.object_type.as_str()))
+            .map(|n| n.object_type.clone())
+            .collect()
     };
     legend_types.sort_by_key(|a| a.to_lowercase());
 

@@ -94,13 +94,9 @@ impl InferenceQueue {
 
     /// Submit a batch of texts for embedding.
     ///
-    /// Each text is submitted as a separate job; calls are made concurrently
-    /// and the results are collected in input order.  This leverages all
-    /// available embedding workers simultaneously.
-    ///
-    /// For small batches this is more efficient than a single
-    /// [`embed_batch`](crate::ai::embeddings::EmbeddingProvider::embed_batch) call
-    /// because it can parallelise across multiple NPU contexts.
+    /// Submissions are pipelined with a concurrency cap of `embedding_workers * 2`
+    /// so bulk imports don't materialise every pending future at once.  Results are
+    /// returned in input order.
     pub async fn embed_many(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if self.embedding_workers == 0 {
             return Err(anyhow!(
@@ -108,11 +104,16 @@ impl InferenceQueue {
             ));
         }
 
-        futures::future::try_join_all(texts.into_iter().map(|text| {
-            let q = self.clone();
-            async move { q.embed(text).await }
-        }))
-        .await
+        use futures::{StreamExt, TryStreamExt};
+        let concurrency = (self.embedding_workers * 2).max(4);
+        futures::stream::iter(texts)
+            .map(|text| {
+                let q = self.clone();
+                async move { q.embed(text).await }
+            })
+            .buffered(concurrency)
+            .try_collect()
+            .await
     }
 
     /// Submit an audio transcription request and await the result.

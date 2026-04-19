@@ -69,6 +69,11 @@ impl EdgeType {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Consume the `EdgeType` and return the inner `String`.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 impl std::fmt::Display for EdgeType {
