@@ -352,9 +352,15 @@ impl AppView {
         self.graph_canvas.read(cx).save_layout();
 
         // 2. Save all dirty editor tabs (also discards empty new nodes).
-        let (saved, saved_ids, discarded_ids) = self
+        let (saved, saved_ids, discarded_ids, skipped_edges) = self
             .node_editor
             .update(cx, |editor, cx| editor.save_dirty_tabs(cx));
+
+        if skipped_edges > 0 {
+            self.state.data_status = Some(format!(
+                "{skipped_edges} incomplete edge(s) skipped — fill both endpoints before saving."
+            ));
+        }
 
         // If any nodes were discarded, refresh the full snapshot.
         if !discarded_ids.is_empty() {

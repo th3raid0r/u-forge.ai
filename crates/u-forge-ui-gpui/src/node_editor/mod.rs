@@ -371,10 +371,11 @@ impl NodeEditorPanel {
     pub(crate) fn save_dirty_tabs(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>) {
+    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
         let mut saved = 0usize;
         let mut saved_ids = Vec::new();
         let mut discarded_ids = Vec::new();
+        let mut skipped_edges = 0usize;
 
         // First pass: identify empty-new tabs to discard.
         let mut discard_indices = Vec::new();
@@ -440,7 +441,7 @@ impl NodeEditorPanel {
 
             if self.graph.update_object(meta.clone()).is_ok() {
                 // ── Save edge changes ─────────────────────────────────────
-                Self::save_edges_for_tab(&self.graph, tab);
+                skipped_edges += Self::save_edges_for_tab(&self.graph, tab);
 
                 saved_ids.push(tab.node_id);
                 tab.original = meta;
@@ -458,14 +459,17 @@ impl NodeEditorPanel {
         }
         cx.notify();
         self.rebuild_field_subscriptions(cx);
-        (saved, saved_ids, discarded_ids)
+        (saved, saved_ids, discarded_ids, skipped_edges)
     }
 
     /// Persist edge changes for a single tab: delete removed edges and add new ones.
     ///
+    /// Returns the number of edges that were skipped because one or both endpoints
+    /// were still `None` (incomplete edges left by the user before saving).
+    ///
     /// Takes `graph` explicitly (rather than `&self`) so this can be called
     /// while iterating over `&mut self.tabs` without a borrow conflict.
-    fn save_edges_for_tab(graph: &KnowledgeGraph, tab: &EditorTab) {
+    fn save_edges_for_tab(graph: &KnowledgeGraph, tab: &EditorTab) -> usize {
         // Build sets of (from, to, type) triples for comparison.
         let orig_set: Vec<(ObjectId, ObjectId, String)> = tab
             .original_edges
@@ -473,16 +477,17 @@ impl NodeEditorPanel {
             .map(|e| (e.from, e.to, e.edge_type.as_str().to_string()))
             .collect();
 
+        let incomplete_count = tab.edited_edges.iter().filter(|e| !e.is_complete()).count();
+
         let edited_set: Vec<(ObjectId, ObjectId, String)> = tab
             .edited_edges
             .iter()
             .filter(|e| e.is_complete())
             .map(|e| {
-                (
-                    e.from.unwrap(),
-                    e.to.unwrap(),
-                    e.edge_type.trim().to_string(),
-                )
+                let (Some(from), Some(to)) = (e.from, e.to) else {
+                    unreachable!("is_complete() guarantees both endpoints are Some")
+                };
+                (from, to, e.edge_type.trim().to_string())
             })
             .collect();
 
@@ -505,6 +510,8 @@ impl NodeEditorPanel {
                 let _ = graph.connect_objects(*from, *to, EdgeType::new(et.clone()));
             }
         }
+
+        incomplete_count
     }
 
     /// Return true if any tab has unsaved changes.
