@@ -6623,6 +6623,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "u-forge-agent",
  "u-forge-core",
  "u-forge-graph-view",

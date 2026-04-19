@@ -9,7 +9,7 @@ use gpui::{
     ParentElement, Render, SharedString, Styled, Window,
 };
 
-use crate::chat_history::StoredMessage;
+use crate::chat_history::{StoredChatMessage, StoredRole, StoredToolCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatMessageRole {
@@ -59,37 +59,50 @@ impl ChatMessageView {
         }
     }
 
-    pub(crate) fn from_stored(msg: StoredMessage) -> Self {
-        let role = match msg.role.as_str() {
-            "user" => ChatMessageRole::User,
-            "assistant" => ChatMessageRole::Assistant,
-            "thinking" => ChatMessageRole::Thinking,
-            "tool_call" => ChatMessageRole::ToolCall,
-            _ => ChatMessageRole::Assistant,
+    pub(crate) fn from_stored(msg: StoredChatMessage) -> Self {
+        let role = match msg.role {
+            StoredRole::User => ChatMessageRole::User,
+            StoredRole::Assistant => ChatMessageRole::Assistant,
+            StoredRole::Thinking => ChatMessageRole::Thinking,
+            StoredRole::ToolCall => ChatMessageRole::ToolCall,
         };
+        let (tool_args, tool_result, tool_internal_id, collapsed) =
+            if let Some(tc) = msg.tool_call {
+                (Some(tc.args), tc.result, Some(tc.internal_id), tc.collapsed)
+            } else {
+                (None, None, None, false)
+            };
         Self {
             role,
             text: msg.text,
-            tool_args: msg.tool_args,
-            tool_result: msg.tool_result,
-            tool_internal_id: msg.tool_internal_id,
-            collapsed: msg.collapsed,
+            tool_args,
+            tool_result,
+            tool_internal_id,
+            collapsed,
         }
     }
 
-    pub(crate) fn to_stored(&self) -> StoredMessage {
-        StoredMessage {
-            role: match self.role {
-                ChatMessageRole::User => "user".to_string(),
-                ChatMessageRole::Assistant => "assistant".to_string(),
-                ChatMessageRole::Thinking => "thinking".to_string(),
-                ChatMessageRole::ToolCall => "tool_call".to_string(),
-            },
+    pub(crate) fn to_stored(&self) -> StoredChatMessage {
+        let stored_role = match self.role {
+            ChatMessageRole::User => StoredRole::User,
+            ChatMessageRole::Assistant => StoredRole::Assistant,
+            ChatMessageRole::Thinking => StoredRole::Thinking,
+            ChatMessageRole::ToolCall => StoredRole::ToolCall,
+        };
+        let tool_call = if self.role == ChatMessageRole::ToolCall {
+            Some(StoredToolCall {
+                internal_id: self.tool_internal_id.clone().unwrap_or_default(),
+                args: self.tool_args.clone().unwrap_or_default(),
+                result: self.tool_result.clone(),
+                collapsed: self.collapsed,
+            })
+        } else {
+            None
+        };
+        StoredChatMessage {
+            role: stored_role,
             text: self.text.clone(),
-            tool_args: self.tool_args.clone(),
-            tool_result: self.tool_result.clone(),
-            tool_internal_id: self.tool_internal_id.clone(),
-            collapsed: self.collapsed,
+            tool_call,
         }
     }
 

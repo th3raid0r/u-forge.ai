@@ -39,6 +39,128 @@ pub struct EmbeddingResult {
     pub total: usize,
 }
 
+/// Aggregated outcome from an [`EmbeddingPlan`] execution.
+#[derive(Debug, Default)]
+pub struct EmbeddingOutcome {
+    /// Chunks successfully embedded at standard quality.
+    pub stored: usize,
+    /// Chunks that failed to embed (logged individually).
+    pub skipped: usize,
+    /// Chunks successfully embedded at high quality (0 when no HQ queue).
+    pub hq_stored: usize,
+}
+
+/// Progress event emitted by [`EmbeddingPlan::execute`].
+#[derive(Debug, Clone)]
+pub enum EmbeddingProgress {
+    /// Rechunking plan: node `done` of `total` nodes processed.
+    Rechunking { done: usize, total: usize },
+}
+
+enum EmbeddingTask {
+    Rechunk(Vec<crate::types::ObjectId>),
+    EmbedAll,
+}
+
+/// Declarative description of an embedding job — either rechunking specific
+/// nodes or sweeping all unembedded chunks.
+///
+/// Build with [`EmbeddingPlan::rechunk`] or [`EmbeddingPlan::embed_all`],
+/// then call [`EmbeddingPlan::execute`].
+pub struct EmbeddingPlan {
+    task: EmbeddingTask,
+}
+
+impl EmbeddingPlan {
+    /// Plan to rechunk and re-embed a specific set of nodes.
+    pub fn rechunk(node_ids: Vec<crate::types::ObjectId>) -> Self {
+        Self {
+            task: EmbeddingTask::Rechunk(node_ids),
+        }
+    }
+
+    /// Plan to embed all chunks that are not yet embedded (bulk sweep).
+    pub fn embed_all() -> Self {
+        Self {
+            task: EmbeddingTask::EmbedAll,
+        }
+    }
+
+    /// Human-readable initial label for the plan (for status bar display).
+    pub fn label(&self) -> String {
+        match &self.task {
+            EmbeddingTask::Rechunk(ids) => format!("Re-embedding {} node(s)…", ids.len()),
+            EmbeddingTask::EmbedAll => "Embedding…".to_string(),
+        }
+    }
+
+    /// Execute the plan, emitting [`EmbeddingProgress`] events via `on_progress`
+    /// as work proceeds.  Returns an [`EmbeddingOutcome`] when complete.
+    ///
+    /// `on_progress` is called synchronously from within the async task — keep it
+    /// cheap (e.g. write to an `Arc<Mutex<_>>`).
+    pub async fn execute(
+        self,
+        graph: &KnowledgeGraph,
+        queue: &InferenceQueue,
+        hq_queue: Option<&InferenceQueue>,
+        on_progress: impl Fn(EmbeddingProgress) + Send,
+    ) -> EmbeddingOutcome {
+        match self.task {
+            EmbeddingTask::Rechunk(node_ids) => {
+                let total = node_ids.len();
+                let mut stored = 0usize;
+                let mut skipped = 0usize;
+                for (done, oid) in node_ids.iter().enumerate() {
+                    match rechunk_and_embed(graph, queue, hq_queue, *oid).await {
+                        Ok(n) => stored += n,
+                        Err(e) => {
+                            warn!(object_id = %oid, %e, "rechunk_and_embed failed");
+                            skipped += 1;
+                        }
+                    }
+                    on_progress(EmbeddingProgress::Rechunking {
+                        done: done + 1,
+                        total,
+                    });
+                }
+                EmbeddingOutcome {
+                    stored,
+                    skipped,
+                    hq_stored: 0,
+                }
+            }
+            EmbeddingTask::EmbedAll => {
+                let std_result =
+                    embed_all_chunks(graph, queue, EmbeddingTarget::Standard).await;
+                let hq_result = if let Some(hq) = hq_queue {
+                    Some(embed_all_chunks(graph, hq, EmbeddingTarget::HighQuality).await)
+                } else {
+                    None
+                };
+
+                let (stored, skipped) = match std_result {
+                    Ok(r) => (r.stored, r.skipped),
+                    Err(e) => {
+                        warn!(%e, "embed_all_chunks (standard) failed");
+                        (0, 0)
+                    }
+                };
+                let hq_stored = hq_result
+                    .and_then(|r| r.ok())
+                    .map(|r| r.stored)
+                    .unwrap_or(0);
+
+                EmbeddingOutcome {
+                    stored,
+                    skipped,
+                    hq_stored,
+                }
+            }
+        }
+    }
+}
+
 /// Re-chunk a single object and embed all its chunks, waiting until complete.
 ///
 /// This is the per-node analogue of the bulk [`embed_all_chunks`] pipeline:
@@ -105,7 +227,7 @@ pub async fn rechunk_and_embed(
         object_id = %object_id,
         name = %meta.name,
         chunks = chunks.len(),
-        hq = hq_queue.map_or(false, |q| q.has_embedding()),
+        hq = hq_queue.is_some_and(|q| q.has_embedding()),
         "Rechunked and embedded node"
     );
 

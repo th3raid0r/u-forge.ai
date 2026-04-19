@@ -107,19 +107,14 @@ Lemonade Server runs on its default port.
 `<db_path>/knowledge.db`. The directory is created automatically if it does not
 exist.
 
-```bash
-# Default in CLI demo: a TempDir is used (ephemeral).
-# For a persistent database, pass an explicit path:
-cargo run --example cli_demo
-# or set UFORGE_DATA_FILE / UFORGE_SCHEMA_DIR to customise import sources.
-```
+The desktop app uses a persistent database. Set `UFORGE_DATA_FILE` / `UFORGE_SCHEMA_DIR` to customise import sources.
 
 ## Build Commands
 
 ```bash
 cargo build --workspace                                                              # Build (first time ~30s for bundled SQLite)
 cargo test --workspace -- --test-threads=1                                           # Run all tests (no server required)
-cargo run --manifest-path crates/u-forge-core/Cargo.toml --example cli_demo         # Run demo with Foundation data
+cargo run -p u-forge-ui-gpui                                                         # Run the desktop app
 RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture               # Tests with debug logging
 ```
 

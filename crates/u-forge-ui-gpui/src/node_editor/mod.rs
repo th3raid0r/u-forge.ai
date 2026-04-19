@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use gpui::{prelude::*, Context, Entity, Pixels, Subscription};
 use parking_lot::RwLock;
-use u_forge_core::{EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, SchemaManager};
+use u_forge_core::{EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyIssue, SchemaManager};
 use u_forge_graph_view::GraphSnapshot;
 
 use crate::selection_model::SelectionModel;
@@ -421,12 +421,20 @@ impl NodeEditorPanel {
                 }
                 // Drop empty strings for description so the key stays absent
                 // rather than storing an empty string.
-                if k == "description" {
-                    if v.as_str().is_some_and(|s| s.is_empty()) {
-                        continue;
-                    }
+                if k == "description" && v.as_str().is_some_and(|s| s.is_empty()) {
+                    continue;
                 }
                 props.insert(k.clone(), v.clone());
+            }
+            // Validate and coerce properties against the schema.
+            let issues = self
+                .graph
+                .validate_and_coerce_properties(&meta.object_type, &mut props);
+            for issue in &issues {
+                match issue {
+                    PropertyIssue::UnknownProperty { .. } => {}
+                    _ => tracing::warn!("node {}: {issue}", meta.id),
+                }
             }
             meta.properties = serde_json::Value::Object(props);
 

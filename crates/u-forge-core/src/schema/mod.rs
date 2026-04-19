@@ -9,4 +9,4 @@ pub use definition::{
     ValidationResult, ValidationRule, ValidationWarning,
 };
 pub use ingestion::SchemaIngestion;
-pub use manager::{SchemaManager, SchemaStats};
+pub use manager::{PropertyIssue, SchemaManager, SchemaStats};

@@ -50,15 +50,58 @@ pub(crate) struct ChatSessionSummary {
     pub updated_at: String,
 }
 
-/// A stored chat message (mirrors `ChatEntry` fields).
+/// Message role — typed counterpart to the `role` column in `chat_messages`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoredRole {
+    User,
+    Assistant,
+    Thinking,
+    ToolCall,
+}
+
+impl StoredRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            StoredRole::User => "user",
+            StoredRole::Assistant => "assistant",
+            StoredRole::Thinking => "thinking",
+            StoredRole::ToolCall => "tool_call",
+        }
+    }
+
+    pub(crate) fn from_str(s: &str) -> Self {
+        match s {
+            "user" => StoredRole::User,
+            "thinking" => StoredRole::Thinking,
+            "tool_call" => StoredRole::ToolCall,
+            _ => StoredRole::Assistant,
+        }
+    }
+}
+
+/// Tool call metadata — present only when `StoredChatMessage.role == ToolCall`.
 #[derive(Debug, Clone)]
-pub(crate) struct StoredMessage {
-    pub role: String,
-    pub text: String,
-    pub tool_args: Option<String>,
-    pub tool_result: Option<String>,
-    pub tool_internal_id: Option<String>,
+pub(crate) struct StoredToolCall {
+    /// Stable correlation ID matching the `ToolCallStart` event.
+    pub internal_id: String,
+    /// Pretty-printed JSON arguments.
+    pub args: String,
+    /// Result text, filled in when the tool returns.
+    pub result: Option<String>,
+    /// Whether the tool call body is collapsed in the UI.
     pub collapsed: bool,
+}
+
+/// A stored chat message — the persistence-layer source of truth.
+///
+/// The UI layer (`ChatMessageView`) converts to/from this type at the
+/// persistence boundary only (`from_stored` / `to_stored`).
+#[derive(Debug, Clone)]
+pub(crate) struct StoredChatMessage {
+    pub role: StoredRole,
+    pub text: String,
+    /// `Some` only when `role == StoredRole::ToolCall`.
+    pub tool_call: Option<StoredToolCall>,
 }
 
 // ── ChatHistoryStore ─────────────────────────────────────────────────────────
@@ -117,7 +160,7 @@ impl ChatHistoryStore {
     }
 
     /// Load all messages for a session, ordered.
-    pub fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
+    pub fn load_messages(&self, session_id: &str) -> Result<Vec<StoredChatMessage>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT role, text, tool_args, tool_result, tool_internal_id, collapsed \
@@ -125,13 +168,23 @@ impl ChatHistoryStore {
         )?;
         let rows = stmt
             .query_map(params![session_id], |row| {
-                Ok(StoredMessage {
-                    role: row.get(0)?,
+                let role_str: String = row.get(0)?;
+                let role = StoredRole::from_str(&role_str);
+                let tool_call = if role == StoredRole::ToolCall {
+                    let internal_id: Option<String> = row.get(4)?;
+                    Some(StoredToolCall {
+                        internal_id: internal_id.unwrap_or_default(),
+                        args: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        result: row.get(3)?,
+                        collapsed: row.get::<_, i32>(5)? != 0,
+                    })
+                } else {
+                    None
+                };
+                Ok(StoredChatMessage {
+                    role,
                     text: row.get(1)?,
-                    tool_args: row.get(2)?,
-                    tool_result: row.get(3)?,
-                    tool_internal_id: row.get(4)?,
-                    collapsed: row.get::<_, i32>(5)? != 0,
+                    tool_call,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -143,7 +196,7 @@ impl ChatHistoryStore {
         &self,
         session_id: &str,
         title: &str,
-        messages: &[StoredMessage],
+        messages: &[StoredChatMessage],
     ) -> Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
@@ -164,15 +217,26 @@ impl ChatHistoryStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         for (i, msg) in messages.iter().enumerate() {
+            let (tool_args, tool_result, tool_internal_id, collapsed) =
+                if let Some(tc) = &msg.tool_call {
+                    (
+                        Some(tc.args.clone()),
+                        tc.result.clone(),
+                        Some(tc.internal_id.clone()),
+                        tc.collapsed,
+                    )
+                } else {
+                    (None, None, None, false)
+                };
             insert.execute(params![
                 session_id,
                 i as i64,
-                msg.role,
+                msg.role.as_str(),
                 msg.text,
-                msg.tool_args,
-                msg.tool_result,
-                msg.tool_internal_id,
-                if msg.collapsed { 1 } else { 0 },
+                tool_args,
+                tool_result,
+                tool_internal_id,
+                if collapsed { 1i32 } else { 0i32 },
             ])?;
         }
         Ok(())

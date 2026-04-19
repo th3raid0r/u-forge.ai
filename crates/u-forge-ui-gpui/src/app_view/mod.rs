@@ -1,23 +1,26 @@
 mod render;
+mod state;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{prelude::*, Context, Empty, Entity, Subscription};
 use parking_lot::RwLock;
 use u_forge_agent::{AgentParams, GraphAgent};
 use u_forge_core::{
-    embed_all_chunks,
-    ingest::{build_hq_embed_queue, rechunk_and_embed},
+    ingest::build_hq_embed_queue,
     lemonade::{
         resolve_lemonade_url, Capability, GpuResourceManager, LemonadeServerCatalog, ModelSelector,
         ProviderFactory, QualityTier,
     },
-    queue::{InferenceQueue, InferenceQueueBuilder},
+    queue::InferenceQueueBuilder,
     types::ObjectId,
-    AppConfig, EmbeddingTarget, KnowledgeGraph, ObjectMetadata, SchemaManager,
+    AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, KnowledgeGraph, ObjectMetadata,
+    SchemaManager,
 };
 use u_forge_graph_view::GraphSnapshot;
+
+use state::AppState;
 
 use crate::chat_panel::{AvailableModel, ChatPanel};
 use crate::graph_canvas::GraphCanvas;
@@ -91,7 +94,60 @@ pub(crate) enum SidebarTab {
     Search,
 }
 
+/// Number of frame-cost samples retained for the rolling perf-overlay average.
+const FRAME_TIME_WINDOW: usize = 60;
+
+/// Fixed-size ring buffer of recent frame costs in microseconds. Recording
+/// is gated on `AppView::perf_enabled`; `clear()` resets the write cursor
+/// when the overlay is toggled off so stale samples don't bleed across
+/// enable/disable cycles.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameTimeRing {
+    samples: [u64; FRAME_TIME_WINDOW],
+    /// Count of valid samples (0..=FRAME_TIME_WINDOW).
+    len: usize,
+    /// Index of the next write slot (wraps modulo FRAME_TIME_WINDOW).
+    write: usize,
+}
+
+impl Default for FrameTimeRing {
+    fn default() -> Self {
+        Self {
+            samples: [0; FRAME_TIME_WINDOW],
+            len: 0,
+            write: 0,
+        }
+    }
+}
+
+impl FrameTimeRing {
+    pub(crate) fn push(&mut self, sample: u64) {
+        self.samples[self.write] = sample;
+        self.write = (self.write + 1) % FRAME_TIME_WINDOW;
+        if self.len < FRAME_TIME_WINDOW {
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+        self.write = 0;
+    }
+
+    /// Mean of the recorded samples, or `None` when the buffer is empty.
+    pub(crate) fn average(&self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        let sum: u64 = self.samples[..self.len].iter().sum();
+        Some(sum / self.len as u64)
+    }
+}
+
 pub struct AppView {
+    // ── Non-render state (graph, queues, config, status strings) ─────────────
+    pub(crate) state: AppState,
+    // ── GPUI entity handles ───────────────────────────────────────────────────
     pub(crate) graph_canvas: Entity<GraphCanvas>,
     pub(crate) node_panel: Entity<NodePanel>,
     pub(crate) search_panel: Entity<SearchPanel>,
@@ -99,10 +155,7 @@ pub struct AppView {
     pub(crate) chat_panel: Entity<ChatPanel>,
     #[allow(dead_code)]
     pub(crate) selection: Entity<SelectionModel>,
-    pub(crate) snapshot: Arc<RwLock<GraphSnapshot>>,
-    pub(crate) graph: Arc<KnowledgeGraph>,
-    pub(crate) data_file: std::path::PathBuf,
-    pub(crate) schema_dir: std::path::PathBuf,
+    // ── UI layout state ───────────────────────────────────────────────────────
     pub(crate) file_menu_open: bool,
     pub(crate) view_menu_open: bool,
     pub(crate) sidebar_open: bool,
@@ -114,30 +167,24 @@ pub struct AppView {
     pub(crate) editor_ratio: f32,
     /// Current right panel width in pixels (user-resizable).
     pub(crate) right_panel_width: f32,
-    /// Status message displayed in the status bar during/after data operations.
-    pub(crate) data_status: Option<String>,
-    /// Embedding progress/completion message shown in the status bar.
-    pub(crate) embedding_status: Option<String>,
-    /// Shared app config.
-    pub(crate) app_config: Arc<AppConfig>,
-    /// Persistent tokio runtime for async core calls from background tasks.
-    pub(crate) tokio_rt: Arc<tokio::runtime::Runtime>,
-    /// Standard embedding + reranking queue (None until Lemonade is discovered).
-    pub(crate) inference_queue: Option<InferenceQueue>,
-    /// High-quality embedding queue (None when HQ embedding is disabled or unavailable).
-    pub(crate) hq_queue: Option<InferenceQueue>,
+    // ── GPUI bookkeeping ──────────────────────────────────────────────────────
     /// Subscriptions to node panel create/delete events — kept alive so handlers fire.
     _node_subs: Vec<Subscription>,
+    // ── Perf overlay ──────────────────────────────────────────────────────────
     /// Whether the perf overlay is visible.
     pub(crate) perf_enabled: bool,
     /// Frame cost (µs) of the last rendered frame, measured via canvas timer
     /// (render-tree build + GPUI layout pass + paint start).
     pub(crate) last_frame_cost_us: u64,
-    /// Rolling window of the last 60 frame costs in microseconds.
-    pub(crate) frame_times_us: VecDeque<u64>,
+    /// Fixed-size ring buffer of recent frame costs (µs). Written by the
+    /// timing canvas only while the perf overlay is visible; summed once
+    /// per frame to compute `avg_ms`. Fixed array avoids any per-frame
+    /// allocation from the prior `VecDeque`.
+    pub(crate) frame_times_us: FrameTimeRing,
 }
 
 impl AppView {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: GraphSnapshot,
         graph: Arc<KnowledgeGraph>,
@@ -149,6 +196,8 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
+
+        // Build child entities — clone Arc handles before they move into AppState.
         let selection = cx.new(|_cx| SelectionModel::new(snapshot_arc.clone()));
         let graph_canvas = cx
             .new(|cx| GraphCanvas::new(snapshot_arc.clone(), graph.clone(), selection.clone(), cx));
@@ -197,17 +246,23 @@ impl AppView {
             )
         });
 
+        let state = AppState::new(
+            graph,
+            snapshot_arc,
+            data_file,
+            schema_dir,
+            app_config,
+            tokio_rt,
+        );
+
         let mut view = Self {
+            state,
             graph_canvas,
             node_panel,
             search_panel,
             node_editor,
             chat_panel,
             selection,
-            snapshot: snapshot_arc,
-            graph,
-            data_file,
-            schema_dir,
             file_menu_open: false,
             view_menu_open: false,
             sidebar_open: false,
@@ -216,16 +271,10 @@ impl AppView {
             sidebar_width: DEFAULT_SIDEBAR_W,
             editor_ratio: DEFAULT_EDITOR_RATIO,
             right_panel_width: DEFAULT_RIGHT_PANEL_W,
-            data_status: None,
-            embedding_status: None,
-            app_config,
-            tokio_rt,
-            inference_queue: None,
-            hq_queue: None,
             _node_subs: vec![node_sub_create, node_sub_delete],
             perf_enabled: false,
             last_frame_cost_us: 0,
-            frame_times_us: VecDeque::new(),
+            frame_times_us: FrameTimeRing::default(),
         };
 
         view.do_init_lemonade(cx);
@@ -234,9 +283,9 @@ impl AppView {
 
     /// Rebuild the in-memory snapshot from the graph and push it to all child views.
     pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
-        match u_forge_graph_view::build_snapshot(&self.graph) {
+        match u_forge_graph_view::build_snapshot(&self.state.graph) {
             Ok(snap) => {
-                *self.snapshot.write() = snap;
+                *self.state.snapshot.write() = snap;
                 self.node_panel
                     .update(cx, |panel, cx| panel.refresh_groups(cx));
                 cx.notify();
@@ -248,24 +297,24 @@ impl AppView {
     }
 
     pub(crate) fn do_clear_data(&mut self, cx: &mut Context<Self>) {
-        match self.graph.clear_all() {
+        match self.state.graph.clear_all() {
             Ok(()) => {
-                self.data_status = Some("Data cleared.".to_string());
+                self.state.data_status = Some("Data cleared.".to_string());
                 self.refresh_snapshot(cx);
             }
             Err(e) => {
-                self.data_status = Some(format!("Clear failed: {e}"));
+                self.state.data_status = Some(format!("Clear failed: {e}"));
                 cx.notify();
             }
         }
     }
 
     pub(crate) fn do_import_data(&mut self, cx: &mut Context<Self>) {
-        let graph = self.graph.clone();
-        let data_file = self.data_file.clone();
-        let schema_dir = self.schema_dir.to_string_lossy().into_owned();
+        let graph = self.state.graph.clone();
+        let data_file = self.state.data_file.clone();
+        let schema_dir = self.state.schema_dir.to_string_lossy().into_owned();
 
-        self.data_status = Some("Importing…".to_string());
+        self.state.data_status = Some("Importing…".to_string());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -279,16 +328,16 @@ impl AppView {
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
                     Ok(stats) => {
-                        view.data_status = Some(format!(
+                        view.state.data_status = Some(format!(
                             "Import done — {} nodes, {} edges",
                             stats.objects_created, stats.relationships_created
                         ));
                         view.refresh_snapshot(cx);
                         // Trigger embedding after successful import.
-                        view.do_embed_all(cx);
+                        view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
                     }
                     Err(e) => {
-                        view.data_status = Some(format!("Import failed: {e}"));
+                        view.state.data_status = Some(format!("Import failed: {e}"));
                         cx.notify();
                     }
                 }
@@ -321,7 +370,7 @@ impl AppView {
 
             // 3. Re-chunk and embed every saved node so semantic search stays current.
             if !saved_ids.is_empty() {
-                self.do_rechunk_and_embed(saved_ids, cx);
+                self.run_embedding_plan(EmbeddingPlan::rechunk(saved_ids), cx);
             }
         }
 
@@ -336,7 +385,7 @@ impl AppView {
         let meta = ObjectMetadata::new(object_type.to_string(), String::new());
         let node_id = meta.id;
 
-        match self.graph.add_object(meta) {
+        match self.state.graph.add_object(meta) {
             Ok(_id) => {
                 // Refresh snapshot so the node panel and canvas see the new node.
                 self.refresh_snapshot(cx);
@@ -357,7 +406,7 @@ impl AppView {
                 self.sidebar_tab = SidebarTab::Nodes;
             }
             Err(e) => {
-                self.data_status = Some(format!("Failed to create node: {e}"));
+                self.state.data_status = Some(format!("Failed to create node: {e}"));
             }
         }
         cx.notify();
@@ -386,75 +435,115 @@ impl AppView {
         }
 
         // Delete from DB (cascades to edges, chunks, etc.).
-        match self.graph.delete_object(node_id) {
+        match self.state.graph.delete_object(node_id) {
             Ok(()) => {
                 self.refresh_snapshot(cx);
             }
             Err(e) => {
-                self.data_status = Some(format!("Delete failed: {e}"));
+                self.state.data_status = Some(format!("Delete failed: {e}"));
             }
         }
         cx.notify();
     }
 
-    /// Asynchronously re-chunk and embed a set of nodes (standard + optional HQ).
-    ///
-    /// Used by [`do_save`] to keep embeddings in sync with edited node content.
-    /// Each node's old chunks are deleted, fresh chunks are created from the
-    /// flattened metadata, and embeddings are computed before the task completes.
-    fn do_rechunk_and_embed(&mut self, node_ids: Vec<ObjectId>, cx: &mut Context<Self>) {
-        let queue = match self.inference_queue.clone() {
-            Some(q) => q,
-            None => return, // No embedding queue yet — nothing to do.
+    /// Format the `embedding_status` string from a completed [`EmbeddingOutcome`].
+    /// Returns `None` when nothing was actually embedded (total == 0).
+    fn format_embedding_outcome(outcome: &EmbeddingOutcome) -> Option<String> {
+        if outcome.stored == 0 && outcome.skipped == 0 {
+            return None;
+        }
+        let hq_suffix = if outcome.hq_stored > 0 {
+            format!(" (+{} HQ)", outcome.hq_stored)
+        } else {
+            String::new()
         };
-        let hq_queue = self.hq_queue.clone();
-        let graph = self.graph.clone();
-        let tokio_rt = self.tokio_rt.clone();
-        let count = node_ids.len();
+        if outcome.skipped > 0 {
+            Some(format!(
+                "Embedded {}{hq_suffix} chunk(s), {} failed",
+                outcome.stored, outcome.skipped
+            ))
+        } else {
+            Some(format!("Embedded {}{hq_suffix} chunk(s)", outcome.stored))
+        }
+    }
 
-        self.embedding_status = Some(format!("Re-embedding {count} node(s)…"));
+    /// Run an [`EmbeddingPlan`] asynchronously, updating `embedding_status`
+    /// from progress events as work proceeds.
+    ///
+    /// Replaces the former `do_rechunk_and_embed` / `do_embed_all` /
+    /// `spawn_embedding_sampler` / `stop_embedding_sampler` quartet.
+    /// Any previously running plan is implicitly cancelled via epoch bump.
+    pub(crate) fn run_embedding_plan(&mut self, plan: EmbeddingPlan, cx: &mut Context<Self>) {
+        let queue = match self.state.inference_queue.clone() {
+            Some(q) => q,
+            None => return,
+        };
+        let hq_queue = self.state.hq_queue.clone();
+        let graph = self.state.graph.clone();
+        let tokio_rt = self.state.tokio_rt.clone();
+
+        self.state.embedding_status = Some(plan.label());
         cx.notify();
 
+        // Bump epoch to cancel any previously running poller.
+        self.state.embedding_plan_epoch = self.state.embedding_plan_epoch.wrapping_add(1);
+        let epoch = self.state.embedding_plan_epoch;
+
+        // Shared progress state written by the tokio worker, read by the poller.
+        let progress_state: Arc<parking_lot::Mutex<Option<EmbeddingProgress>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let progress_write = Arc::clone(&progress_state);
+
+        // Poller: reads shared progress every 500 ms and refreshes the status bar.
         cx.spawn(async move |this, cx| {
-            let result = cx
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let Some(this) = this.upgrade() else { return };
+                let snap = progress_state.lock().clone();
+                let keep_running = this
+                    .update(cx, |view: &mut AppView, cx| {
+                        if view.state.embedding_plan_epoch != epoch {
+                            return false;
+                        }
+                        if let Some(EmbeddingProgress::Rechunking { done, total }) = snap {
+                            view.state.embedding_status =
+                                Some(format!("Re-embedding… ({done}/{total})"));
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .ok();
+                if keep_running != Some(true) {
+                    return;
+                }
+            }
+        })
+        .detach();
+
+        // Worker: runs the plan on the tokio runtime and reports outcome.
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    tokio_rt.block_on(async {
-                        let hq_ref = hq_queue.as_ref();
-                        let mut total_chunks = 0usize;
-                        let mut errors = 0usize;
-                        for oid in &node_ids {
-                            match rechunk_and_embed(&graph, &queue, hq_ref, *oid).await {
-                                Ok(n) => total_chunks += n,
-                                Err(e) => {
-                                    eprintln!("rechunk_and_embed({oid}): {e:#}");
-                                    errors += 1;
-                                }
-                            }
-                        }
-                        Ok::<_, anyhow::Error>((total_chunks, errors))
+                    tokio_rt.block_on(async move {
+                        plan.execute(
+                            &graph,
+                            &queue,
+                            hq_queue.as_ref(),
+                            move |p| *progress_write.lock() = Some(p),
+                        )
+                        .await
                     })
                 })
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
-                match result {
-                    Ok((chunks, 0)) if chunks > 0 => {
-                        view.embedding_status = Some(format!("Re-embedded {chunks} chunk(s)"));
-                    }
-                    Ok((chunks, errs)) if errs > 0 => {
-                        view.embedding_status = Some(format!(
-                            "Re-embedded {chunks} chunk(s), {errs} node(s) failed"
-                        ));
-                    }
-                    Ok(_) => {
-                        view.embedding_status = None;
-                    }
-                    Err(e) => {
-                        eprintln!("Re-embed failed: {e}");
-                        view.embedding_status = Some(format!("Re-embed failed: {e}"));
-                    }
-                }
+                // Stop the poller by advancing the epoch.
+                view.state.embedding_plan_epoch =
+                    view.state.embedding_plan_epoch.wrapping_add(1);
+                view.state.embedding_status = Self::format_embedding_outcome(&outcome);
                 cx.notify();
             })
             .ok();
@@ -465,8 +554,8 @@ impl AppView {
     /// Asynchronously discover Lemonade Server and build the InferenceQueue + ChatProvider.
     /// FTS5 search works immediately even if this fails.
     pub(crate) fn do_init_lemonade(&mut self, cx: &mut Context<Self>) {
-        let app_config = self.app_config.clone();
-        let tokio_rt = self.tokio_rt.clone();
+        let app_config = self.state.app_config.clone();
+        let tokio_rt = self.state.tokio_rt.clone();
 
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -595,8 +684,8 @@ impl AppView {
                 match result {
                     Ok((lemonade_url, queue, hq_queue, chat_provider, llm_models, preferred_idx)) => {
                         eprintln!("Lemonade connected — embedding queue ready");
-                        view.inference_queue = Some(queue.clone());
-                        view.hq_queue = hq_queue.clone();
+                        view.state.inference_queue = Some(queue.clone());
+                        view.state.hq_queue = hq_queue.clone();
 
                         // Wrap HQ queue in Arc before it's consumed below.
                         let hq_arc = hq_queue.clone().map(Arc::new);
@@ -607,21 +696,22 @@ impl AppView {
                         });
 
                         // Build the graph agent and wire it to the chat panel.
-                        let graph = view.graph.clone();
-                        let system_prompt = view.app_config.chat.system_prompt.clone();
-                        let dev = view.app_config.chat.active_device_config();
-                        let mut agent_params = AgentParams::default();
-                        if let Some(v) = dev.temperature { agent_params.temperature = v as f64; }
-                        if let Some(v) = dev.max_tokens { agent_params.max_tokens = Some(v as u64); }
-                        if let Some(v) = dev.top_p { agent_params.top_p = Some(v as f64); }
-                        if let Some(v) = dev.top_k { agent_params.top_k = Some(v); }
-                        if let Some(v) = dev.min_p { agent_params.min_p = Some(v as f64); }
-                        if let Some(v) = dev.frequency_penalty { agent_params.frequency_penalty = Some(v as f64); }
-                        if let Some(v) = dev.presence_penalty { agent_params.presence_penalty = Some(v as f64); }
-                        if let Some(v) = dev.repetition_penalty { agent_params.repetition_penalty = Some(v as f64); }
-                        if let Some(v) = dev.seed { agent_params.seed = Some(v); }
-                        if dev.stop.is_some() { agent_params.stop = dev.stop.clone(); }
-                        agent_params.max_tool_turns = view.app_config.chat.max_tool_turns;
+                        let graph = view.state.graph.clone();
+                        let system_prompt = view.state.app_config.chat.system_prompt.clone();
+                        let dev = view.state.app_config.chat.active_device_config();
+                        let agent_params = AgentParams {
+                            temperature: dev.temperature.map(|v| v as f64),
+                            max_tokens: dev.max_tokens.map(|v| v as u64),
+                            top_p: dev.top_p.map(|v| v as f64),
+                            top_k: dev.top_k,
+                            min_p: dev.min_p.map(|v| v as f64),
+                            frequency_penalty: dev.frequency_penalty.map(|v| v as f64),
+                            presence_penalty: dev.presence_penalty.map(|v| v as f64),
+                            repetition_penalty: dev.repetition_penalty.map(|v| v as f64),
+                            seed: dev.seed,
+                            stop: dev.stop.clone(),
+                            max_tool_turns: view.state.app_config.chat.max_tool_turns,
+                        };
                         match GraphAgent::new(
                             &lemonade_url,
                             graph,
@@ -648,7 +738,7 @@ impl AppView {
                         }
 
                         // Trigger bulk embedding for any unembedded chunks.
-                        view.do_embed_all(cx);
+                        view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
                     }
                     Err(e) => {
                         eprintln!("Lemonade init skipped: {e}");
@@ -662,10 +752,10 @@ impl AppView {
     }
 
     pub(crate) fn do_export_data(&mut self, cx: &mut Context<Self>) {
-        let graph = self.graph.clone();
-        let data_file = self.data_file.clone();
+        let graph = self.state.graph.clone();
+        let data_file = self.state.data_file.clone();
 
-        self.data_status = Some("Exporting…".to_string());
+        self.state.data_status = Some("Exporting…".to_string());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -735,12 +825,12 @@ impl AppView {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .into_owned();
-                        view.data_status = Some(format!(
+                        view.state.data_status = Some(format!(
                             "Exported {node_count} nodes, {edge_count} edges → {filename}"
                         ));
                     }
                     Err(e) => {
-                        view.data_status = Some(format!("Export failed: {e}"));
+                        view.state.data_status = Some(format!("Export failed: {e}"));
                     }
                 }
                 cx.notify();
@@ -750,70 +840,4 @@ impl AppView {
         .detach();
     }
 
-    /// Trigger bulk embedding of all unembedded chunks (standard + optional HQ).
-    pub(crate) fn do_embed_all(&mut self, cx: &mut Context<Self>) {
-        let queue = match self.inference_queue.clone() {
-            Some(q) => q,
-            None => return,
-        };
-        let hq_queue = self.hq_queue.clone();
-        let graph = self.graph.clone();
-        let tokio_rt = self.tokio_rt.clone();
-
-        self.embedding_status = Some("Embedding…".to_string());
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    tokio_rt.block_on(async move {
-                        let std_result =
-                            embed_all_chunks(&graph, &queue, EmbeddingTarget::Standard).await?;
-
-                        let hq_result = if let Some(hq) = &hq_queue {
-                            let r =
-                                embed_all_chunks(&graph, hq, EmbeddingTarget::HighQuality).await?;
-                            Some(r)
-                        } else {
-                            None
-                        };
-
-                        Ok::<_, anyhow::Error>((std_result, hq_result))
-                    })
-                })
-                .await;
-
-            this.update(cx, |view: &mut AppView, cx| {
-                match result {
-                    Ok((std_r, hq_r)) => {
-                        // Only report if something was actually embedded.
-                        // total == 0 means no unembedded chunks existed — nothing to do.
-                        view.embedding_status = if std_r.total == 0 {
-                            None
-                        } else if std_r.stored > 0 {
-                            let hq_suffix = hq_r
-                                .filter(|hq| hq.stored > 0)
-                                .map(|hq| format!(" (+{} HQ)", hq.stored))
-                                .unwrap_or_default();
-                            Some(format!("Embedded {}{} chunks", std_r.stored, hq_suffix))
-                        } else {
-                            // Had candidates but none stored (all failed).
-                            Some(format!(
-                                "Embedding: {}/{} failed",
-                                std_r.skipped, std_r.total
-                            ))
-                        };
-                    }
-                    Err(e) => {
-                        eprintln!("Embedding failed: {e}");
-                        view.embedding_status = Some(format!("Embedding failed: {e}"));
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
 }

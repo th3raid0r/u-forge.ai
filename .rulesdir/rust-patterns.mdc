@@ -323,11 +323,11 @@ Both vector indexes are **kept in sync automatically** via DML triggers (see `SQ
 deleting a chunk cascades to its vectors. Never manually manage `chunks_vec` or
 `chunks_vec_hq` — always go through `upsert_chunk_embedding` / `upsert_chunk_embedding_hq`.
 
-**Demo workflow:**
-1. `cli_demo` checks if embeddings already exist (via `GraphStats.embedded_count`).
-2. If data was loaded previously and embeddings exist, re-embedding is skipped.
-3. If `[database] clear = true` in config or the DB is new, embedding workers are built only if Lemonade Server is reachable.
-4. The reusable vector index means running the demo multiple times builds embeddings once.
+**Incremental embedding workflow:**
+1. `do_embed_all()` checks if embeddings already exist (via `GraphStats.embedded_count`).
+2. If embeddings exist for all chunks, re-embedding is skipped.
+3. Embedding workers are built only if Lemonade Server is reachable.
+4. The reusable vector index means startup builds embeddings once; subsequent starts skip the work.
 
 ---
 

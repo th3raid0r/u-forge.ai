@@ -33,7 +33,7 @@ impl Render for AppView {
         let sidebar_width = self.sidebar_width;
         let editor_ratio = self.editor_ratio;
         let right_panel_width = self.right_panel_width;
-        let embedding_status = self.embedding_status.clone();
+        let embedding_status = self.state.embedding_status.clone();
         let perf_enabled = self.perf_enabled;
 
         // Build perf overlay text when enabled.
@@ -42,13 +42,11 @@ impl Render for AppView {
         // start, which is the actual frame cost the user perceives.
         let perf_text: Option<String> = if perf_enabled {
             let frame_ms = self.last_frame_cost_us as f32 / 1_000.0;
-            let avg_ms = if !self.frame_times_us.is_empty() {
-                let avg_us = self.frame_times_us.iter().sum::<u64>()
-                    / self.frame_times_us.len() as u64;
-                avg_us as f32 / 1_000.0
-            } else {
-                frame_ms
-            };
+            let avg_ms = self
+                .frame_times_us
+                .average()
+                .map(|us| us as f32 / 1_000.0)
+                .unwrap_or(frame_ms);
             let chat_us = self.chat_panel.read(cx).last_render_us;
             let chat_ms = chat_us as f32 / 1_000.0;
             Some(format!(
@@ -59,7 +57,7 @@ impl Render for AppView {
         };
 
         // Read graph stats for the status bar.
-        let snap = self.snapshot.read();
+        let snap = self.state.snapshot.read();
         let node_count = snap.nodes.len();
         let edge_count = snap.edges.len();
         drop(snap);
@@ -83,6 +81,9 @@ impl Render for AppView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _window, cx| {
+                if this.right_panel_open {
+                    this.chat_panel.update(cx, |panel, _cx| panel.last_render_us = 0);
+                }
                 this.right_panel_open = !this.right_panel_open;
                 cx.notify();
             }))
@@ -521,7 +522,7 @@ impl Render for AppView {
                     )
                     // ── Center: graph stats + operation status ────────────────
                     .child({
-                        let data_status = self.data_status.clone();
+                        let data_status = self.state.data_status.clone();
                         let mut center = div()
                             .id("status-center")
                             .flex()
@@ -577,6 +578,10 @@ impl Render for AppView {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            if this.right_panel_open {
+                                                this.chat_panel
+                                                    .update(cx, |panel, _cx| panel.last_render_us = 0);
+                                            }
                                             this.right_panel_open = !this.right_panel_open;
                                             cx.notify();
                                         }),
@@ -776,6 +781,11 @@ impl Render for AppView {
                                             MouseButton::Left,
                                             cx.listener(
                                                 |this, _: &MouseDownEvent, _window, cx| {
+                                                    if this.right_panel_open {
+                                                        this.chat_panel.update(cx, |panel, _cx| {
+                                                            panel.last_render_us = 0;
+                                                        });
+                                                    }
                                                     this.right_panel_open =
                                                         !this.right_panel_open;
                                                     this.view_menu_open = false;
@@ -804,10 +814,7 @@ impl Render for AppView {
                             let elapsed_us = frame_start.elapsed().as_micros() as u64;
                             timing_entity.update(cx, |this, _cx| {
                                 this.last_frame_cost_us = elapsed_us;
-                                this.frame_times_us.push_back(elapsed_us);
-                                if this.frame_times_us.len() > 60 {
-                                    this.frame_times_us.pop_front();
-                                }
+                                this.frame_times_us.push(elapsed_us);
                             });
                         },
                     )

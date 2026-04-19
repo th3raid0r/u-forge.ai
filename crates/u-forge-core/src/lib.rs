@@ -46,7 +46,8 @@ pub use graph::{
 };
 pub use ingest::{
     build_hq_embed_queue, embed_all_chunks, rechunk_and_embed, setup_and_index, DataIngestion,
-    EmbeddingResult, EmbeddingTarget, IngestionStats, SetupResult,
+    EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, EmbeddingResult, EmbeddingTarget,
+    IngestionStats, SetupResult,
 };
 pub use lemonade::{
     load_model, ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage,
@@ -56,8 +57,8 @@ pub use lemonade::{
 };
 pub use rag::{build_rag_messages, format_search_context, RagContext};
 pub use schema::{
-    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType, SchemaDefinition,
-    SchemaIngestion, SchemaManager, SchemaStats, ValidationResult,
+    EdgeTypeSchema, ObjectTypeSchema, PropertyIssue, PropertySchema, PropertyType,
+    SchemaDefinition, SchemaIngestion, SchemaManager, SchemaStats, ValidationResult,
 };
 pub use search::{
     search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
@@ -450,6 +451,18 @@ impl KnowledgeGraph {
     /// Validate `object` against its registered schema.
     pub async fn validate_object(&self, object: &ObjectMetadata) -> Result<ValidationResult> {
         self.schema_manager.validate_object(object).await
+    }
+
+    /// Validate and coerce `properties` for `object_type` against the cached schema.
+    ///
+    /// See [`SchemaManager::validate_and_coerce_properties`] for full semantics.
+    pub fn validate_and_coerce_properties(
+        &self,
+        object_type: &str,
+        properties: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<PropertyIssue> {
+        self.schema_manager
+            .validate_and_coerce_properties(object_type, properties)
     }
 
     /// Persist `metadata` only if it passes schema validation.

@@ -24,7 +24,7 @@ use serde::Deserialize;
 use u_forge_core::ingest::rechunk_and_embed;
 use u_forge_core::search::{search_hybrid, HybridSearchConfig, NodeSearchResult};
 use u_forge_core::types::ObjectMetadata;
-use u_forge_core::{queue::InferenceQueue, types::ObjectId, KnowledgeGraph};
+use u_forge_core::{queue::InferenceQueue, types::ObjectId, KnowledgeGraph, PropertyIssue};
 
 // ── History and token counting ────────────────────────────────────────────────
 
@@ -626,6 +626,15 @@ impl Tool for UpsertNodeTool {
             }
         }
 
+        // Validate and coerce properties against the schema. Coercions (e.g. "42" → 42) are
+        // applied in-place; issues are appended to the output so the LLM can self-correct.
+        let prop_issues = if let serde_json::Value::Object(ref mut props) = meta.properties {
+            self.graph
+                .validate_and_coerce_properties(&meta.object_type, props)
+        } else {
+            vec![]
+        };
+
         // Persist the node.
         if is_update {
             self.graph
@@ -644,11 +653,18 @@ impl Tool for UpsertNodeTool {
             .map_err(|e| ToolError(format!("Embedding failed: {e:#}")))?;
 
         let action = if is_update { "Updated" } else { "Created" };
-        Ok(format!(
+        let mut output = format!(
             "{action} node \"{name}\" ({object_type}). node_id: {object_id}. chunks_embedded: {chunks}.",
             name = meta.name,
             object_type = meta.object_type,
-        ))
+        );
+        for issue in &prop_issues {
+            match issue {
+                PropertyIssue::UnknownProperty { .. } => {}
+                _ => output.push_str(&format!("\n[warning] {issue}")),
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -755,14 +771,18 @@ impl Tool for UpsertEdgeTool {
 
         // Re-embed both endpoints so the new relationship appears in semantic search.
         // Deduplicate when source == target (self-loop) to avoid embedding the same node twice.
+        // Collect failures so the LLM sees partial success in the tool Output rather than
+        // believing the edge is fully indexed.
         let hq_ref = self.hq_queue.as_deref();
         let mut to_reembed = vec![source_id];
         if target_id != source_id {
             to_reembed.push(target_id);
         }
+        let mut reembed_warnings: Vec<String> = Vec::new();
         for &oid in &to_reembed {
             if let Err(e) = rechunk_and_embed(&self.graph, &self.queue, hq_ref, oid).await {
                 tracing::warn!(object_id = %oid, %e, "Re-embed after edge upsert failed");
+                reembed_warnings.push(format!("[warning] endpoint {oid} re-embed failed: {e:#}"));
             }
         }
 
@@ -782,10 +802,15 @@ impl Tool for UpsertEdgeTool {
             .map(|m| m.name)
             .unwrap_or_else(|| target_id.to_string());
 
-        Ok(format!(
+        let mut output = format!(
             "Edge created: {source_name} -[{}]-> {target_name} (weight: {weight:.2})",
             args.edge_type,
-        ))
+        );
+        for w in &reembed_warnings {
+            output.push('\n');
+            output.push_str(w);
+        }
+        Ok(output)
     }
 }
 
@@ -833,8 +858,8 @@ pub enum AgentStreamEvent {
 /// [`ChatDeviceConfig`] + [`ChatConfig`].
 #[derive(Debug, Clone)]
 pub struct AgentParams {
-    /// Sampling temperature (default 0.3 for reliable tool use).
-    pub temperature: f64,
+    /// Sampling temperature. `None` defers to the server/model default.
+    pub temperature: Option<f64>,
     /// Maximum generation tokens.
     pub max_tokens: Option<u64>,
     /// Nucleus sampling threshold (0.0–1.0).
@@ -860,7 +885,7 @@ pub struct AgentParams {
 impl Default for AgentParams {
     fn default() -> Self {
         Self {
-            temperature: 0.3,
+            temperature: None,
             max_tokens: None,
             top_p: None,
             top_k: None,
@@ -981,8 +1006,10 @@ impl GraphAgent {
         let mut builder = self
             .client
             .agent(model_id)
-            .preamble(&self.system_prompt)
-            .temperature(self.params.temperature);
+            .preamble(&self.system_prompt);
+        if let Some(temp) = self.params.temperature {
+            builder = builder.temperature(temp);
+        }
 
         if let Some(max_tokens) = self.params.max_tokens {
             builder = builder.max_tokens(max_tokens);
@@ -1052,12 +1079,18 @@ impl GraphAgent {
 
             let mut final_text = String::new();
 
-            while let Some(item) = stream.next().await {
+            // `'stream` labels the outer loop so every send-on-error can break it directly.
+            // If the receiver is dropped (user closed the chat panel, app exited) we stop
+            // driving the rig stream instead of burning LLM inference and potentially
+            // running write tools the caller will never observe.
+            'stream: while let Some(item) = stream.next().await {
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
                         StreamedAssistantContent::Text(t) => {
                             final_text.push_str(&t.text);
-                            let _ = tx.send(AgentStreamEvent::TextDelta(t.text)).await;
+                            if tx.send(AgentStreamEvent::TextDelta(t.text)).await.is_err() {
+                                break 'stream;
+                            }
                         }
                         StreamedAssistantContent::ToolCall {
                             tool_call,
@@ -1066,13 +1099,17 @@ impl GraphAgent {
                             let args_display =
                                 serde_json::to_string_pretty(&tool_call.function.arguments)
                                     .unwrap_or_else(|_| tool_call.function.arguments.to_string());
-                            let _ = tx
+                            if tx
                                 .send(AgentStreamEvent::ToolCallStart {
                                     internal_id: internal_call_id,
                                     name: tool_call.function.name,
                                     args_display,
                                 })
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                break 'stream;
+                            }
                         }
                         StreamedAssistantContent::Reasoning(r) => {
                             // Full reasoning block (some providers emit this instead of deltas).
@@ -1082,14 +1119,24 @@ impl GraphAgent {
                                     ..
                                 } = chunk
                                 {
-                                    let _ = tx
+                                    if tx
                                         .send(AgentStreamEvent::ReasoningDelta(text.clone()))
-                                        .await;
+                                        .await
+                                        .is_err()
+                                    {
+                                        break 'stream;
+                                    }
                                 }
                             }
                         }
                         StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                            let _ = tx.send(AgentStreamEvent::ReasoningDelta(reasoning)).await;
+                            if tx
+                                .send(AgentStreamEvent::ReasoningDelta(reasoning))
+                                .await
+                                .is_err()
+                            {
+                                break 'stream;
+                            }
                         }
                         // Final(R) and ToolCallDelta are ignored — text arrives via TextDelta.
                         _ => {}
@@ -1111,12 +1158,16 @@ impl GraphAgent {
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            let _ = tx
+                            if tx
                                 .send(AgentStreamEvent::ToolResult {
                                     internal_id: internal_call_id,
                                     content: result_text,
                                 })
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                break 'stream;
+                            }
                         }
                     },
                     Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
@@ -1128,14 +1179,14 @@ impl GraphAgent {
                             final_text.clone()
                         };
                         let _ = tx.send(AgentStreamEvent::Done(text)).await;
-                        break;
+                        break 'stream;
                     }
                     Ok(_) => {
                         // Non-exhaustive: ignore any new MultiTurnStreamItem variants.
                     }
                     Err(e) => {
                         let _ = tx.send(AgentStreamEvent::Error(e.to_string())).await;
-                        break;
+                        break 'stream;
                     }
                 }
             }

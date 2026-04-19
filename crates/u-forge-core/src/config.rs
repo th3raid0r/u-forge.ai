@@ -475,7 +475,6 @@ impl Default for StorageConfig {
 /// Data import settings.
 ///
 /// Corresponds to the `[data]` section of `u-forge.toml`.
-/// Also honoured by `defaults/demo_config.toml` for the CLI demo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataConfig {
     /// Path to the JSONL file loaded on startup (and by File > Import Data).

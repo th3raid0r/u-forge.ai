@@ -7,28 +7,41 @@
 use glam::Vec2;
 use u_forge_graph_view::{GraphSnapshot, LodLevel};
 
-/// A positioned, styled rendering primitive that UI frameworks draw.
+/// A node primitive (circle / squircle) in screen space.
 #[derive(Debug, Clone)]
-pub enum DrawCommand {
-    Circle {
-        center: Vec2,
-        radius: f32,
-        color: [u8; 4],
-        /// Whether this node is the currently selected node.
-        selected: bool,
-    },
-    Line {
-        from: Vec2,
-        to: Vec2,
-        width: f32,
-        color: [u8; 4],
-    },
-    Text {
-        position: Vec2,
-        content: String,
-        size: f32,
-        color: [u8; 4],
-    },
+pub struct NodeCmd {
+    pub center: Vec2,
+    pub radius: f32,
+    pub color: [u8; 4],
+    /// Whether this node is the currently selected node.
+    pub selected: bool,
+}
+
+/// An edge primitive (straight line) in screen space.
+#[derive(Debug, Clone)]
+pub struct LineCmd {
+    pub from: Vec2,
+    pub to: Vec2,
+    pub width: f32,
+    pub color: [u8; 4],
+}
+
+/// A text primitive (node label, etc.) in screen space.
+#[derive(Debug, Clone)]
+pub struct TextCmd {
+    pub position: Vec2,
+    pub content: String,
+    pub size: f32,
+    pub color: [u8; 4],
+}
+
+/// Output of [`generate_draw_commands`]: typed primitive lists partitioned by
+/// kind so renderers iterate each vec once without enum branch mispredicts.
+#[derive(Debug, Clone, Default)]
+pub struct DrawCommands {
+    pub nodes: Vec<NodeCmd>,
+    pub edges: Vec<LineCmd>,
+    pub labels: Vec<TextCmd>,
 }
 
 /// Camera/viewport state for culling and LOD decisions.
@@ -74,7 +87,7 @@ impl Viewport {
 
 /// Trait that each UI backend implements.
 pub trait GraphRenderer {
-    fn draw_commands(&mut self, commands: &[DrawCommand]);
+    fn draw_commands(&mut self, commands: &DrawCommands);
     fn canvas_size(&self) -> Vec2;
 }
 
@@ -147,7 +160,7 @@ pub fn generate_draw_commands(
     snapshot: &GraphSnapshot,
     viewport: &Viewport,
     selected_idx: Option<usize>,
-) -> Vec<DrawCommand> {
+) -> DrawCommands {
     let (world_min, world_max) = viewport.world_rect();
     let lod = viewport.lod_level();
 
@@ -163,16 +176,17 @@ pub fn generate_draw_commands(
         visible_set[idx] = true;
     }
 
-    let mut commands = Vec::new();
+    let mut out = DrawCommands::default();
 
     // Edges first (drawn behind nodes)
     if lod != LodLevel::Dot {
         let visible_edge_indices = snapshot.edges_in_viewport(&visible_set);
+        out.edges.reserve(visible_edge_indices.len());
         for idx in visible_edge_indices {
             let edge = &snapshot.edges[idx];
             let from = viewport.world_to_screen(snapshot.nodes[edge.source_idx].position);
             let to = viewport.world_to_screen(snapshot.nodes[edge.target_idx].position);
-            commands.push(DrawCommand::Line {
+            out.edges.push(LineCmd {
                 from,
                 to,
                 width: EDGE_WIDTH,
@@ -186,6 +200,7 @@ pub fn generate_draw_commands(
     // Screen radius used to gate text visibility.
     let screen_radius = NODE_RADIUS * viewport.zoom;
 
+    out.nodes.reserve(visible_indices.len());
     for &idx in &visible_indices {
         let node = &snapshot.nodes[idx];
         let screen_pos = viewport.world_to_screen(node.position);
@@ -197,7 +212,7 @@ pub fn generate_draw_commands(
             base_color
         };
 
-        commands.push(DrawCommand::Circle {
+        out.nodes.push(NodeCmd {
             center: screen_pos,
             radius,
             color,
@@ -218,7 +233,7 @@ pub fn generate_draw_commands(
             } else {
                 node.name.clone()
             };
-            commands.push(DrawCommand::Text {
+            out.labels.push(TextCmd {
                 // Center position — the renderer centers the text here.
                 position: screen_pos,
                 content: display_name,
@@ -229,7 +244,7 @@ pub fn generate_draw_commands(
         }
     }
 
-    commands
+    out
 }
 
 fn brighten(color: [u8; 4], factor: f32) -> [u8; 4] {

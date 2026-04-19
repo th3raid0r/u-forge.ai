@@ -4,6 +4,7 @@ use crate::graph::KnowledgeGraphStorage;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -442,6 +443,144 @@ impl SchemaManager {
 
         Ok(())
     }
+
+    /// Validate and coerce `properties` for `object_type` against the cached schema.
+    ///
+    /// Coercions applied in-place (silently, not in the returned vec):
+    /// - `String("42")` → `Number(42)` when the schema declares `Number`
+    /// - `String("true"/"false"/"yes"/"no"/"1"/"0")` → `Bool` when the schema declares `Boolean`
+    ///
+    /// Issues returned for caller action:
+    /// - [`PropertyIssue::TypeMismatch`] — wrong type and no coercion available
+    /// - [`PropertyIssue::UnknownProperty`] — key not declared in the schema
+    /// - [`PropertyIssue::InvalidEnum`] — string not in the enum's allowed list
+    ///
+    /// Returns an empty vec when the schema or object type is not cached yet.
+    pub fn validate_and_coerce_properties(
+        &self,
+        object_type: &str,
+        properties: &mut serde_json::Map<String, Value>,
+    ) -> Vec<PropertyIssue> {
+        let type_schema = match self.get_object_type_schema("default", object_type) {
+            Some(s) => s,
+            None => return vec![],
+        };
+
+        let mut issues = Vec::new();
+        let mut coercions: Vec<(String, Value)> = Vec::new();
+
+        for (key, value) in properties.iter() {
+            let prop_schema = match type_schema.properties.get(key) {
+                Some(s) => s,
+                None => {
+                    issues.push(PropertyIssue::UnknownProperty { key: key.clone() });
+                    continue;
+                }
+            };
+
+            match (&prop_schema.property_type, value) {
+                // Already the right type.
+                (PropertyType::String, Value::String(_))
+                | (PropertyType::Text, Value::String(_))
+                | (PropertyType::Number, Value::Number(_))
+                | (PropertyType::Boolean, Value::Bool(_))
+                | (PropertyType::Array(_), Value::Array(_))
+                | (PropertyType::Object(_), Value::Object(_))
+                | (PropertyType::Reference(_), Value::String(_)) => {}
+
+                // Enum: string must be in the allowed list.
+                (PropertyType::Enum(allowed), Value::String(s)) => {
+                    if !allowed.contains(s) {
+                        issues.push(PropertyIssue::InvalidEnum {
+                            key: key.clone(),
+                            value: s.clone(),
+                            allowed: allowed.clone(),
+                        });
+                    }
+                }
+
+                // Number schema + String value: attempt numeric coercion.
+                (PropertyType::Number, Value::String(s)) => {
+                    if let Ok(n) = s.parse::<f64>() {
+                        if let Some(num) = serde_json::Number::from_f64(n) {
+                            coercions.push((key.clone(), Value::Number(num)));
+                        } else {
+                            issues.push(PropertyIssue::TypeMismatch {
+                                key: key.clone(),
+                                expected: "number".to_string(),
+                            });
+                        }
+                    } else {
+                        issues.push(PropertyIssue::TypeMismatch {
+                            key: key.clone(),
+                            expected: "number".to_string(),
+                        });
+                    }
+                }
+
+                // Boolean schema + String value: attempt boolean coercion.
+                (PropertyType::Boolean, Value::String(s)) => {
+                    match s.to_lowercase().as_str() {
+                        "true" | "1" | "yes" => coercions.push((key.clone(), Value::Bool(true))),
+                        "false" | "0" | "no" => coercions.push((key.clone(), Value::Bool(false))),
+                        _ => issues.push(PropertyIssue::TypeMismatch {
+                            key: key.clone(),
+                            expected: "boolean".to_string(),
+                        }),
+                    }
+                }
+
+                // All other mismatches.
+                _ => {
+                    issues.push(PropertyIssue::TypeMismatch {
+                        key: key.clone(),
+                        expected: prop_schema.property_type.name().to_string(),
+                    });
+                }
+            }
+        }
+
+        for (key, new_value) in coercions {
+            properties.insert(key, new_value);
+        }
+
+        issues
+    }
+}
+
+/// Describes a validation or coercion result for a single property.
+///
+/// Returned by [`SchemaManager::validate_and_coerce_properties`]. Coercions are applied
+/// in-place and are NOT included in the returned vec — only issues that require caller
+/// attention are reported.
+#[derive(Debug, Clone)]
+pub enum PropertyIssue {
+    /// Value type does not match schema and could not be automatically coerced.
+    TypeMismatch { key: String, expected: String },
+    /// Property key is not declared in the schema for this object type.
+    UnknownProperty { key: String },
+    /// String value is not in the enum's allowed list.
+    InvalidEnum { key: String, value: String, allowed: Vec<String> },
+}
+
+impl fmt::Display for PropertyIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PropertyIssue::TypeMismatch { key, expected } => {
+                write!(f, "property '{key}': expected {expected}")
+            }
+            PropertyIssue::UnknownProperty { key } => {
+                write!(f, "property '{key}' is not declared in schema")
+            }
+            PropertyIssue::InvalidEnum { key, value, allowed } => {
+                write!(
+                    f,
+                    "property '{key}': '{value}' is not a valid enum value (allowed: {})",
+                    allowed.join(", ")
+                )
+            }
+        }
+    }
 }
 
 /// Statistics about a schema
@@ -511,7 +650,7 @@ mod tests {
         let result = manager.validate_object(&invalid_character).await.unwrap();
         // Should still be valid since most fields are optional in our default schema
         // This test demonstrates the validation is working
-        assert!(result.errors.is_empty() || result.warnings.len() > 0);
+        assert!(result.errors.is_empty() || !result.warnings.is_empty());
     }
 
     #[tokio::test]
@@ -532,7 +671,7 @@ mod tests {
 
         let result = manager.validate_edge(&invalid_edge, &location, &character1).await.unwrap();
         // This should generate an error or warning depending on schema constraints
-        assert!(result.errors.len() > 0 || result.warnings.len() > 0);
+        assert!(!result.errors.is_empty() || !result.warnings.is_empty());
     }
 
     #[tokio::test]

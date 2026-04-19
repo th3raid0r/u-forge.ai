@@ -369,12 +369,11 @@ mod tests {
         let mut edges = Vec::new();
 
         for line in json_data.lines() {
-            match serde_json::from_str::<JsonEntry>(line) {
-                Ok(entry) => match entry {
+            if let Ok(entry) = serde_json::from_str::<JsonEntry>(line) {
+                match entry {
                     JsonEntry::Node { .. } => nodes.push(entry),
                     JsonEntry::Edge { .. } => edges.push(entry),
-                },
-                Err(_) => {}
+                }
             }
         }
 
