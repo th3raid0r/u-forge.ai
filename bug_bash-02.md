@@ -368,7 +368,7 @@ the node — the value round-trips unmodified.
 Items identified as "over-abstraction that doesn't earn its keep." Each
 is a small, contained refactor. None are functional fixes.
 
-### 4.1 ✅ Collapse `FieldKind` into the schema's `PropertyType`
+### 4.1 🔎 Collapse `FieldKind` into the schema's `PropertyType`
 
 **Where:**
 - `crates/u-forge-ui-gpui/src/node_editor/field_spec.rs:49-56, 64, 67-73`
@@ -386,6 +386,8 @@ arms (`FIELD_H_SINGLE` / `FIELD_H_MULTI`) to match `PropertyType`
 variants instead. If a node's object type has no schema, render all
 properties as free-text — this is already the fallback; it just
 doesn't need a parallel enum.
+
+**Status: not implemented.** `FieldKind` still exists in `field_spec.rs`.
 
 **Verification.** `cargo test --workspace -- --test-threads=1`, then
 manual smoke: open a node of every built-in object type in
@@ -412,7 +414,7 @@ epoch check. Net: ~40 lines of state-machine gone.
 click out, click in rapidly. Blink should stay smooth with no stuck-on
 or stuck-off cursors.
 
-### 4.3 ✅ Delete speculative `EmbeddingProviderType` variants
+### 4.3 🔎 Delete speculative `EmbeddingProviderType` variants
 
 **Where:** `crates/u-forge-core/src/ai/embeddings.rs:20-27`.
 
@@ -435,11 +437,13 @@ lands; the enum is `serde`-derived so on-disk config with a future
 variant will just fail `serde_json::from_str` — which is better than a
 silent no-op.
 
+**Status: not implemented.** Both variants still present in `embeddings.rs`.
+
 **Verification.** `cargo test --workspace` clean. Grep the workspace for
 `Ollama` and `Cloud` — the only remaining hits should be doc / comment
 references, if any.
 
-### 4.4 ✅ Delete the unused `inheritance` field on `ObjectTypeSchema`
+### 4.4 🔎 Delete the unused `inheritance` field on `ObjectTypeSchema`
 
 **Where:** `crates/u-forge-core/src/schema/definition.rs:129, 141`.
 
@@ -454,6 +458,8 @@ describes a feature that was never implemented.
 construction (the default impl at line 141). If schema inheritance
 becomes a real feature, design it with resolution semantics then — not
 as a silent placeholder.
+
+**Status: not implemented.** Field still present in `definition.rs`.
 
 **Verification.** `cargo build --workspace` — compiler catches all
 construction sites. `cargo test --workspace -- --test-threads=1` clean.
