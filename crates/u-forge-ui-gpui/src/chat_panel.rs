@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     div, list, prelude::*, px, rgb, rgba, relative, App, Context, Entity, ListAlignment, ListState,
@@ -71,6 +72,8 @@ pub(crate) struct ChatPanel {
     session_list: Vec<ChatSessionSummary>,
     /// Whether the history selector dropdown is open.
     history_dropdown_open: bool,
+    /// CPU time (µs) spent building the element tree in the last render call.
+    pub(crate) last_render_us: u64,
 }
 
 /// A simplified model entry for the UI dropdown.
@@ -164,6 +167,7 @@ impl ChatPanel {
             current_session_id,
             session_list,
             history_dropdown_open: false,
+            last_render_us: 0,
         }
     }
 
@@ -704,6 +708,7 @@ impl ChatPanel {
 
 impl Render for ChatPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_start = Instant::now();
         let enter_to_submit = self.enter_to_submit;
         let streaming = self.streaming;
         let model_dropdown_open = self.model_dropdown_open;
@@ -846,7 +851,7 @@ impl Render for ChatPanel {
             Vec::new()
         };
 
-        div()
+        let root = div()
             .id("chat-panel")
             .flex()
             .flex_col()
@@ -1174,6 +1179,8 @@ impl Render for ChatPanel {
                                 )
                             }),
                     ),
-            )
+            );
+        self.last_render_us = render_start.elapsed().as_micros() as u64;
+        root
     }
 }

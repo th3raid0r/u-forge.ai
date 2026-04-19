@@ -63,7 +63,17 @@ a "remaining work" section in any of those files, stop and put it in the appropr
 - Where to find things
 - Invariants and constraints the code already enforces
 
-### 4. Source code is the source of truth — docs are indexes, not mirrors
+### 4. GPUI perf — measure, then apply the known patterns
+
+Before guessing at a UI slowdown, enable the perf overlay (`Ctrl+Shift+P` in the GPUI app) and watch `frame:<ms>` while reproducing. `render()` call frequency is **not** frame cost — only the 1×1 canvas paint closure in `app_view/render.rs` captures it honestly.
+
+Two reusable patterns live in `feature_UI.md` under "GPUI view-level caching" and "Always-mounted panel pattern":
+- Heavy sub-views that re-lay-out when a parent notifies should be wrapped with `AnyView::from(entity).cached(StyleRefinement::default().size_full())`.
+- Panels that should survive toggles without cold-layout cost must stay mounted with a two-layer wrapper (outer variable-width `overflow_hidden`, inner fixed-width absolute-positioned) so the cached view's bounds stay stable.
+
+Common pitfall: calling `cx.notify()` from inside a `canvas` paint closure (or from `paint`) schedules a redraw and doubles the work every frame. Size-affecting work belongs in `request_layout`, not `paint`.
+
+### 5. Source code is the source of truth — docs are indexes, not mirrors
 
 Every `.rs` file in `src/` and `examples/` is thoroughly commented. `.md` files
 and `.mdc` rules exist to tell you **where to look and why it matters**, not to

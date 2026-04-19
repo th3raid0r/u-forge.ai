@@ -1,9 +1,14 @@
+use std::time::Instant;
+
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, relative, rgb, rgba, App, ClickEvent, Context,
-    Corner, MouseButton, MouseDownEvent, Render, StyleRefinement, Window,
+    anchored, canvas, deferred, div, point, prelude::*, px, relative, rgb, rgba, AnyView, App,
+    ClickEvent, Context, Corner, MouseButton, MouseDownEvent, Render, StyleRefinement, Window,
 };
 
-use crate::{ClearData, ImportData, SaveLayout, ToggleRightPanel, ToggleSidebar};
+use crate::{
+    ClearData, ExportData, ImportData, SaveLayout, TogglePerfOverlay, ToggleRightPanel,
+    ToggleSidebar,
+};
 
 use super::{
     AppView, SidebarTab, DEFAULT_EDITOR_RATIO, DEFAULT_RIGHT_PANEL_W, DEFAULT_SIDEBAR_W,
@@ -13,6 +18,13 @@ use super::{
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Capture frame start time. The canvas element appended at the end of the
+        // tree records elapsed time in its paint closure — after GPUI's full layout
+        // pass — giving an honest measure of frame cost rather than render() call
+        // frequency.
+        let frame_start = Instant::now();
+        let timing_entity = cx.entity().clone();
+
         let file_menu_open = self.file_menu_open;
         let view_menu_open = self.view_menu_open;
         let sidebar_open = self.sidebar_open;
@@ -22,6 +34,29 @@ impl Render for AppView {
         let editor_ratio = self.editor_ratio;
         let right_panel_width = self.right_panel_width;
         let embedding_status = self.embedding_status.clone();
+        let perf_enabled = self.perf_enabled;
+
+        // Build perf overlay text when enabled.
+        // `last_frame_cost_us` is populated by the timing canvas at the bottom of
+        // the tree — it captures render-tree build + full GPUI layout pass + paint
+        // start, which is the actual frame cost the user perceives.
+        let perf_text: Option<String> = if perf_enabled {
+            let frame_ms = self.last_frame_cost_us as f32 / 1_000.0;
+            let avg_ms = if !self.frame_times_us.is_empty() {
+                let avg_us = self.frame_times_us.iter().sum::<u64>()
+                    / self.frame_times_us.len() as u64;
+                avg_us as f32 / 1_000.0
+            } else {
+                frame_ms
+            };
+            let chat_us = self.chat_panel.read(cx).last_render_us;
+            let chat_ms = chat_us as f32 / 1_000.0;
+            Some(format!(
+                "frame:{frame_ms:.1}ms  avg:{avg_ms:.1}ms  chat:{chat_ms:.2}ms"
+            ))
+        } else {
+            None
+        };
 
         // Read graph stats for the status bar.
         let snap = self.snapshot.read();
@@ -56,6 +91,16 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ImportData, _window, cx| {
                 this.do_import_data(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportData, _window, cx| {
+                this.do_export_data(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TogglePerfOverlay, _window, cx| {
+                this.perf_enabled = !this.perf_enabled;
+                if !this.perf_enabled {
+                    this.frame_times_us.clear();
+                }
+                cx.notify();
             }))
             // ── Menu bar ──────────────────────────────────────────────────────
             .child(
@@ -309,48 +354,75 @@ impl Render for AppView {
                         .child(graph_pane),
                 );
 
-                // Right panel + resize handle on its left edge.
+                // Right panel + resize handle.
+                //
+                // The chat panel is always mounted in the tree so its
+                // element_state survives toggles. An outer wrapper sets the
+                // visible width (0 when closed, right_panel_width when open)
+                // with overflow_hidden; an inner absolute-positioned div
+                // always lays out at right_panel_width so the cached chat
+                // panel sees stable bounds across toggles.
+                //
+                // The AnyView::cached wrapper lets GPUI skip the chat panel's
+                // layout + paint on frames where no ChatPanel / ChatMessageView
+                // entity was notified (e.g. sidebar drags, status bar ticks).
+                let right_open_w = if right_panel_open { right_panel_width } else { 0.0 };
+                let handle_w = if right_panel_open { RESIZE_HANDLE_SIZE } else { 0.0 };
+
+                // Resize handle — present but zero-width when closed so its
+                // mouse hitbox disappears.
+                let handle_right_reset = handle.clone();
+                let mut resize_handle = div()
+                    .id("right-panel-resize-handle")
+                    .flex_none()
+                    .w(px(handle_w))
+                    .h_full()
+                    .overflow_hidden();
                 if right_panel_open {
-                    let handle_right_reset = handle.clone();
-                    body = body
-                        .child(
-                            // Right resize handle
-                            div()
-                                .id("right-panel-resize-handle")
-                                .flex_none()
-                                .w(px(RESIZE_HANDLE_SIZE))
-                                .h_full()
-                                .cursor_col_resize()
-                                .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
-                                .on_drag(ResizeRightPanel, |_, _, _, cx: &mut App| {
-                                    cx.new(|_| ResizeRightPanel)
-                                })
-                                .on_click(
-                                    move |event: &ClickEvent, _window, cx: &mut App| {
-                                        if event.click_count() == 2 {
-                                            handle_right_reset
-                                                .update(cx, |view, cx| {
-                                                    view.right_panel_width = DEFAULT_RIGHT_PANEL_W;
-                                                    cx.notify();
-                                                })
-                                                .ok();
-                                        }
-                                    },
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("right-panel-container")
-                                .flex()
-                                .flex_col()
-                                .flex_none()
-                                .w(px(right_panel_width))
-                                .h_full()
-                                .min_h_0()
-                                .overflow_hidden()
-                                .child(self.chat_panel.clone()),
+                    resize_handle = resize_handle
+                        .cursor_col_resize()
+                        .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                        .on_drag(ResizeRightPanel, |_, _, _, cx: &mut App| {
+                            cx.new(|_| ResizeRightPanel)
+                        })
+                        .on_click(
+                            move |event: &ClickEvent, _window, cx: &mut App| {
+                                if event.click_count() == 2 {
+                                    handle_right_reset
+                                        .update(cx, |view, cx| {
+                                            view.right_panel_width = DEFAULT_RIGHT_PANEL_W;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }
+                            },
                         );
                 }
+                body = body.child(resize_handle);
+
+                body = body.child(
+                    div()
+                        .id("right-panel-container")
+                        .relative()
+                        .flex_none()
+                        .w(px(right_open_w))
+                        .h_full()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("right-panel-inner")
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w(px(right_panel_width))
+                                .h_full()
+                                .overflow_hidden()
+                                .child(
+                                    AnyView::from(self.chat_panel.clone())
+                                        .cached(StyleRefinement::default().size_full()),
+                                ),
+                        ),
+                );
 
                 body
             })
@@ -469,6 +541,13 @@ impl Render for AppView {
                         if let Some(msg) = embedding_status {
                             center = center.child(div().text_color(rgba(0xf9e2afff)).child(msg));
                         }
+                        if let Some(perf) = perf_text {
+                            center = center.child(
+                                div()
+                                    .text_color(rgba(0xa6e3a1ff))
+                                    .child(perf),
+                            );
+                        }
                         center
                     })
                     // ── Right: chat toggle button ─────────────────────────────
@@ -503,6 +582,32 @@ impl Render for AppView {
                                         }),
                                     )
                                     .child("Chat"),
+                            )
+                            .child(
+                                div()
+                                    .id("status-perf-btn")
+                                    .flex()
+                                    .items_center()
+                                    .px_2()
+                                    .h(px(STATUS_BAR_H - 4.0))
+                                    .cursor_pointer()
+                                    .text_color(if perf_enabled {
+                                        rgba(0xa6e3a1ff)
+                                    } else {
+                                        rgba(0x6c7086ff)
+                                    })
+                                    .when(perf_enabled, |el| el.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.perf_enabled = !this.perf_enabled;
+                                            if !this.perf_enabled {
+                                                this.frame_times_us.clear();
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("Perf"),
                             ),
                     ),
             )
@@ -565,6 +670,28 @@ impl Render for AppView {
                                             ),
                                         )
                                         .child("Import Data"),
+                                )
+                                .child(
+                                    div()
+                                        .id("export-data-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |this, _: &MouseDownEvent, _window, cx| {
+                                                    this.file_menu_open = false;
+                                                    this.do_export_data(cx);
+                                                },
+                                            ),
+                                        )
+                                        .child("Export Data"),
                                 )
                                 .child(
                                     div()
@@ -664,6 +791,32 @@ impl Render for AppView {
                                 ),
                         ),
                 ))
+            })
+            // ── Frame-cost timing canvas ──────────────────────────────────────
+            // Zero-size absolute element; its paint closure fires after GPUI
+            // completes the full layout pass, making elapsed() an honest measure
+            // of frame cost (tree build + layout + paint start).
+            .when(perf_enabled, |root| {
+                root.child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, (), _, cx| {
+                            let elapsed_us = frame_start.elapsed().as_micros() as u64;
+                            timing_entity.update(cx, |this, _cx| {
+                                this.last_frame_cost_us = elapsed_us;
+                                this.frame_times_us.push_back(elapsed_us);
+                                if this.frame_times_us.len() > 60 {
+                                    this.frame_times_us.pop_front();
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(1.0))
+                    .h(px(1.0)),
+                )
             })
     }
 }

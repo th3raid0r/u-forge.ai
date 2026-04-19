@@ -6,7 +6,9 @@ use gpui::{
 };
 use u_forge_core::AppConfig;
 use u_forge_graph_view::build_snapshot;
-use u_forge_ui_gpui::{AppView, ClearData, ImportData, SaveLayout, ToggleRightPanel, ToggleSidebar};
+use u_forge_ui_gpui::{
+    AppView, ClearData, ImportData, SaveLayout, TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
+};
 
 fn main() {
     let cfg = Arc::new(AppConfig::load_default());
@@ -113,6 +115,7 @@ fn main() {
             KeyBinding::new("ctrl-s", SaveLayout, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("ctrl-j", ToggleRightPanel, None),
+            KeyBinding::new("ctrl-shift-p", TogglePerfOverlay, None),
         ]);
 
         // Register native application menu (macOS menu bar; no-op on Linux).
@@ -131,6 +134,8 @@ fn main() {
                 items: vec![
                     MenuItem::action("Toggle Left Panel", ToggleSidebar),
                     MenuItem::action("Toggle Right Panel", ToggleRightPanel),
+                    MenuItem::separator(),
+                    MenuItem::action("Toggle Perf Overlay", TogglePerfOverlay),
                 ],
             },
         ]);
