@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use gpui::{prelude::*, Context, Entity, Pixels, Subscription};
 use parking_lot::RwLock;
-use u_forge_core::{EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyIssue, SchemaManager};
+use u_forge_core::{EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyIssue, PropertyType, SchemaManager};
 use u_forge_graph_view::GraphSnapshot;
 
 use crate::selection_model::SelectionModel;
 use crate::text_field::{TextArrowKey, TextChanged, TextFieldView, TextSubmit};
 
-pub(crate) use field_spec::{EditableEdge, EditorTab, FieldKind};
+pub(crate) use field_spec::{EditableEdge, EditorTab};
 
 // ── Edge node-selector dropdown state ─────────────────────────────────────────
 
@@ -234,8 +234,12 @@ impl NodeEditorPanel {
         };
         let specs = tmp_tab.field_specs();
         for spec in &specs {
-            match spec.field_kind {
-                FieldKind::Text | FieldKind::Number => {
+            match &spec.field_kind {
+                PropertyType::Text
+                | PropertyType::String
+                | PropertyType::Number
+                | PropertyType::Reference(_)
+                | PropertyType::Object(_) => {
                     let multiline = spec.multiline;
                     let placeholder = spec.label.clone();
                     let key = spec.key.clone();
@@ -253,7 +257,7 @@ impl NodeEditorPanel {
                     });
                     field_entities.insert(spec.key.clone(), entity);
                 }
-                FieldKind::Enum(_) => {
+                PropertyType::Enum(_) => {
                     let key = spec.key.clone();
                     let entity = cx.new(|cx| {
                         let mut tf = TextFieldView::new(false, &spec.label, cx);

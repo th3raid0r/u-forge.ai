@@ -217,8 +217,6 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 
 `SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and adds 24 common TTRPG edge types automatically.
 
-`inheritance` in `ObjectTypeSchema` exists but is never acted on.
-
 ---
 
 ## Data Ingestion (`src/ingest/`)
@@ -237,7 +235,6 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 - **`properties` as JSON text** — stored as an opaque string. Filtering inside the blob requires deserializing at the Rust layer, or using `json_set`/`json_extract` for targeted mutations. Acceptable for now; revisit if query patterns demand indexed property access.
 - **Schema naming `add_npc` vs `npc`** — `.schema.json` files are named after MCP tool actions. `SchemaIngestion` strips the `add_` prefix, but the file names leak an external convention.
 - **`save_schema` is `async` but has no `.await`** — called with `.await` by several callers; making it sync would require updating all of them. Minor but misleading.
-- **`inheritance` in `ObjectTypeSchema` is never acted on** — still present as a schema field, still ignored at runtime.
 - **`embedding_manager` not in `KnowledgeGraph`** — embedding is now a caller concern. Simplifies the core struct but means callers must manage the embedding lifecycle separately from storage.
 
 ---

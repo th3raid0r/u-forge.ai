@@ -5,7 +5,9 @@ use gpui::{
 
 use crate::text_field::{TextFieldView, TextSubmit};
 
-use super::field_spec::{FieldKind, SubTab};
+use u_forge_core::PropertyType;
+
+use super::field_spec::SubTab;
 use super::{
     field_spec::{
         COLUMN_W, DETAIL_TAB_H, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H, PAGE_NAV_H,
@@ -345,7 +347,7 @@ impl Render for NodeEditorPanel {
 
                 // Widget
                 let widget: gpui::AnyElement = match &spec.field_kind {
-                    FieldKind::Boolean => {
+                    PropertyType::Boolean => {
                         let checked = value.and_then(|v| v.as_bool()).unwrap_or(false);
                         let key = spec.key.clone();
                         div()
@@ -400,7 +402,7 @@ impl Render for NodeEditorPanel {
                             )
                             .into_any_element()
                     }
-                    FieldKind::Enum(values) => {
+                    PropertyType::Enum(values) => {
                         let current_val: SharedString = value
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
@@ -522,7 +524,7 @@ impl Render for NodeEditorPanel {
 
                         enum_div.into_any_element()
                     }
-                    FieldKind::Array => {
+                    PropertyType::Array(_) => {
                         // Render array items as comma-separated tags with an add field.
                         let items: Vec<String> = value
                             .and_then(|v| v.as_array())

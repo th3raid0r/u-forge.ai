@@ -4,7 +4,7 @@ use gpui::{
     canvas, div, fill, font, point, prelude::*, px, rgba, size, App, Bounds, Context,
     ElementInputHandler, EntityInputHandler, FocusHandle, Focusable, Hsla, KeyDownEvent,
     MouseButton, MouseDownEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    TextAlign, TextRun, UTF16Selection, Window, WrappedLine,
+    Task, TextAlign, TextRun, UTF16Selection, Window, WrappedLine,
 };
 
 /// Single-line text field height (px).
@@ -50,8 +50,8 @@ pub(crate) struct TextFieldView {
     placeholder: String,
     /// Whether the cursor is currently visible (used for blinking).
     cursor_visible: bool,
-    /// Epoch counter — incremented on every reset or stop to cancel stale blink timers.
-    blink_epoch: usize,
+    /// Active blink task — dropped (and thus cancelled) on blur or reset.
+    blink_task: Option<Task<()>>,
     /// Tracks the focused state from the previous render, so we can detect changes.
     was_focused: bool,
     /// Actual line height measured from font metrics, updated each paint.
@@ -86,7 +86,7 @@ impl TextFieldView {
             submit_on_enter: false,
             placeholder: placeholder.to_string(),
             cursor_visible: true,
-            blink_epoch: 0,
+            blink_task: None,
             was_focused: false,
             measured_line_h: 19.0,
             field_origin_x: 0.0,
@@ -100,48 +100,31 @@ impl TextFieldView {
         }
     }
 
-    /// Show cursor immediately and restart the blink cycle with a 500 ms head-start,
-    /// matching Zed's `pause_blinking` → `blink_cursors` pattern.
+    /// Show cursor immediately and restart the blink cycle with a 500 ms period.
     fn reset_blink(&mut self, cx: &mut Context<Self>) {
         self.cursor_visible = true;
-        self.blink_epoch += 1;
-        let epoch = self.blink_epoch;
-        cx.spawn(async move |this, cx| {
+        self.blink_task = Some(cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(500))
                 .await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |this, cx| this.blink_tick(epoch, cx)).ok();
+            match this.upgrade() {
+                Some(entity) => {
+                    entity
+                        .update(cx, |this, cx| {
+                            this.cursor_visible = !this.cursor_visible;
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                None => break,
             }
-        })
-        .detach();
-    }
-
-    /// Toggle cursor visibility and reschedule; cancelled automatically when epoch
-    /// no longer matches (i.e. `reset_blink` or `stop_blinking` was called).
-    fn blink_tick(&mut self, epoch: usize, cx: &mut Context<Self>) {
-        if epoch != self.blink_epoch {
-            return;
-        }
-        self.cursor_visible = !self.cursor_visible;
-        cx.notify();
-        self.blink_epoch += 1;
-        let next_epoch = self.blink_epoch;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(500))
-                .await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |this, cx| this.blink_tick(next_epoch, cx)).ok();
-            }
-        })
-        .detach();
+        }));
     }
 
     /// Stop blinking and hide the cursor (called when focus is lost).
     fn stop_blinking(&mut self) {
         self.cursor_visible = false;
-        self.blink_epoch += 1; // invalidates any pending blink_tick timers
+        self.blink_task = None;
     }
 
     /// Map a click position (local to text area, after subtracting element origin
