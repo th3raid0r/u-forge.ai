@@ -6614,10 +6614,12 @@ name = "u-forge-ui-gpui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "glam",
  "gpui",
  "parking_lot",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",
@@ -6625,6 +6627,7 @@ dependencies = [
  "u-forge-core",
  "u-forge-graph-view",
  "u-forge-ui-traits",
+ "uuid",
 ]
 
 [[package]]

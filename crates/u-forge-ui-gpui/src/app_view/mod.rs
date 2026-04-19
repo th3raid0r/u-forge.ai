@@ -1,5 +1,6 @@
 mod render;
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use gpui::{prelude::*, Context, Empty, Entity, Subscription};
@@ -127,6 +128,13 @@ pub struct AppView {
     pub(crate) hq_queue: Option<InferenceQueue>,
     /// Subscriptions to node panel create/delete events — kept alive so handlers fire.
     _node_subs: Vec<Subscription>,
+    /// Whether the perf overlay is visible.
+    pub(crate) perf_enabled: bool,
+    /// Frame cost (µs) of the last rendered frame, measured via canvas timer
+    /// (render-tree build + GPUI layout pass + paint start).
+    pub(crate) last_frame_cost_us: u64,
+    /// Rolling window of the last 60 frame costs in microseconds.
+    pub(crate) frame_times_us: VecDeque<u64>,
 }
 
 impl AppView {
@@ -177,11 +185,13 @@ impl AppView {
                 cx,
             )
         });
+        let db_path = app_config.storage.db_path.clone();
         let chat_panel = cx.new(|cx| {
             ChatPanel::new(
                 app_config.chat.system_prompt.clone(),
                 app_config.chat.max_context_tokens,
                 app_config.chat.response_reserve,
+                &db_path,
                 tokio_rt.clone(),
                 cx,
             )
@@ -213,6 +223,9 @@ impl AppView {
             inference_queue: None,
             hq_queue: None,
             _node_subs: vec![node_sub_create, node_sub_delete],
+            perf_enabled: false,
+            last_frame_cost_us: 0,
+            frame_times_us: VecDeque::new(),
         };
 
         view.do_init_lemonade(cx);
@@ -535,11 +548,32 @@ impl AppView {
                         // Build optional HQ embedding queue.
                         let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
 
-                        // Select LLM models and build a chat provider for the first one.
-                        let llm_models = selector.select_llm_models();
+                        // Select ALL LLM models for the UI picker (no device-slot dedup).
+                        let all_llm = selector.select_all_llm_models();
                         let llm_available: Vec<AvailableModel> =
-                            llm_models.iter().map(AvailableModel::from).collect();
-                        let chat_provider = llm_models.first().map(|sel| {
+                            all_llm.iter().map(AvailableModel::from).collect();
+
+                        // Determine the preferred model for initial connection.
+                        // Use the active device config's explicit model override,
+                        // falling back to the first GPU model, then the first model.
+                        let preferred_model_id = app_config
+                            .chat
+                            .active_device_config()
+                            .model
+                            .clone();
+
+                        let preferred_idx = preferred_model_id
+                            .as_ref()
+                            .and_then(|pref| all_llm.iter().position(|m| m.model_id == *pref))
+                            .or_else(|| {
+                                // Fallback: first GPU-backed model in the list.
+                                all_llm.iter().position(|m| {
+                                    matches!(m.backend.as_deref(), Some("rocm") | Some("vulkan") | Some("metal"))
+                                })
+                            })
+                            .unwrap_or(0);
+
+                        let chat_provider = all_llm.get(preferred_idx).map(|sel| {
                             let gpu = match sel.recipe.as_str() {
                                 "llamacpp" => match sel.backend.as_deref() {
                                     Some("rocm") | Some("vulkan") | Some("metal") => {
@@ -552,14 +586,14 @@ impl AppView {
                             u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
                         });
 
-                        Ok((url, queue, hq_queue, chat_provider, llm_available))
+                        Ok((url, queue, hq_queue, chat_provider, llm_available, preferred_idx))
                     })
                 })
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
-                    Ok((lemonade_url, queue, hq_queue, chat_provider, llm_models)) => {
+                    Ok((lemonade_url, queue, hq_queue, chat_provider, llm_models, preferred_idx)) => {
                         eprintln!("Lemonade connected — embedding queue ready");
                         view.inference_queue = Some(queue.clone());
                         view.hq_queue = hq_queue.clone();
@@ -609,7 +643,7 @@ impl AppView {
                         // Push chat provider to chat panel (model list + direct streaming fallback).
                         if let Some(provider) = chat_provider {
                             view.chat_panel.update(cx, |panel, _cx| {
-                                panel.set_provider(provider, llm_models);
+                                panel.set_provider(provider, llm_models, preferred_idx);
                             });
                         }
 
@@ -621,6 +655,95 @@ impl AppView {
                         cx.notify();
                     }
                 }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn do_export_data(&mut self, cx: &mut Context<Self>) {
+        let graph = self.graph.clone();
+        let data_file = self.data_file.clone();
+
+        self.data_status = Some("Exporting…".to_string());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let objects = graph.get_all_objects()?;
+                    let edges = graph.get_all_edges()?;
+
+                    let id_to_name: HashMap<u_forge_core::types::ObjectId, String> =
+                        objects.iter().map(|o| (o.id, o.name.clone())).collect();
+
+                    let mut lines = Vec::with_capacity(objects.len() + edges.len());
+
+                    for obj in &objects {
+                        let mut props = match &obj.properties {
+                            serde_json::Value::Object(m) => m.clone(),
+                            _ => serde_json::Map::new(),
+                        };
+                        props
+                            .entry("name".to_string())
+                            .or_insert_with(|| serde_json::Value::String(obj.name.clone()));
+
+                        let entry = serde_json::json!({
+                            "entitytype": "node",
+                            "id": obj.id.to_string(),
+                            "nodetype": obj.object_type,
+                            "properties": props,
+                        });
+                        lines.push(serde_json::to_string(&entry)?);
+                    }
+
+                    for edge in &edges {
+                        let from = id_to_name
+                            .get(&edge.from)
+                            .cloned()
+                            .unwrap_or_else(|| edge.from.to_string());
+                        let to = id_to_name
+                            .get(&edge.to)
+                            .cloned()
+                            .unwrap_or_else(|| edge.to.to_string());
+                        let entry = serde_json::json!({
+                            "entitytype": "edge",
+                            "from": from,
+                            "to": to,
+                            "edgeType": edge.edge_type.0,
+                        });
+                        lines.push(serde_json::to_string(&entry)?);
+                    }
+
+                    let out_dir = data_file
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+                    let out_path = out_dir.join(format!("export_{timestamp}.jsonl"));
+                    std::fs::write(&out_path, lines.join("\n"))?;
+
+                    Ok::<_, anyhow::Error>((out_path, objects.len(), edges.len()))
+                })
+                .await;
+
+            this.update(cx, |view: &mut AppView, cx| {
+                match result {
+                    Ok((path, node_count, edge_count)) => {
+                        let filename = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        view.data_status = Some(format!(
+                            "Exported {node_count} nodes, {edge_count} edges → {filename}"
+                        ));
+                    }
+                    Err(e) => {
+                        view.data_status = Some(format!("Export failed: {e}"));
+                    }
+                }
+                cx.notify();
             })
             .ok();
         })

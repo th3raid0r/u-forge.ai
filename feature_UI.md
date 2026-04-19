@@ -166,7 +166,8 @@ The crate is split into focused modules under `src/`. `main.rs` is the binary en
 | `text_field.rs` | `TextFieldView` — canvas-based text input widget (`EntityInputHandler`, cursor, IME, blink, vertical scroll (multiline), horizontal scroll (single-line), `submit_on_enter` flag for chat); emits `TextChanged`, `TextSubmit`, and `TextArrowKey` (Up/Down arrows → `bool`) events |
 | `node_panel.rs` | `NodePanel` — collapsible node-by-type sidebar; uses `w_full()` so parent container controls width |
 | `search_panel.rs` | `SearchPanel` — left sidebar search tab: FTS5 / Semantic / Hybrid modes, single-line query field, results list, `set_queues()` updater |
-| `chat_panel.rs` | `ChatPanel` — streaming LLM chat: model selector dropdown, enter-to-submit toggle, multiline input + send button, message history with thinking/reasoning and collapsible tool call entries, `set_provider()` and `set_agent()` updaters |
+| `chat_history.rs` | `ChatHistoryStore` — SQLite-backed chat session persistence at `<db_path>/chat_history.db`; `chat_sessions` + `chat_messages` tables (WAL, FK cascade); `create_session`, `list_sessions`, `load_messages`, `save_session`, `delete_session` |
+| `chat_panel.rs` | `ChatPanel` — streaming LLM chat. **Header**: session history selector (title dropdown button + green "New" button; each row has title-to-load + ✕ delete; dismisses on click outside the header). **Input area**: multiline text field + Send button + enter-to-submit toggle + model selector dropdown (below input, lists all downloaded LLM models via `select_all_llm_models()`, defaults to preferred device model). Sessions auto-save on stream completion, resume most-recent on startup. `set_provider(provider, models, preferred_idx)` and `set_agent()` updaters. Tool calls collapsible with purple accent; thinking/reasoning shown for both agent and direct paths. |
 | `graph_canvas.rs` | `GraphCanvas` — pan/zoom canvas with edge/node/legend rendering |
 | `node_editor/mod.rs` | `NodeEditorPanel` struct, constructor, tab management (`open_or_focus_tab`, `save_dirty_tabs` → `(count, Vec<ObjectId>)`, `commit_array_add`); edge editing helpers (`add_edge_row` auto-fills `from` from current node, `open_edge_dropdown`, `select_edge_node`, `remove_edge_row`); `EdgeNodeDropdown` with filter text, arrow-key highlight navigation, and Enter-to-confirm |
 | `node_editor/field_spec.rs` | `FieldSpec`, `FieldKind`, `EditorTab` — form field descriptions and dirty-state tracking; `SubTab` enum (`Properties` / `Edges`) per tab |
@@ -245,6 +246,73 @@ These patterns are required for scroll areas to work correctly inside a flex lay
 - **`flex_none` on the sidebar** — the node panel must not participate in flex stretching; only the workspace should grow.
 - **`WeakEntity<T>` for drag callbacks** — `on_drag_move` and `on_click` closures receive `&mut App` (no `Context<V>`). Capture `cx.weak_entity()` before building the element tree, then call `handle.update(cx, |view, cx| { … })` inside the closure to mutate view state. This is the correct pattern for GPUI 0.2.2 whenever event handlers need access to a view but `cx.listener()` isn't available.
 
+### GPUI view-level caching (`AnyView::cached`)
+
+Heavy sub-views that re-lay-out on every root-view notify (e.g. the chat panel during drag/resize of unrelated panels) should be wrapped with `AnyView::cached(StyleRefinement)`. The pattern used on the right panel in `app_view/render.rs`:
+
+```rust
+AnyView::from(self.chat_panel.clone())
+    .cached(StyleRefinement::default().size_full())
+```
+
+**What `.cached()` does** (`gpui-0.2.2/src/view.rs::AnyView::prepaint`): stores `bounds`, `content_mask`, and `text_style` as a cache key in the element_state. On the next frame it checks all four conditions:
+1. cache-key fields match this frame's values
+2. `window.dirty_views` does NOT contain this entity's id (i.e. neither the entity nor any descendant called `cx.notify()`)
+3. `window.refreshing == false`
+
+If all hold, `prepaint` reuses the stored `prepaint_range`/`paint_range` via `window.reuse_prepaint()` / `window.reuse_paint()` — the subtree's `render()`, layout, and paint are **all skipped**. This is why dragging the left sidebar with the chat panel open no longer spikes frame time: only `AppView` is in `dirty_views`, chat-panel bounds are unchanged, and the whole chat subtree is cache-reused.
+
+`.cached()` lives on `AnyView`, not `Entity<V>`. Use `AnyView::from(entity).cached(...)` or `entity.to_any().cached(...)` (Zed's pattern).
+
+**Required invariant: cache key must be stable across user actions you want to be free.**
+- Bounds are per-frame layout output, keyed on the parent's constraint. Any change invalidates the cache.
+- If the outer container's width changes (e.g. `w(0.)` ↔ `w(400.)` when toggling a panel), the cached view's bounds change and the cache misses — paying full cold-mount cost on every toggle.
+
+### Always-mounted panel pattern (the companion of `.cached()`)
+
+To avoid cold-mount cost when a panel is toggled, do **not** use `if panel_open { body.child(panel) }`. When an element is absent from the tree for a frame, its element_state (including the `.cached()` key) is GC'd, so the next mount is cold.
+
+Instead, use a two-layer wrapper that keeps the panel in the tree always and varies only the **outer** container's visible width:
+
+```rust
+// Outer: variable width, overflow_hidden, relative (anchor for absolute child).
+div()
+    .relative().flex_none()
+    .w(px(if open { width } else { 0.0 }))
+    .h_full()
+    .overflow_hidden()
+    .child(
+        // Inner: fixed width always, absolute-positioned so it escapes the
+        // outer's layout constraint. Clipped to 0 px by the outer's
+        // overflow_hidden when closed.
+        div()
+            .absolute().top_0().left_0()
+            .w(px(width)).h_full().overflow_hidden()
+            .child(
+                AnyView::from(panel.clone())
+                    .cached(StyleRefinement::default().size_full()),
+            ),
+    )
+```
+
+The inner absolute-positioned div gives the cached view stable bounds; the outer's width controls visibility via clipping. Toggle becomes cache-hit, not cache-miss. Resize still invalidates (width actually changes), which is correct — the user sees the resize.
+
+This pattern is in use for the right (chat) panel; apply it to any future heavy-to-layout side panel.
+
+### When `cx.notify()` causes a cache miss
+
+`window.dirty_views` is populated via `cx.notify()`, which **only marks the calling entity** — children are not transitively dirtied, and neither is the parent. Consequences:
+
+- Dragging a sidebar handle in `AppView` calls `cx.notify()` on `AppView` only. `ChatPanel` and every `ChatMessageView` stay clean → `.cached()` on the chat panel hits.
+- Streaming a token calls `cx.notify()` on one `ChatMessageView`. That entity is dirty; any ancestor that also uses `.cached()` would miss — which is fine, because it's the right frame to update.
+- A global `window.refresh()` bypasses `.cached()` entirely and forces everything to re-render. Don't call it unless you mean it.
+
+### Frame-cost profiling (perf overlay)
+
+Don't trust how often `render()` is called — that measures re-render frequency, not frame cost. To measure real frame time (tree build + layout + paint start), append a 1×1 `canvas` element whose paint closure records `frame_start.elapsed()` into entity state. The canvas's paint closure fires after GPUI has laid everything out, so the measurement captures the actual per-frame cost.
+
+`AppView` has a built-in perf overlay toggled by `Ctrl+Shift+P` or the "Perf" button in the status bar, showing `frame:<ms>  avg:<60-frame>  chat:<chat render>`. See `app_view/render.rs` — the canvas at the bottom of the tree is the frame-cost meter.
+
 ### Canvas architecture
 
 `GraphCanvas` is a child `Entity<V>` rendered inside `AppView`. It renders a `div#graph-root` (with `overflow_hidden()`) containing a single `gpui::canvas` element.
@@ -296,9 +364,31 @@ The GPUI canvas saves positions **on explicit save** (Ctrl+S or File > Save) rat
 13. ✅ **Rig-based agent tool loop + streaming UI** — New `u-forge-agent` crate (`rig-core 0.35.0` + `schemars 1.x`) exposes three graph search tools to the LLM: `FtsSearchTool` (SQLite FTS5 keyword search), `SemanticSearchTool` (ANN embedding search), `HybridSearchTool` (RRF fusion + optional reranking). `GraphAgent` holds a `rig::providers::openai::CompletionsClient` pointed at Lemonade's OpenAI-compatible `/chat/completions` endpoint, an `Arc<KnowledgeGraph>`, an `Arc<InferenceQueue>`, and a system prompt string. `prompt_stream()` builds a fresh rig agent per call, runs `agent.stream_prompt(&msg).multi_turn(n).await`, and emits `AgentStreamEvent` variants over a `tokio::sync::mpsc::channel(64)`: `ReasoningDelta(String)` (thinking tokens), `TextDelta(String)` (response tokens), `ToolCallStart { internal_id, name, args_display }`, `ToolResult { internal_id, content }`, `Done(String)`, `Error(String)`. `ChatPanel` gains `agent: Option<Arc<GraphAgent>>` field and `set_agent()`. When an agent is set, `do_send()` routes through `prompt_stream()` instead of `LemonadeChatProvider`: a blank `Thinking` + `Assistant` entry are pushed upfront; `ReasoningDelta` events append to the `Thinking` entry; `TextDelta` events stream into the `Assistant` entry; `ToolCallStart` inserts a collapsible `ChatRole::ToolCall` entry (purple left-border accent, `▶/▼` toggle, collapsed by default); `ToolResult` fills in the result field and adds a `✓` checkmark. Empty `Thinking`/`Assistant` entries are pruned on `Done`. `ChatEntry` extended with `tool_args: Option<String>`, `tool_result: Option<String>`, `tool_internal_id: Option<String>`, `collapsed: bool`; `ChatRole::ToolCall` variant added. `AppView::do_init_lemonade()` constructs `GraphAgent::new(&url, graph, Arc::new(queue), system_prompt, params)` and calls `chat_panel.set_agent()` on success.
 14b. ✅ **Node editor sub-tabs + edge editor UX polish** — Each node editor tab now has two sub-tabs: **Properties** (existing multi-column form with pagination, fully restored) and **Edges** (edge editor fills the full panel height, separated from the scroll container that was clipping the dropdown). `SubTab` enum (`Properties` / `Edges`, default `Properties`) added to `field_spec.rs`; `EditorTab` gains `active_subtab` field. Sub-tab bar (24 px) renders below the main tab bar. `add_edge_row()` auto-populates the `from` endpoint from the currently-edited node — the "From" selector column is removed from edge rows, simplifying the row to `[type] → [To ▾] [✕]`. "Add Edge" button shrinks to content width (`align_self: Start`). Dropdown rendering restructured: the overlay is the last child of `edges-section` (which is `relative()`), so it paints over the add button; Y position computed from the edge row index. Dropdown results capped at 10. `TextFieldView` emits a new `TextArrowKey(bool)` event on Up/Down keys; `EdgeNodeDropdown` subscribes to it to move `highlighted_idx`; `TextSubmit` (Enter) selects the highlighted candidate. The highlighted row is visually distinguished with `bg(0x45475a)`. `highlighted_idx` resets to 0 when filter text changes.
 
+14d. ⚠️ **Chat-panel per-message entity port (Zed pattern) — did not fix the perf issue; may have made it worse.** Attempted to port Zed's agent-UI pattern of splitting each chat message into its own `Entity<T: Render>` child, so that streaming token deltas call `cx.notify()` on one message entity instead of the whole `ChatPanel`. Added `crates/u-forge-ui-gpui/src/chat_message.rs` with `ChatMessageView` (role enum, `append_text`, `set_tool_result`, `toggle_collapsed`) and an internal-id → entity hashmap on the panel for tool-call routing. Refactored `chat_panel.rs` to hold `Vec<Entity<ChatMessageView>>`; the `list()` callback returns `msg.clone().into_any_element()`. Lazy-created Thinking/Assistant entities on first delta (replacing the old "push empty placeholder + filter on Done" dance). Persistence format (`StoredMessage`) unchanged. **Result:** streaming is not smoother than before, and the UI now pauses at message boundaries (first reasoning token, first text token, tool-call start) in addition to the pre-existing launch and window-resize pauses. Lazy entity creation + the `ListState::reset` call that follows it is the most likely regression source; the old path front-loaded both placeholders before the stream body and so only took one pause. The root cause of the underlying streaming slowness is not `cx.notify()` scope — it's somewhere else we haven't identified yet. See the "Known performance issues — chat panel" section below before attempting further work.
+
 14. ✅ **Destructive agent tools + embedding-on-save** — Two new `rig::tool::Tool` impls in `u-forge-agent`: `UpsertNodeTool` (create/update nodes) and `UpsertEdgeTool` (create/update edges with node-by-name-or-UUID resolution via `resolve_node()` helper). Both tools call `rechunk_and_embed()` before returning, so the LLM gets confirmation only after DB writes + all embeddings (standard 768-dim + optional HQ 4096-dim) are stored. `GraphAgent` extended with `hq_queue: Option<Arc<InferenceQueue>>` field; constructor updated to accept it; all five tools registered in both `prompt_stream()` and `prompt()`. `SearchToolError` renamed to `ToolError` (shared by all five tools). New core function `rechunk_and_embed(graph, queue, hq_queue, object_id)` in `ingest/embedding.rs` — per-node analogue of `embed_all_chunks`: deletes old chunks → flattens metadata + edges → creates new chunks → embeds standard → embeds HQ → blocks until complete. `KnowledgeGraph::delete_chunks_for_node()` added. UI `do_save()` (Ctrl+S / File > Save) now collects saved node IDs from `save_dirty_tabs()` (return type changed to `(usize, Vec<ObjectId>)`) and triggers `do_rechunk_and_embed()` — async background task that re-chunks and re-embeds each saved node, with status bar feedback. BPE tokenizer (`tiktoken_rs::o200k_harmony()`) cached via `LazyLock<CoreBPE>` in `text.rs` and `u-forge-agent/lib.rs` — was constructing ~200k-entry vocabulary per call, causing `split_text()` to hang on long inputs.
 
+14e. ✅ **Chat-panel perf fix (.cached + always-mounted).** Drag-while-chat-open was spiking to 30-500 ms per frame because every `cx.notify()` on `AppView` re-ran the chat panel's full tree build + text shaping. Two changes in `app_view/render.rs`: (1) wrap the chat panel in `AnyView::from(self.chat_panel.clone()).cached(StyleRefinement::default().size_full())`, so when `dirty_views` doesn't contain the panel or its descendants, GPUI reuses the previous frame's prepaint/paint ranges and skips the subtree entirely; (2) mount the chat panel unconditionally inside a two-layer wrapper — an outer variable-width `overflow_hidden` container (width flips between `right_panel_width` and `0`) plus an inner absolute-positioned fixed-width div, so the cached view's bounds stay stable across toggles. The `.cached()` wrapper lives on `AnyView` (not `Entity<V>`); GPUI 0.2.2 exposes it via `From<Entity<V>> for AnyView`. A perf overlay (`Ctrl+Shift+P`) added to `AppView` reports real per-frame cost by recording elapsed time inside a 1×1 canvas paint closure appended to the tree — `render()` call frequency alone is not a valid perf metric. See `feature_UI.md` → "GPUI view-level caching" and "Always-mounted panel pattern" for the reusable parts.
+
 14c. ✅ **Agent tool-loop reliability improvements** — Addressed several AI misbehaviors (blank-node loops, duplicate creation, wrong object_type, forgotten properties). Changes span `u-forge-agent`, `u-forge-core`, and config: (1) **Property merge semantics** — `UpsertNodeTool` now merges the caller-supplied `properties` object key-by-key into the existing node rather than wholesale replacing it. Null/omitted keys preserve existing values; `""` deletes a key; any other value overwrites. This lets the LLM issue partial updates without clobbering fields it doesn't mention. (2) **Object type validation** — `UpsertNodeTool::call` validates `object_type` against `SchemaManager::is_valid_object_type()`; on failure it returns the full list of valid types so the model can self-correct. (3) **Schema injection** — `GraphAgent::new` builds the full system prompt by appending tool-use guidelines (`## Tool-use guidelines`) and a merged schema summary (`KnowledgeGraph::schema_prompt_summary_all()`) from all persisted schemas. `SchemaDefinition::prompt_summary()` generates a markdown block with all node types, their properties (type, required flag, description), and edge types. `SchemaManager` gains `is_valid_object_type`, `is_valid_edge_type`, `all_object_type_names`, `all_edge_type_names`. (4) **`AgentParams` struct** — all LLM sampling knobs (`temperature`, `max_tokens`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `seed`, `stop`) plus `max_tool_turns` gathered into `AgentParams`; `GraphAgent::new` now takes `AgentParams` instead of a bare temperature. `prompt_stream` and `prompt` drop their `max_turns` argument (now from `params.max_tool_turns`). A `build_agent()` helper deduplicates agent construction. Non-standard knobs are sent via `additional_params` (rig's flattened JSON passthrough). (5) **`ChatDeviceConfig` expanded** — all new sampling fields (`top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `seed`, `stop`) added. `ChatConfig` gains `max_tool_turns: usize` (default 5). `AppView::do_init_lemonade()` builds `AgentParams` from the active device config. (6) **Tool-call–optimized defaults** — `u-forge.toml` tuned: `temperature = 0.3`, `top_p = 0.9`, `frequency_penalty = 0.3`, `max_tool_turns = 5`; all available commented-out knobs documented inline. Edge type is freeform (no schema validation) — freeform labels like `"led_by"` or `"located_in"` are idiomatic.
+
+---
+
+## Chat-panel perf — resolved
+
+Three successive fixes landed; all reported pauses are gone.
+
+1. **`ListState::splice` for appends (not `reset`).** `reset(len)` invalidates every cached item measurement; visible messages re-lay-out on the next paint. `splice(prev_len..prev_len, 1)` only invalidates the newly-appended item. `ChatPanel::splice_appended` is used on every append; `reset_list_state()` is retained only for wholesale replacement (session switch / load / delete). See `chat_panel.rs`.
+
+2. **Per-message entities** (`Entity<ChatMessageView>` per row). Streaming token deltas now only notify one entity, not the whole panel. Earned back most of the pre-14d render-time cost. See `chat_message.rs`.
+
+3. **`AnyView::cached(StyleRefinement)` wrapper + always-mounted right-panel.** This eliminated the drag/resize spike (previously 30-500ms per frame when dragging any panel boundary with the chat panel open). The two parts work together — see the "GPUI view-level caching" section below.
+
+### What was a dead end
+
+**Paint-time shape cache (reverted).** Moving text rendering into a `canvas` with a cross-frame `WrappedLine` cache (keyed by `text_len` + `wrap_width`) regressed launch, resize, and streaming. `shape_text` ran in the **paint** phase, not `request_layout` — when measured height differed from the pre-paint guess, `cx.notify()` forced a double-pass. A paint-phase cache cannot beat a layout-phase non-cache unless it avoids the notify cascade.
+
+**Lesson:** GPUI has three phases — `request_layout`, `prepaint`, `paint`. Anything that affects size must run in `request_layout`. Mutating view state in `paint` and calling `cx.notify()` (e.g. from a `canvas` closure) re-invalidates the frame you just finished and doubles cost.
 
 ---
 
