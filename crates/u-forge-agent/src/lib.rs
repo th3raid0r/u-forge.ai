@@ -24,7 +24,7 @@ use serde::Deserialize;
 use u_forge_core::ingest::rechunk_and_embed;
 use u_forge_core::search::{search_hybrid, HybridSearchConfig, NodeSearchResult};
 use u_forge_core::types::ObjectMetadata;
-use u_forge_core::{queue::InferenceQueue, types::ObjectId, KnowledgeGraph};
+use u_forge_core::{queue::InferenceQueue, types::ObjectId, KnowledgeGraph, PropertyIssue};
 
 // ── History and token counting ────────────────────────────────────────────────
 
@@ -626,6 +626,15 @@ impl Tool for UpsertNodeTool {
             }
         }
 
+        // Validate and coerce properties against the schema. Coercions (e.g. "42" → 42) are
+        // applied in-place; issues are appended to the output so the LLM can self-correct.
+        let prop_issues = if let serde_json::Value::Object(ref mut props) = meta.properties {
+            self.graph
+                .validate_and_coerce_properties(&meta.object_type, props)
+        } else {
+            vec![]
+        };
+
         // Persist the node.
         if is_update {
             self.graph
@@ -644,11 +653,18 @@ impl Tool for UpsertNodeTool {
             .map_err(|e| ToolError(format!("Embedding failed: {e:#}")))?;
 
         let action = if is_update { "Updated" } else { "Created" };
-        Ok(format!(
+        let mut output = format!(
             "{action} node \"{name}\" ({object_type}). node_id: {object_id}. chunks_embedded: {chunks}.",
             name = meta.name,
             object_type = meta.object_type,
-        ))
+        );
+        for issue in &prop_issues {
+            match issue {
+                PropertyIssue::UnknownProperty { .. } => {}
+                _ => output.push_str(&format!("\n[warning] {issue}")),
+            }
+        }
+        Ok(output)
     }
 }
 

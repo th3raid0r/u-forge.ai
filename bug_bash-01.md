@@ -320,7 +320,7 @@ multi-PR cascade. Hickey flagged all three. The **Tier 4.1 (typed
 properties)** item is the natural partner to the schema-migration system
 the user has already scheduled; do them together.
 
-### 4.1 🔎 Typed properties on `ObjectMetadata`
+### ~~4.1 🔎 Typed properties on `ObjectMetadata`~~
 
 **Where:** `crates/u-forge-core/src/types.rs:129`
 (`properties: serde_json::Value`), validated downstream in
@@ -340,11 +340,19 @@ text without schema awareness.
 requires brittle JSON-path logic spread across multiple layers. Today a
 property typo is silently accepted.
 
-**Untangling (pair with schema migration).** Introduce
-`SchemaValidatedValue` — a newtype wrapping `Value` that requires a
-`SchemaRef` at construction. Thread it through `ObjectMetadata`. The UI
-reads field kinds from the schema, not from the value. The agent's
-`UpsertNodeTool` validates at the boundary, not after persistence.
+**Landed (boundary enforcement approach — schema migration pairing deferred).**
+`SchemaValidatedValue` newtype threading was deferred (requires schema
+injection at deserialization time, which migration manages). Instead:
+`SchemaManager::validate_and_coerce_properties` was added — a sync,
+cache-based method that coerces `String("42")` → `Number` and
+`String("true"/"false")` → `Bool` in-place, and returns `Vec<PropertyIssue>`
+for type mismatches and invalid enum values. `KnowledgeGraph` exposes a
+wrapper. `UpsertNodeTool` calls it after the property merge and appends
+`[warning]` lines to tool output for issues the LLM can self-correct.
+`NodeEditorView::save_dirty_tabs` calls it before `update_object` and
+emits `tracing::warn!` for the same classes. Unknown properties are
+accepted silently at both boundaries. `PropertyIssue` is re-exported from
+`u-forge-core`.
 
 ### 4.2 🔎 Declarative embedding pipeline
 
