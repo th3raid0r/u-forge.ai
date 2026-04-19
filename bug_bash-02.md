@@ -297,28 +297,27 @@ rather than running its ticks down.
 
 **Where:** `crates/u-forge-core/src/graph/storage.rs:134, 162`.
 
-```rust
-pub const EMBEDDING_DIMENSIONS: usize = 768;
-pub const HIGH_QUALITY_EMBEDDING_DIMENSIONS: usize = 4096;
-```
+The `vec0` virtual table declaration bakes `EMBEDDING_DIMENSIONS` (768)
+and `HIGH_QUALITY_EMBEDDING_DIMENSIONS` (4096) into the on-disk schema.
+Changing the embedding model forced a DB rebuild with no warning — an
+upgrade path that lowers dims silently corrupted the vector index.
 
-The `vec0` virtual table declaration bakes these constants into the
-on-disk schema. Changing the embedding model forces a DB rebuild, and
-there's nothing in the file that warns the user — an upgrade path that
-lowers dim from 4096→1024 silently corrupts the vector index.
+**Fix.** Added a `schema_metadata` TEXT key/value table to `SQL_SCHEMA`.
+The new `check_or_init_embedding_dims` helper runs inside
+`KnowledgeGraphStorage::new` immediately after `execute_batch`:
+- First open → inserts `chunks_vec_dims` and `chunks_vec_hq_dims`.
+- Subsequent opens → reads back the stored values and compares against
+  the compile-time constants.
+- Mismatch → returns `EmbeddingDimensionMismatch { table, stored, expected }`
+  (a `thiserror` struct, re-exported from `u_forge_core`) with a message
+  telling the user to re-index or pin the old model. No auto-migration.
 
-**Fix.** Persist the embedding dimensions in a dedicated
-`schema_metadata` table keyed by vec table name. On `open()`, read back
-the stored dims and compare against the compile-time constants:
+Two new unit tests: `test_open_records_dims_in_schema_metadata` and
+`test_open_with_mismatched_dims_returns_error` (tampers the stored value
+and verifies the error downcasts to `EmbeddingDimensionMismatch`).
 
-- Match → continue.
-- Mismatch → return a structured error (`EmbeddingDimensionMismatch { stored, expected }`) with guidance on what to do (reindex, or pin the old model).
-
-This makes the failure mode obvious instead of silent corruption. No
-auto-migration — that's a feature, not a bash item.
-
-**Verification.** Create a DB with dim=768, recompile with dim=4096 in
-the source constant, reopen. Expect a clear error at open time.
+**Verification.** Create a DB with dim=768, tamper `schema_metadata` to
+999, reopen — clear `EmbeddingDimensionMismatch` error at open time.
 
 ### 3.3 ✅ Chunk sizing heuristic can under-count tokens
 
