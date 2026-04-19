@@ -121,6 +121,10 @@ Recent quality improvements:
 - `generate_draw_commands()` returns a typed `DrawCommands { nodes, edges, labels }` struct instead of a mixed `Vec<DrawCommand>`. The GPUI canvas iterates each typed vec once — no more three filter passes over the same Vec with enum discriminant branches on the paint hot path.
 - Chat history dropdown is virtualized via a second `ListState` on `ChatPanel`. Only visible rows allocate and render, so accumulating 100+ sessions no longer spikes the frame while the dropdown is open. State is reset whenever `session_list` is refreshed.
 - Perf-overlay frame-cost window moved from `VecDeque<u64>` to a fixed `FrameTimeRing` (`[u64; 60]` circular buffer). Average and sampling are both gated on `perf_enabled`, so a disabled overlay does zero work beyond the enable check.
+- `SelectionModel` no longer carries `selected_node_idx` — `selected_node_id: Option<ObjectId>` is the sole source of truth. Callers that need an index (e.g. `generate_draw_commands`) compute it on demand via `nodes.iter().position(...)` inside the snapshot read. Eliminates the stale-index hazard on snapshot rebuilds.
+- `AgentParams.temperature` changed from `f64` (unconditional `0.3` override) to `Option<f64>` — `None` defers to the server/model default. Restores symmetry with `top_p`/`top_k`/`min_p` which were already optional.
+- Chat persistence layer now has typed `StoredRole` enum and `StoredToolCall` struct. `StoredMessage` renamed to `StoredChatMessage`. UI layer (`ChatMessageView`) converts to/from `StoredChatMessage` at the persistence boundary only — no more stringly-typed role strings or loose tool call fields leaking into the domain model.
+- 11 pre-existing clippy lints in `u-forge-core` and `u-forge-ui-gpui` resolved: `map_or(false, …)` → `is_some_and`, `repeat().take()` → `repeat_n`, `single_match` → `if let`, `field_reassign_with_default`, `len() > 0` → `!is_empty()`, `collapsible_if`, `manual_clamp`, `useless_conversion`.
 
 The core library has been fully refactored (hardware abstraction layer removed):
 - `hardware/` directory deleted — `NpuDevice`, `GpuDevice`, `CpuDevice`, `DeviceWorker`

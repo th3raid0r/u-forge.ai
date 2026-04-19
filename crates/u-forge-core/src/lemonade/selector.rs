@@ -519,8 +519,7 @@ mod tests {
             ],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );
-        let mut cfg = ModelConfig::default();
-        cfg.embedding_model_preferences = vec!["model-a".to_string()];
+        let cfg = ModelConfig { embedding_model_preferences: vec!["model-a".to_string()], ..Default::default() };
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
@@ -565,8 +564,7 @@ mod tests {
             ],
             vec![installed_backend("flm", "npu", &["amd_npu"])],
         );
-        let mut cfg = ModelConfig::default();
-        cfg.embedding_model_preferences = vec!["embed-gemma-FLM".to_string()];
+        let cfg = ModelConfig { embedding_model_preferences: vec!["embed-gemma-FLM".to_string()], ..Default::default() };
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
@@ -776,8 +774,7 @@ mod tests {
             ],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );
-        let mut cfg = ModelConfig::default();
-        cfg.llm_model_preferences = vec!["Gemma-4-26B-A4B-it-GGUF".to_string()];
+        let cfg = ModelConfig { llm_model_preferences: vec!["Gemma-4-26B-A4B-it-GGUF".to_string()], ..Default::default() };
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
@@ -819,8 +816,7 @@ mod tests {
             ],
             vec![installed_backend("whispercpp", "cpu", &["cpu"])],
         );
-        let mut cfg = ModelConfig::default();
-        cfg.stt_model_preferences = vec!["Whisper-Large-v3-Turbo".to_string()];
+        let cfg = ModelConfig { stt_model_preferences: vec!["Whisper-Large-v3-Turbo".to_string()], ..Default::default() };
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 

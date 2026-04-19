@@ -52,9 +52,10 @@ impl GraphCanvas {
         let sel_sub = cx.observe(&selection, |this: &mut GraphCanvas, sel, cx| {
             if this.suppress_pan {
                 this.suppress_pan = false;
-            } else if let Some(idx) = sel.read(cx).selected_node_idx {
-                let pos = this.snapshot.read().nodes[idx].position;
-                this.camera = pos;
+            } else if let Some(id) = sel.read(cx).selected_node_id {
+                if let Some(node) = this.snapshot.read().nodes.iter().find(|n| n.id == id) {
+                    this.camera = node.position;
+                }
             }
             cx.notify();
         });
@@ -124,7 +125,7 @@ impl Render for GraphCanvas {
         let zoom = self.zoom;
         let camera = self.camera;
         let snapshot = self.snapshot.clone();
-        let selected_node_idx = self.selection.read(cx).selected_node_idx;
+        let selected_node_id = self.selection.read(cx).selected_node_id;
         let canvas_bounds_arc = self.canvas_bounds.clone();
 
         div()
@@ -239,8 +240,10 @@ impl Render for GraphCanvas {
                         };
 
                         let snap = snapshot.read();
+                        let selected_idx = selected_node_id
+                            .and_then(|id| snap.nodes.iter().position(|n| n.id == id));
                         let commands =
-                            generate_draw_commands(&snap, &viewport, selected_node_idx);
+                            generate_draw_commands(&snap, &viewport, selected_idx);
                         let lod = viewport.lod_level();
                         // Clone the precomputed legend so we can drop the read lock.
                         // `legend_types` is built once in `build_snapshot()` and only

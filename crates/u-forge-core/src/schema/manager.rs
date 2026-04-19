@@ -511,7 +511,7 @@ mod tests {
         let result = manager.validate_object(&invalid_character).await.unwrap();
         // Should still be valid since most fields are optional in our default schema
         // This test demonstrates the validation is working
-        assert!(result.errors.is_empty() || result.warnings.len() > 0);
+        assert!(result.errors.is_empty() || !result.warnings.is_empty());
     }
 
     #[tokio::test]
@@ -532,7 +532,7 @@ mod tests {
 
         let result = manager.validate_edge(&invalid_edge, &location, &character1).await.unwrap();
         // This should generate an error or warning depending on schema constraints
-        assert!(result.errors.len() > 0 || result.warnings.len() > 0);
+        assert!(!result.errors.is_empty() || !result.warnings.is_empty());
     }
 
     #[tokio::test]

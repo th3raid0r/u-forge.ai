@@ -842,8 +842,8 @@ pub enum AgentStreamEvent {
 /// [`ChatDeviceConfig`] + [`ChatConfig`].
 #[derive(Debug, Clone)]
 pub struct AgentParams {
-    /// Sampling temperature (default 0.3 for reliable tool use).
-    pub temperature: f64,
+    /// Sampling temperature. `None` defers to the server/model default.
+    pub temperature: Option<f64>,
     /// Maximum generation tokens.
     pub max_tokens: Option<u64>,
     /// Nucleus sampling threshold (0.0–1.0).
@@ -869,7 +869,7 @@ pub struct AgentParams {
 impl Default for AgentParams {
     fn default() -> Self {
         Self {
-            temperature: 0.3,
+            temperature: None,
             max_tokens: None,
             top_p: None,
             top_k: None,
@@ -990,8 +990,10 @@ impl GraphAgent {
         let mut builder = self
             .client
             .agent(model_id)
-            .preamble(&self.system_prompt)
-            .temperature(self.params.temperature);
+            .preamble(&self.system_prompt);
+        if let Some(temp) = self.params.temperature {
+            builder = builder.temperature(temp);
+        }
 
         if let Some(max_tokens) = self.params.max_tokens {
             builder = builder.max_tokens(max_tokens);

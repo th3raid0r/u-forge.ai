@@ -235,12 +235,12 @@ Sub-millisecond noise, cumulative on high-refresh displays.
 
 ---
 
-## Tier 3 — Small untanglings (queued, low effort, high future leverage)
+## Tier 3 — Small untanglings (**LANDED** on this branch)
 
 Each of these is worth landing before the big architectural items in Tier 4,
 because they reduce the surface area those items need to touch.
 
-### 3.1 ✅ Collapse `SelectionModel` to `selected_node_id` only
+### ~~3.1 ✅ Collapse `SelectionModel` to `selected_node_id` only~~
 
 **Where:** `crates/u-forge-ui-gpui/src/selection_model.rs:11-57`.
 
@@ -263,7 +263,12 @@ the snapshot read (`nodes.iter().position(|n| n.id == id)`). If profiling
 shows the O(N) lookup matters, build a `HashMap<ObjectId, usize>` once per
 `GraphSnapshot` rebuild and store it alongside `nodes`.
 
-### 3.2 🔎 Single `StoredChatMessage` source of truth
+**Landed.** `selected_node_idx` dropped from `SelectionModel`. `select_by_id`
+return value removed (all callers ignored it). `select_by_idx` now just looks
+up the id from the snapshot. `graph_canvas.rs` computes idx on demand inside
+the `snapshot.read()` guard before calling `generate_draw_commands`.
+
+### ~~3.2 🔎 Single `StoredChatMessage` source of truth~~
 
 **Where:** `crates/u-forge-ui-gpui/src/chat_history.rs` (`StoredMessage`,
 CHAT_SCHEMA) and `crates/u-forge-ui-gpui/src/chat_panel.rs` + `chat_message.rs`
@@ -282,7 +287,13 @@ UI-layer `ChatMessageView` converts to/from `StoredChatMessage` at the
 persistence boundary only. Keep the schema additive (new columns nullable)
 until a real migration tool lands.
 
-### 3.3 ✅ `AgentParams.temperature` becomes `Option<f64>`
+**Landed.** `StoredMessage` renamed to `StoredChatMessage`. Added `StoredRole`
+enum and `StoredToolCall` struct to `chat_history.rs`. SQLite schema unchanged
+(columns stay additive). `ChatMessageView::from_stored` / `to_stored` now work
+with typed fields — no more string-matching on `role` outside the persistence
+boundary.
+
+### ~~3.3 ✅ `AgentParams.temperature` becomes `Option<f64>`~~
 
 **Where:** `crates/u-forge-agent/src/lib.rs` — `AgentParams` struct around
 line 835, applied to the agent builder further down.
@@ -294,6 +305,11 @@ and prevents users from respecting Lemonade's per-model tuning.
 
 **Untangling.** Change the field to `Option<f64>`. Call
 `.temperature(value)` only if `Some`. Update `Default` to return `None`.
+
+**Landed.** `AgentParams.temperature: Option<f64>`, default `None`. `build_agent`
+only calls `.temperature()` when `Some`. UI side (`app_view/mod.rs`) uses
+`dev.temperature.map(|v| v as f64)` directly in the struct literal — no more
+conditional assignment.
 
 ---
 

@@ -194,6 +194,7 @@ pub struct AppView {
 }
 
 impl AppView {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: GraphSnapshot,
         graph: Arc<KnowledgeGraph>,
@@ -723,18 +724,19 @@ impl AppView {
                         let graph = view.graph.clone();
                         let system_prompt = view.app_config.chat.system_prompt.clone();
                         let dev = view.app_config.chat.active_device_config();
-                        let mut agent_params = AgentParams::default();
-                        if let Some(v) = dev.temperature { agent_params.temperature = v as f64; }
-                        if let Some(v) = dev.max_tokens { agent_params.max_tokens = Some(v as u64); }
-                        if let Some(v) = dev.top_p { agent_params.top_p = Some(v as f64); }
-                        if let Some(v) = dev.top_k { agent_params.top_k = Some(v); }
-                        if let Some(v) = dev.min_p { agent_params.min_p = Some(v as f64); }
-                        if let Some(v) = dev.frequency_penalty { agent_params.frequency_penalty = Some(v as f64); }
-                        if let Some(v) = dev.presence_penalty { agent_params.presence_penalty = Some(v as f64); }
-                        if let Some(v) = dev.repetition_penalty { agent_params.repetition_penalty = Some(v as f64); }
-                        if let Some(v) = dev.seed { agent_params.seed = Some(v); }
-                        if dev.stop.is_some() { agent_params.stop = dev.stop.clone(); }
-                        agent_params.max_tool_turns = view.app_config.chat.max_tool_turns;
+                        let agent_params = AgentParams {
+                            temperature: dev.temperature.map(|v| v as f64),
+                            max_tokens: dev.max_tokens.map(|v| v as u64),
+                            top_p: dev.top_p.map(|v| v as f64),
+                            top_k: dev.top_k,
+                            min_p: dev.min_p.map(|v| v as f64),
+                            frequency_penalty: dev.frequency_penalty.map(|v| v as f64),
+                            presence_penalty: dev.presence_penalty.map(|v| v as f64),
+                            repetition_penalty: dev.repetition_penalty.map(|v| v as f64),
+                            seed: dev.seed,
+                            stop: dev.stop.clone(),
+                            max_tool_turns: view.app_config.chat.max_tool_turns,
+                        };
                         match GraphAgent::new(
                             &lemonade_url,
                             graph,

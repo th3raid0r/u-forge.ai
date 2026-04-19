@@ -421,10 +421,8 @@ impl NodeEditorPanel {
                 }
                 // Drop empty strings for description so the key stays absent
                 // rather than storing an empty string.
-                if k == "description" {
-                    if v.as_str().is_some_and(|s| s.is_empty()) {
-                        continue;
-                    }
+                if k == "description" && v.as_str().is_some_and(|s| s.is_empty()) {
+                    continue;
                 }
                 props.insert(k.clone(), v.clone());
             }

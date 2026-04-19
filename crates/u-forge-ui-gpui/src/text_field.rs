@@ -711,7 +711,7 @@ impl Render for TextFieldView {
 
         // Single-line: fixed height. Multiline: grow with content, capped at max.
         let dynamic_h = if self.multiline {
-            self.content_height.max(TEXT_FIELD_MIN_H).min(TEXT_FIELD_MAX_H)
+            self.content_height.clamp(TEXT_FIELD_MIN_H, TEXT_FIELD_MAX_H)
         } else {
             TEXT_FIELD_MIN_H
         };
@@ -757,7 +757,7 @@ impl Render for TextFieldView {
                 }
                 let delta_y = match event.delta {
                     ScrollDelta::Pixels(p) => -f32::from(p.y),
-                    ScrollDelta::Lines(l) => -f32::from(l.y) * this.measured_line_h,
+                    ScrollDelta::Lines(l) => -l.y * this.measured_line_h,
                 };
                 let max_scroll = (this.content_height - TEXT_FIELD_MAX_H).max(0.0);
                 this.scroll_offset = (this.scroll_offset + delta_y).clamp(0.0, max_scroll);

@@ -105,7 +105,7 @@ pub async fn rechunk_and_embed(
         object_id = %object_id,
         name = %meta.name,
         chunks = chunks.len(),
-        hq = hq_queue.map_or(false, |q| q.has_embedding()),
+        hq = hq_queue.is_some_and(|q| q.has_embedding()),
         "Rechunked and embedded node"
     );
 

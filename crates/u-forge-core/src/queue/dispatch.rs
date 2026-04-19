@@ -440,7 +440,7 @@ mod tests {
         buf.extend_from_slice(&bits_per_sample.to_le_bytes());
         buf.extend_from_slice(b"data");
         buf.extend_from_slice(&data_size.to_le_bytes());
-        buf.extend(std::iter::repeat(0u8).take(data_size as usize));
+        buf.extend(std::iter::repeat_n(0u8, data_size as usize));
         buf
     }
 

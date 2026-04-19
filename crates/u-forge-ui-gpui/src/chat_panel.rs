@@ -13,7 +13,7 @@ use u_forge_core::{
     ChatMessage, ChatRequest, StreamToken,
 };
 
-use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredMessage};
+use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessage};
 use crate::chat_message::{ChatMessageRole, ChatMessageView};
 use crate::text_field::{TextFieldView, TextSubmit};
 
@@ -634,7 +634,7 @@ impl ChatPanel {
             },
         };
 
-        let stored: Vec<StoredMessage> = self
+        let stored: Vec<StoredChatMessage> = self
             .messages
             .iter()
             .map(|h| h.read(cx).to_stored())
