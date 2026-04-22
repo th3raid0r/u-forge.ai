@@ -125,3 +125,26 @@ Do not trust how often `render()` is called — that measures re-render frequenc
 `AppView` has a built-in perf overlay toggled by `Ctrl+Shift+P` (or the "Perf" button in the status bar), showing `frame:<ms>  avg:<60-frame>  chat:<chat_ms>`. Enable it before guessing at a UI slowdown. See `app_view/render.rs` — the timing canvas is the last element in the tree.
 
 The 60-frame average uses `FrameTimeRing` (`[u64; 60]` circular buffer in `app_view/state.rs`); sampling and averaging are both gated on `perf_enabled` so a disabled overlay does zero work beyond the enable check.
+
+---
+
+## Text rendering performance — the ShapePlan root cause
+
+**Background — what `tracing` spans reveal and don't reveal:**
+
+`ChatMessageView::render` is instrumented with a `trace_span!("chat_message::render", role, text_len, collapsed)` and `chat_panel::list_item` wraps the list render closure. These spans measure element-tree *construction* only — a few microseconds. GPUI's actual text-shaping cost happens later in `prepaint`, which runs after `render()` returns. The 500 ms scroll hitch will not appear inside these spans; it appears as *wall-clock silence* between successive span events. Enable with `RUST_LOG=u_forge_ui_gpui=trace`.
+
+**How the hitch was diagnosed:**
+
+1. `tracing` spans confirmed `render()` is fast (~10 µs); the 550 ms gap between consecutive `list_item` close events pointed squarely at GPUI's post-render pipeline.
+2. `samply record cargo run -p u-forge-ui-gpui` + `RUST_LOG=off` during a scroll-in of a large message produced a flamegraph: **89 % of samples in `gpui::text_system::shape_text`**, **77 % in `rustybuzz::hb::ot_map::hb_ot_map_builder_t::compile` → `find_language_feature`**.
+3. Root cause: `cosmic-text 0.14.2` calls `rustybuzz::ShapePlan::new(...)` for every word on every cold-cache text shape. Creating a `ShapePlan` parses the font's OpenType layout tables — several ms per call. `gpui`'s `LineLayoutCache` is frame-scoped; any message scrolled out of view has its layouts evicted. On scroll-back, all lines re-shape simultaneously.
+
+**Fix:** `crates/cosmic-text-patched` adds a `VecDeque<(fontdb::ID, Direction, Script, ShapePlan)>` cache to `ShapeBuffer`, backported from `cosmic-text 0.17.1`. See ARCHITECTURE.md — "Patched / Vendored Dependencies" for full details and removal instructions.
+
+**Rules that follow from this:**
+
+- `render()` spans are useful for measuring re-render *frequency* (catching unnecessary `cx.notify()` calls), not shaping cost. Use `samply` for the latter.
+- **Never hand a multi-kilobyte `SharedString` to a div child unless the message is likely to stay in view.** The collapse-by-default on `Thinking` blocks exists partly for this reason — a collapsed block renders only a header line, so only that line shapes on scroll-in instead of hundreds.
+- When adding any new text-heavy view (log viewer, diff display, long node descriptions), default to collapsed or paginated to bound the cold-shape cost per scroll-in. The ShapePlan cache amortises the per-word plan cost but does not eliminate the per-line layout cost for lines that have never been seen before.
+- **Do not mix large text rendering with `cx.notify()` hot paths.** Streaming tokens call `notify()` on the target `ChatMessageView` only; all sibling messages are not dirtied. If you restructure the streaming path so that a parent entity notifies, all visible chat messages will re-shape every token — catastrophic at 50 tok/s.

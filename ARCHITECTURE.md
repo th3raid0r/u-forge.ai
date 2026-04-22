@@ -268,6 +268,45 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 
 ---
 
+## Patched / Vendored Dependencies
+
+### `crates/cosmic-text-patched` — ShapePlan cache backport
+
+**What:** A local copy of `cosmic-text 0.14.2` (the version pulled in by `gpui 0.2.2`) with a single targeted fix backported from `cosmic-text 0.17.1`. Activated via `[patch.crates-io]` in the root `Cargo.toml` — `gpui` picks it up transparently.
+
+**Why it exists:** `cosmic-text 0.14.2` creates a new `rustybuzz::ShapePlan` on every word of every cold-cache text shape call. A `ShapePlan` compiles the font's OpenType layout tables (GSUB/GPOS feature lookup via `hb_ot_map_builder_t::compile` → `find_language_feature`) — an operation costing several milliseconds per call. With `gpui`'s frame-scoped `LineLayoutCache`, any message that scrolls off-screen has its line layouts evicted; on scroll-back every line re-shapes, paying this cost for every word on every line simultaneously. A 4 KB assistant message (~87 lines × ~8 words each) produced a measured ~550 ms freeze confirmed via `samply` flamegraph (89% of samples in `shape_text`, 77% in `find_language_feature`).
+
+**The fix** (`crates/cosmic-text-patched/src/shape.rs`):
+- Added `shape_plan_cache: VecDeque<(fontdb::ID, rustybuzz::Direction, rustybuzz::Script, rustybuzz::ShapePlan)>` to `ShapeBuffer`.
+- `shape_fallback` checks the cache (keyed on font + direction + script) before calling `ShapePlan::new`. Plans are reused across all lines sharing the same font/direction/script combination. Cache is capped at 6 entries (FIFO eviction).
+- No public API changes — the patch is invisible to `gpui`.
+
+**Why `cosmic-text 0.17.1` fixes it:** Version 0.17.1 (used by Zed's internal `gpui` fork) introduced the same `VecDeque` plan cache. `gpui 0.2.2` on crates.io cannot be bumped to use 0.17.x directly because the crate has not been republished with updated deps.
+
+**Maintenance — how to check for an upstream fix:**
+
+1. Check whether a new `gpui` version has been published to crates.io:
+   ```sh
+   cargo search gpui
+   ```
+   If `gpui > 0.2.2` appears, inspect its `Cargo.toml` for `cosmic-text` version. If it depends on `cosmic-text >= 0.17`, remove the patch.
+
+2. Alternatively, check the `cosmic-text` version pulled in by `gpui`:
+   ```sh
+   cargo tree -p gpui --depth 1 | grep cosmic
+   ```
+   If the resolved version is `>= 0.17`, the upstream fix is present and the patch can be dropped.
+
+**Maintenance — how to remove the patch once upstream is fixed:**
+
+1. Delete `crates/cosmic-text-patched/` from the workspace.
+2. Remove the `[patch.crates-io]` block and its comment from `Cargo.toml`.
+3. Remove `cosmic-text-patched` from the `members` glob (it auto-excludes when the directory is gone since members uses `crates/*`).
+4. Run `cargo build -p u-forge-ui-gpui` to confirm the upstream version compiles and `cargo test --workspace -- --test-threads=1` to verify nothing regressed.
+5. Run under `samply` during a chat scroll to confirm the `find_language_feature` hotspot is gone from the flamegraph.
+
+---
+
 ## Build Requirements
 
 Standard Rust stable toolchain + a C compiler (`gcc`, `clang`, or MSVC) for bundled SQLite compilation. No system SQLite, no ONNX Runtime, no RocksDB. `source env.sh` is not required.
