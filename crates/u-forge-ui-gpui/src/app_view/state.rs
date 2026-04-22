@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use parking_lot::RwLock;
 use u_forge_core::{queue::InferenceQueue, AppConfig, KnowledgeGraph};
@@ -28,6 +31,20 @@ pub(crate) struct AppState {
     /// Epoch for the embedding-plan status poller. Bumping cancels any
     /// in-flight poller timer so stale ticks don't overwrite a fresh status.
     pub(crate) embedding_plan_epoch: usize,
+    /// Cancellation flag for the active embedding pipeline.
+    ///
+    /// Set to `true` when a new pipeline starts (cancelling the old one) or
+    /// when the pipeline completes. Tasks check this with `Relaxed` loads; the
+    /// epoch check remains as the authoritative guard for work-skipping.
+    pub(crate) embedding_cancel: Arc<AtomicBool>,
+}
+
+/// RAII guard that sets the cancel flag on drop (including panic).
+pub(crate) struct CancelOnDrop(pub(crate) Arc<AtomicBool>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 impl AppState {
@@ -51,6 +68,7 @@ impl AppState {
             data_status: None,
             embedding_status: None,
             embedding_plan_epoch: 0,
+            embedding_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 }

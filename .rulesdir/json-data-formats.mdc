@@ -102,31 +102,11 @@ For each edge entry in the JSONL:
 
 ## Schema Files (defaults/schemas/)
 
-Named `*.schema.json`. Define object types and validation rules.
-
-```json
-{
-  "name": "add_npc",
-  "description": "Add a new NPC to the knowledge graph",
-  "properties": {
-    "name": { "type": "string", "required": true },
-    "skills": { "type": "array", "description": "Skills the NPC possesses" },
-    "currentLocation": {
-      "type": "string",
-      "relationship": { "edgeType": "located_in" }
-    }
-  }
-}
-```
-
-### Property types
-`string`, `text`, `number`, `boolean`, `array`, `object`, `reference`, `enum`
-
-### Validation rules
-`min_length`, `max_length`, `min_value`, `max_value`, `pattern` (regex), `allowed_values`, `required`
-
-### Naming convention
-Files use `add_` prefix in `name` field (MCP tool convention). `SchemaIngestion` strips the prefix — `add_npc` becomes `npc` internally. Schemas are saved under the `"imported_schemas"` namespace; the UI loads both `"default"` (built-in hardcoded types) and `"imported_schemas"` at startup.
+Schema file format, property types, and validation rules are documented in
+[schema-system.mdc](mdc:.rulesdir/schema-system.mdc). One non-obvious detail
+that affects import: schemas are saved under the `"imported_schemas"`
+namespace; the UI loads both `"default"` (built-in hardcoded types) and
+`"imported_schemas"` at startup.
 
 ---
 

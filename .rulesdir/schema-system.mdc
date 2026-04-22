@@ -113,6 +113,5 @@ npc, player_character, location, faction, quest, artifact, currency, inventory, 
 
 ## Known Limitations
 
-- `inheritance` field exists in `ObjectTypeSchema` but is stored and never acted on
 - Schema files use `add_` prefix naming (MCP convention leak)
 - Async methods on `SchemaManager` contain no `.await` points (unnecessary async wrapper)

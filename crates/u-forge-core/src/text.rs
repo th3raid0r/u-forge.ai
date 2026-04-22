@@ -3,6 +3,7 @@
 use std::sync::LazyLock;
 
 use tiktoken_rs::CoreBPE;
+use tracing::info;
 
 use crate::graph::MAX_CHUNK_TOKENS;
 
@@ -19,8 +20,32 @@ pub(crate) fn count_tokens(text: &str) -> usize {
     O200K_BPE.encode_with_special_tokens(text).len()
 }
 
+/// Bisect `word` at character midpoints until every piece fits within
+/// [`MAX_CHUNK_TOKENS`]. Used for words (or runs of text without whitespace,
+/// such as CJK prose or base64 blobs) that cannot be split at spaces.
+///
+/// Logs at `info` level when a hard-split fires — useful signal during
+/// ingestion of non-Latin corpora.
+fn split_oversized_word(word: &str) -> Vec<String> {
+    if count_tokens(word) <= MAX_CHUNK_TOKENS {
+        return vec![word.to_string()];
+    }
+    info!(
+        len_chars = word.chars().count(),
+        "hard-splitting oversized token-dense word at character midpoint"
+    );
+    let chars: Vec<char> = word.chars().collect();
+    let mid = chars.len() / 2;
+    let left: String = chars[..mid].iter().collect();
+    let right: String = chars[mid..].iter().collect();
+    let mut result = split_oversized_word(&left);
+    result.extend(split_oversized_word(&right));
+    result
+}
+
 /// Split `text` into pieces of at most [`MAX_CHUNK_TOKENS`] tokens, breaking
-/// only at whitespace boundaries.
+/// at whitespace boundaries where possible and bisecting at character midpoints
+/// for runs without whitespace (CJK prose, base64 blobs, long URLs).
 ///
 /// Token counts are measured with the o200k_harmony BPE tokenizer so that the
 /// budget is exact and consistent with what is stored in
@@ -44,8 +69,8 @@ pub(crate) fn split_text(text: &str) -> Vec<String> {
         let candidate = current_words.join(" ");
         if count_tokens(&candidate) > MAX_CHUNK_TOKENS {
             if current_words.len() == 1 {
-                // Single word exceeds budget — hard-cut it in as its own chunk.
-                pieces.push(candidate);
+                // Single token-dense word (CJK, base64, etc.) — bisect it.
+                pieces.extend(split_oversized_word(&candidate));
                 current_words.clear();
             } else {
                 // Flush everything except the word that pushed us over.
@@ -130,15 +155,39 @@ mod tests {
 
     #[test]
     fn test_split_text_hard_cut_when_no_whitespace() {
-        // A single token-dense word that exceeds MAX_CHUNK_TOKENS would be
-        // pathological in practice, but the splitter must not panic.
-        // Use a realistically long "word" (e.g. a base64 blob with no spaces).
+        // A single token-dense word that exceeds MAX_CHUNK_TOKENS is bisected
+        // at character midpoints until every piece fits the budget.
         let content = "x".repeat(MAX_CHUNK_TOKENS * 6);
         let pieces = split_text(&content);
-        // The hard-cut path emits it as a single oversized chunk (no whitespace
-        // to split on), which is the best we can do.
         assert!(!pieces.is_empty());
         for piece in &pieces {
+            assert!(!piece.is_empty());
+            assert!(
+                count_tokens(piece) <= MAX_CHUNK_TOKENS,
+                "bisected piece still exceeds token budget: {} tokens",
+                count_tokens(piece)
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_text_cjk_stays_within_budget() {
+        // CJK text has no whitespace — split_text must bisect it rather than
+        // emitting a single oversized chunk.
+        let cjk_char = '字';
+        // Each CJK character is roughly 1 token, so repeat well past budget.
+        let content: String = std::iter::repeat(cjk_char)
+            .take(MAX_CHUNK_TOKENS * 3)
+            .collect();
+        assert!(count_tokens(&content) > MAX_CHUNK_TOKENS);
+        let pieces = split_text(&content);
+        assert!(pieces.len() >= 2, "CJK blob must be split");
+        for piece in &pieces {
+            assert!(
+                count_tokens(piece) <= MAX_CHUNK_TOKENS,
+                "CJK piece exceeds token budget: {} tokens",
+                count_tokens(piece)
+            );
             assert!(!piece.is_empty());
         }
     }

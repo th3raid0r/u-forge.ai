@@ -72,7 +72,7 @@ impl InferenceQueue {
     /// - No embedding-capable device is registered.
     /// - The worker task was dropped before completing the job (internal error).
     /// - The underlying embedding provider returned an error.
-    #[instrument(skip(self, text), fields(text_len))]
+    #[instrument(skip(self, text), fields(text_len, pending_jobs, selected_worker_id, duration_us))]
     pub async fn embed(&self, text: impl Into<String>) -> Result<Vec<f32>> {
         if self.embedding_workers == 0 {
             return Err(anyhow!(
@@ -83,24 +83,26 @@ impl InferenceQueue {
         }
 
         let text = text.into();
-        tracing::Span::current().record("text_len", text.len());
+        let span = tracing::Span::current();
+        span.record("text_len", text.len());
+        span.record("pending_jobs", self.embed_dispatcher.pending());
 
+        let t0 = std::time::Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.embed_dispatcher.submit(EmbedJob { text, response: tx });
+        let worker_id = self.embed_dispatcher.submit(EmbedJob { text, response: tx });
+        span.record("selected_worker_id", worker_id);
 
-        rx.await
-            .map_err(|_| anyhow!("InferenceQueue: embedding worker dropped the response channel"))?
+        let result = rx.await
+            .map_err(|_| anyhow!("InferenceQueue: embedding worker dropped the response channel"))?;
+        span.record("duration_us", t0.elapsed().as_micros() as u64);
+        result
     }
 
     /// Submit a batch of texts for embedding.
     ///
-    /// Each text is submitted as a separate job; calls are made concurrently
-    /// and the results are collected in input order.  This leverages all
-    /// available embedding workers simultaneously.
-    ///
-    /// For small batches this is more efficient than a single
-    /// [`embed_batch`](crate::ai::embeddings::EmbeddingProvider::embed_batch) call
-    /// because it can parallelise across multiple NPU contexts.
+    /// Submissions are pipelined with a concurrency cap of `embedding_workers * 2`
+    /// so bulk imports don't materialise every pending future at once.  Results are
+    /// returned in input order.
     pub async fn embed_many(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if self.embedding_workers == 0 {
             return Err(anyhow!(
@@ -108,11 +110,16 @@ impl InferenceQueue {
             ));
         }
 
-        futures::future::try_join_all(texts.into_iter().map(|text| {
-            let q = self.clone();
-            async move { q.embed(text).await }
-        }))
-        .await
+        use futures::{StreamExt, TryStreamExt};
+        let concurrency = (self.embedding_workers * 2).max(4);
+        futures::stream::iter(texts)
+            .map(|text| {
+                let q = self.clone();
+                async move { q.embed(text).await }
+            })
+            .buffered(concurrency)
+            .try_collect()
+            .await
     }
 
     /// Submit an audio transcription request and await the result.

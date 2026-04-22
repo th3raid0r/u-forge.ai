@@ -11,6 +11,27 @@
 //! The `From<anyhow::Error>` impl is present so handlers can use `?` with
 //! `anyhow`-returning functions once the axum dependency is wired.
 
+/// Returned by [`crate::graph::KnowledgeGraphStorage::new`] when the
+/// on-disk embedding dimensions differ from the compiled-in constants.
+///
+/// This indicates the embedding model was changed without recreating the
+/// database.  The caller should either re-index the database or pin the
+/// old model — no auto-migration is performed.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "embedding dimension mismatch for vec table '{table}': \
+     database has {stored}-dim embeddings but the current model produces {expected}-dim. \
+     Re-index the database or pin the previous embedding model."
+)]
+pub struct EmbeddingDimensionMismatch {
+    /// The `vec0` virtual table whose schema diverges (e.g. `"chunks_vec"`).
+    pub table: String,
+    /// Dimensions recorded in the database at creation time.
+    pub stored: usize,
+    /// Dimensions expected by the current compile-time constant.
+    pub expected: usize,
+}
+
 /// Application-level error returned by axum HTTP handlers.
 ///
 /// Convert any `anyhow::Error` via the `From` impl (or `?` operator) and let

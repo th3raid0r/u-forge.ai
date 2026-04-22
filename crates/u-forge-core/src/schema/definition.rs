@@ -126,7 +126,6 @@ pub struct ObjectTypeSchema {
     pub properties: HashMap<String, PropertySchema>,
     pub required_properties: Vec<String>,
     pub allowed_edges: Vec<String>,
-    pub inheritance: Option<String>, // Parent object type for inheritance
     pub metadata: HashMap<String, String>,
 }
 
@@ -138,7 +137,6 @@ impl ObjectTypeSchema {
             properties: HashMap::new(),
             required_properties: Vec::new(),
             allowed_edges: Vec::new(),
-            inheritance: None,
             metadata: HashMap::new(),
         }
     }

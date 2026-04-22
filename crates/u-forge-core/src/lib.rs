@@ -35,6 +35,7 @@ pub mod types;
 pub use ai::embeddings::{
     EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType, LemonadeProvider,
 };
+pub use error::EmbeddingDimensionMismatch;
 pub use builder::ObjectBuilder;
 pub use config::{
     AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig,

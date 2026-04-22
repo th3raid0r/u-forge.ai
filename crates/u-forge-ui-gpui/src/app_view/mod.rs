@@ -2,9 +2,13 @@ mod render;
 mod state;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use gpui::{prelude::*, Context, Empty, Entity, Subscription};
+use tracing::Instrument;
 use parking_lot::RwLock;
 use u_forge_agent::{AgentParams, GraphAgent};
 use u_forge_core::{
@@ -282,8 +286,20 @@ impl AppView {
     }
 
     /// Rebuild the in-memory snapshot from the graph and push it to all child views.
+    ///
+    /// Uses `build_snapshot_incremental` when a previous snapshot exists so that
+    /// single-mutation events (e.g. agent `UpsertNodeTool`) apply R-tree and
+    /// legend deltas in O(delta × log N) instead of rebuilding from scratch.
     pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
-        match u_forge_graph_view::build_snapshot(&self.state.graph) {
+        let result = {
+            let prev = self.state.snapshot.read();
+            if prev.nodes.is_empty() && prev.edges.is_empty() {
+                u_forge_graph_view::build_snapshot(&self.state.graph)
+            } else {
+                u_forge_graph_view::build_snapshot_incremental(&self.state.graph, &prev)
+            }
+        };
+        match result {
             Ok(snap) => {
                 *self.state.snapshot.write() = snap;
                 self.node_panel
@@ -352,9 +368,15 @@ impl AppView {
         self.graph_canvas.read(cx).save_layout();
 
         // 2. Save all dirty editor tabs (also discards empty new nodes).
-        let (saved, saved_ids, discarded_ids) = self
+        let (saved, saved_ids, discarded_ids, skipped_edges) = self
             .node_editor
             .update(cx, |editor, cx| editor.save_dirty_tabs(cx));
+
+        if skipped_edges > 0 {
+            self.state.data_status = Some(format!(
+                "{skipped_edges} incomplete edge(s) skipped — fill both endpoints before saving."
+            ));
+        }
 
         // If any nodes were discarded, refresh the full snapshot.
         if !discarded_ids.is_empty() {
@@ -482,8 +504,14 @@ impl AppView {
         let graph = self.state.graph.clone();
         let tokio_rt = self.state.tokio_rt.clone();
 
+        let plan_kind = plan.kind();
         self.state.embedding_status = Some(plan.label());
         cx.notify();
+
+        // Cancel any previously running pipeline (sets the old flag → tasks exit on next tick).
+        self.state.embedding_cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.state.embedding_cancel = Arc::clone(&cancel);
 
         // Bump epoch to cancel any previously running poller.
         self.state.embedding_plan_epoch = self.state.embedding_plan_epoch.wrapping_add(1);
@@ -494,12 +522,19 @@ impl AppView {
             Arc::new(parking_lot::Mutex::new(None));
         let progress_write = Arc::clone(&progress_state);
 
+        let cancel_poller = Arc::clone(&cancel);
         // Poller: reads shared progress every 500 ms and refreshes the status bar.
         cx.spawn(async move |this, cx| {
             loop {
+                if cancel_poller.load(Ordering::Relaxed) {
+                    return;
+                }
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
                     .await;
+                if cancel_poller.load(Ordering::Relaxed) {
+                    return;
+                }
                 let Some(this) = this.upgrade() else { return };
                 let snap = progress_state.lock().clone();
                 let keep_running = this
@@ -523,20 +558,26 @@ impl AppView {
         .detach();
 
         // Worker: runs the plan on the tokio runtime and reports outcome.
+        // `_cancel_guard` sets the cancel flag on drop (including panic), which
+        // stops the poller immediately rather than waiting for an epoch bump.
         cx.spawn(async move |this, cx| {
+            let _cancel_guard = state::CancelOnDrop(Arc::clone(&cancel));
             let outcome = cx
                 .background_executor()
-                .spawn(async move {
-                    tokio_rt.block_on(async move {
-                        plan.execute(
-                            &graph,
-                            &queue,
-                            hq_queue.as_ref(),
-                            move |p| *progress_write.lock() = Some(p),
-                        )
-                        .await
-                    })
-                })
+                .spawn(
+                    async move {
+                        tokio_rt.block_on(async move {
+                            plan.execute(
+                                &graph,
+                                &queue,
+                                hq_queue.as_ref(),
+                                move |p| *progress_write.lock() = Some(p),
+                            )
+                            .await
+                        })
+                    }
+                    .instrument(tracing::info_span!("embedding_plan", plan_kind)),
+                )
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
@@ -560,16 +601,23 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
+                .spawn(
+                    async move {
                     tokio_rt.block_on(async move {
                         // Discover Lemonade Server URL.
                         let url = match resolve_lemonade_url().await {
                             Some(u) => u,
                             None => return Err(anyhow::anyhow!("Lemonade Server not reachable")),
                         };
+                        tracing::debug!("milestone: discover — server reachable at {url}");
 
                         // Discover available models.
                         let catalog = LemonadeServerCatalog::discover(&url).await?;
+                        tracing::debug!(
+                            loaded = catalog.loaded.len(),
+                            models = catalog.models.len(),
+                            "milestone: select — catalog fetched"
+                        );
                         let selector =
                             ModelSelector::new(&catalog, &app_config.models, &app_config.embedding);
                         let embed_models = selector.select_embedding_models();
@@ -633,6 +681,10 @@ impl AppView {
                             .with_providers(providers)
                             .with_config((*app_config).clone())
                             .build();
+                        tracing::debug!(
+                            embedding_workers = queue.embedding_worker_count(),
+                            "milestone: build queue — providers ready"
+                        );
 
                         // Build optional HQ embedding queue.
                         let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
@@ -675,9 +727,16 @@ impl AppView {
                             u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
                         });
 
+                        tracing::debug!(
+                            llm_count = all_llm.len(),
+                            preferred_idx,
+                            "milestone: ready — init complete"
+                        );
                         Ok((url, queue, hq_queue, chat_provider, llm_available, preferred_idx))
                     })
-                })
+                }
+                .instrument(tracing::info_span!("lemonade_init")),
+                )
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {

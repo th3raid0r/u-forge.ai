@@ -8,229 +8,98 @@ description: Development workflow and setup guide
 
 ```bash
 cargo build --workspace                                        # Build all crates
-cargo test --workspace -- --test-threads=1                     # Run all tests (always single-threaded)
+cargo test --workspace -- --test-threads=1                     # Run all tests
 cargo run -p u-forge-ui-gpui                                   # Run the desktop app
 ```
 
-> **No `source env.sh` required.** Bundled SQLite compiles with any standard C compiler on PATH.
+> **No `source env.sh` required.** Bundled SQLite compiles with any standard C
+> compiler on PATH. Lemonade Server on `localhost:13305` is auto-discovered.
+> See [environment-config.mdc](mdc:.rulesdir/environment-config.mdc) for env
+> vars and server setup.
 
 ---
 
 ## First Time Setup
 
-1. **Install prerequisites:**
-   - Rust stable toolchain — [rustup.rs](https://rustup.rs)
-   - A C compiler (`gcc`, `clang`, or MSVC) — needed only for `openssl-sys` (reqwest TLS)
-   - *(Optional)* [Lemonade Server](https://github.com/lemonade-sdk/lemonade) for semantic embeddings
-
-2. **Build:**
-   ```bash
-   cargo build --workspace   # ~30 seconds first time (bundled SQLite compilation)
-   ```
-
-3. **Run tests:**
-   ```bash
-   cargo test --workspace -- --test-threads=1   # All 220+ tests pass with no server required
-   ```
-
-4. **Run the desktop app:**
-   ```bash
-   cargo run -p u-forge-ui-gpui
-   ```
+1. Install Rust stable ([rustup.rs](https://rustup.rs)) and a C compiler
+   (`gcc`, `clang`, or MSVC) — needed for `openssl-sys` (reqwest TLS).
+2. *(Optional)* Install [Lemonade Server](https://github.com/lemonade-sdk/lemonade)
+   for AI features. See `environment-config.mdc` for pulls.
+3. `cargo build --workspace` — first build is ~30 s (bundled SQLite compilation).
+4. `cargo test --workspace -- --test-threads=1` — 220+ tests pass with no
+   server required.
+5. `cargo run -p u-forge-ui-gpui` — launch the desktop app.
 
 ---
 
 ## Architecture Context
 
-Before making changes, read:
-- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — Current state (SQLite schema, module map, resolved bugs, design decisions)
+Before making changes, read [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — SQLite
+schema, inference design, design decisions.
 
 ---
 
-## Development Patterns
+## Adding a new EmbeddingProvider
 
-### Adding a new TranscriptionProvider
+1. Implement the `EmbeddingProvider` trait in
+   `crates/u-forge-core/src/ai/embeddings.rs`. The trait contract is
+   documented in the file — copy the shape from `LemonadeProvider`
+   (`lemonade/embedding.rs`).
+2. There is no `EmbeddingManager`. Construct directly, wrap in a
+   `BuiltProvider`, and register with `InferenceQueueBuilder::with_provider`.
+3. Gate live-server tests with `require_integration_url!()`
+   (`crate::test_helpers`) — tests skip silently when no server is reachable.
+4. **Never add `Mutex<T>` around synchronous work in an async embedding path**
+   (the BUG-5 pattern). Use `tokio::task::spawn_blocking` if CPU-bound work is
+   unavoidable, or keep the provider fully async via HTTP.
 
-1. Implement the `TranscriptionProvider` trait in `crates/u-forge-core/src/ai/transcription.rs`:
+## Adding a new TranscriptionProvider
 
-```rust
-pub struct MyTranscriptionProvider { /* base_url, model, client */ }
+1. Implement the `TranscriptionProvider` trait in
+   `crates/u-forge-core/src/ai/transcription.rs`. Return the server's response
+   text trimmed of leading/trailing whitespace; use `mime_for_filename()` for
+   MIME detection.
+2. There is no `TranscriptionManager`. To wire into `InferenceQueue`, expose
+   via `ProviderFactory` or register directly with
+   `InferenceQueueBuilder::with_provider`.
+3. **Do NOT add `GpuResourceManager` unless you need GPU contention
+   serialisation.** `LemonadeTranscriptionProvider` is intentionally simple;
+   GPU contention belongs in `LemonadeSttProvider` / `GpuResourceManager`.
 
-#[async_trait]
-impl TranscriptionProvider for MyTranscriptionProvider {
-    async fn transcribe(&self, audio_bytes: Vec<u8>, filename: &str) -> Result<String> {
-        // Upload audio_bytes as multipart to the backend endpoint
-        // Return the transcribed text, trimmed
-        todo!()
-    }
-    fn model_name(&self) -> &str { &self.model }
-}
-```
-
-2. Expose construction directly (there is no `TranscriptionManager`).
-
-3. To wire into `InferenceQueue`, expose the provider via `ProviderFactory` or
-   register it directly with `InferenceQueueBuilder::with_provider`.
-
-4. Gate live-server tests on `LEMONADE_URL` — see the existing
-   `test_lemonade_transcribe_*` tests in `ai/transcription.rs` for the pattern.
-
-5. **Do NOT add GPU resource management here** unless you need GPU contention
-   serialisation. `LemonadeTranscriptionProvider` is intentionally simple. GPU
-   contention belongs in `LemonadeSttProvider` / `GpuResourceManager`.
-
----
-
-### Adding a new EmbeddingProvider
-
-1. Implement the `EmbeddingProvider` trait in `crates/u-forge-core/src/ai/embeddings.rs`:
-
-```rust
-pub struct MyProvider { /* ... */ }
-
-#[async_trait]
-impl EmbeddingProvider for MyProvider {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> { /* ... */ }
-    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> { /* ... */ }
-    fn dimensions(&self) -> Result<usize> { Ok(self.dimensions) }
-    fn max_tokens(&self) -> Result<usize> { Ok(8192) }
-    fn provider_type(&self) -> EmbeddingProviderType { EmbeddingProviderType::Lemonade }
-    fn model_info(&self) -> Option<EmbeddingModelInfo> { None }
-}
-```
-
-2. Expose construction directly (there is no `EmbeddingManager`). Wrap in a
-   `BuiltProvider` and register with `InferenceQueueBuilder::with_provider`.
-
-3. Add tests — gate live-server tests using `crate::test_helpers::lemonade_url`
-   (see `ai/embeddings.rs` pattern: `let Some(url) = lemonade_url().await else { return; }`).
-   The helper probes `localhost:13305` first, then falls back to `LEMONADE_URL`.
-
-4. **Do NOT add `Mutex<T>` around synchronous work in async embedding paths** (BUG-5
-   pattern). Use `tokio::task::spawn_blocking` if CPU-bound work is unavoidable, or
-   — preferably — keep the provider fully async via HTTP like `LemonadeProvider`.
-
-### Adding a new schema type
+## Adding a new schema type
 
 1. Create `{type}.schema.json` in `defaults/schemas/`.
-2. Test with: `cargo run -p u-forge-ui-gpui`
-3. Schema is auto-loaded by `SchemaIngestion::load_schemas_from_directory`.
+2. Restart — schemas are auto-loaded by
+   `SchemaIngestion::load_schemas_from_directory`.
 
-### Working with SQLite storage
+## Working with SQLite storage
 
-All storage goes through `KnowledgeGraphStorage` in `src/storage.rs`.
-Use `rusqlite` with `params![]` macros and `INSERT OR REPLACE` for upserts:
+All storage goes through `KnowledgeGraphStorage`. See
+[rust-patterns.mdc](mdc:.rulesdir/rust-patterns.mdc) for the
+`INSERT OR REPLACE` vs `ON CONFLICT DO UPDATE` design decisions — they are
+load-bearing, not stylistic.
 
-```rust
-conn.execute(
-    "INSERT OR REPLACE INTO nodes \
-     (id, object_type, name, properties, tags, created_at, updated_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    params![id_str, obj_type, name, props_json, tags_json, created_at, updated_at],
-)?;
-```
+`KnowledgeGraph::new(db_path)` takes **one argument** (the directory path).
+The SQLite file is created at `<db_path>/knowledge.db`.
 
-- UUIDs → hyphenated `TEXT`
-- `tags: Vec<String>` → `serde_json::to_string`
-- `properties: serde_json::Value` → `serde_json::to_string`
-- Datetimes → RFC 3339 `TEXT`
-- `EdgeType` → `edge_type.as_str()` on write; `EdgeType::new(s)` on read
+## Bug fix workflow
 
-`KnowledgeGraph::new(db_path)` takes **one argument** (the directory path). The
-SQLite file is created at `<db_path>/knowledge.db`.
-
-### Bug fix workflow
-
-1. Check [ARCHITECTURE.md](mdc:ARCHITECTURE.md) for the bug description and resolution status.
-   BUG-1 through BUG-9 are all resolved — do not re-introduce them.
+1. Read the relevant source file and its comments — resolved issues are noted
+   inline.
 2. Write a regression test that would have caught the bug.
 3. Fix and verify — `cargo test` must stay green.
 
 ---
 
-## Lemonade Server Development
+## Testing
 
-When Lemonade Server is running, both the embedding and transcription pipelines are
-fully operational:
-
-```bash
-# Start Lemonade (separate terminal)
-lemonade-server serve
-
-# Verify
-curl http://localhost:13305/api/v1/health
-
-# Pull models
-lemonade-server pull embed-gemma-300m-FLM        # embeddings (NPU, 0.62 GB) — default
-lemonade-server pull bge-reranker-v2-m3-GGUF     # reranking (GPU/CPU)
-lemonade-server pull whisper-v3-turbo-FLM        # transcription (NPU, 1.55 GB)
-
-# Point u-forge.ai at it (optional — localhost:13305 is auto-discovered)
-export LEMONADE_URL="http://localhost:13305/api/v1"
-```
-
-**Standard GPU/CPU embedding:** Any llamacpp embedding model with the `embeddings`
-label in the catalog is eligible. The model is selected by preference list in
-`ModelConfig.embedding_model_preferences`. Standard embeddings use a 768-dim vector
-space (e.g. `embed-gemma-300m-FLM`). High-quality embeddings use 4096-dim models
-(e.g. `Qwen3-Embedding-8B-GGUF`). Do not mix models from incompatible spaces.
-
-**Server URL resolution** (`lemonade::resolve_lemonade_url()`):
-1. `GET http://localhost:13305/api/v1/health` (2 s timeout)
-2. `GET http://127.0.0.1:13305/api/v1/health`
-3. `LEMONADE_URL` environment variable — accepted as-is, no liveness check
-
-Setting `LEMONADE_URL` is therefore **optional** when Lemonade Server is running on
-its default port. If no server can be found at all, a descriptive error is returned —
-there is no silent local fallback.
-
-```rust
-// Discover catalog and build a provider
-let url = lemonade::resolve_lemonade_url().await
-    .ok_or_else(|| anyhow!("No Lemonade Server found"))?;
-let catalog = LemonadeServerCatalog::discover(&url).await?;
-let selector = ModelSelector::new(&catalog, &config.models, &config.embedding);
-
-// Extract currently-loaded model IDs — load_model skips the round-trip for these.
-let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
-
-// Construct embedding providers (run all in parallel with futures::future::join_all)
-for sel in selector.select_embedding_models() {
-    let p = ProviderFactory::build(&sel, Capability::Embedding, &url, 10, None, &already_loaded).await?;
-    // register with InferenceQueueBuilder
-}
-
-// For STT/LLM that share the GPU, pass the shared gpu_mgr
-let gpu_mgr = Arc::new(GpuResourceManager::new());
-let p = ProviderFactory::build(&llm_sel, Capability::TextGeneration, &url, 100, Some(Arc::clone(&gpu_mgr)), &already_loaded).await?;
-```
+See [testing-debugging.mdc](mdc:.rulesdir/testing-debugging.mdc) for test
+commands, mock provider patterns, skip guards, and the `UFORGE_INTEGRATION_TESTS`
+control variable.
 
 ---
 
-## Testing
-
-```bash
-cargo test --workspace -- --test-threads=1                      # All tests (always single-threaded)
-cargo test --workspace storage -- --test-threads=1              # Module-specific
-cargo test --workspace -- --test-threads=1 --nocapture          # With stdout
-RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture  # With debug logging
-cargo test --workspace test_name -- --exact --test-threads=1    # Single test by name
-```
-
-### Test conventions
-
-- Every test gets its own `TempDir` → `KnowledgeGraph::new(temp_dir.path())`.
-- No model downloads in unit tests. Embedding tests use `MockEmbeddingProvider`
-  (deterministic fake vectors, defined inline) or skip when no Lemonade Server is
-  reachable (auto-probed via `test_helpers::lemonade_url`).
-- Transcription tests use `MockTranscriptionProvider` (returns a fixed string) for
-  unit tests, or skip when no server is reachable for integration tests.
-- Audio bytes in integration tests are generated by `make_silence_wav(secs)` — a
-  pure-Rust WAV builder in the `embeddings` test module. No binary fixture files.
-- Schema tests use `TempDir` for storage isolation.
-- FTS5 search tests: insert a chunk, call `search_chunks_fts`, assert result.
-
-### CI commands
+## CI commands
 
 ```bash
 cargo fmt --check
@@ -246,11 +115,7 @@ cargo doc --no-deps --workspace
 | Problem | Fix |
 |---|---|
 | `openssl-sys` build error | `apt install pkg-config libssl-dev` (Ubuntu) / `brew install openssl` (macOS) |
-| `Lemonade Server not available` error | Run `lemonade-server serve` — server on `localhost:13305` is auto-discovered; `LEMONADE_URL` only needed for non-default URLs |
-| Transcription error on first call | Model not loaded yet — first call triggers load; retry, or check `GET /api/v1/health` |
-| `transcribe()` returns error: "Could not open audio data" | Empty or corrupt audio bytes passed to provider |
-| `LemonadeTranscriptionProvider` transcription fails immediately | Model not pulled or server not running — errors surface on first `transcribe()` call, not at construction |
-| Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
-| Dimension mismatch (future sqlite-vec) | Ensure embedding model matches vector column dimensions |
-| `database is locked` | Only one writer at a time; check for stale processes holding `knowledge.db` |
-| Tests fail after adding SQLite column | Run `cargo test` against a fresh `TempDir` — tests never share state |
+| Tests fail after adding SQLite column | Run against a fresh `TempDir` — tests never share state |
+| `database is locked` | Only one writer at a time; check for stale processes |
+
+Lemonade-specific troubleshooting lives in `environment-config.mdc`.

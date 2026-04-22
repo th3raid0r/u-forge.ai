@@ -13,6 +13,7 @@
 //! in the facade layer.  `parking_lot::Mutex` has no poisoning semantics, so
 //! lock guards are obtained without `.unwrap()`.
 
+use crate::error::EmbeddingDimensionMismatch;
 use crate::schema::SchemaDefinition;
 use crate::types::{ChunkType, ObjectId, ObjectMetadata};
 use anyhow::{Context, Result};
@@ -120,6 +121,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec_hq USING vec0(
 CREATE TRIGGER IF NOT EXISTS chunks_vec_hq_ad AFTER DELETE ON chunks BEGIN
     DELETE FROM chunks_vec_hq WHERE rowid = old.rowid;
 END;
+
+-- ── Embedding schema metadata ─────────────────────────────────────────────────
+-- Records the dimensionality baked into each vec0 virtual table at creation
+-- time.  On open, KnowledgeGraphStorage compares these stored values against
+-- the compile-time constants and returns EmbeddingDimensionMismatch if they
+-- diverge — making a model-change failure loud rather than silently corrupt.
+CREATE TABLE IF NOT EXISTS schema_metadata (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 // ─── Constants & process-level init ───────────────────────────────────────────
@@ -255,6 +266,55 @@ pub(super) fn row_to_metadata(
     })
 }
 
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Verify — or initialise — the embedding dimension records in `schema_metadata`.
+///
+/// For each `(table_name, expected_dims)` pair:
+/// * If no record exists → insert `expected_dims` (first open after schema creation).
+/// * If a record exists and matches → OK.
+/// * If a record exists but differs → return [`EmbeddingDimensionMismatch`].
+fn check_or_init_embedding_dims(
+    conn: &Connection,
+    checks: &[(&str, usize)],
+) -> Result<()> {
+    for &(table, expected) in checks {
+        let key = format!("{table}_dims");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .with_context(|| format!("Failed to query schema_metadata for {key}"))?;
+
+        match stored {
+            None => {
+                conn.execute(
+                    "INSERT INTO schema_metadata (key, value) VALUES (?1, ?2)",
+                    params![key, expected.to_string()],
+                )
+                .with_context(|| format!("Failed to write {key} to schema_metadata"))?;
+            }
+            Some(s) => {
+                let recorded: usize = s.parse().with_context(|| {
+                    format!("schema_metadata.{key} is not a valid integer: '{s}'")
+                })?;
+                if recorded != expected {
+                    return Err(EmbeddingDimensionMismatch {
+                        table: table.to_string(),
+                        stored: recorded,
+                        expected,
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 impl KnowledgeGraphStorage {
@@ -296,6 +356,17 @@ impl KnowledgeGraphStorage {
         // sqlite3_exec internally and ignores result rows from PRAGMA statements.
         conn.execute_batch(SQL_SCHEMA)
             .context("Failed to initialise database schema")?;
+
+        // Verify (or record) the embedding dimensions baked into each vec0 table.
+        // Returns EmbeddingDimensionMismatch if the model was changed without
+        // recreating the database.
+        check_or_init_embedding_dims(
+            &conn,
+            &[
+                ("chunks_vec", EMBEDDING_DIMENSIONS),
+                ("chunks_vec_hq", HIGH_QUALITY_EMBEDDING_DIMENSIONS),
+            ],
+        )?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -1169,5 +1240,62 @@ mod tests {
         assert_eq!(seen, sorted, "results must be name-ordered across pages");
         let unique: HashSet<&String> = seen.iter().collect();
         assert_eq!(unique.len(), 10, "no duplicates across pages");
+    }
+
+    // ── schema_metadata / dimension guard ─────────────────────────────────────
+
+    #[test]
+    fn test_open_records_dims_in_schema_metadata() {
+        let (storage, _dir) = create_test_storage();
+        let conn = storage.conn.lock();
+        let std_dims: String = conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'chunks_vec_dims'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("chunks_vec_dims must be recorded");
+        let hq_dims: String = conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'chunks_vec_hq_dims'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("chunks_vec_hq_dims must be recorded");
+        assert_eq!(std_dims, EMBEDDING_DIMENSIONS.to_string());
+        assert_eq!(hq_dims, HIGH_QUALITY_EMBEDDING_DIMENSIONS.to_string());
+    }
+
+    #[test]
+    fn test_open_with_mismatched_dims_returns_error() {
+        let dir = TempDir::new().unwrap();
+        // First open: initialise with real constants.
+        {
+            KnowledgeGraphStorage::new(dir.path()).expect("first open must succeed");
+        }
+        // Tamper: overwrite the stored dim so it looks like a different model.
+        {
+            let db_file = dir.path().join("knowledge.db");
+            let conn = Connection::open(&db_file).unwrap();
+            conn.execute(
+                "UPDATE schema_metadata SET value = '999' WHERE key = 'chunks_vec_dims'",
+                [],
+            )
+            .unwrap();
+        }
+        // Second open: should detect the mismatch.
+        let result = KnowledgeGraphStorage::new(dir.path());
+        assert!(result.is_err(), "second open with tampered dims must fail");
+        let err = result.err().unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunks_vec") && msg.contains("999"),
+            "error must name the table and stored dim, got: {msg}"
+        );
+        // Confirm it downcasts to the structured error type.
+        assert!(
+            err.downcast_ref::<EmbeddingDimensionMismatch>().is_some(),
+            "error must be EmbeddingDimensionMismatch"
+        );
     }
 }

@@ -1,0 +1,150 @@
+---
+globs: crates/u-forge-ui-gpui/**/*.rs,crates/u-forge-graph-view/**/*.rs,crates/u-forge-ui-traits/**/*.rs
+---
+
+# GPUI Patterns for u-forge.ai
+
+Hard-won lessons from building the Alpha desktop UI on GPUI 0.2.2 (crates.io, blade-graphics backend). Violating these causes subtle bugs, silent regressions, or hard-to-diagnose perf spikes.
+
+**Stay on `gpui = "0.2.2"`.** Zed `main` has restructured into
+`gpui_platform`/`gpui_linux`/`gpui_wgpu` sub-crates with a different entry
+point; upgrading requires a targeted API compatibility pass.
+
+---
+
+## Render phases — the critical invariant
+
+GPUI processes each frame in three sequential phases: `request_layout` → `prepaint` → `paint`.
+
+**Never mutate view state or call `cx.notify()` from inside a `canvas` paint closure or from `paint`.** This re-invalidates the frame you just finished and doubles cost per frame. Size-affecting work belongs in `request_layout`.
+
+This was the root cause of the reverted paint-time shape-cache: moving text shaping into `paint` with a cross-frame `WrappedLine` cache caused measured height to differ from the pre-paint guess, triggering `cx.notify()` and a double-pass on every frame. A paint-phase cache cannot beat a layout-phase non-cache unless it avoids the notify cascade.
+
+---
+
+## `AnyView::cached()` — view-level caching
+
+Wrap heavy sub-views that re-lay-out on every root-view notify with:
+
+```rust
+AnyView::from(entity).cached(StyleRefinement::default().size_full())
+```
+
+How it works (`gpui-0.2.2` `AnyView::prepaint`): stores `bounds`, `content_mask`, and `text_style` as a cache key. On the next frame, if all three match AND `window.dirty_views` does NOT contain this entity's id AND `window.refreshing == false`, GPUI calls `reuse_prepaint()` / `reuse_paint()` — the subtree's `render()`, layout, and paint are **all skipped**.
+
+`cx.notify()` **only marks the calling entity** — children are not transitively dirtied. So dragging a sidebar handle notifies `AppView` only; `ChatPanel` is not in `dirty_views` and its `.cached()` hits. Streaming a token notifies one `ChatMessageView`; other panels stay clean.
+
+`window.refresh()` bypasses `.cached()` entirely and forces everything to re-render. Do not call it unless you mean it.
+
+**Required invariant:** the cache-key (bounds) must be stable for the frames you want to be free. If the outer container changes width (e.g. `w(0.)` ↔ `w(400.)` on toggle), bounds change and the cache misses — paying full cold-mount cost on every toggle.
+
+`.cached()` lives on `AnyView`, not `Entity<V>`. Use `AnyView::from(entity).cached(...)` or `entity.to_any().cached(...)`.
+
+---
+
+## Always-mounted panel pattern
+
+The companion to `.cached()`. Do NOT use `if panel_open { body.child(panel) }` — removing an element from the tree for a frame GC's its element_state including the `.cached()` key, so the next mount is cold.
+
+Instead, keep the panel always in the tree and vary only the **outer** container's visible width:
+
+```rust
+// Outer: variable width, overflow_hidden, relative (anchor for absolute child).
+div()
+    .relative().flex_none()
+    .w(px(if open { width } else { 0.0 }))
+    .h_full()
+    .overflow_hidden()
+    .child(
+        // Inner: fixed width always, absolute-positioned so it escapes the
+        // outer's layout constraint. Clipped to 0px by overflow_hidden when closed.
+        div()
+            .absolute().top_0().left_0()
+            .w(px(width)).h_full().overflow_hidden()
+            .child(
+                AnyView::from(panel.clone())
+                    .cached(StyleRefinement::default().size_full()),
+            ),
+    )
+```
+
+The inner absolute-positioned div gives the cached view stable bounds; the outer width controls visibility via clipping. Toggle is a cache-hit. Resize still invalidates (correct — user sees the resize).
+
+Applied to `ChatPanel` in `app_view/render.rs`. Apply to any future heavy-to-layout side panel.
+
+---
+
+## Canvas coordinate system
+
+`window.paint_*` calls take _window_ coordinates. `generate_draw_commands()` produces _canvas-local_ coordinates (origin at the canvas element's top-left).
+
+When the canvas doesn't fill the full window (it sits below a menu bar and editor pane), all paint positions must be offset by `bounds.origin`. `GraphCanvas` stores `canvas_bounds: Rc<Cell<Bounds<Pixels>>>` — written once per paint closure via `.set(bounds)`, read in mouse handlers via `.get()`. No lock; `Rc` is safe because GPUI runs on a single thread. Mouse handlers subtract `bounds.origin` before `screen_to_world`.
+
+`overflow_hidden()` on `div#graph-root` installs a GPUI `content_mask` that clips all descendant paint ops to the pane's layout bounds. Without it, nodes near the viewport edge paint into adjacent panes.
+
+```
+World-to-screen (canvas-local): screen = (world_pos - pan) * zoom + canvas_size * 0.5
+Window-space: window_pos = screen + bounds.origin
+```
+
+---
+
+## TextFieldView — canvas-based text rendering
+
+`TextFieldView` renders text via `shape_line`/`shape_text` + `paint()` on a `canvas` element — **not** as a `SharedString` child of a div.
+
+**Why not div child?** When text is placed as a div child, GPUI's own text layout system owns the glyph positions and there is no public API to query those positions from outside the div's render tree. Any cursor overlay div with hardcoded pixel offsets drifts as soon as font, DPI, or font-size varies. This was the root cause of all five cursor/click bugs encountered during development.
+
+**Correct approach (same as Zed's `EditorElement`):**
+1. `window.text_system().shape_line(text, font_size, &[run], None)` (single-line) or `shape_text(text, font_size, &[run], Some(wrap_width), None)` (multiline)
+2. `shaped.paint(origin, line_height, window, cx)` to draw glyphs
+3. `ShapedLine::x_for_index` / `WrappedLineLayout::position_for_index(byte_idx, line_h)` for pixel-exact cursor position
+4. `ShapedLine::closest_index_for_x` / `WrappedLineLayout::closest_index_for_position(point, line_h)` for click-to-cursor
+
+Key metrics: font size = `window.rem_size() * 0.75` (matches `text_xs()` = 0.75 rem); line height = `font_size * 1.618` (GPUI's `phi()` default). The hardcoded 16px that was there before was wrong.
+
+Single-line mode: `wrap_width = None`, track `h_scroll_offset: f32`, mouse click adds `h_scroll_offset` to `local_x` before hit-testing. Multiline: `wrap_width = Some(inner_w)`, grows up to 120 px cap, `overflow_hidden()` clips.
+
+---
+
+## GPUI layout constraints
+
+Required for scroll areas to work correctly inside a flex layout:
+
+- **`overflow_hidden()` on the body container** — without this, flex children that render more content than their computed size grow the parent rather than clip.
+- **`min_h_0()` on flex children with scrollable content** — flex items default to `min-height: auto`, preventing them from shrinking below content height. `min_h_0()` overrides this so the item can shrink to its flex-allocated size and let the inner `overflow_y_scroll()` div take over.
+- **Separate shell div from scroll area div** — outer div (`flex_col`, `flex_none` width, `min_h_0()`) provides the fixed size; inner div (`overflow_y_scroll()`, `flex_grow`) holds scrollable content. Combining them on one div causes layout issues.
+- **`WeakEntity<T>` for drag callbacks** — `on_drag_move` and `on_click` closures receive `&mut App` (no `Context<V>`). Capture `cx.weak_entity()` before building the element tree, then call `handle.update(cx, |view, cx| { … })` inside the closure. This is the correct GPUI 0.2.2 pattern when `cx.listener()` isn't available.
+
+---
+
+## Frame-cost profiling
+
+Do not trust how often `render()` is called — that measures re-render frequency, not actual frame cost. To measure real frame time (tree build + layout + paint), append a 1×1 `canvas` element whose paint closure records `frame_start.elapsed()` into entity state. The canvas fires after GPUI has completed layout, so it captures the true per-frame cost.
+
+`AppView` has a built-in perf overlay toggled by `Ctrl+Shift+P` (or the "Perf" button in the status bar), showing `frame:<ms>  avg:<60-frame>  chat:<chat_ms>`. Enable it before guessing at a UI slowdown. See `app_view/render.rs` — the timing canvas is the last element in the tree.
+
+The 60-frame average uses `FrameTimeRing` (`[u64; 60]` circular buffer in `app_view/state.rs`); sampling and averaging are both gated on `perf_enabled` so a disabled overlay does zero work beyond the enable check.
+
+---
+
+## Text rendering performance — the ShapePlan root cause
+
+**Background — what `tracing` spans reveal and don't reveal:**
+
+`ChatMessageView::render` is instrumented with a `trace_span!("chat_message::render", role, text_len, collapsed)` and `chat_panel::list_item` wraps the list render closure. These spans measure element-tree *construction* only — a few microseconds. GPUI's actual text-shaping cost happens later in `prepaint`, which runs after `render()` returns. The 500 ms scroll hitch will not appear inside these spans; it appears as *wall-clock silence* between successive span events. Enable with `RUST_LOG=u_forge_ui_gpui=trace`.
+
+**How the hitch was diagnosed:**
+
+1. `tracing` spans confirmed `render()` is fast (~10 µs); the 550 ms gap between consecutive `list_item` close events pointed squarely at GPUI's post-render pipeline.
+2. `samply record cargo run -p u-forge-ui-gpui` + `RUST_LOG=off` during a scroll-in of a large message produced a flamegraph: **89 % of samples in `gpui::text_system::shape_text`**, **77 % in `rustybuzz::hb::ot_map::hb_ot_map_builder_t::compile` → `find_language_feature`**.
+3. Root cause: `cosmic-text 0.14.2` calls `rustybuzz::ShapePlan::new(...)` for every word on every cold-cache text shape. Creating a `ShapePlan` parses the font's OpenType layout tables — several ms per call. `gpui`'s `LineLayoutCache` is frame-scoped; any message scrolled out of view has its layouts evicted. On scroll-back, all lines re-shape simultaneously.
+
+**Fix:** `crates/cosmic-text-patched` adds a `VecDeque<(fontdb::ID, Direction, Script, ShapePlan)>` cache to `ShapeBuffer`, backported from `cosmic-text 0.17.1`. See ARCHITECTURE.md — "Patched / Vendored Dependencies" for full details and removal instructions.
+
+**Rules that follow from this:**
+
+- `render()` spans are useful for measuring re-render *frequency* (catching unnecessary `cx.notify()` calls), not shaping cost. Use `samply` for the latter.
+- **Never hand a multi-kilobyte `SharedString` to a div child unless the message is likely to stay in view.** The collapse-by-default on `Thinking` blocks exists partly for this reason — a collapsed block renders only a header line, so only that line shapes on scroll-in instead of hundreds.
+- When adding any new text-heavy view (log viewer, diff display, long node descriptions), default to collapsed or paginated to bound the cold-shape cost per scroll-in. The ShapePlan cache amortises the per-word plan cost but does not eliminate the per-line layout cost for lines that have never been seen before.
+- **Do not mix large text rendering with `cx.notify()` hot paths.** Streaming tokens call `notify()` on the target `ChatMessageView` only; all sibling messages are not dirtied. If you restructure the streaming path so that a parent entity notifies, all visible chat messages will re-shape every token — catastrophic at 50 tok/s.

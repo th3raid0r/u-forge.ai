@@ -44,39 +44,20 @@ pub(crate) enum SubTab {
 
 // ── Field types ───────────────────────────────────────────────────────────────
 
-/// Infer a FieldKind from a JSON value's runtime type, used as a fallback when
-/// no schema is available or when a property is not declared in the schema.
-pub(crate) fn field_kind_from_value(v: &serde_json::Value) -> FieldKind {
-    match v {
-        serde_json::Value::Bool(_) => FieldKind::Boolean,
-        serde_json::Value::Number(_) => FieldKind::Number,
-        serde_json::Value::Array(_) => FieldKind::Array,
-        _ => FieldKind::Text,
-    }
-}
-
 /// Describes a single form field for rendering.
 pub(crate) struct FieldSpec {
     pub(crate) key: String,
     pub(crate) label: String,
     pub(crate) required: bool,
     pub(crate) multiline: bool,
-    pub(crate) field_kind: FieldKind,
-}
-
-pub(crate) enum FieldKind {
-    Text,
-    Number,
-    Boolean,
-    Enum(Vec<String>),
-    Array,
+    pub(crate) field_kind: PropertyType,
 }
 
 impl FieldSpec {
     pub(crate) fn height(&self) -> f32 {
-        match self.field_kind {
-            FieldKind::Boolean => FIELD_H_SINGLE,
-            FieldKind::Array => FIELD_H_MULTI,
+        match &self.field_kind {
+            PropertyType::Boolean => FIELD_H_SINGLE,
+            PropertyType::Array(_) => FIELD_H_MULTI,
             _ => {
                 if self.multiline {
                     FIELD_H_MULTI
@@ -213,7 +194,7 @@ impl EditorTab {
             label: "Name".into(),
             required: true,
             multiline: false,
-            field_kind: FieldKind::Text,
+            field_kind: PropertyType::String,
         });
 
         // 2. description — always second
@@ -222,7 +203,7 @@ impl EditorTab {
             label: "Description".into(),
             required: false,
             multiline: true,
-            field_kind: FieldKind::Text,
+            field_kind: PropertyType::Text,
         });
 
         if let Some(schema) = &self.schema {
@@ -246,14 +227,16 @@ impl EditorTab {
             for key in required_keys.iter().chain(optional_keys.iter()) {
                 if let Some(prop) = schema.properties.get(*key) {
                     let (kind, multiline) = match &prop.property_type {
-                        PropertyType::Text | PropertyType::String | PropertyType::Reference(_) => {
-                            (FieldKind::Text, true)
+                        PropertyType::Text
+                        | PropertyType::String
+                        | PropertyType::Reference(_) => (prop.property_type.clone(), true),
+                        PropertyType::Number | PropertyType::Boolean => {
+                            (prop.property_type.clone(), false)
                         }
-                        PropertyType::Number => (FieldKind::Number, false),
-                        PropertyType::Boolean => (FieldKind::Boolean, false),
-                        PropertyType::Enum(vals) => (FieldKind::Enum(vals.clone()), false),
-                        PropertyType::Array(_) => (FieldKind::Array, false),
-                        PropertyType::Object(_) => (FieldKind::Text, true),
+                        PropertyType::Enum(_) | PropertyType::Array(_) => {
+                            (prop.property_type.clone(), false)
+                        }
+                        PropertyType::Object(_) => (PropertyType::String, true),
                     };
                     specs.push(FieldSpec {
                         key: (*key).clone(),
@@ -265,7 +248,7 @@ impl EditorTab {
                 }
             }
 
-            // Extra properties not in schema — infer kind from JSON value type.
+            // Extra properties not in schema — render as free-text.
             for key in self.edited_values.keys() {
                 if skip.contains(&key.as_str()) {
                     continue;
@@ -273,22 +256,16 @@ impl EditorTab {
                 if schema.properties.contains_key(key) {
                     continue;
                 }
-                let kind = self
-                    .edited_values
-                    .get(key)
-                    .map(field_kind_from_value)
-                    .unwrap_or(FieldKind::Text);
-                let multiline = matches!(kind, FieldKind::Text);
                 specs.push(FieldSpec {
                     key: key.clone(),
                     label: key.replace('_', " "),
                     required: false,
-                    multiline,
-                    field_kind: kind,
+                    multiline: true,
+                    field_kind: PropertyType::String,
                 });
             }
         } else {
-            // No schema — infer field kind from JSON value type.
+            // No schema — render all properties as free-text.
             let mut keys: Vec<&String> = self
                 .edited_values
                 .keys()
@@ -296,18 +273,12 @@ impl EditorTab {
                 .collect();
             keys.sort();
             for key in keys {
-                let kind = self
-                    .edited_values
-                    .get(key)
-                    .map(field_kind_from_value)
-                    .unwrap_or(FieldKind::Text);
-                let multiline = matches!(kind, FieldKind::Text);
                 specs.push(FieldSpec {
                     key: key.clone(),
                     label: key.replace('_', " "),
                     required: false,
-                    multiline,
-                    field_kind: kind,
+                    multiline: true,
+                    field_kind: PropertyType::String,
                 });
             }
         }
@@ -318,7 +289,7 @@ impl EditorTab {
             label: "Tags".into(),
             required: false,
             multiline: false,
-            field_kind: FieldKind::Array,
+            field_kind: PropertyType::Array(Box::new(PropertyType::String)),
         });
 
         specs

@@ -4,33 +4,35 @@ globs: env.sh,dev.sh,*.toml,*.yaml,*.yml,config.*
 
 # Environment and Configuration
 
-## Current Setup
+## env.sh is optional
 
-`env.sh` is **optional**. It no longer sets compiler variables — bundled SQLite
-compiles with any standard C compiler. Source it only if you want the convenience
-path exports.
-
-```bash
-source env.sh   # optional — sets UFORGE_* path variables
-```
+`env.sh` no longer sets compiler variables — bundled SQLite compiles with any
+standard C compiler on PATH. Source it only if you want the convenience path
+exports.
 
 ## Environment Variables
 
-### Build-time (no longer required)
 ```bash
-# CC / CXX — no longer need to be set to gcc-13.
-# Any C/C++ compiler found on PATH works.
+# All optional — the app runs with nothing set.
+export LEMONADE_URL="http://localhost:13305/api/v1"  # Only needed for non-default server URL
+export UFORGE_SCHEMA_DIR="./defaults/schemas"        # Override schema directory
+export UFORGE_DATA_FILE="./defaults/data/memory.jsonl" # Override data file
+export RUST_LOG=info                                 # Log verbosity
+
+# Integration test control (default: auto-skip when no server found)
+export UFORGE_INTEGRATION_TESTS=require  # Panic instead of skip when server unreachable
+export UFORGE_INTEGRATION_TESTS=skip     # Force-skip even when a server is present
 ```
 
-### Runtime / Optional
-```bash
-export LEMONADE_URL="http://localhost:13305/api/v1"  # Lemonade Server for embeddings
-export UFORGE_SCHEMA_DIR="./defaults/schemas"       # Override schema directory
-export UFORGE_DATA_FILE="./defaults/data/memory.json" # Override data file
-export RUST_LOG=info                                # Log verbosity
-```
+### Why env vars are overrides, not requirements
+
+`cargo run -p u-forge-ui-gpui` must work with zero env vars set. An unset env
+var must never be a hard error for core functionality.
+`lemonade::resolve_lemonade_url()` encodes this — never `env::var(...).unwrap()`
+at the top level.
 
 ### Module-specific logging
+
 ```bash
 export RUST_LOG=u_forge_core::graph::storage=debug,u_forge_core::ai::embeddings=info
 ```
@@ -44,98 +46,89 @@ export RUST_LOG=u_forge_core::graph::storage=debug,u_forge_core::ai::embeddings=
 
 ### Data File (checked in order)
 1. `$UFORGE_DATA_FILE`
-2. `./defaults/data/memory.json`
-3. `../defaults/data/memory.json`
-
-## Lemonade Server Configuration
-
-Lemonade Server provides all AI inference (embedding, reranking, chat, STT, TTS) via
-an OpenAI-compatible HTTP API. u-forge.ai does **not** fall back to a local model if
-Lemonade is unavailable — it returns a clear error with instructions.
-
-```bash
-# Install on Linux (snap)
-sudo snap install lemonade-server
-
-# Pull required models
-lemonade-server pull embed-gemma-300m-FLM    # embeddings (NPU, 0.62 GB) — default embedding model
-lemonade-server pull whisper-v3-turbo-FLM    # transcription (NPU, 1.55 GB)
-lemonade-server pull bge-reranker-v2-m3      # reranking (GPU/CPU)
-
-# Start the server
-lemonade-server serve
-
-# Verify health (also shows which models are currently loaded in RAM)
-curl http://localhost:13305/api/v1/health
-
-# Point u-forge.ai at it (optional — localhost:13305 is auto-discovered)
-export LEMONADE_URL="http://localhost:13305/api/v1"
-```
-
-`lemonade::resolve_lemonade_url()` resolves the server URL in this order:
-1. `GET http://localhost:13305/api/v1/health` — probed with 2 s timeout
-2. `GET http://127.0.0.1:13305/api/v1/health` — explicit IPv4 loopback
-3. `LEMONADE_URL` environment variable — accepted as-is, no liveness check
-
-Returns `None` when no server is found. Setting `LEMONADE_URL` is optional when
-Lemonade Server runs on its default port.
-
-### Lemonade API Endpoints in Use
-
-| Endpoint | Method | Provider / Purpose |
-|---|---|---|
-| `/api/v1/models` | GET | `LemonadeServerCatalog::discover()` — catalog discovery |
-| `/system-info` | GET | `LemonadeServerCatalog::discover()` — installed backends |
-| `/api/v1/health` | GET | `LemonadeServerCatalog::discover()` + manual verification |
-| `/api/v1/load` | POST | `load_model()` — load a model before inference |
-| `/api/v1/embeddings` | POST (JSON) | `LemonadeProvider` (`lemonade/embedding.rs`) |
-| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeTranscriptionProvider` (simple, no GPU lock) |
-| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeSttProvider` (GPU-managed) |
-| `/api/v1/audio/speech` | POST (JSON) | `LemonadeTtsProvider` (`lemonade/tts.rs`) |
-| `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` (`lemonade/chat.rs`) |
-| `/api/v1/reranking` | POST (JSON) | `LemonadeRerankProvider` (`lemonade/rerank.rs`) |
-
-> **Note on the two transcription providers:** `LemonadeTranscriptionProvider`
-> has no GPU resource management — suitable for NPU FLM whisper and standalone use.
-> `LemonadeSttProvider` integrates with `GpuResourceManager` to prevent contention
-> when LLM inference is running concurrently on the same GPU. Both are constructed
-> via `ProviderFactory::build` with `Capability::Transcription`.
+2. `./defaults/data/memory.jsonl`
+3. `../defaults/data/memory.jsonl`
 
 ## Database Location
 
 `KnowledgeGraph::new(db_path)` opens (or creates) a SQLite database at
-`<db_path>/knowledge.db`. The directory is created automatically if it does not
-exist.
+`<db_path>/knowledge.db`. The directory is created automatically.
 
-The desktop app uses a persistent database. Set `UFORGE_DATA_FILE` / `UFORGE_SCHEMA_DIR` to customise import sources.
+The desktop app uses a persistent database. Set `UFORGE_DATA_FILE` /
+`UFORGE_SCHEMA_DIR` to customise import sources.
 
-## Build Commands
+---
+
+## Lemonade Server
+
+Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
+TTS) via an OpenAI-compatible HTTP API. u-forge.ai does **not** fall back to a
+local model if Lemonade is unavailable — features degrade gracefully and a
+clear error is returned to the user.
+
+### Setup
 
 ```bash
-cargo build --workspace                                                              # Build (first time ~30s for bundled SQLite)
-cargo test --workspace -- --test-threads=1                                           # Run all tests (no server required)
-cargo run -p u-forge-ui-gpui                                                         # Run the desktop app
-RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture               # Tests with debug logging
+# Install (Linux via snap)
+sudo snap install lemonade-server
+
+# Pull required models
+lemonade-server pull embed-gemma-300m-FLM      # embeddings (NPU, 0.62 GB) — default
+lemonade-server pull whisper-v3-turbo-FLM      # transcription (NPU, 1.55 GB)
+lemonade-server pull bge-reranker-v2-m3-GGUF   # reranking (GPU/CPU)
+
+# Start
+lemonade-server serve
+
+# Verify — also shows which models are currently loaded in RAM
+curl http://localhost:13305/api/v1/health
 ```
 
-## Cross-Platform
+Cross-platform Lemonade install: Linux → `snap`; macOS → `.pkg` from GitHub
+releases; Windows → `.exe` installer.
 
-| OS | C compiler needed | Lemonade install |
+### URL Resolution Order
+
+`lemonade::resolve_lemonade_url()`:
+1. `GET http://localhost:13305/api/v1/health` — probed with 2 s timeout
+2. `GET http://127.0.0.1:13305/api/v1/health` — explicit IPv4 loopback
+3. `LEMONADE_URL` env var — accepted as-is, no liveness check
+
+Returns `None` when no server is found. Setting `LEMONADE_URL` is optional when
+Lemonade runs on its default port.
+
+### Endpoints in Use
+
+| Endpoint | Method | Provider / Purpose |
 |---|---|---|
-| Ubuntu / Debian | `apt install gcc` (usually pre-installed) | `snap install lemonade-server` |
-| macOS | Xcode CLT (`xcode-select --install`) | `.pkg` from GitHub releases |
-| Windows | MSVC (Visual Studio Build Tools) or MinGW | `.exe` installer from releases |
+| `/api/v1/models` | GET | `LemonadeServerCatalog::discover()` |
+| `/system-info` | GET | `LemonadeServerCatalog::discover()` — installed backends |
+| `/api/v1/health` | GET | `LemonadeServerCatalog::discover()` + manual verification |
+| `/api/v1/load` | POST | `load_model()` — load a model before inference |
+| `/api/v1/embeddings` | POST (JSON) | `LemonadeProvider` |
+| `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeTranscriptionProvider` (no GPU lock) / `LemonadeSttProvider` (GPU-managed) |
+| `/api/v1/audio/speech` | POST (JSON) | `LemonadeTtsProvider` |
+| `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` |
+| `/api/v1/reranking` | POST (JSON) | `LemonadeRerankProvider` |
+
+### Why two transcription providers
+
+`LemonadeTranscriptionProvider` has no GPU resource management — suitable for
+NPU FLM whisper and standalone use. `LemonadeSttProvider` integrates with
+`GpuResourceManager` to prevent contention when LLM inference runs concurrently
+on the same GPU. Both are constructed via `ProviderFactory::build` with
+`Capability::Transcription`. Choice is based on whether GPU contention is
+possible, not ergonomic preference.
+
+---
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `openssl-sys` build error | Install `pkg-config libssl-dev` (Ubuntu) or `openssl` (macOS brew) |
-| `Lemonade Server not available` error | Run `lemonade-server serve` and set `LEMONADE_URL` |
+| `Lemonade Server not available` | Run `lemonade-server serve` — `localhost:13305` is auto-discovered |
 | `lemonade-server pull` fails | Check disk space; retry; verify network access |
 | Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
-| Database locked | Only one process should open the same `knowledge.db` at a time |
-| Dimension mismatch (future sqlite-vec) | Ensure embedding model matches vector column dimensions |
-| Transcription returns error immediately | Model not pulled — run `lemonade-server pull whisper-v3-turbo-FLM` |
-| Transcription error: "Could not open audio data" | Audio bytes are empty or the file is not a valid audio format |
-| Whisper not loaded in RAM | First transcription call triggers model load; subsequent calls are fast. Check `GET /api/v1/health` to see which models are in RAM. |
+| Dimension mismatch | Ensure embedding model matches vector column dimensions (768 vs 4096) |
+| Whisper not loaded in RAM | First transcription call triggers load; subsequent calls are fast. `GET /api/v1/health` shows loaded models |
+| Transcription error: "Could not open audio data" | Audio bytes empty or not a valid WAV/MP3/OGG |

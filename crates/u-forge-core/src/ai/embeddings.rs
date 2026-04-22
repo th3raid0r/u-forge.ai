@@ -20,10 +20,6 @@ pub use crate::lemonade::embedding::LemonadeProvider;
 pub enum EmbeddingProviderType {
     /// Lemonade Server HTTP provider (AMD OpenAI-compatible API).
     Lemonade,
-    /// Placeholder for future Ollama integration.
-    Ollama,
-    /// Placeholder for future cloud API integration.
-    Cloud,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

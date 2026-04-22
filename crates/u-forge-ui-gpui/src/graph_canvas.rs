@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::Arc,
+};
 
 use glam::Vec2;
 use gpui::{
@@ -27,12 +31,12 @@ pub(crate) struct GraphCanvas {
     zoom: f32,
     /// True when the user is panning the canvas (drag on empty space).
     panning: bool,
-    /// Index into `snapshot.nodes` of the node being dragged, if any.
-    dragging_node: Option<usize>,
+    /// Identity of the node being dragged, if any.
+    dragging_node: Option<ObjectId>,
     last_mouse: Point<Pixels>,
     /// Canvas bounds in window coordinates, updated each paint frame.
     /// Used to convert window-space mouse positions to canvas-local coordinates.
-    canvas_bounds: Arc<RwLock<Bounds<Pixels>>>,
+    canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// When true, the next selection-model observe callback skips panning
     /// (because the selection originated from a canvas click, not the tree).
     suppress_pan: bool,
@@ -68,7 +72,7 @@ impl GraphCanvas {
             panning: false,
             dragging_node: None,
             last_mouse: point(px(0.0), px(0.0)),
-            canvas_bounds: Arc::new(RwLock::new(Bounds::default())),
+            canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             suppress_pan: false,
             _selection_sub: sel_sub,
         }
@@ -84,7 +88,7 @@ impl GraphCanvas {
 
     /// Returns (canvas_size, canvas_origin) from the last paint frame.
     fn canvas_metrics(&self) -> (Vec2, Vec2) {
-        let b = *self.canvas_bounds.read();
+        let b = self.canvas_bounds.get();
         (
             Vec2::new(f32::from(b.size.width), f32::from(b.size.height)),
             Vec2::new(f32::from(b.origin.x), f32::from(b.origin.y)),
@@ -150,12 +154,13 @@ impl Render for GraphCanvas {
                     if let Some(idx) =
                         this.snapshot.read().node_at_point_aabb(world_pos, half_size)
                     {
+                        let node_id = this.snapshot.read().nodes[idx].id;
                         // Selection originated from the canvas — don't pan.
                         this.suppress_pan = true;
                         this.selection.update(cx, |sel, cx| {
                             sel.select_by_idx(Some(idx), cx);
                         });
-                        this.dragging_node = Some(idx);
+                        this.dragging_node = Some(node_id);
                     } else {
                         this.suppress_pan = true;
                         this.selection.update(cx, |sel, cx| sel.clear(cx));
@@ -179,12 +184,19 @@ impl Render for GraphCanvas {
                 let delta = event.position - this.last_mouse;
                 this.last_mouse = event.position;
 
-                if let Some(node_idx) = this.dragging_node {
+                if let Some(drag_id) = this.dragging_node {
                     let world_delta = Vec2::new(
                         f32::from(delta.x) / this.zoom,
                         f32::from(delta.y) / this.zoom,
                     );
-                    this.snapshot.write().nodes[node_idx].position += world_delta;
+                    let mut snap = this.snapshot.write();
+                    if let Some(node) = snap.nodes.iter_mut().find(|n| n.id == drag_id) {
+                        node.position += world_delta;
+                    } else {
+                        // Node was removed from snapshot mid-drag; end drag silently.
+                        drop(snap);
+                        this.dragging_node = None;
+                    }
                     cx.notify();
                 } else if this.panning {
                     this.camera.x -= f32::from(delta.x) / this.zoom;
@@ -221,7 +233,7 @@ impl Render for GraphCanvas {
                     |_bounds, _window, _cx| {},
                     move |bounds, (), window, cx| {
                         // Record bounds so event handlers can convert window → canvas coords.
-                        *canvas_bounds_arc.write() = bounds;
+                        canvas_bounds_arc.set(bounds);
 
                         window.paint_quad(fill(bounds, rgb(0x1e1e2e)));
 

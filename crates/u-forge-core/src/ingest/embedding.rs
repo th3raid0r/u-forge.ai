@@ -8,6 +8,9 @@
 //! single-worker [`InferenceQueue`] for the first high-quality embedding model
 //! selected by [`ModelSelector`] from a live [`LemonadeServerCatalog`].
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use anyhow::Result;
 use tracing::{info, warn};
 
@@ -86,6 +89,14 @@ impl EmbeddingPlan {
         }
     }
 
+    /// Short machine-readable kind string for tracing spans.
+    pub fn kind(&self) -> &'static str {
+        match &self.task {
+            EmbeddingTask::Rechunk(_) => "rechunk",
+            EmbeddingTask::EmbedAll => "embed_all",
+        }
+    }
+
     /// Human-readable initial label for the plan (for status bar display).
     pub fn label(&self) -> String {
         match &self.task {
@@ -106,12 +117,18 @@ impl EmbeddingPlan {
         hq_queue: Option<&InferenceQueue>,
         on_progress: impl Fn(EmbeddingProgress) + Send,
     ) -> EmbeddingOutcome {
+        let t0 = std::time::Instant::now();
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+
         match self.task {
             EmbeddingTask::Rechunk(node_ids) => {
                 let total = node_ids.len();
                 let mut stored = 0usize;
                 let mut skipped = 0usize;
                 for (done, oid) in node_ids.iter().enumerate() {
+                    let cur = inflight.fetch_add(1, Ordering::Relaxed) + 1;
+                    max_inflight.fetch_max(cur, Ordering::Relaxed);
                     match rechunk_and_embed(graph, queue, hq_queue, *oid).await {
                         Ok(n) => stored += n,
                         Err(e) => {
@@ -119,11 +136,21 @@ impl EmbeddingPlan {
                             skipped += 1;
                         }
                     }
+                    inflight.fetch_sub(1, Ordering::Relaxed);
                     on_progress(EmbeddingProgress::Rechunking {
                         done: done + 1,
                         total,
                     });
                 }
+                let peak = max_inflight.load(Ordering::Relaxed);
+                let duration_ms = t0.elapsed().as_millis() as u64;
+                info!(
+                    target: "u_forge::ingest",
+                    max_inflight = peak,
+                    total_jobs = total,
+                    duration_ms,
+                    "EmbeddingPlan::Rechunk complete"
+                );
                 EmbeddingOutcome {
                     stored,
                     skipped,
@@ -139,17 +166,29 @@ impl EmbeddingPlan {
                     None
                 };
 
-                let (stored, skipped) = match std_result {
-                    Ok(r) => (r.stored, r.skipped),
+                let (stored, skipped, total_jobs) = match std_result {
+                    Ok(r) => (r.stored, r.skipped, r.total),
                     Err(e) => {
                         warn!(%e, "embed_all_chunks (standard) failed");
-                        (0, 0)
+                        (0, 0, 0)
                     }
                 };
                 let hq_stored = hq_result
                     .and_then(|r| r.ok())
                     .map(|r| r.stored)
                     .unwrap_or(0);
+
+                // embed_many uses (workers * 2).max(4) as its concurrency cap.
+                let concurrency_cap = (queue.embedding_worker_count() * 2).max(4);
+                let peak = concurrency_cap.min(total_jobs);
+                let duration_ms = t0.elapsed().as_millis() as u64;
+                info!(
+                    target: "u_forge::ingest",
+                    max_inflight = peak,
+                    total_jobs,
+                    duration_ms,
+                    "EmbeddingPlan::EmbedAll complete"
+                );
 
                 EmbeddingOutcome {
                     stored,

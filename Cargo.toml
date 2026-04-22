@@ -1,3 +1,9 @@
 [workspace]
 members = ["crates/*"]
 resolver = "2"
+
+[patch.crates-io]
+# Backport of the ShapePlan cache from cosmic-text 0.17.1 into 0.14.2.
+# Without this, rustybuzz recompiles OpenType layout tables on every cold-cache
+# shape call, causing ~500ms hitches when large text blocks scroll into view.
+cosmic-text = { path = "crates/cosmic-text-patched" }

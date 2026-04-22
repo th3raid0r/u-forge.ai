@@ -6,8 +6,12 @@ description: Testing and debugging patterns
 
 ## Test Environment
 
-All tests use `TempDir` for isolation. `KnowledgeGraph::new(temp_dir.path())` creates
-`<temp_dir>/knowledge.db` automatically. No `env.sh`, no model downloads, no server needed.
+All tests use `TempDir` for isolation. `KnowledgeGraph::new(temp_dir.path())`
+creates `<temp_dir>/knowledge.db` automatically. No `env.sh`, no model downloads,
+no server needed.
+
+Bind the `TempDir` to a named variable (`_tmp`), not `_` — `TempDir` deletes its
+directory on drop. Discarding to `_` can drop before the test body runs.
 
 ---
 
@@ -21,171 +25,74 @@ RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture  # With de
 cargo test --workspace test_name -- --exact --test-threads=1           # Single test by name
 ```
 
-Always pass `--test-threads=1`. Integration tests share GPU/NPU hardware on a live
-Lemonade Server and fail intermittently when run in parallel. Unit tests pass with
-no external service. Integration tests skip automatically when no server is reachable.
+**Always pass `--test-threads=1`.** Integration tests share GPU/NPU hardware on
+a live Lemonade Server and fail intermittently when run in parallel. Unit tests
+pass with no external service; integration tests skip automatically when no
+server is reachable.
 
 ---
 
-## Embedding Providers in Tests
+## Mock providers
 
-### Mock provider (fast, no server — use for all unit tests)
+`MockEmbeddingProvider` and `MockTranscriptionProvider` are deterministic
+in-memory impls — mock vectors vary by text length, mock transcripts echo the
+filename. Copy the pattern when you need a provider in a unit test without a
+live server.
 
-The mock produces deterministic fake vectors based on input length. It is
-used by `embedding_queue` tests and any test that needs an `EmbeddingProvider`
-without a live Lemonade Server.
+Live references to copy from:
+- `src/search/mod.rs` (`tests::MockEmbeddingProvider`)
+- `src/queue/dispatch.rs` (`tests::MockEmbeddingProvider`, `MockTranscriptionProvider`)
+- `src/ingest/embedding.rs` (`tests::MockEmbeddingProvider`)
 
-```rust
-use u_forge_core::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
+Each test module defines its own mock rather than sharing one — small on-purpose
+duplication, because different tests need slightly different vector shapes, and
+a shared mock in a test utility crate would drag `u-forge-core` into a cyclical
+test-only dependency.
 
-const MOCK_DIMS: usize = 16;
+> **There is no FastEmbed / local fallback.** FastEmbed and ONNX Runtime have
+> been removed. Do not reference `FastEmbedProvider`, `try_new_local_default`,
+> or `FASTEMBED_CACHE_PATH` — they no longer exist.
 
-struct MockEmbeddingProvider;
+---
 
-#[async_trait::async_trait]
-impl EmbeddingProvider for MockEmbeddingProvider {
-    async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        Ok((0..MOCK_DIMS)
-            .map(|i| (text.len() as f32 + i as f32) / 100.0)
-            .collect())
-    }
+## Audio test helper: `make_silence_wav`
 
-    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-        let mut out = Vec::with_capacity(texts.len());
-        for t in &texts {
-            out.push(self.embed(t).await?);
-        }
-        Ok(out)
-    }
+Lives in `src/ai/transcription.rs` inside the `tests` module (`pub(crate)`).
+Builds a valid mono 16-bit 16 kHz PCM WAV entirely in memory — no binary
+fixtures. Copy the pattern when a test needs real audio bytes.
 
-    fn dimensions(&self) -> anyhow::Result<usize> { Ok(MOCK_DIMS) }
-    fn max_tokens(&self) -> anyhow::Result<usize>  { Ok(512) }
+Silence input produces hallucinated transcripts by design — whisper-family
+models hallucinate on silence. For tests that assert on content, use real
+speech audio. For smoke tests of the transcribe path, only check `result.is_ok()`.
 
-    fn provider_type(&self) -> EmbeddingProviderType {
-        EmbeddingProviderType::Lemonade
-    }
+---
 
-    fn model_info(&self) -> Option<EmbeddingModelInfo> { None }
-}
-```
+## Lemonade integration tests — skip guard
 
-### Lemonade Server (integration tests — controlled by `UFORGE_INTEGRATION_TESTS`)
+Use the `require_integration_url!()` macro from `crate::test_helpers`. It probes
+the live server and skips the test silently when none is reachable. Resolution
+order:
 
-Use `crate::test_helpers::lemonade_url` — it probes `localhost:13305` via the
-`GET /api/v1/health` endpoint first, then falls back to the `LEMONADE_URL`
-environment variable. Tests skip silently when neither yields a reachable server:
-
-```rust
-use crate::test_helpers::require_integration_url;
-
-#[tokio::test]
-async fn test_lemonade_embed() {
-    let url = require_integration_url!();
-
-    let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
-        .await
-        .expect("Connect to Lemonade");
-
-    let embedding = provider.embed("Test text").await.unwrap();
-    assert_eq!(embedding.len(), provider.dimensions().unwrap());
-}
-```
-
-Under the hood, `integration_test_url()` delegates to the production
-`crate::lemonade::resolve_lemonade_url()` for the default (unset) case.
-Resolution order:
 1. `http://localhost:13305/api/v1` — probed via `GET /api/v1/health` (2 s timeout)
-2. `http://127.0.0.1:13305/api/v1` — same probe, explicit IPv4 loopback
-3. `LEMONADE_URL` environment variable — accepted as-is, no liveness check
+2. `http://127.0.0.1:13305/api/v1` — explicit IPv4 loopback
+3. `LEMONADE_URL` env var — accepted as-is, no liveness check
 
-> **There is no FastEmbed / local fallback.** FastEmbed and ONNX Runtime have been
-> removed. Do not attempt to reference `FastEmbedProvider`,
-> `try_new_local_default`, or `FASTEMBED_CACHE_PATH` — they no longer exist.
+Control variable:
+- `UFORGE_INTEGRATION_TESTS=require` — panic instead of skip (CI enforcement)
+- `UFORGE_INTEGRATION_TESTS=skip` — force-skip even when a server is present
 
----
-
-## Transcription Providers in Tests
-
-### Mock transcription provider (no server required)
-
-For tests that need a `TranscriptionProvider` without a live server, implement
-the trait inline:
-
-```rust
-use u_forge_core::ai::transcription::TranscriptionProvider;
-
-struct MockTranscriptionProvider;
-
-#[async_trait::async_trait]
-impl TranscriptionProvider for MockTranscriptionProvider {
-    async fn transcribe(
-        &self,
-        _audio_bytes: Vec<u8>,
-        filename: &str,
-    ) -> anyhow::Result<String> {
-        Ok(format!("mock transcript for {}", filename))
-    }
-
-    fn model_name(&self) -> &str {
-        "mock-whisper"
-    }
-}
-```
-
-### WAV test helper: `make_silence_wav`
-
-`make_silence_wav(duration_secs: f32) -> Vec<u8>` lives in the `ai::transcription::tests`
-module (`src/ai/transcription.rs`). It builds a valid mono 16-bit 16 kHz PCM WAV entirely
-in memory — no binary fixtures needed. Refer to the source for the implementation; copy the
-pattern when you need real audio bytes in a test.
-
-> **`LemonadeTranscriptionProvider::new` is synchronous** — no probe at construction.
-> Errors surface only when `transcribe()` is called. There is no `TranscriptionManager`.
-
-Transcription integration tests use the same `require_integration_url!()` macro
-as all other integration tests. See `src/test_helpers.rs` for the implementation.
+Under the hood, `test_helpers::integration_test_url()` delegates to the
+production `crate::lemonade::resolve_lemonade_url()` for the default (unset)
+case — so tests and the app follow the same discovery logic.
 
 ---
 
-## Storage Tests
-
-`KnowledgeGraphStorage` (SQLite) is tested directly in `src/graph/storage.rs`. Key
-behaviours to cover:
+## What each storage layer test must cover
 
 - `upsert_node` — updating must not wipe edges/chunks (`ON CONFLICT DO UPDATE`)
 - `delete_node` — verify `ON DELETE CASCADE` removes edges and chunks
 - `search_chunks_fts` — insert a chunk, then query by keyword
 - `query_subgraph` — verify BFS hop depth and edge deduplication
-
----
-
-## FTS5 Search Tests
-
-```rust
-#[test]
-fn test_fts_search_basic() {
-    let (graph, _tmp) = create_test_graph();
-
-    let id = ObjectBuilder::character("Saruman".to_string())
-        .add_to_graph(&graph)
-        .unwrap();
-
-    graph.add_text_chunk(
-        id,
-        "Saruman the White was head of the Istari order.".to_string(),
-        ChunkType::Description,
-    ).unwrap();
-
-    // Keyword present
-    let hits = graph.search_chunks_fts("Istari", 5).unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].1, id);
-
-    // Keyword absent
-    let empty = graph.search_chunks_fts("dragon", 5).unwrap();
-    assert!(empty.is_empty());
-}
-```
 
 FTS5 query syntax supported: phrase (`"foo bar"`), prefix (`foo*`), boolean
 (`foo AND bar`, `foo OR bar`, `foo NOT bar`), column filters.
@@ -195,27 +102,13 @@ FTS5 query syntax supported: phrase (`"foo bar"`), prefix (`foo*`), boolean
 ## Debugging
 
 ### Log levels
+
 ```bash
 RUST_LOG=trace                                       # Everything
 RUST_LOG=debug                                       # Development detail
-RUST_LOG=info                                        # Normal operation (default in demo)
+RUST_LOG=info                                        # Normal operation
 RUST_LOG=u_forge_core::graph::storage=debug          # Single module
 RUST_LOG=u_forge_core::ingest=warn                   # Suppress noisy modules
-```
-
-### Structured logging in code
-```rust
-tracing::info!(
-    operation = "upsert_node",
-    object_type = %obj.object_type,
-    name = %obj.name,
-    "Node persisted"
-);
-
-tracing::warn!(
-    name = %name,
-    "Skipping duplicate object during import"
-);
 ```
 
 ### Common issues
@@ -223,10 +116,9 @@ tracing::warn!(
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `openssl-sys` compile error | Missing system OpenSSL headers | `apt install pkg-config libssl-dev` (Ubuntu) |
-| `Lemonade Server not available` | Server not running or `LEMONADE_URL` not set | `lemonade-server serve` + `export LEMONADE_URL=http://localhost:13305/api/v1` |
-| Transcription returns immediate error | Model not pulled or server can't open audio | Run `lemonade-server pull whisper-v3-turbo-FLM`; verify audio bytes are non-empty and a valid WAV/MP3/OGG |
-| Transcription test passes but text is noise | Silence input hallucinations are normal | Use real speech audio for content assertions; only check `result.is_ok()` for silence |
-| `LemonadeTranscriptionProvider::new` used but transcription fails | Server not reachable or model not pulled | Run `lemonade-server serve` + `lemonade-server pull whisper-v3-turbo-FLM`; errors surface on first `transcribe()` call |
+| `Lemonade Server not available` | Server not running | `lemonade-server serve` — `localhost:13305` is auto-discovered |
+| Transcription returns immediate error | Model not pulled or server can't open audio | `lemonade-server pull whisper-v3-turbo-FLM`; verify audio bytes are non-empty |
+| Transcription test passes but text is noise | Silence input hallucinations are normal | Use real speech for content assertions; only check `result.is_ok()` for silence |
 | FTS5 search returns nothing | Chunk not yet added for the object | Call `add_text_chunk` before `search_chunks_fts` |
 | `database is locked` | Two processes sharing the same `knowledge.db` | Ensure only one writer at a time |
 | Import creates 0 edges | Node names in edges don't match node names exactly | Check spelling; `resolve_node_id` does exact-match lookup |
@@ -245,12 +137,5 @@ cargo doc --no-deps --workspace
 ```
 
 No `source env.sh` required. No model downloads. All commands work offline.
-
-Integration tests are automatically skipped when no Lemonade Server is reachable
-(localhost probe finds nothing and `LEMONADE_URL` is unset). To **require** them
-in CI, set `UFORGE_INTEGRATION_TESTS=require` — tests will panic instead of
-silently skipping. To force-skip even when a server is present, set
-`UFORGE_INTEGRATION_TESTS=skip`.
-
-Always pass `--test-threads=1` — integration tests share GPU/NPU hardware on
-the server and must not run concurrently.
+Integration tests auto-skip when no Lemonade Server is reachable — set
+`UFORGE_INTEGRATION_TESTS=require` in CI to enforce them.

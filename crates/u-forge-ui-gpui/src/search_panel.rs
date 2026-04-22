@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use gpui::{div, prelude::*, px, rgb, rgba, relative, Context, Entity, MouseButton, MouseDownEvent, Window};
+use tracing::Instrument;
 use u_forge_core::{
     AppConfig, HybridSearchConfig, KnowledgeGraph, ObjectId,
     queue::InferenceQueue,
@@ -110,16 +111,23 @@ impl SearchPanel {
 
         let graph = self.graph.clone();
         let mode = self.mode;
+        let query_len = query.len();
         let limit = self.search_limit;
         let queue = self.inference_queue.clone();
         let hq_queue = self.hq_queue.clone();
         let app_config = self.app_config.clone();
         let tokio_rt = self.tokio_rt.clone();
+        let mode_str = match mode {
+            SearchMode::Fts5 => "fts5",
+            SearchMode::Semantic => "semantic",
+            SearchMode::Hybrid => "hybrid",
+        };
 
         cx.spawn(async move |this, cx| {
             let result: Result<Vec<ObjectId>, anyhow::Error> = cx
                 .background_executor()
-                .spawn(async move {
+                .spawn(
+                    async move {
                     tokio_rt.block_on(async move {
                         let r: anyhow::Result<Vec<ObjectId>> = match mode {
                             SearchMode::Fts5 => {
@@ -189,7 +197,9 @@ impl SearchPanel {
                         };
                         r
                     })
-                })
+                }
+                .instrument(tracing::info_span!("search_kickoff", mode = mode_str, query_len)),
+                )
                 .await;
 
             this.update(cx, |panel, cx| {
