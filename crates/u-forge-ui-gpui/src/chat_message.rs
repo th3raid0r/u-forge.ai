@@ -8,6 +8,7 @@ use gpui::{
     div, prelude::*, px, rgb, rgba, Context, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Render, SharedString, Styled, Window,
 };
+use tracing::trace_span;
 
 use crate::chat_history::{StoredChatMessage, StoredRole, StoredToolCall};
 
@@ -25,33 +26,36 @@ pub(crate) enum ChatMessageRole {
 pub(crate) struct ChatMessageView {
     pub(crate) role: ChatMessageRole,
     /// Main text content (or tool name for `ToolCall` entries).
-    text: String,
+    /// Stored as SharedString so render clones are O(1) Arc refcount bumps
+    /// rather than O(n) heap allocations per frame during streaming.
+    text: SharedString,
     /// For `ToolCall` entries: the pretty-printed JSON arguments.
     tool_args: Option<String>,
     /// For `ToolCall` entries: the tool result text (filled in when available).
     tool_result: Option<String>,
     /// Stable ID correlating a `ToolCall` entry with its result event.
     tool_internal_id: Option<String>,
-    /// Whether the tool call body is collapsed (tool-call entries only).
+    /// Whether the block body is collapsed. Defaults true for Thinking blocks.
     collapsed: bool,
 }
 
 impl ChatMessageView {
     pub(crate) fn new_text(role: ChatMessageRole, text: String) -> Self {
+        let is_thinking = role == ChatMessageRole::Thinking;
         Self {
             role,
-            text,
+            text: SharedString::new(text),
             tool_args: None,
             tool_result: None,
             tool_internal_id: None,
-            collapsed: false,
+            collapsed: is_thinking,
         }
     }
 
     pub(crate) fn new_tool_call(internal_id: String, name: String, args: String) -> Self {
         Self {
             role: ChatMessageRole::ToolCall,
-            text: name,
+            text: SharedString::new(name),
             tool_args: Some(args),
             tool_result: None,
             tool_internal_id: Some(internal_id),
@@ -70,11 +74,11 @@ impl ChatMessageView {
             if let Some(tc) = msg.tool_call {
                 (Some(tc.args), tc.result, Some(tc.internal_id), tc.collapsed)
             } else {
-                (None, None, None, false)
+                (None, None, None, role == ChatMessageRole::Thinking)
             };
         Self {
             role,
-            text: msg.text,
+            text: SharedString::new(msg.text),
             tool_args,
             tool_result,
             tool_internal_id,
@@ -101,7 +105,7 @@ impl ChatMessageView {
         };
         StoredChatMessage {
             role: stored_role,
-            text: self.text.clone(),
+            text: self.text.to_string(),
             tool_call,
         }
     }
@@ -111,8 +115,18 @@ impl ChatMessageView {
     }
 
     /// Hot path: called on every streamed token. Only this entity notifies.
+    /// Rebuilds the SharedString once here so render's clone is O(1).
     pub(crate) fn append_text(&mut self, delta: &str, cx: &mut Context<Self>) {
-        self.text.push_str(delta);
+        let _span = trace_span!(
+            "chat_message::append_text",
+            delta_len = delta.len(),
+            prev_len = self.text.len(),
+        )
+        .entered();
+        let mut buf = String::with_capacity(self.text.len() + delta.len());
+        buf.push_str(&self.text);
+        buf.push_str(delta);
+        self.text = SharedString::new(buf);
         cx.notify();
     }
 
@@ -122,7 +136,10 @@ impl ChatMessageView {
     }
 
     pub(crate) fn append_error(&mut self, msg: &str, cx: &mut Context<Self>) {
-        self.text.push_str(msg);
+        let mut buf = String::with_capacity(self.text.len() + msg.len());
+        buf.push_str(&self.text);
+        buf.push_str(msg);
+        self.text = SharedString::new(buf);
         cx.notify();
     }
 
@@ -145,16 +162,10 @@ impl ChatMessageView {
                 "Assistant",
                 rgba(0xcdd6f4ff),
             ),
-            ChatMessageRole::Thinking => (
-                rgb(0x181825),
-                rgba(0xf9e2afff),
-                "Thinking",
-                rgba(0x6c7086ff),
-            ),
-            ChatMessageRole::ToolCall => unreachable!(),
+            ChatMessageRole::Thinking | ChatMessageRole::ToolCall => unreachable!(),
         };
 
-        let text: SharedString = self.text.clone().into();
+        let text = self.text.clone();
 
         div()
             .flex()
@@ -171,6 +182,64 @@ impl ChatMessageView {
                     .child(label),
             )
             .child(div().text_xs().text_color(text_color).child(text))
+    }
+
+    /// Collapsible thinking block. Collapsed by default so the virtual list
+    /// measures only a single header line when scrolling past it, avoiding the
+    /// full text-layout cost of a potentially large reasoning block. When
+    /// expanded, the body grows to its natural height and the outer list
+    /// scrolls normally — matches Zed's agent-panel UX (no inner scrollbar).
+    fn render_thinking(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let _span = trace_span!(
+            "chat_message::render_thinking",
+            text_len = self.text.len(),
+            collapsed = self.collapsed,
+        )
+        .entered();
+        let collapsed = self.collapsed;
+        let chevron = if collapsed { "▶" } else { "▼" };
+        let header = SharedString::from(format!("{chevron} Thinking"));
+
+        let mut el = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .px_2()
+            .py_1()
+            .bg(rgb(0x181825))
+            .child(
+                div()
+                    .id("thinking-hdr")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.toggle_collapsed(cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgba(0xf9e2afff))
+                            .child(header),
+                    ),
+            );
+
+        if !collapsed {
+            let text = self.text.clone();
+            el = el.child(
+                div()
+                    .text_xs()
+                    .text_color(rgba(0x6c7086ff))
+                    .mt_1()
+                    .child(text),
+            );
+        }
+
+        el
     }
 
     fn render_tool_call(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -271,8 +340,16 @@ impl ChatMessageView {
 
 impl Render for ChatMessageView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = trace_span!(
+            "chat_message::render",
+            role = ?self.role,
+            text_len = self.text.len(),
+            collapsed = self.collapsed,
+        )
+        .entered();
         match self.role {
             ChatMessageRole::ToolCall => self.render_tool_call(cx),
+            ChatMessageRole::Thinking => self.render_thinking(cx),
             _ => self.render_text(),
         }
     }

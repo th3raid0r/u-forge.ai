@@ -841,6 +841,7 @@ impl Render for ChatPanel {
         let list_el = list(
             self.list_state.clone(),
             move |ix, _window, cx: &mut App| {
+                let _span = tracing::trace_span!("chat_panel::list_item", ix).entered();
                 let panel = list_entity.read(cx);
                 match panel.messages.get(ix) {
                     Some(msg) => msg.clone().into_any_element(),

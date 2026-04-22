@@ -11,6 +11,11 @@ use u_forge_ui_gpui::{
 };
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .init();
+
     let cfg = Arc::new(AppConfig::load_default());
     let data_dir = cfg.storage.db_path.clone();
     let data_file = cfg.data.import_file.clone();
