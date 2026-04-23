@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use gpui::{div, prelude::*, px, rgb, rgba, relative, Context, Entity, MouseButton, MouseDownEvent, Window};
+use gpui::{
+    div, prelude::*, px, relative, rgb, rgba, Context, Entity, MouseButton, MouseDownEvent, Window,
+};
 use tracing::Instrument;
 use u_forge_core::{
-    AppConfig, HybridSearchConfig, KnowledgeGraph, ObjectId,
-    queue::InferenceQueue,
-    search_hybrid,
+    queue::InferenceQueue, search_hybrid, AppConfig, HybridSearchConfig, KnowledgeGraph, ObjectId,
 };
 use u_forge_ui_traits::node_color_for_type;
 
@@ -128,77 +128,79 @@ impl SearchPanel {
                 .background_executor()
                 .spawn(
                     async move {
-                    tokio_rt.block_on(async move {
-                        let r: anyhow::Result<Vec<ObjectId>> = match mode {
-                            SearchMode::Fts5 => {
-                                // FTS5: call directly, no embedding needed.
-                                let fts_limit = limit * 4;
-                                let raw = graph.search_chunks_fts(&query, fts_limit)?;
-                                // Deduplicate by ObjectId, preserving first-seen order.
-                                let mut seen = std::collections::HashSet::new();
-                                let mut node_ids = Vec::new();
-                                for (_, obj_id, _) in raw {
-                                    if seen.insert(obj_id) {
-                                        node_ids.push(obj_id);
-                                        if node_ids.len() >= limit {
-                                            break;
+                        tokio_rt.block_on(async move {
+                            let r: anyhow::Result<Vec<ObjectId>> = match mode {
+                                SearchMode::Fts5 => {
+                                    // FTS5: call directly, no embedding needed.
+                                    let fts_limit = limit * 4;
+                                    let raw = graph.search_chunks_fts(&query, fts_limit)?;
+                                    // Deduplicate by ObjectId, preserving first-seen order.
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut node_ids = Vec::new();
+                                    for (_, obj_id, _) in raw {
+                                        if seen.insert(obj_id) {
+                                            node_ids.push(obj_id);
+                                            if node_ids.len() >= limit {
+                                                break;
+                                            }
                                         }
                                     }
+                                    Ok(node_ids)
                                 }
-                                Ok(node_ids)
-                            }
-                            SearchMode::Semantic => {
-                                let q = queue.as_ref().unwrap();
-                                // Prefer HQ (4096-dim) embeddings when available — they
-                                // were used during bulk indexing if HQ is enabled, so
-                                // querying them gives meaningfully better recall.
-                                let raw: Vec<(_, ObjectId, _, _)> =
-                                    if let Some(hq_q) = hq_queue.as_ref() {
-                                        let embedding: Vec<f32> =
-                                            hq_q.embed(&query).await?;
-                                        graph
-                                            .search_chunks_semantic_hq(&embedding, limit * 4)?
+                                SearchMode::Semantic => {
+                                    let q = queue.as_ref().unwrap();
+                                    // Prefer HQ (4096-dim) embeddings when available — they
+                                    // were used during bulk indexing if HQ is enabled, so
+                                    // querying them gives meaningfully better recall.
+                                    let raw: Vec<(_, ObjectId, _, _)> = if let Some(hq_q) =
+                                        hq_queue.as_ref()
+                                    {
+                                        let embedding: Vec<f32> = hq_q.embed(&query).await?;
+                                        graph.search_chunks_semantic_hq(&embedding, limit * 4)?
                                     } else {
                                         let embedding: Vec<f32> = q.embed(&query).await?;
-                                        graph
-                                            .search_chunks_semantic(&embedding, limit * 4)?
+                                        graph.search_chunks_semantic(&embedding, limit * 4)?
                                     };
-                                let mut seen = std::collections::HashSet::new();
-                                let mut node_ids = Vec::new();
-                                for (_, obj_id, _, _) in raw {
-                                    if seen.insert(obj_id) {
-                                        node_ids.push(obj_id);
-                                        if node_ids.len() >= limit {
-                                            break;
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut node_ids = Vec::new();
+                                    for (_, obj_id, _, _) in raw {
+                                        if seen.insert(obj_id) {
+                                            node_ids.push(obj_id);
+                                            if node_ids.len() >= limit {
+                                                break;
+                                            }
                                         }
                                     }
+                                    Ok(node_ids)
                                 }
-                                Ok(node_ids)
-                            }
-                            SearchMode::Hybrid => {
-                                let q = queue.as_ref().unwrap();
-                                let cfg = HybridSearchConfig {
-                                    alpha: if q.has_embedding() {
-                                        app_config.chat.alpha
-                                    } else {
-                                        0.0
-                                    },
-                                    fts_limit: limit * 4,
-                                    semantic_limit: limit * 4,
-                                    rerank: q.has_reranking(),
-                                    limit,
-                                    hq_semantic_boost: app_config.chat.hq_semantic_boost,
-                                };
-                                let results =
-                                    search_hybrid(&graph, q, hq_queue.as_ref(), &query, &cfg)
-                                        .await?;
-                                Ok(results.into_iter().map(|r| r.node.id).collect::<Vec<_>>())
-                            }
-                        };
-                        r
-                    })
-                }
-                .instrument(tracing::info_span!("search_kickoff", mode = mode_str, query_len)),
+                                SearchMode::Hybrid => {
+                                    let q = queue.as_ref().unwrap();
+                                    let cfg = HybridSearchConfig {
+                                        alpha: if q.has_embedding() {
+                                            app_config.chat.alpha
+                                        } else {
+                                            0.0
+                                        },
+                                        fts_limit: limit * 4,
+                                        semantic_limit: limit * 4,
+                                        rerank: q.has_reranking(),
+                                        limit,
+                                        hq_semantic_boost: app_config.chat.hq_semantic_boost,
+                                    };
+                                    let results =
+                                        search_hybrid(&graph, q, hq_queue.as_ref(), &query, &cfg)
+                                            .await?;
+                                    Ok(results.into_iter().map(|r| r.node.id).collect::<Vec<_>>())
+                                }
+                            };
+                            r
+                        })
+                    }
+                    .instrument(tracing::info_span!(
+                        "search_kickoff",
+                        mode = mode_str,
+                        query_len
+                    )),
                 )
                 .await;
 
@@ -275,7 +277,7 @@ impl Render for SearchPanel {
                 .border_color(rgb(0x313244))
                 .text_color(rgba(0xcdd6f4ff))
                 .text_base()
-                .child("SEARCH"),
+                .child("Search"),
         );
 
         // ── Mode selector ─────────────────────────────────────────────────────
