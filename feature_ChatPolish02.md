@@ -366,6 +366,64 @@ session. No per-message delete. The last-message slot had no affordance.
 
 ---
 
+## Bug fixes (ChatPolish02-D)
+
+Small UI bugs addressed in the same branch after features A–C landed.
+All changes are in `chat_panel.rs` unless noted.
+
+### D1 — History dropdown: text overflow + fade + delete button visibility ✓ DONE
+
+**Problem.** Session titles in the history dropdown ran to the edge of the
+panel, carrying the `✕` delete button off-screen or making it hard to see.
+
+**Solution.**
+- Row: `relative()`, `w_full()`, `overflow_x_hidden()` to constrain width.
+- Title div: `flex_grow/shrink`, `min_w_0()`, `overflow_x_hidden()` to clip text.
+- Gradient fade: row-level `absolute()` child, `right(px(26.0))` (= 8 px
+  padding + 18 px button), `w(px(28.0))`. Both colour stops share the same
+  hue — only alpha differs — so the gradient is invisible over empty space
+  and only appears where text overflows beneath it.
+- Delete button: `flex_none` sibling, always visible at the right edge.
+- Row backgrounds converted to pre-composited opaque values so gradient
+  end colours match exactly:
+  - default:  `rgb(0x313244)` (dropdown bg)
+  - selected: `rgb(0x3c3d50)` (= `rgba(0x45475a88)` over `#313244`)
+  - hovered:  `rgb(0x393a4d)` (= `rgba(0x45475a66)` over `#313244`)
+- `hovered_history_ix: Option<usize>` field added to `ChatPanel`; wired
+  via `on_hover` on each row so the gradient end colour updates on hover.
+- `linear_gradient`, `linear_color_stop` added to gpui imports.
+
+### D2 — History dropdown hover gradient: directional bug ⚠ DEFERRED
+
+**Symptom.** When the cursor *descends* into a history row from above, the
+gradient colour fails to update to the hovered value. Entering from the
+side or bottom works correctly.
+
+**Root cause (hypothesis).** `on_hover` callbacks in GPUI appear to fire
+only when the row's own hitbox is the top-most entry point. A `relative()`-
+positioned child div (title, previously) creates a separate stacking
+context that paints on top of the row, so top-entry hits the child's
+hitbox first and the row's `on_hover` never transitions. Moving `relative()`
+from the title to the row (so the title is `position: static`) did not
+fully resolve the issue — the GPUI hitbox/stacking system may have a deeper
+interaction with how list items register hover when traversed vertically.
+
+**Workaround.** None applied. The gradient colour is slightly wrong on
+top-entry hover but corrects itself as soon as the cursor moves within the
+row. Visually minor — the row background itself switches via `.hover()` CSS
+styling (which is unaffected), only the gradient lags.
+
+**To investigate later.**
+- Whether GPUI's virtualized `list()` element interferes with child hover
+  detection across item boundaries.
+- Whether `on_hover` has a known limitation with top-to-bottom cursor
+  traversal in stacked-item layouts.
+- Potential alternative: track hover via `on_mouse_move` on the dropdown
+  container and derive the hovered index from `event.position.y` and item
+  height (24 px), bypassing per-item `on_hover` entirely.
+
+---
+
 ## Cross-cutting concerns
 
 ### Stream cancellation ordering (Features A, B, C)

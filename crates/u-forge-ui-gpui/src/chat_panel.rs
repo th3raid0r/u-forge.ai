@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, list, prelude::*, px, rgb, rgba, relative, App, Context, Entity, EntityId,
-    EventEmitter, ListAlignment, ListState, MouseButton, MouseDownEvent, Window,
+    div, linear_color_stop, linear_gradient, list, prelude::*, px, rgb, rgba, relative, App,
+    Context, Entity, EntityId, EventEmitter, ListAlignment, ListState, MouseButton, MouseDownEvent,
+    Window,
 };
 use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
@@ -92,6 +93,8 @@ pub(crate) struct ChatPanel {
     session_list: Vec<ChatSessionSummary>,
     /// Whether the history selector dropdown is open.
     history_dropdown_open: bool,
+    /// Index of the history row currently under the pointer, for gradient sync.
+    hovered_history_ix: Option<usize>,
     /// CPU time (µs) spent building the element tree in the last render call.
     pub(crate) last_render_us: u64,
 }
@@ -205,6 +208,7 @@ impl ChatPanel {
             current_session_id,
             session_list,
             history_dropdown_open: false,
+            hovered_history_ix: None,
             last_render_us: 0,
         }
     }
@@ -902,22 +906,50 @@ impl Render for ChatPanel {
                 };
                 let is_current =
                     panel.current_session_id.as_deref() == Some(&session.id);
+                let is_hovered = panel.hovered_history_ix == Some(ix);
                 let entity_load = history_list_entity.clone();
                 let sid_load = session.id.clone();
                 let entity_del = history_list_entity.clone();
                 let sid_del = session.id.clone();
+                let entity_hover = history_list_entity.clone();
                 let title = session.title.clone();
+
+                // Both gradient stops share the same hue (only alpha differs)
+                // so the gradient is invisible over empty space and only masks
+                // text that actually overflows. Colours are pre-composited
+                // equivalents of the semi-transparent row backgrounds:
+                //   selected: rgba(0x45475a88) over #313244 ≈ #3C3D50
+                //   hovered:  rgba(0x45475a66) over #313244 ≈ #393A4D
+                let (gradient_start, gradient_end) = if is_current {
+                    (rgba(0x3c3d5000), rgba(0x3c3d50ff))
+                } else if is_hovered {
+                    (rgba(0x393a4d00), rgba(0x393a4dff))
+                } else {
+                    (rgba(0x31324400), rgba(0x313244ff))
+                };
 
                 div()
                     .id(("hist", ix))
+                    .relative()
+                    .w_full()
+                    .overflow_x_hidden()
                     .flex()
                     .flex_row()
                     .items_center()
                     .h(px(24.0))
                     .px_2()
-                    .when(is_current, |el| el.bg(rgba(0x45475a88)))
-                    .hover(|s| s.bg(rgba(0x45475a66)))
+                    .when(is_current, |el| el.bg(rgb(0x3c3d50)))
+                    .hover(|s| s.bg(rgb(0x393a4d)))
+                    .on_hover(move |is_hov, _window, cx| {
+                        entity_hover.update(cx, |this, cx| {
+                            this.hovered_history_ix = if *is_hov { Some(ix) } else { None };
+                            cx.notify();
+                        });
+                    })
                     .child({
+                        // No `relative()` here — keeping the title static avoids
+                        // a separate stacking context that confuses the row's
+                        // on_hover hit-testing when the cursor descends from above.
                         let mut title_el = div()
                             .id(("hist-title", ix))
                             .flex()
@@ -944,6 +976,23 @@ impl Render for ChatPanel {
                         title_el.style().flex_shrink = Some(1.0);
                         title_el
                     })
+                    // Gradient is a row-level absolute child so it doesn't
+                    // interfere with the title's hit-box. right(26) aligns its
+                    // right edge with the delete button's left edge
+                    // (8 px padding + 18 px button = 26 px from outer right).
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(26.0))
+                            .top_0()
+                            .h_full()
+                            .w(px(28.0))
+                            .bg(linear_gradient(
+                                90.,
+                                linear_color_stop(gradient_start, 0.0),
+                                linear_color_stop(gradient_end, 1.0),
+                            )),
+                    )
                     .child(
                         div()
                             .id(("hist-del", ix))
