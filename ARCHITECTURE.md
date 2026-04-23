@@ -235,6 +235,36 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 
 ---
 
+## Chat UI Component Model (`u-forge-ui-gpui`)
+
+### Component hierarchy
+
+```
+AppView
+  └─ ChatPanel  (Entity<ChatPanel>)
+       ├─ messages: Vec<Entity<ChatMessageView>>
+       ├─ stream_task: Option<gpui::Task<()>>   — stored (not detached) for cancellation
+       ├─ connecting: bool                       — true while do_init_lemonade is in-flight
+       └─ list_state: ListState                 — virtualized list; reset() on any structural change
+            └─ item builder closure (render-site action bar)
+                 └─ Entity<ChatMessageView>
+                      └─ body: Option<Entity<TextFieldView>>  — None for ToolCall rows
+```
+
+### Key design rules
+
+**`stream_task` must be stored, never detached.** Dropping the `Task<()>` cancels the outer GPUI spawn, which drops the `mpsc::Receiver`, causing `tx.send().await` inside `prompt_stream` to return `Err` and break the stream loop. `finalize_stream` sets it back to `None`. This is the Stop button's cancellation mechanism.
+
+**Action bar lives in the list item builder, not in `ChatMessageView`.** The ⟳ retry, × delete, and ⎘ copy buttons are rendered by the closure in `chat_panel.rs` that builds each list item — not inside `ChatMessageView::render`. This eliminates per-message `gpui::Subscription` vectors. See `.rulesdir/gpui-patterns.mdc` — "Render-site action bar pattern".
+
+**`TextFieldView` serves two roles.** The same widget is used as the editable chat input (bottom) and as the read-only, selectable body of User/Assistant/Thinking messages. Construct with `TextFieldView::new_read_only(text, color, cx)` for message bodies. ToolCall rows skip the body entity and render plain divs.
+
+**`ConnectRequested` event bridges `ChatPanel` → `AppView`.** `ChatPanel` cannot call `do_init_lemonade` directly (it doesn't hold the full app state). Instead it emits `ConnectRequested`; `AppView` subscribes, calls `do_init_lemonade`, and calls `ChatPanel::set_connecting(false)` on completion or `set_connect_failed(msg)` on failure.
+
+**Send button is four-state, width-pinned.** States: Connect (yellow) / Connecting… (grey) / Send (blue) / Stop (red). Width is pinned to 88 px so the input row doesn't reflow on state change.
+
+---
+
 ## Design Decisions — Questionable / Still Open
 
 - **`chat.rs` uses hand-crafted HTTP, not `async-openai`** — Lemonade Server's `enable_thinking: bool` parameter is non-standard; `async-openai`'s typed struct has no way to inject it. The other Lemonade endpoints (embeddings, TTS, STT, reranking) remain genuinely OpenAI-compatible and continue using `async-openai`. If Lemonade ever standardises the thinking parameter, `LemonadeChatProvider` can be ported.
