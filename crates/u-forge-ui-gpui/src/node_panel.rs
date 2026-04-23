@@ -128,7 +128,7 @@ impl Render for NodePanel {
                 .border_color(rgb(0x313244))
                 .text_color(rgba(0xcdd6f4ff))
                 .text_base()
-                .child("NODES"),
+                .child("Nodes"),
         );
 
         // Scrollable content area that fills remaining height.
