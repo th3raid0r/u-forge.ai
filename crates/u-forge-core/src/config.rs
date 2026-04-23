@@ -538,7 +538,7 @@ pub struct UiConfig {
 
 impl UiConfig {
     fn default_font_size() -> f32 {
-        18.0
+        16.0
     }
 }
 
@@ -634,7 +634,9 @@ impl AppConfig {
         let xdg_base = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                dirs_or_home().map(|h| h.join(".config")).unwrap_or_default()
+                dirs_or_home()
+                    .map(|h| h.join(".config"))
+                    .unwrap_or_default()
             });
 
         if !xdg_base.as_os_str().is_empty() {
@@ -673,11 +675,7 @@ fn default_hq_embedding_models() -> Vec<String> {
 }
 
 fn default_llamacpp_backend_preference() -> Vec<String> {
-    vec![
-        "rocm".to_string(),
-        "vulkan".to_string(),
-        "cpu".to_string(),
-    ]
+    vec!["rocm".to_string(), "vulkan".to_string(), "cpu".to_string()]
 }
 
 fn default_embedding_model_preferences() -> Vec<String> {
@@ -712,12 +710,18 @@ fn default_tts_model_preferences() -> Vec<String> {
 /// Built-in load parameters for known models.
 fn default_model_load_params() -> HashMap<String, ModelLoadParams> {
     fn ctx(ctx_size: usize) -> ModelLoadParams {
-        ModelLoadParams { ctx_size: Some(ctx_size), ..Default::default() }
+        ModelLoadParams {
+            ctx_size: Some(ctx_size),
+            ..Default::default()
+        }
     }
     let mut m = HashMap::new();
     m.insert("embed-gemma-300m-FLM".to_string(), ctx(2048));
     m.insert("embed-gemma-300M-GGUF".to_string(), ctx(2048));
-    m.insert("user.ggml-org/embeddinggemma-300M-GGUF".to_string(), ctx(2048));
+    m.insert(
+        "user.ggml-org/embeddinggemma-300M-GGUF".to_string(),
+        ctx(2048),
+    );
     m.insert("Qwen3-Embedding-8B-GGUF".to_string(), ctx(32768));
     m.insert("bge-reranker-v2-m3-GGUF".to_string(), ctx(8192));
     m
@@ -746,11 +750,18 @@ mod tests {
     fn test_default_model_load_params() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.models.ctx_size_for("embed-gemma-300m-FLM"), 2048);
-        assert_eq!(cfg.models.ctx_size_for("user.ggml-org/embeddinggemma-300M-GGUF"), 2048);
+        assert_eq!(
+            cfg.models
+                .ctx_size_for("user.ggml-org/embeddinggemma-300M-GGUF"),
+            2048
+        );
         assert_eq!(cfg.models.ctx_size_for("bge-reranker-v2-m3-GGUF"), 8192);
         assert_eq!(cfg.models.ctx_size_for("Qwen3-Embedding-8B-GGUF"), 32768);
         // Unknown model falls back to default
-        assert_eq!(cfg.models.ctx_size_for("unknown-model-GGUF"), crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS);
+        assert_eq!(
+            cfg.models.ctx_size_for("unknown-model-GGUF"),
+            crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS
+        );
     }
 
     #[test]
@@ -843,9 +854,9 @@ cpu_enabled = false
         .unwrap();
 
         let cfg = AppConfig::load(f.path()).unwrap();
-        assert!(cfg.embedding.npu_enabled);      // default
-        assert!(cfg.embedding.gpu_enabled);      // default
-        assert!(!cfg.embedding.cpu_enabled);     // overridden
+        assert!(cfg.embedding.npu_enabled); // default
+        assert!(cfg.embedding.gpu_enabled); // default
+        assert!(!cfg.embedding.cpu_enabled); // overridden
         assert_eq!(cfg.embedding.npu_weight, 100); // default
     }
 
