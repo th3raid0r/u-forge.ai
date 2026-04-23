@@ -979,7 +979,7 @@ impl Render for TextFieldView {
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                if !this.multiline {
+                if !this.multiline || this.read_only {
                     return;
                 }
                 let delta_y = match event.delta {
