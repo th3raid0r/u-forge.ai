@@ -332,7 +332,7 @@ impl AppView {
     }
 
     pub(crate) fn do_clear_data(&mut self, cx: &mut Context<Self>) {
-        match self.state.graph.clear_all() {
+        match self.state.graph.clear_data() {
             Ok(()) => {
                 self.state.data_status = Some("Data cleared.".to_string());
                 self.refresh_snapshot(cx);
@@ -344,18 +344,30 @@ impl AppView {
         }
     }
 
+    pub(crate) fn do_clear_schema(&mut self, cx: &mut Context<Self>) {
+        match self.state.graph.clear_schemas() {
+            Ok(()) => {
+                self.state.schema_loaded = false;
+                self.state.data_status = Some("Schemas cleared.".to_string());
+                cx.notify();
+            }
+            Err(e) => {
+                self.state.data_status = Some(format!("Clear schema failed: {e}"));
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn do_import_data(&mut self, cx: &mut Context<Self>) {
         let graph = self.state.graph.clone();
         let data_file = self.state.data_file.clone();
-        let schema_dir = self.state.schema_dir.to_string_lossy().into_owned();
 
         self.state.data_status = Some("Importing…".to_string());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result = u_forge_core::ingest::setup_and_index(
+            let result = u_forge_core::ingest::import_data_only(
                 &graph,
-                &schema_dir,
                 data_file.to_str().unwrap_or(""),
             )
             .await;
@@ -469,10 +481,15 @@ impl AppView {
                     let result = mgr.save_schema(&schema_def).await;
                     let _ = mgr.delete_schema("default");
                     this.update(cx, |view, cx| {
-                        view.state.data_status = match result {
-                            Ok(_) => Some("Schema directory loaded".to_string()),
-                            Err(e) => Some(format!("Schema load failed: {e}")),
-                        };
+                        match result {
+                            Ok(_) => {
+                                view.state.schema_loaded = true;
+                                view.state.data_status = Some("Schema directory loaded".to_string());
+                            }
+                            Err(e) => {
+                                view.state.data_status = Some(format!("Schema load failed: {e}"));
+                            }
+                        }
                         cx.notify();
                     })
                     .ok();

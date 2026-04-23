@@ -13,4 +13,4 @@ pub mod node_panel;
 pub use app_view::AppView;
 
 use gpui::actions;
-actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ImportData, ImportSchema, ExportData, TogglePerfOverlay]);
+actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ClearSchema, ImportData, ImportSchema, ExportData, TogglePerfOverlay]);

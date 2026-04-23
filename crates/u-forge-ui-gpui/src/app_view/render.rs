@@ -6,7 +6,7 @@ use gpui::{
 };
 
 use crate::{
-    ClearData, ExportData, ImportData, ImportSchema, SaveLayout, TogglePerfOverlay,
+    ClearData, ClearSchema, ExportData, ImportData, ImportSchema, SaveLayout, TogglePerfOverlay,
     ToggleRightPanel, ToggleSidebar,
 };
 
@@ -56,10 +56,12 @@ impl Render for AppView {
             None
         };
 
-        // Read graph stats for the status bar.
+        // Read graph stats for the status bar and menu grey-out logic.
         let snap = self.state.snapshot.read();
         let node_count = snap.nodes.len();
         let edge_count = snap.edges.len();
+        let has_data = node_count > 0;
+        let has_schema = self.state.schema_loaded;
         drop(snap);
 
         // Weak handle used by drag-move closures to update panel sizes.
@@ -89,6 +91,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ClearData, _window, cx| {
                 this.do_clear_data(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearSchema, _window, cx| {
+                this.do_clear_schema(cx);
             }))
             .on_action(cx.listener(|this, _: &ImportData, window, cx| {
                 this.do_import_data_picker(window, cx);
@@ -657,28 +662,7 @@ impl Render for AppView {
                                 )
                                 // ── separator ──
                                 .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
-                                .child(
-                                    div()
-                                        .id("import-data-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(px(28.0))
-                                        .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_sm()
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgba(0x45475a88)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, window, cx| {
-                                                    this.file_menu_open = false;
-                                                    this.do_import_data_picker(window, cx);
-                                                },
-                                            ),
-                                        )
-                                        .child("Import Data…"),
-                                )
+                                // Import Schema… — always enabled
                                 .child(
                                     div()
                                         .id("import-schema-item")
@@ -701,50 +685,116 @@ impl Render for AppView {
                                         )
                                         .child("Import Schema…"),
                                 )
-                                .child(
-                                    div()
+                                // Import Data… — greyed when no schema loaded
+                                .child({
+                                    let el = div()
+                                        .id("import-data-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_sm();
+                                    if has_schema {
+                                        el.text_color(rgba(0xcdd6f4ff))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, _: &MouseDownEvent, window, cx| {
+                                                        this.file_menu_open = false;
+                                                        this.do_import_data_picker(window, cx);
+                                                    },
+                                                ),
+                                            )
+                                    } else {
+                                        el.text_color(rgba(0xcdd6f450))
+                                    }
+                                    .child("Import Data…")
+                                })
+                                // Export Data… — greyed when no data
+                                .child({
+                                    let el = div()
                                         .id("export-data-item")
                                         .flex()
                                         .items_center()
                                         .h(px(28.0))
                                         .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_sm()
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgba(0x45475a88)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, window, cx| {
-                                                    this.file_menu_open = false;
-                                                    this.do_export_data_picker(window, cx);
-                                                },
-                                            ),
-                                        )
-                                        .child("Export Data…"),
-                                )
-                                .child(
-                                    div()
+                                        .text_sm();
+                                    if has_data {
+                                        el.text_color(rgba(0xcdd6f4ff))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, _: &MouseDownEvent, window, cx| {
+                                                        this.file_menu_open = false;
+                                                        this.do_export_data_picker(window, cx);
+                                                    },
+                                                ),
+                                            )
+                                    } else {
+                                        el.text_color(rgba(0xcdd6f450))
+                                    }
+                                    .child("Export Data…")
+                                })
+                                // ── separator ──
+                                .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                                // Clear Schema — greyed when no schemas
+                                .child({
+                                    let el = div()
+                                        .id("clear-schema-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_sm();
+                                    if has_schema {
+                                        el.text_color(rgba(0xf38ba8ff))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, _: &MouseDownEvent, _window, cx| {
+                                                        this.file_menu_open = false;
+                                                        this.do_clear_schema(cx);
+                                                    },
+                                                ),
+                                            )
+                                    } else {
+                                        el.text_color(rgba(0xf38ba850))
+                                    }
+                                    .child("Clear Schema")
+                                })
+                                // Clear Data — greyed when no data
+                                .child({
+                                    let el = div()
                                         .id("clear-data-item")
                                         .flex()
                                         .items_center()
                                         .h(px(28.0))
                                         .px_3()
-                                        .text_color(rgba(0xf38ba8ff))
-                                        .text_sm()
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgba(0x45475a88)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
-                                                    this.file_menu_open = false;
-                                                    this.do_clear_data(cx);
-                                                },
-                                            ),
-                                        )
-                                        .child("Clear Data"),
-                                ),
+                                        .text_sm();
+                                    if has_data {
+                                        el.text_color(rgba(0xf38ba8ff))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, _: &MouseDownEvent, _window, cx| {
+                                                        this.file_menu_open = false;
+                                                        this.do_clear_data(cx);
+                                                    },
+                                                ),
+                                            )
+                                    } else {
+                                        el.text_color(rgba(0xf38ba850))
+                                    }
+                                    .child("Clear Data")
+                                }),
                         ),
                 ))
             })

@@ -25,6 +25,50 @@ pub struct SetupResult {
     pub chunks_indexed: usize,
 }
 
+/// Import data and index for FTS5 — schema loading is intentionally omitted.
+///
+/// Use this when schemas are already present. Unlike [`setup_and_index`] this
+/// always runs (no `node_count > 0` guard) so the caller controls whether to
+/// clear first.
+pub async fn import_data_only(graph: &KnowledgeGraph, data_file: &str) -> Result<SetupResult> {
+    info!(data_file, "Importing data (schema-independent)");
+    let mut ingestion = DataIngestion::new(graph);
+    ingestion.import_json_data(data_file).await?;
+    let stats = ingestion.get_stats();
+    let objects_created = stats.objects_created;
+    let relationships_created = stats.relationships_created;
+    info!(objects_created, relationships_created, "Data imported");
+
+    info!("Indexing text for full-text search");
+    let all_objects = graph.get_all_objects()?;
+    let id_to_name: HashMap<ObjectId, String> =
+        all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
+    let mut chunks_indexed = 0usize;
+    for obj in &all_objects {
+        let edges = graph.get_relationships(obj.id).unwrap_or_default();
+        let edge_lines: Vec<String> = edges
+            .iter()
+            .filter_map(|e| {
+                let from_name = id_to_name.get(&e.from)?;
+                let to_name = id_to_name.get(&e.to)?;
+                Some(format!("{} {} {}", from_name, e.edge_type.as_str(), to_name))
+            })
+            .collect();
+        let text = obj.flatten_for_embedding(&edge_lines);
+        chunks_indexed += graph
+            .add_text_chunk(obj.id, text, ChunkType::Imported)?
+            .len();
+    }
+    info!(chunks_indexed, "FTS5 indexing complete");
+
+    Ok(SetupResult {
+        fresh_import: true,
+        objects_created,
+        relationships_created,
+        chunks_indexed,
+    })
+}
+
 /// Load schemas, import data, and index all objects for FTS5 full-text search.
 ///
 /// The caller is responsible for opening the [`KnowledgeGraph`] and calling

@@ -42,12 +42,24 @@ Each new item opens `PathPickerModal` pre-seeded from the relevant `AppState` pa
 
 The `if stats.node_count == 0 { … }` block that automatically imported schemas and data on a fresh DB is gone. The graph now starts empty; the user imports explicitly via the picker flow. The schema cache pre-load (needed for the node editor's synchronous schema lookup) is kept.
 
-## Remaining work (tracked separately)
+## Flow fixes (second commit)
 
-- **Separate import data from import schema**: `do_import_data` currently calls `setup_and_index` which also loads schemas. Need `import_data_only` in `pipeline.rs`.
-- **Clear Schema** menu item: delete all schemas without touching node data.
-- **Clear Data** should not clear schemas (currently `clear_all` deletes both).
-- **Grey-out logic** for menu items:
-  - "Clear Data" greyed when `node_count == 0`
-  - "Clear Schema" greyed when no schemas present
-  - "Import Data" greyed when no schema present
+### Separated import data from import schema
+- `import_data_only(graph, data_file)` added to `ingest/pipeline.rs` — does data import + FTS5 indexing with no schema side-effects
+- `do_import_data` now calls `import_data_only` instead of `setup_and_index`
+
+### Separate clear operations
+- `KnowledgeGraph::clear_data()` — deletes nodes/edges/chunks/vectors, schemas intact
+- `KnowledgeGraph::clear_schemas()` — deletes all schemas, node data intact
+- `do_clear_data` uses `clear_data()` (was `clear_all` which wiped schemas too)
+- `do_clear_schema` (new) calls `clear_schemas()`, sets `schema_loaded = false`
+
+### Grey-out logic
+- `AppState.schema_loaded: bool` — updated on schema import/clear, initialised from DB at startup
+- "Import Data…" greyed (50% alpha, no hover/click) when `!schema_loaded`
+- "Export Data…" greyed when `node_count == 0`
+- "Clear Schema" greyed when `!schema_loaded`
+- "Clear Data" greyed when `node_count == 0`
+
+### Menu order
+Import Schema → Import Data → Export Data → [separator] → Clear Schema → Clear Data

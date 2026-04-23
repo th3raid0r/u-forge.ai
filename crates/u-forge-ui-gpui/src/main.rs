@@ -7,8 +7,8 @@ use gpui::{
 use u_forge_core::AppConfig;
 use u_forge_graph_view::build_snapshot;
 use u_forge_ui_gpui::{
-    AppView, ClearData, ExportData, ImportData, ImportSchema, SaveLayout, TogglePerfOverlay,
-    ToggleRightPanel, ToggleSidebar,
+    AppView, ClearData, ClearSchema, ExportData, ImportData, ImportSchema, SaveLayout,
+    TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
 };
 
 fn main() {
@@ -83,10 +83,11 @@ fn main() {
                 items: vec![
                     MenuItem::action("Save", SaveLayout),
                     MenuItem::separator(),
-                    MenuItem::action("Import Data…", ImportData),
                     MenuItem::action("Import Schema…", ImportSchema),
+                    MenuItem::action("Import Data…", ImportData),
                     MenuItem::action("Export Data…", ExportData),
                     MenuItem::separator(),
+                    MenuItem::action("Clear Schema", ClearSchema),
                     MenuItem::action("Clear Data", ClearData),
                 ],
             },

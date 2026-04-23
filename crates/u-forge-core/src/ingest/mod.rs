@@ -18,4 +18,4 @@ pub use embedding::{
     build_hq_embed_queue, embed_all_chunks, rechunk_and_embed, EmbeddingOutcome, EmbeddingPlan,
     EmbeddingProgress, EmbeddingResult, EmbeddingTarget,
 };
-pub use pipeline::{setup_and_index, SetupResult};
+pub use pipeline::{import_data_only, setup_and_index, SetupResult};
