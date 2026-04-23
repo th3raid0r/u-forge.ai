@@ -274,7 +274,7 @@ impl Render for SearchPanel {
                 .border_b_1()
                 .border_color(rgb(0x313244))
                 .text_color(rgba(0xcdd6f4ff))
-                .text_xs()
+                .text_base()
                 .child("SEARCH"),
         );
 
@@ -299,7 +299,7 @@ impl Render for SearchPanel {
                     .h(px(20.0))
                     .rounded(px(3.0))
                     .cursor_pointer()
-                    .text_xs()
+                    .text_base()
                     .text_color(if mode == SearchMode::Fts5 {
                         rgba(0xcdd6f4ff)
                     } else {
@@ -323,7 +323,7 @@ impl Render for SearchPanel {
                     .px_2()
                     .h(px(20.0))
                     .rounded(px(3.0))
-                    .text_xs()
+                    .text_base()
                     .text_color(if !has_queue {
                         rgba(0x45475aff)
                     } else if mode == SearchMode::Semantic {
@@ -353,7 +353,7 @@ impl Render for SearchPanel {
                     .px_2()
                     .h(px(20.0))
                     .rounded(px(3.0))
-                    .text_xs()
+                    .text_base()
                     .text_color(if !has_queue {
                         rgba(0x45475aff)
                     } else if mode == SearchMode::Hybrid {
@@ -407,7 +407,7 @@ impl Render for SearchPanel {
                     .h(px(24.0))
                     .rounded(px(4.0))
                     .bg(rgb(0x313244))
-                    .text_xs()
+                    .text_base()
                     .text_color(rgba(0xcdd6f4ff))
                     .cursor_pointer()
                     .on_mouse_down(
@@ -431,7 +431,7 @@ impl Render for SearchPanel {
                     .items_center()
                     .h(px(22.0))
                     .px_3()
-                    .text_xs()
+                    .text_base()
                     .text_color(rgba(0xa6adc8ff))
                     .child("Searching…"),
             );
@@ -445,7 +445,7 @@ impl Render for SearchPanel {
                     .items_center()
                     .h(px(22.0))
                     .px_3()
-                    .text_xs()
+                    .text_base()
                     .text_color(rgba(0xf38ba8ff))
                     .child(err),
             );
@@ -485,7 +485,7 @@ impl Render for SearchPanel {
                     .pr(px(4.0))
                     .flex_none()
                     .gap(px(6.0))
-                    .text_xs()
+                    .text_base()
                     .cursor_pointer()
                     .text_color(if is_selected {
                         rgba(0xffffffff)

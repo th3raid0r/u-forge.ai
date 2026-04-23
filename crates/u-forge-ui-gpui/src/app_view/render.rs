@@ -17,7 +17,9 @@ use super::{
 };
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_rem_size(px(self.state.app_config.ui.font_size));
+
         // Capture frame start time. The canvas element appended at the end of the
         // tree records elapsed time in its paint closure — after GPUI's full layout
         // pass — giving an honest measure of frame cost rather than render() call
@@ -132,7 +134,7 @@ impl Render for AppView {
                             .h_full()
                             .px_3()
                             .text_color(rgba(0xcdd6f4ff))
-                            .text_sm()
+                            .text_xs()
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -153,7 +155,7 @@ impl Render for AppView {
                             .h_full()
                             .px_3()
                             .text_color(rgba(0xcdd6f4ff))
-                            .text_sm()
+                            .text_xs()
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -448,7 +450,7 @@ impl Render for AppView {
                     .border_t_1()
                     .border_color(rgb(0x313244))
                     .items_center()
-                    .text_xs()
+                    .text_sm()
                     // ── Left: panel toggle buttons ────────────────────────────
                     .child(
                         div()
@@ -645,7 +647,7 @@ impl Render for AppView {
                                         .h(px(28.0))
                                         .px_3()
                                         .text_color(rgba(0xcdd6f4ff))
-                                        .text_sm()
+                                        .text_xs()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgba(0x45475a88)))
                                         .on_mouse_down(
@@ -671,7 +673,7 @@ impl Render for AppView {
                                         .h(px(28.0))
                                         .px_3()
                                         .text_color(rgba(0xcdd6f4ff))
-                                        .text_sm()
+                                        .text_xs()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgba(0x45475a88)))
                                         .on_mouse_down(
@@ -693,7 +695,7 @@ impl Render for AppView {
                                         .items_center()
                                         .h(px(28.0))
                                         .px_3()
-                                        .text_sm();
+                                        .text_xs();
                                     if has_schema {
                                         el.text_color(rgba(0xcdd6f4ff))
                                             .cursor_pointer()
@@ -720,7 +722,7 @@ impl Render for AppView {
                                         .items_center()
                                         .h(px(28.0))
                                         .px_3()
-                                        .text_sm();
+                                        .text_xs();
                                     if has_data {
                                         el.text_color(rgba(0xcdd6f4ff))
                                             .cursor_pointer()
@@ -749,7 +751,7 @@ impl Render for AppView {
                                         .items_center()
                                         .h(px(28.0))
                                         .px_3()
-                                        .text_sm();
+                                        .text_xs();
                                     if has_schema {
                                         el.text_color(rgba(0xf38ba8ff))
                                             .cursor_pointer()
@@ -776,7 +778,7 @@ impl Render for AppView {
                                         .items_center()
                                         .h(px(28.0))
                                         .px_3()
-                                        .text_sm();
+                                        .text_xs();
                                     if has_data {
                                         el.text_color(rgba(0xf38ba8ff))
                                             .cursor_pointer()
@@ -822,7 +824,7 @@ impl Render for AppView {
                                         .h(px(28.0))
                                         .px_3()
                                         .text_color(rgba(0xcdd6f4ff))
-                                        .text_sm()
+                                        .text_xs()
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -850,7 +852,7 @@ impl Render for AppView {
                                         .h(px(28.0))
                                         .px_3()
                                         .text_color(rgba(0xcdd6f4ff))
-                                        .text_sm()
+                                        .text_xs()
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,

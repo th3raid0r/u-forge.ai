@@ -1,3 +1,10 @@
+[ui]
+# Base font size in pixels (rem unit). All text scales relative to this:
+#   text_xs (labels, timestamps) = 0.75 × font_size
+#   text_sm (body, menus)        = 0.875 × font_size
+# Default: 16.0. Increase for high-DPI or accessibility; decrease for compact UI.
+font_size = 16.0
+
 [storage]
 # Path to the SQLite database directory. Defaults to ./data/db if omitted.
 db_path = "./data/db"

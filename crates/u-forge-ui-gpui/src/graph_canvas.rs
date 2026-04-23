@@ -251,11 +251,12 @@ impl Render for GraphCanvas {
                             zoom,
                         };
 
+                        let font_scale = f32::from(window.rem_size()) / 16.0;
                         let snap = snapshot.read();
                         let selected_idx = selected_node_id
                             .and_then(|id| snap.nodes.iter().position(|n| n.id == id));
                         let commands =
-                            generate_draw_commands(&snap, &viewport, selected_idx);
+                            generate_draw_commands(&snap, &viewport, selected_idx, font_scale);
                         let lod = viewport.lod_level();
                         // Clone the precomputed legend so we can drop the read lock.
                         // `legend_types` is built once in `build_snapshot()` and only
@@ -385,7 +386,7 @@ impl Render for GraphCanvas {
                                 rgba(0x1e1e2ed8),
                             ));
 
-                            let label_size = px(10.0);
+                            let label_size = window.rem_size() * 0.875;
                             let line_h = label_size * 1.3;
 
                             for (i, type_name) in legend_types.iter().enumerate() {

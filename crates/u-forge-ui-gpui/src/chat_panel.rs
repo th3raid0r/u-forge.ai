@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    anchored, deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px,
+    anchored, deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px, rems,
     rgb, rgba, relative, App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter,
     ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Window,
 };
@@ -934,7 +934,7 @@ impl Render for ChatPanel {
                             .flex()
                             .items_center()
                             .min_w_0()
-                            .text_xs()
+                            .text_sm()
                             .text_color(if is_current {
                                 rgba(0xcdd6f4ff)
                             } else {
@@ -982,7 +982,7 @@ impl Render for ChatPanel {
                             .w(px(18.0))
                             .h(px(18.0))
                             .rounded(px(2.0))
-                            .text_xs()
+                            .text_sm()
                             .text_color(rgba(0x6c708688))
                             .cursor_pointer()
                             .hover(|s| s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66)))
@@ -1077,9 +1077,9 @@ impl Render for ChatPanel {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .w(px(14.0))
-                                .h(px(14.0))
-                                .text_xs()
+                                .w(rems(1.0))
+                                .h(rems(1.0))
+                                .text_sm()
                                 .text_color(rgba(0x6c708688))
                                 .cursor_pointer()
                                 .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
@@ -1102,9 +1102,9 @@ impl Render for ChatPanel {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .text_xs()
+                            .w(rems(1.0))
+                            .h(rems(1.0))
+                            .text_sm()
                             .text_color(rgba(0x6c708688))
                             .cursor_pointer()
                             .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
@@ -1130,10 +1130,10 @@ impl Render for ChatPanel {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .w(px(14.0))
-                                .h(px(14.0))
+                                .w(rems(1.0))
+                                .h(rems(1.0))
                                 .rounded(px(2.0))
-                                .text_xs()
+                                .text_sm()
                                 .text_color(rgba(0x6c708688))
                                 .cursor_pointer()
                                 .hover(|s| {
@@ -1180,7 +1180,7 @@ impl Render for ChatPanel {
                         .items_center()
                         .h(px(24.0))
                         .px_2()
-                        .text_xs()
+                        .text_sm()
                         .text_color(if is_selected {
                             rgba(0xcdd6f4ff)
                         } else {
@@ -1269,7 +1269,7 @@ impl Render for ChatPanel {
                                     .border_1()
                                     .border_color(rgb(0x45475a))
                                     .rounded(px(3.0))
-                                    .text_xs()
+                                    .text_sm()
                                     .text_color(rgba(0xcdd6f4ff))
                                     .cursor_pointer()
                                     .overflow_x_hidden()
@@ -1301,7 +1301,7 @@ impl Render for ChatPanel {
                                     .h(px(22.0))
                                     .bg(rgb(0xa6e3a1))
                                     .rounded(px(3.0))
-                                    .text_xs()
+                                    .text_sm()
                                     .text_color(rgba(0x1e1e2eff))
                                     .cursor_pointer()
                                     .on_mouse_down(
@@ -1379,7 +1379,7 @@ impl Render for ChatPanel {
                             .flex_none()
                             .px_2()
                             .py_1()
-                            .text_xs()
+                            .text_sm()
                             .text_color(rgba(0xf9e2afff))
                             .child("Generating…"),
                     );
@@ -1525,7 +1525,7 @@ impl Render for ChatPanel {
                                     .h(px(28.0))
                                     .bg(bg)
                                     .rounded(px(3.0))
-                                    .text_xs()
+                                    .text_sm()
                                     .text_color(fg)
                                     .cursor_pointer()
                                     .on_mouse_down(
@@ -1548,7 +1548,7 @@ impl Render for ChatPanel {
                         el.child(
                             div()
                                 .id("connect-error")
-                                .text_xs()
+                                .text_sm()
                                 .text_color(rgba(0xf38ba8ff))
                                 .child(err),
                         )
@@ -1567,7 +1567,7 @@ impl Render for ChatPanel {
                                     .gap(px(4.0))
                                     .child(
                                         div()
-                                            .text_xs()
+                                            .text_sm()
                                             .text_color(rgba(0x6c7086ff))
                                             .child("Model:"),
                                     )
@@ -1582,7 +1582,7 @@ impl Render for ChatPanel {
                                             .border_1()
                                             .border_color(rgb(0x45475a))
                                             .rounded(px(3.0))
-                                            .text_xs()
+                                            .text_sm()
                                             .text_color(if has_provider {
                                                 rgba(0xcdd6f4ff)
                                             } else {
@@ -1643,7 +1643,7 @@ impl Render for ChatPanel {
                                     .items_center()
                                     .h(px(24.0))
                                     .px_3()
-                                    .text_xs()
+                                    .text_sm()
                                     .text_color(rgba(0xcdd6f4ff))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgba(0x45475a88)))
@@ -1658,7 +1658,7 @@ impl Render for ChatPanel {
                                     .items_center()
                                     .h(px(24.0))
                                     .px_3()
-                                    .text_xs()
+                                    .text_sm()
                                     .text_color(rgba(0xcdd6f4ff))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgba(0x45475a88)))

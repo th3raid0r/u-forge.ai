@@ -39,7 +39,7 @@ pub use error::EmbeddingDimensionMismatch;
 pub use builder::ObjectBuilder;
 pub use config::{
     AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig,
-    ModelConfig, ModelLoadParams, StorageConfig,
+    ModelConfig, ModelLoadParams, StorageConfig, UiConfig,
 };
 pub use graph::{
     GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,

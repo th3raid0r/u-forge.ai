@@ -241,7 +241,7 @@ impl ChatMessageView {
             .map(|b| b.into_any_element())
             .unwrap_or_else(|| {
                 div()
-                    .text_xs()
+                    .text_base()
                     .text_color(text_color)
                     .child(self.text.clone())
                     .into_any_element()
@@ -256,7 +256,7 @@ impl ChatMessageView {
             .bg(bg)
             .child(
                 div()
-                    .text_xs()
+                    .text_base()
                     .text_color(label_color)
                     .pb(px(2.0))
                     .child(label),
@@ -302,7 +302,7 @@ impl ChatMessageView {
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_base()
                             .text_color(rgba(0xf9e2afff))
                             .child(header),
                     ),
@@ -315,7 +315,7 @@ impl ChatMessageView {
                 .map(|b| b.into_any_element())
                 .unwrap_or_else(|| {
                     div()
-                        .text_xs()
+                        .text_base()
                         .text_color(rgba(0x6c7086ff))
                         .mt_1()
                         .child(self.text.clone())
@@ -358,14 +358,14 @@ impl ChatMessageView {
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_base()
                             .text_color(rgba(0xcba6f7ff))
                             .child(SharedString::from(header_label)),
                     )
                     .when(has_result, |row| {
                         row.child(
                             div()
-                                .text_xs()
+                                .text_base()
                                 .text_color(rgba(0xa6e3a188))
                                 .child("✓"),
                         )
@@ -384,13 +384,13 @@ impl ChatMessageView {
                     .rounded(px(3.0))
                     .child(
                         div()
-                            .text_xs()
+                            .text_base()
                             .text_color(rgba(0x6c7086ff))
                             .child("Args:"),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_base()
                             .text_color(rgba(0xcdd6f4cc))
                             .child(tool_args),
                     ),
@@ -406,13 +406,13 @@ impl ChatMessageView {
                         .rounded(px(3.0))
                         .child(
                             div()
-                                .text_xs()
+                                .text_base()
                                 .text_color(rgba(0x6c7086ff))
                                 .child("Result:"),
                         )
                         .child(
                             div()
-                                .text_xs()
+                                .text_base()
                                 .text_color(rgba(0xa6e3a1cc))
                                 .child(result),
                         ),
