@@ -5,17 +5,12 @@
 //! input field, dropdowns, and sibling messages don't re-render per token.
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, Context, EntityId, EventEmitter, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, Styled, Window,
+    div, prelude::*, px, rgb, rgba, Context, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Render, SharedString, Styled, Window,
 };
 use tracing::trace_span;
 
 use crate::chat_history::{StoredChatMessage, StoredRole, StoredToolCall};
-
-/// Emitted by an assistant `ChatMessageView` when the user clicks "⟳ Retry".
-/// The payload is the entity ID of the emitting message so `ChatPanel` can
-/// locate it in its `messages` vec and replay the preceding user turn.
-pub(crate) struct RetryRequested(pub EntityId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatMessageRole {
@@ -26,8 +21,6 @@ pub(crate) enum ChatMessageRole {
     /// A tool call made by the agent during the response loop.
     ToolCall,
 }
-
-impl EventEmitter<RetryRequested> for ChatMessageView {}
 
 /// A single message in the chat, backed by its own GPUI entity.
 pub(crate) struct ChatMessageView {
@@ -155,7 +148,7 @@ impl ChatMessageView {
         cx.notify();
     }
 
-    fn render_text(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_text(&self, _cx: &mut Context<Self>) -> gpui::Div {
         let (bg, label_color, label, text_color) = match self.role {
             ChatMessageRole::User => (
                 rgb(0x313244),
@@ -173,7 +166,6 @@ impl ChatMessageView {
         };
 
         let text = self.text.clone();
-        let is_assistant = self.role == ChatMessageRole::Assistant;
 
         div()
             .flex()
@@ -190,35 +182,6 @@ impl ChatMessageView {
                     .child(label),
             )
             .child(div().text_xs().text_color(text_color).child(text))
-            .when(is_assistant, |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .pt(px(2.0))
-                        .child(
-                            div()
-                                .id("retry-btn")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(px(14.0))
-                                .h(px(14.0))
-                                .text_xs()
-                                .text_color(rgba(0x6c708688))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
-                                        cx.emit(RetryRequested(cx.entity_id()));
-                                    }),
-                                )
-                                .child("⟳"),
-                        ),
-                )
-            })
     }
 
     /// Collapsible thinking block. Collapsed by default so the virtual list

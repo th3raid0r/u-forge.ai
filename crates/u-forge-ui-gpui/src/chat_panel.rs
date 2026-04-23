@@ -15,7 +15,7 @@ use u_forge_core::{
 };
 
 use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessage};
-use crate::chat_message::{ChatMessageRole, ChatMessageView, RetryRequested};
+use crate::chat_message::{ChatMessageRole, ChatMessageView};
 use crate::text_field::{TextFieldView, TextSubmit};
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -76,9 +76,6 @@ pub(crate) struct ChatPanel {
     /// Subscription for the Enter-submit event from the input field.
     #[allow(dead_code)]
     submit_sub: gpui::Subscription,
-    /// One subscription per message (parallel to `messages`) for retry events.
-    /// Dropping a subscription unsubscribes. Cleared on session switch.
-    msg_subscriptions: Vec<gpui::Subscription>,
     /// Virtualized list state for the message area (only renders visible items).
     list_state: ListState,
     /// Virtualized list state for the session history dropdown. Prevents
@@ -167,15 +164,6 @@ impl ChatPanel {
             };
         let msg_count = messages.len();
 
-        let msg_subscriptions: Vec<gpui::Subscription> = messages
-            .iter()
-            .map(|msg| {
-                cx.subscribe(msg, |this: &mut Self, _src, ev: &RetryRequested, cx| {
-                    this.retry_message(ev.0, cx);
-                })
-            })
-            .collect();
-
         Self {
             input_field,
             enter_to_submit: true,
@@ -197,7 +185,6 @@ impl ChatPanel {
             response_reserve,
             tokio_rt,
             submit_sub,
-            msg_subscriptions,
             list_state: ListState::new(msg_count, ListAlignment::Bottom, px(200.0)),
             history_list_state: ListState::new(
                 session_list.len(),
@@ -275,12 +262,8 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) -> Entity<ChatMessageView> {
         let msg = cx.new(|_cx| ChatMessageView::new_text(role, text));
-        let sub = cx.subscribe(&msg, |this: &mut Self, _src, ev: &RetryRequested, cx| {
-            this.retry_message(ev.0, cx);
-        });
         let prev_len = self.messages.len();
         self.messages.push(msg.clone());
-        self.msg_subscriptions.push(sub);
         self.splice_appended(prev_len);
         msg
     }
@@ -294,12 +277,8 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) -> Entity<ChatMessageView> {
         let msg = cx.new(|_cx| ChatMessageView::new_tool_call(internal_id, name, args));
-        let sub = cx.subscribe(&msg, |this: &mut Self, _src, ev: &RetryRequested, cx| {
-            this.retry_message(ev.0, cx);
-        });
         let prev_len = self.messages.len();
         self.messages.push(msg.clone());
-        self.msg_subscriptions.push(sub);
         self.splice_appended(prev_len);
         msg
     }
@@ -323,8 +302,9 @@ impl ChatPanel {
         self.finalize_stream(cx);
     }
 
-    /// Re-run the user turn that precedes `msg_entity_id`, replacing that
-    /// assistant message and everything after it.
+    /// Re-run the user turn at or before `msg_entity_id`.
+    /// If the clicked message is itself a User message, replays it directly.
+    /// Otherwise walks backwards to find the nearest preceding User message.
     fn retry_message(&mut self, msg_entity_id: EntityId, cx: &mut Context<Self>) {
         if self.streaming {
             tracing::debug!("retry_message suppressed: stream in progress");
@@ -336,18 +316,21 @@ impl ChatPanel {
             None => return,
         };
 
-        // Walk backwards to find the nearest preceding User message.
-        let Some(user_idx) = (0..msg_idx).rev().find(|&i| {
-            self.messages[i].read(cx).role == ChatMessageRole::User
-        }) else {
-            return;
+        let user_idx = if self.messages[msg_idx].read(cx).role == ChatMessageRole::User {
+            msg_idx
+        } else {
+            match (0..msg_idx).rev().find(|&i| {
+                self.messages[i].read(cx).role == ChatMessageRole::User
+            }) {
+                Some(idx) => idx,
+                None => return,
+            }
         };
 
         let user_text = self.messages[user_idx].read(cx).text().to_string();
 
         // Truncate from the user message onward (inclusive); send_with_text re-pushes it.
         self.messages.truncate(user_idx);
-        self.msg_subscriptions.truncate(user_idx);
         self.list_state.reset(self.messages.len());
 
         self.send_with_text(user_text, cx);
@@ -775,7 +758,6 @@ impl ChatPanel {
         }
 
         self.messages.clear();
-        self.msg_subscriptions.clear();
         self.current_session_id = None;
         self.history_dropdown_open = false;
         self.reset_list_state();
@@ -806,15 +788,6 @@ impl ChatPanel {
                     .into_iter()
                     .map(|m| cx.new(|_cx| ChatMessageView::from_stored(m)))
                     .collect();
-                self.msg_subscriptions = self
-                    .messages
-                    .iter()
-                    .map(|msg| {
-                        cx.subscribe(msg, |this: &mut Self, _src, ev: &RetryRequested, cx| {
-                            this.retry_message(ev.0, cx);
-                        })
-                    })
-                    .collect();
                 self.current_session_id = Some(session_id.to_string());
                 self.history_dropdown_open = false;
                 self.reset_list_state();
@@ -840,7 +813,6 @@ impl ChatPanel {
             return;
         }
         self.messages.remove(ix);
-        let _ = self.msg_subscriptions.remove(ix);
         self.list_state.reset(self.messages.len());
         self.save_current_session(cx);
         cx.notify();
@@ -869,7 +841,6 @@ impl ChatPanel {
         // If we just deleted the active session, clear the chat.
         if self.current_session_id.as_deref() == Some(session_id) {
             self.messages.clear();
-            self.msg_subscriptions.clear();
             self.current_session_id = None;
             self.reset_list_state();
         }
@@ -1036,7 +1007,10 @@ impl Render for ChatPanel {
                 };
                 let is_last = ix + 1 == panel.messages.len();
                 let is_streaming = panel.streaming;
-                let entity = list_entity.clone();
+                let role = msg.read(cx).role;
+                let can_retry = !is_streaming
+                    && matches!(role, ChatMessageRole::User | ChatMessageRole::Assistant);
+                let show_delete = is_last && !is_streaming;
 
                 let mut row = div()
                     .id(("msg-row", ix))
@@ -1045,43 +1019,82 @@ impl Render for ChatPanel {
                     .w_full()
                     .child(msg);
 
-                if is_last && !is_streaming {
-                    row = row.child(
-                        div()
-                            .id(("del-row", ix))
-                            .flex()
-                            .flex_row()
-                            .justify_end()
-                            .px_2()
-                            .py(px(2.0))
-                            .child(
-                                div()
-                                    .id(("del", ix))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .rounded(px(2.0))
-                                    .text_xs()
-                                    .text_color(rgba(0x6c708688))
-                                    .cursor_pointer()
-                                    .hover(|s| {
-                                        s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66))
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_, _, cx: &mut App| {
-                                            entity.update(cx, |this, cx| {
-                                                let last =
-                                                    this.messages.len().saturating_sub(1);
-                                                this.delete_message_at(last, cx);
-                                            });
-                                        },
-                                    )
-                                    .child("🗑"),
-                            ),
-                    );
+                if can_retry || show_delete {
+                    let del_entity = list_entity.clone();
+                    let retry_entity = list_entity.clone();
+                    let msg_entity_id = panel.messages[ix].entity_id();
+
+                    let bubble_bg = match role {
+                        ChatMessageRole::User => rgb(0x313244),
+                        ChatMessageRole::Thinking => rgb(0x181825),
+                        ChatMessageRole::Assistant | ChatMessageRole::ToolCall => rgb(0x1e1e2e),
+                    };
+
+                    let mut action_bar = div()
+                        .id(("action-bar", ix))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap_1()
+                        .px_2()
+                        .py(px(2.0))
+                        .bg(bubble_bg);
+
+                    if can_retry {
+                        action_bar = action_bar.child(
+                            div()
+                                .id(("retry", ix))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .text_xs()
+                                .text_color(rgba(0x6c708688))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_, _, cx: &mut App| {
+                                        retry_entity.update(cx, |this, cx| {
+                                            this.retry_message(msg_entity_id, cx);
+                                        });
+                                    },
+                                )
+                                .child("⟳"),
+                        );
+                    }
+
+                    if show_delete {
+                        action_bar = action_bar.child(
+                            div()
+                                .id(("del", ix))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .rounded(px(2.0))
+                                .text_xs()
+                                .text_color(rgba(0x6c708688))
+                                .cursor_pointer()
+                                .hover(|s| {
+                                    s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_, _, cx: &mut App| {
+                                        del_entity.update(cx, |this, cx| {
+                                            let last = this.messages.len().saturating_sub(1);
+                                            this.delete_message_at(last, cx);
+                                        });
+                                    },
+                                )
+                                .child("x"),
+                        );
+                    }
+
+                    row = row.child(action_bar);
                 }
                 row.into_any_element()
             },

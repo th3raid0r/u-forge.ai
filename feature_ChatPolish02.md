@@ -12,98 +12,64 @@ Canonical test command: `cargo test --workspace -- --test-threads=1`.
 
 ---
 
-## Feature A — Retry button on every assistant message ✓ DONE
+## Feature A — Retry button on assistant and user messages ✓ DONE
 
 ### Intent
-Each assistant message shows a "⟳ Retry" button. Clicking it re-runs the
-immediately preceding user turn, replacing this assistant message (and
-anything after it — thinking blocks, tool calls, later turns).
+Every user and assistant message shows a "⟳" retry button. Clicking it
+re-runs the nearest user turn at or before that message, replacing it and
+everything after it (thinking blocks, tool calls, later turns).
+
+User-message retry is especially useful after deleting an assistant response:
+the remaining user message gets a retry button so generation can be
+re-triggered without retyping.
 
 ### Status
-**Implemented.** All tests pass (`cargo test --workspace -- --test-threads=1`).
+**Implemented and refactored.** All tests pass (`cargo test --workspace -- --test-threads=1`).
 
-Key changes landed:
-- `chat_message.rs`: `RetryRequested(EntityId)` event + `EventEmitter` impl;
-  `render_text` takes `cx` and appends a `⟳` footer button on assistant
-  messages that emits `RetryRequested(cx.entity_id())` on click.
-- `chat_panel.rs`: `msg_subscriptions: Vec<gpui::Subscription>` parallel to
-  `messages`; `send_with_text` extracted from `do_send`; `retry_message`
-  finds the preceding user turn, truncates `messages` + `msg_subscriptions`
-  to that index, resets `list_state`, and calls `send_with_text`.
-  Subscriptions created on push, rebuilt on `load_session`, cleared on
-  `new_session` / `delete_session`.
+Key changes from initial implementation through final refactor:
+- `send_with_text` extracted from `do_send`; `retry_message` finds the
+  correct user turn, truncates `messages` to that index, resets `list_state`,
+  calls `send_with_text`.
+- `retry_message` extended: if the clicked message IS a `User` role, it
+  uses it directly instead of walking backwards. This enables retry on
+  dangling user messages (e.g. after deleting an assistant response).
+- **Retry button moved to render-site** (see "Render-site action bar" in
+  Feature C). `RetryRequested` event, `EventEmitter` impl, and
+  `msg_subscriptions` vector were all removed — the list item builder
+  renders the button directly and calls `retry_message` via entity update.
 
 ### Original current state (pre-implementation)
 `ChatPanel::do_send` pushed a `User` message then streamed the response.
 No retry existed. Messages stored as `Vec<Entity<ChatMessageView>>`.
 
-### Plan
+### Plan (historical — superseded by action bar refactor)
 
-1. Add a `retry_message(&mut self, msg_entity_id: gpui::EntityId, cx: &mut Context<Self>)`
-   method on `ChatPanel`:
-   - Abort if `self.streaming` — log via `tracing::debug!` and return, same
-     pattern as `new_session`/`load_session`/`delete_session`.
-   - Find `msg_idx` by searching `self.messages` for the entity with a
-     matching id. If not found, return.
-   - Walk backwards from `msg_idx - 1` to find the nearest preceding
-     `ChatMessageRole::User` message. Record its text.
-   - If none found, return (guards against corrupt state).
-   - Truncate `self.messages` to remove everything from and including
-     the User message we're about to re-send — we'll push it back fresh
-     so `save_current_session` sees a clean tail.
-   - Call `self.list_state.reset(self.messages.len())` — truncation
-     invalidates cached item measurements past the cut point.
-   - Call `self.send_with_text(user_text, cx)` (new helper, see below).
+The initial design used GPUI event emission:
+1. `RetryRequested(EntityId)` event emitted from `ChatMessageView`.
+2. `ChatPanel` subscribed per-message via `msg_subscriptions: Vec<gpui::Subscription>`.
+3. Retry button rendered inside `ChatMessageView::render_text` for assistant only.
 
-2. Extract a `fn send_with_text(&mut self, text: String, cx: &mut Context<Self>)`
-   helper that contains the current `do_send` body from "Clear input..."
-   onward. `do_send` becomes:
-   ```rust
-   fn do_send(&mut self, cx: &mut Context<Self>) {
-       let text = self.input_field.read(cx).content.trim().to_string();
-       if text.is_empty() || self.streaming { return; }
-       self.input_field.update(cx, |field, cx| field.set_content("", cx));
-       self.send_with_text(text, cx);
-   }
-   ```
-   Retry reuses `send_with_text` without going through the input field.
-
-3. Add a footer row to `ChatMessageView::render_text` when
-   `role == Assistant` containing the retry button. 14×14 `div`, text
-   `"⟳"`, `rgba(0x6c708688)` idle, hover to `rgba(0xcdd6f4ff)`.
-4. The retry button needs to tell the parent `ChatPanel` which message to
-   retry. The message entity doesn't know its own index and doesn't know
-   about `ChatPanel`. Use event emission:
-   - Add `pub(crate) struct RetryRequested(pub gpui::EntityId);` to
-     `chat_message.rs`.
-   - `impl EventEmitter<RetryRequested> for ChatMessageView`.
-   - The button handler emits `cx.emit(RetryRequested(cx.entity_id()))`.
-5. `ChatPanel` subscribes on each push:
-   ```rust
-   let sub = cx.subscribe(&msg, |this: &mut ChatPanel, _src, ev: &RetryRequested, cx| {
-       this.retry_message(ev.0, cx);
-   });
-   // stored so it isn't dropped
-   ```
-   Subscriptions stored in a `Vec<gpui::Subscription>` on `ChatPanel`
-   (alongside the existing `submit_sub`). Cleared on session switch.
+This was replaced by the render-site action bar (see Feature C) which
+eliminated the subscription machinery entirely and extended retry to user
+messages at the same time.
 
 **Edge cases**
 - Retry on the *last* assistant message: behaves as a regenerate.
-- Retry when the provider isn't configured: the existing "Chat unavailable"
-  fallback in `do_send` (now `send_with_text`) handles this.
+- Retry a dangling user message (assistant deleted): uses that message directly.
+- Retry when the provider isn't configured: `send_with_text` handles this.
 - Retry during streaming: suppressed via the `self.streaming` guard.
-- Retry across a Thinking block: Thinking blocks are filtered out of
-  `raw_history` in `send_with_text` (`chat_panel.rs:281-297`), so removing
-  them doesn't change the effective history. Safe to truncate.
+- Retry across a Thinking block: Thinking blocks are filtered from
+  `raw_history` in `send_with_text`, so truncating past them is safe.
 - Retry across tool calls: same reasoning — tool call messages aren't in
-  `raw_history`. Safe to truncate.
+  `raw_history`.
 
 ### Files touched
-- `crates/u-forge-ui-gpui/src/chat_message.rs` — `RetryRequested` event,
-  `EventEmitter` impl, retry button in `render_text` for Assistant.
-- `crates/u-forge-ui-gpui/src/chat_panel.rs` — new `retry_message`,
-  `send_with_text` extraction, per-message subscription vector.
+- `crates/u-forge-ui-gpui/src/chat_message.rs` — retry button removed
+  from `render_text`; `RetryRequested` event and `EventEmitter` impl
+  removed; `msg_subscriptions` machinery eliminated.
+- `crates/u-forge-ui-gpui/src/chat_panel.rs` — `retry_message` extended
+  for user-role messages; `send_with_text` extraction; subscription vector
+  removed; retry button moved to render-site action bar (see Feature C).
 
 ---
 
@@ -237,11 +203,15 @@ so the user can chain-click to walk backwards through history.
 This is an undo / "back button" for conversation tail, used to trim
 before a retry (or instead of one).
 
-### Status — DONE
-- `delete_message_at` added to `ChatPanel` (`chat_panel.rs:825`).
-- Virtual-list item builder wraps each message in a `div` that conditionally
-  appends the 🗑 button when `is_last && !is_streaming`.
-- `msg_subscriptions.remove(ix)` in sync with `messages.remove(ix)`.
+### Status — DONE (refactored)
+- `delete_message_at` added to `ChatPanel`.
+- **Render-site action bar** replaces both the original `del-row` and the
+  per-entity retry button from Feature A. The list item builder conditionally
+  appends a shared action bar below each message containing `[⟳] [x]`
+  buttons. Retry shows for User/Assistant when not streaming; delete (`x`)
+  shows only on the last message when not streaming.
+- Action bar background matches the bubble above it per role.
+- `msg_subscriptions.remove(ix)` removed — subscription vector eliminated.
 - `list_state.reset(len)` + `save_current_session` called on every delete.
 - `cargo check -p u-forge-ui-gpui` and full workspace tests pass clean.
 
@@ -257,99 +227,35 @@ session. No per-message delete. The last-message slot had no affordance.
 - **Re-evaluates after deletion.** The new tail picks up the button.
 - Chainable: click repeatedly to delete all messages.
 
-### Plan
+### Plan (as implemented)
 
-1. Add `fn delete_message_at(&mut self, ix: usize, cx: &mut Context<Self>)`
-   on `ChatPanel`:
-   - Abort if `self.streaming` — same suppression pattern as other
-     mutators. (The last message during streaming is the in-flight
-     assistant response; allowing delete mid-stream would race with
-     `append_text`.)
-   - Bounds-check: `if ix >= self.messages.len() { return; }`.
-   - `self.messages.remove(ix);`
-   - `self.list_state.reset(self.messages.len())` — truncation (or
-     mid-list removal) invalidates cached measurements.
-   - Drop any subscriptions the deleted entity owned (see step 3 below).
-   - `self.save_current_session(cx);` — persistence stays in sync.
-   - `cx.notify();`.
+1. `fn delete_message_at(&mut self, ix: usize, cx: &mut Context<Self>)` on `ChatPanel`:
+   - Abort if `self.streaming`.
+   - Bounds-check `ix`.
+   - `self.messages.remove(ix)`.
+   - `self.list_state.reset(self.messages.len())`.
+   - `self.save_current_session(cx)` + `cx.notify()`.
 
-   **No group-pop behavior.** Each click deletes exactly one message —
-   user's explicit "back button" semantics. A Thinking block followed by
-   an Assistant takes two clicks to clear; that's intentional.
+   **No group-pop behavior.** Each click deletes exactly one message.
+   A Thinking block followed by an Assistant takes two clicks; intentional.
 
-2. Button placement — **render-site, not per-entity**. Wrap each list
-   item in the virtualized list builder (`chat_panel.rs:841-851`) with
-   a container that conditionally adds the delete button when
-   `ix == panel.messages.len() - 1`:
-   ```rust
-   move |ix, _window, cx: &mut App| {
-       let panel = list_entity.read(cx);
-       let Some(msg) = panel.messages.get(ix).cloned() else {
-           return div().into_any_element();
-       };
-       let is_last = ix + 1 == panel.messages.len();
-       let is_streaming = panel.streaming;
-       let entity = list_entity.clone();
+2. **Render-site action bar** — both retry and delete live in the list item
+   builder in `chat_panel.rs`, not inside `ChatMessageView`. On each render
+   the builder reads `role`, `is_last`, and `is_streaming` from the panel,
+   then conditionally appends an action bar:
+   - `can_retry`: `User` or `Assistant` role, not streaming → shows `⟳`.
+   - `show_delete`: `is_last && !is_streaming` → shows `x`.
+   - Action bar only rendered when at least one button is visible.
+   - Background color matches the bubble above it:
+     User → `rgb(0x313244)`, Thinking → `rgb(0x181825)`,
+     Assistant/ToolCall → `rgb(0x1e1e2e)`.
+   - Retry calls `retry_message(msg_entity_id, cx)` directly via entity
+     update — no event emission needed.
+   - Delete calls `delete_message_at(last, cx)` via entity update.
 
-       let mut row = div()
-           .id(("msg-row", ix))
-           .flex()
-           .flex_col()
-           .w_full()
-           .child(msg);
-
-       if is_last && !is_streaming {
-           row = row.child(
-               div()
-                   .id(("del-row", ix))
-                   .flex()
-                   .flex_row()
-                   .justify_end()
-                   .px_2()
-                   .py(px(2.0))
-                   .child(
-                       div()
-                           .id(("del", ix))
-                           .flex()
-                           .items_center()
-                           .justify_center()
-                           .w(px(18.0))
-                           .h(px(18.0))
-                           .rounded(px(2.0))
-                           .text_xs()
-                           .text_color(rgba(0x6c708688))
-                           .cursor_pointer()
-                           .hover(|s| s.text_color(rgba(0xf38ba8ff))
-                                       .bg(rgba(0x45475a66)))
-                           .on_mouse_down(
-                               MouseButton::Left,
-                               move |_, _, cx: &mut App| {
-                                   entity.update(cx, |this, cx| {
-                                       let last = this.messages.len().saturating_sub(1);
-                                       this.delete_message_at(last, cx);
-                                   });
-                               },
-                           )
-                           .child("🗑"),
-                   ),
-           );
-       }
-       row.into_any_element()
-   }
-   ```
-
-   This keeps the button **outside** `ChatMessageView`. No per-message
-   `is_last` bookkeeping, no re-notify dance when the tail shifts — the
-   list automatically re-renders items when their data changes, and the
-   wrapper div recomputes `is_last` on each render.
-
-3. Subscription cleanup for Feature A:
-   When Feature A adds `Vec<gpui::Subscription>` on `ChatPanel` (one per
-   message for retry), `delete_message_at` must also remove the
-   corresponding subscription. Since `gpui::Subscription` doesn't carry
-   a natural key, store them in a parallel `Vec<gpui::Subscription>`
-   indexed the same as `self.messages`, and `subs.remove(ix)` alongside
-   `self.messages.remove(ix)`. Dropping a `Subscription` unsubscribes.
+   This eliminates `RetryRequested`, `EventEmitter<RetryRequested>`, and
+   the entire `msg_subscriptions: Vec<gpui::Subscription>` vector that
+   Feature A originally introduced.
 
 **Edge cases**
 - Deleting down to zero messages: session becomes empty;
@@ -361,8 +267,10 @@ session. No per-message delete. The last-message slot had no affordance.
 
 ### Files touched
 - `crates/u-forge-ui-gpui/src/chat_panel.rs` — `delete_message_at`,
-  wrapper div in the virtual-list item builder, subscription-vector
-  sync.
+  render-site action bar in the list item builder (retry + delete),
+  `msg_subscriptions` vector removed entirely.
+- `crates/u-forge-ui-gpui/src/chat_message.rs` — retry button and
+  `RetryRequested` event removed; `render_text` no longer takes `cx`.
 
 ---
 
@@ -450,16 +358,13 @@ Feature A (retry truncates) and Feature C (delete-at-ix removes) both
 need `reset(self.messages.len())`. Feature B doesn't touch the list
 structure.
 
-### Subscription storage
-Feature A introduces one subscription per message (for retry events).
-Keep a parallel `Vec<gpui::Subscription>` on `ChatPanel`:
-- Push alongside `self.messages.push(msg)`.
-- `remove(ix)` alongside `self.messages.remove(ix)`.
-- `clear()` on session switch (alongside `self.messages.clear()`).
-- On wholesale session load, rebuild from the new message list.
-
-This same vector carries any future per-message subscription (e.g. a
-future "edit message" event).
+### Subscription storage ✗ ELIMINATED
+The `msg_subscriptions: Vec<gpui::Subscription>` vector planned in Feature A
+was removed when retry moved to render-site (Feature C refactor). The list
+item builder reads panel state directly and calls `retry_message` via entity
+update — no per-message subscriptions needed. Future per-message actions
+should follow the same render-site pattern rather than reintroducing a
+subscription vector.
 
 ---
 
@@ -472,14 +377,8 @@ future "edit message" event).
 3. **Feature B2–B4 (Connect / Stop button states + wiring)** — depends
    on B1.
 4. **Feature A (retry)** ✓ DONE — `send_with_text` extracted; `retry_message`
-   implemented; `Vec<Subscription>` pattern in place. Feature C's delete
-   path (`delete_message_at`) must also call
-   `self.msg_subscriptions.remove(ix)` when it lands.
-
-Note on order vs dependency: C's subscription-cleanup concern (step
-C.3) is only meaningful once A lands. Land C first *without* the
-subscription-vector hook (there's nothing to clean up yet), then when A
-adds the vector, extend C's delete path in the same PR.
+   implemented and extended to handle user-role messages. Subscription vector
+   approach superseded by render-site action bar (see Feature C).
 
 ## Testing
 
@@ -493,8 +392,11 @@ adds the vector, extend C's delete path in the same PR.
     "[Cancelled]" marker appears, button returns to "Send".
   - Retry an assistant message mid-session: subsequent turns disappear,
     new response streams in.
-  - Inline delete on the tail: message vanishes, button re-appears on
-    the new tail; chain-click through multiple messages of varying
-    roles; confirm session empties cleanly.
+  - Delete the last assistant message: remaining user message shows `⟳`;
+    clicking it re-submits without retyping.
+  - Inline delete on the tail: message vanishes, `x` re-appears on the
+    new tail; chain-click through multiple messages of varying roles;
+    confirm session empties cleanly.
+  - Action bar background matches the bubble above it for each role.
 - Persistence: all above operations should survive an app restart via
   the `chat_history.db` session replay.
