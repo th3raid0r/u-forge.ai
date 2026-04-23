@@ -12,18 +12,30 @@ Canonical test command: `cargo test --workspace -- --test-threads=1`.
 
 ---
 
-## Feature A — Retry button on every assistant message
+## Feature A — Retry button on every assistant message ✓ DONE
 
 ### Intent
 Each assistant message shows a "⟳ Retry" button. Clicking it re-runs the
 immediately preceding user turn, replacing this assistant message (and
 anything after it — thinking blocks, tool calls, later turns).
 
-### Current state
-`ChatPanel::do_send` (`chat_panel.rs:264`) pushes a `User` message then
-streams the response. No retry exists. Messages are stored as
-`Vec<Entity<ChatMessageView>>` and `messages[i].read(cx).role` tells us what
-each is.
+### Status
+**Implemented.** All tests pass (`cargo test --workspace -- --test-threads=1`).
+
+Key changes landed:
+- `chat_message.rs`: `RetryRequested(EntityId)` event + `EventEmitter` impl;
+  `render_text` takes `cx` and appends a `⟳` footer button on assistant
+  messages that emits `RetryRequested(cx.entity_id())` on click.
+- `chat_panel.rs`: `msg_subscriptions: Vec<gpui::Subscription>` parallel to
+  `messages`; `send_with_text` extracted from `do_send`; `retry_message`
+  finds the preceding user turn, truncates `messages` + `msg_subscriptions`
+  to that index, resets `list_state`, and calls `send_with_text`.
+  Subscriptions created on push, rebuilt on `load_session`, cleared on
+  `new_session` / `delete_session`.
+
+### Original current state (pre-implementation)
+`ChatPanel::do_send` pushed a `User` message then streamed the response.
+No retry existed. Messages stored as `Vec<Entity<ChatMessageView>>`.
 
 ### Plan
 
@@ -379,10 +391,10 @@ future "edit message" event).
    list-wrapper approach. Doesn't depend on A.
 3. **Feature B2–B4 (Connect / Stop button states + wiring)** — depends
    on B1.
-4. **Feature A (retry)** — last. Reuses the `send_with_text` extraction
-   and introduces the `Vec<Subscription>` pattern that Feature C needs
-   to know about (Feature C's delete path must also drop the matching
-   subscription — see C.3).
+4. **Feature A (retry)** ✓ DONE — `send_with_text` extracted; `retry_message`
+   implemented; `Vec<Subscription>` pattern in place. Feature C's delete
+   path (`delete_message_at`) must also call
+   `self.msg_subscriptions.remove(ix)` when it lands.
 
 Note on order vs dependency: C's subscription-cleanup concern (step
 C.3) is only meaningful once A lands. Land C first *without* the
