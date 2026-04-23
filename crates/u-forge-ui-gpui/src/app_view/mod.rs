@@ -26,7 +26,7 @@ use u_forge_graph_view::GraphSnapshot;
 
 use state::AppState;
 
-use crate::chat_panel::{AvailableModel, ChatPanel};
+use crate::chat_panel::{AvailableModel, ChatPanel, ConnectRequested};
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
 use crate::search_panel::SearchPanel;
@@ -172,7 +172,7 @@ pub struct AppView {
     /// Current right panel width in pixels (user-resizable).
     pub(crate) right_panel_width: f32,
     // ── GPUI bookkeeping ──────────────────────────────────────────────────────
-    /// Subscriptions to node panel create/delete events — kept alive so handlers fire.
+    /// Subscriptions kept alive so handlers fire (node events, chat connect).
     _node_subs: Vec<Subscription>,
     // ── Perf overlay ──────────────────────────────────────────────────────────
     /// Whether the perf overlay is visible.
@@ -249,6 +249,15 @@ impl AppView {
                 cx,
             )
         });
+        let connect_sub = cx.subscribe(
+            &chat_panel,
+            |this: &mut Self, _panel, _ev: &ConnectRequested, cx| {
+                this.chat_panel.update(cx, |panel, _cx| {
+                    panel.set_connecting(true);
+                });
+                this.do_init_lemonade(cx);
+            },
+        );
 
         let state = AppState::new(
             graph,
@@ -275,7 +284,7 @@ impl AppView {
             sidebar_width: DEFAULT_SIDEBAR_W,
             editor_ratio: DEFAULT_EDITOR_RATIO,
             right_panel_width: DEFAULT_RIGHT_PANEL_W,
-            _node_subs: vec![node_sub_create, node_sub_delete],
+            _node_subs: vec![node_sub_create, node_sub_delete, connect_sub],
             perf_enabled: false,
             last_frame_cost_us: 0,
             frame_times_us: FrameTimeRing::default(),
@@ -801,6 +810,10 @@ impl AppView {
                     }
                     Err(e) => {
                         eprintln!("Lemonade init skipped: {e}");
+                        let msg = format!("{e}");
+                        view.chat_panel.update(cx, |panel, _cx| {
+                            panel.set_connect_failed(&msg);
+                        });
                         cx.notify();
                     }
                 }

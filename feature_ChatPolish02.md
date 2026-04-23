@@ -107,7 +107,7 @@ No retry existed. Messages stored as `Vec<Entity<ChatMessageView>>`.
 
 ---
 
-## Feature B — Three-state send button: Connect / Send / Stop
+## Feature B — Three-state send button: Connect / Send / Stop ✓ DONE
 
 ### Intent
 The bottom-right action button reflects the app's chat state:
@@ -117,7 +117,21 @@ The bottom-right action button reflects the app's chat state:
 - **"Stop"** — rendered when `self.streaming` is true; clicking cancels
   the in-flight stream.
 
-### Current state
+### Status
+DONE. Implemented on feature_ChatPolish02 branch.
+
+- `stream_task: Option<gpui::Task<()>>` field stores the active stream handle;
+  `stop_stream()` drops it, appends `\n[Cancelled]`, then calls `finalize_stream`.
+- `ConnectRequested` event emitted by `do_send` (and the Connect button) when no
+  provider/agent is present; AppView subscribes, sets `connecting = true`, and
+  re-invokes `do_init_lemonade`. On failure `set_connect_failed` is called and
+  the error renders in red below the input row.
+- Button is now four-state (Connect / Connecting… / Send / Stop) with width
+  pinned to 88 px to prevent input-row reflow.
+- `do_send` is guarded: streaming → no-op; no provider → emit ConnectRequested
+  (or no-op if already connecting).
+
+### Original current state (pre-implementation)
 - The button (`chat_panel.rs:1133-1164`) shows "Send" always; when streaming
   it just greys out and becomes a no-op.
 - `do_init_lemonade` runs exactly once at startup (`app_view/mod.rs:284`).

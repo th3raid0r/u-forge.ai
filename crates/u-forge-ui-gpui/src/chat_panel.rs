@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use gpui::{
     div, list, prelude::*, px, rgb, rgba, relative, App, Context, Entity, EntityId,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, Window,
+    EventEmitter, ListAlignment, ListState, MouseButton, MouseDownEvent, Window,
 };
 use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
@@ -16,6 +16,11 @@ use u_forge_core::{
 use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessage};
 use crate::chat_message::{ChatMessageRole, ChatMessageView, RetryRequested};
 use crate::text_field::{TextFieldView, TextSubmit};
+
+// ── Events ────────────────────────────────────────────────────────────────────
+
+pub(crate) struct ConnectRequested;
+impl EventEmitter<ConnectRequested> for ChatPanel {}
 
 // ── ChatPanel ───────────────────────────────────────────────────────────────
 
@@ -30,6 +35,10 @@ pub(crate) struct ChatPanel {
     messages: Vec<Entity<ChatMessageView>>,
     /// Whether a response is currently streaming.
     streaming: bool,
+    /// Handle to the active stream task. Dropping it cancels the outer async
+    /// consumer, which closes the mpsc::Receiver and causes the next tx.send()
+    /// inside prompt_stream to return Err — breaking the stream loop.
+    stream_task: Option<gpui::Task<()>>,
     /// During streaming: handle to the Thinking message entity being appended to
     /// (lazily created on the first ReasoningDelta / Thinking token).
     streaming_thinking: Option<Entity<ChatMessageView>>,
@@ -48,6 +57,10 @@ pub(crate) struct ChatPanel {
     model_dropdown_open: bool,
     /// The active chat provider for direct streaming (None until Lemonade is discovered).
     chat_provider: Option<LemonadeChatProvider>,
+    /// True while a do_init_lemonade call is in flight (after ConnectRequested emitted).
+    connecting: bool,
+    /// Brief error string shown under the button when the last connect attempt failed.
+    connect_error: Option<String>,
     /// Rig agent with graph search tools (None until Lemonade + graph are wired up).
     /// When present, messages are routed through the agent loop instead of direct streaming.
     agent: Option<Arc<GraphAgent>>,
@@ -165,6 +178,7 @@ impl ChatPanel {
             enter_to_submit: true,
             messages,
             streaming: false,
+            stream_task: None,
             streaming_thinking: None,
             streaming_assistant: None,
             streaming_tool_calls: HashMap::new(),
@@ -172,6 +186,8 @@ impl ChatPanel {
             selected_model_idx: 0,
             model_dropdown_open: false,
             chat_provider: None,
+            connecting: false,
+            connect_error: None,
             agent: None,
             system_prompt,
             max_context_tokens,
@@ -203,12 +219,26 @@ impl ChatPanel {
         self.chat_provider = Some(provider);
         self.available_models = models;
         self.selected_model_idx = preferred_idx;
+        self.connecting = false;
+        self.connect_error = None;
     }
 
     /// Called from AppView once the graph, inference queue, and Lemonade URL
     /// are all available. Enables the agent tool-calling path.
     pub(crate) fn set_agent(&mut self, agent: GraphAgent) {
         self.agent = Some(Arc::new(agent));
+    }
+
+    pub(crate) fn set_connecting(&mut self, b: bool) {
+        self.connecting = b;
+        if b {
+            self.connect_error = None;
+        }
+    }
+
+    pub(crate) fn set_connect_failed(&mut self, msg: &str) {
+        self.connecting = false;
+        self.connect_error = Some(msg.to_string());
     }
 
     /// Full rebuild of the virtualized list state — invalidates all cached
@@ -273,11 +303,20 @@ impl ChatPanel {
     /// Finalize streaming state and persist the session.
     fn finalize_stream(&mut self, cx: &mut Context<Self>) {
         self.streaming = false;
+        self.stream_task = None;
         self.streaming_thinking = None;
         self.streaming_assistant = None;
         self.streaming_tool_calls.clear();
         self.save_current_session(cx);
         cx.notify();
+    }
+
+    fn stop_stream(&mut self, cx: &mut Context<Self>) {
+        self.stream_task.take();
+        if let Some(msg) = self.streaming_assistant.clone() {
+            msg.update(cx, |m, cx| m.append_text("\n[Cancelled]", cx));
+        }
+        self.finalize_stream(cx);
     }
 
     /// Re-run the user turn that precedes `msg_entity_id`, replacing that
@@ -313,8 +352,18 @@ impl ChatPanel {
     /// Send the current input. Routes to the agent loop when an agent is
     /// available, otherwise falls back to direct LLM streaming.
     fn do_send(&mut self, cx: &mut Context<Self>) {
+        if self.streaming {
+            return;
+        }
+        let has_provider = self.chat_provider.is_some() || self.agent.is_some();
+        if !has_provider {
+            if !self.connecting {
+                cx.emit(ConnectRequested);
+            }
+            return;
+        }
         let text = self.input_field.read(cx).content.trim().to_string();
-        if text.is_empty() || self.streaming {
+        if text.is_empty() {
             return;
         }
         self.input_field.update(cx, |field, cx| {
@@ -371,7 +420,7 @@ impl ChatPanel {
             };
             let tokio_rt = self.tokio_rt.clone();
 
-            cx.spawn(async move |this, cx| {
+            let task = cx.spawn(async move |this, cx| {
                 // Get the mpsc::Receiver on the background executor.
                 let mut rx = cx
                     .background_executor()
@@ -481,8 +530,8 @@ impl ChatPanel {
                         }
                     }
                 }
-            })
-            .detach();
+            });
+            self.stream_task = Some(task);
             return;
         }
 
@@ -528,7 +577,7 @@ impl ChatPanel {
         let tokio_rt = self.tokio_rt.clone();
 
         // Spawn a background task to drive the stream.
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let rx = cx
                 .background_executor()
                 .spawn(async move {
@@ -607,8 +656,8 @@ impl ChatPanel {
                     }
                 }
             }
-        })
-        .detach();
+        });
+        self.stream_task = Some(task);
     }
 
     /// Label for the currently selected model (or a placeholder).
@@ -813,8 +862,10 @@ impl Render for ChatPanel {
         let render_start = Instant::now();
         let enter_to_submit = self.enter_to_submit;
         let streaming = self.streaming;
+        let connecting = self.connecting;
+        let connect_error = self.connect_error.clone();
         let model_dropdown_open = self.model_dropdown_open;
-        let has_provider = self.chat_provider.is_some();
+        let has_provider = self.chat_provider.is_some() || self.agent.is_some();
         let model_label = self.selected_model_label();
         let history_dropdown_open = self.history_dropdown_open;
         let history_label = self.session_title();
@@ -1198,39 +1249,62 @@ impl Render for ChatPanel {
                                 field_container.style().flex_basis = Some(relative(0.).into());
                                 field_container
                             })
-                            .child(
+                            .child({
+                                #[derive(Clone, Copy)]
+                                enum BtnState { Connect, Connecting, Send, Stop }
+                                let btn_state = if streaming {
+                                    BtnState::Stop
+                                } else if connecting {
+                                    BtnState::Connecting
+                                } else if !has_provider {
+                                    BtnState::Connect
+                                } else {
+                                    BtnState::Send
+                                };
+                                let (label, bg, fg) = match btn_state {
+                                    BtnState::Connect    => ("Connect",     rgb(0xf9e2af_u32), rgba(0x1e1e2eff_u32)),
+                                    BtnState::Connecting => ("Connecting…", rgb(0x45475a_u32), rgba(0x6c7086ff_u32)),
+                                    BtnState::Send       => ("Send",        rgb(0x89b4fa_u32), rgba(0x1e1e2eff_u32)),
+                                    BtnState::Stop       => ("Stop",        rgb(0xf38ba8_u32), rgba(0x1e1e2eff_u32)),
+                                };
                                 div()
                                     .id("send-btn")
                                     .flex()
                                     .flex_none()
                                     .items_center()
                                     .justify_center()
-                                    .w(px(56.0))
+                                    .w(px(88.0))
                                     .h(px(28.0))
-                                    .bg(if streaming {
-                                        rgb(0x45475a)
-                                    } else {
-                                        rgb(0x89b4fa)
-                                    })
+                                    .bg(bg)
                                     .rounded(px(3.0))
                                     .text_xs()
-                                    .text_color(if streaming {
-                                        rgba(0x6c7086ff)
-                                    } else {
-                                        rgba(0x1e1e2eff)
-                                    })
+                                    .text_color(fg)
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
-                                            |this, _: &MouseDownEvent, _window, cx| {
-                                                this.do_send(cx);
+                                            move |this, _: &MouseDownEvent, _window, cx| {
+                                                match btn_state {
+                                                    BtnState::Connect => cx.emit(ConnectRequested),
+                                                    BtnState::Connecting => {}
+                                                    BtnState::Send => this.do_send(cx),
+                                                    BtnState::Stop => this.stop_stream(cx),
+                                                }
                                             },
                                         ),
                                     )
-                                    .child("Send"),
-                            ),
+                                    .child(label)
+                            }),
                     )
+                    .when_some(connect_error, |el, err| {
+                        el.child(
+                            div()
+                                .id("connect-error")
+                                .text_xs()
+                                .text_color(rgba(0xf38ba8ff))
+                                .child(err),
+                        )
+                    })
                     .child(
                         div()
                             .id("model-selector-row")
