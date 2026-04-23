@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, list, prelude::*, px, rgb, rgba, relative, App, Context, Entity, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, Window,
+    anchored, deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px,
+    rgb, rgba, relative, App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Window,
 };
 use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
@@ -17,7 +18,17 @@ use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessag
 use crate::chat_message::{ChatMessageRole, ChatMessageView};
 use crate::text_field::{TextFieldView, TextSubmit};
 
+// ── Events ────────────────────────────────────────────────────────────────────
+
+pub(crate) struct ConnectRequested;
+impl EventEmitter<ConnectRequested> for ChatPanel {}
+
 // ── ChatPanel ───────────────────────────────────────────────────────────────
+
+struct ContextMenuState {
+    position: Point<Pixels>,
+    text: String,
+}
 
 pub(crate) struct ChatPanel {
     /// The text input field for composing messages.
@@ -30,6 +41,10 @@ pub(crate) struct ChatPanel {
     messages: Vec<Entity<ChatMessageView>>,
     /// Whether a response is currently streaming.
     streaming: bool,
+    /// Handle to the active stream task. Dropping it cancels the outer async
+    /// consumer, which closes the mpsc::Receiver and causes the next tx.send()
+    /// inside prompt_stream to return Err — breaking the stream loop.
+    stream_task: Option<gpui::Task<()>>,
     /// During streaming: handle to the Thinking message entity being appended to
     /// (lazily created on the first ReasoningDelta / Thinking token).
     streaming_thinking: Option<Entity<ChatMessageView>>,
@@ -48,6 +63,10 @@ pub(crate) struct ChatPanel {
     model_dropdown_open: bool,
     /// The active chat provider for direct streaming (None until Lemonade is discovered).
     chat_provider: Option<LemonadeChatProvider>,
+    /// True while a do_init_lemonade call is in flight (after ConnectRequested emitted).
+    connecting: bool,
+    /// Brief error string shown under the button when the last connect attempt failed.
+    connect_error: Option<String>,
     /// Rig agent with graph search tools (None until Lemonade + graph are wired up).
     /// When present, messages are routed through the agent loop instead of direct streaming.
     agent: Option<Arc<GraphAgent>>,
@@ -76,8 +95,12 @@ pub(crate) struct ChatPanel {
     session_list: Vec<ChatSessionSummary>,
     /// Whether the history selector dropdown is open.
     history_dropdown_open: bool,
+    /// Index of the history row currently under the pointer, for gradient sync.
+    hovered_history_ix: Option<usize>,
     /// CPU time (µs) spent building the element tree in the last render call.
     pub(crate) last_render_us: u64,
+    /// Active right-click context menu (position + text to copy).
+    context_menu: Option<ContextMenuState>,
 }
 
 /// A simplified model entry for the UI dropdown.
@@ -140,7 +163,7 @@ impl ChatPanel {
                     .unwrap_or_default();
                 let entities = msgs
                     .into_iter()
-                    .map(|m| cx.new(|_cx| ChatMessageView::from_stored(m)))
+                    .map(|m| cx.new(|cx| ChatMessageView::from_stored(m, cx)))
                     .collect();
                 (Some(first.id.clone()), entities)
             } else {
@@ -153,6 +176,7 @@ impl ChatPanel {
             enter_to_submit: true,
             messages,
             streaming: false,
+            stream_task: None,
             streaming_thinking: None,
             streaming_assistant: None,
             streaming_tool_calls: HashMap::new(),
@@ -160,6 +184,8 @@ impl ChatPanel {
             selected_model_idx: 0,
             model_dropdown_open: false,
             chat_provider: None,
+            connecting: false,
+            connect_error: None,
             agent: None,
             system_prompt,
             max_context_tokens,
@@ -176,7 +202,9 @@ impl ChatPanel {
             current_session_id,
             session_list,
             history_dropdown_open: false,
+            hovered_history_ix: None,
             last_render_us: 0,
+            context_menu: None,
         }
     }
 
@@ -190,12 +218,26 @@ impl ChatPanel {
         self.chat_provider = Some(provider);
         self.available_models = models;
         self.selected_model_idx = preferred_idx;
+        self.connecting = false;
+        self.connect_error = None;
     }
 
     /// Called from AppView once the graph, inference queue, and Lemonade URL
     /// are all available. Enables the agent tool-calling path.
     pub(crate) fn set_agent(&mut self, agent: GraphAgent) {
         self.agent = Some(Arc::new(agent));
+    }
+
+    pub(crate) fn set_connecting(&mut self, b: bool) {
+        self.connecting = b;
+        if b {
+            self.connect_error = None;
+        }
+    }
+
+    pub(crate) fn set_connect_failed(&mut self, msg: &str) {
+        self.connecting = false;
+        self.connect_error = Some(msg.to_string());
     }
 
     /// Full rebuild of the virtualized list state — invalidates all cached
@@ -227,7 +269,7 @@ impl ChatPanel {
         text: String,
         cx: &mut Context<Self>,
     ) -> Entity<ChatMessageView> {
-        let msg = cx.new(|_cx| ChatMessageView::new_text(role, text));
+        let msg = cx.new(|cx| ChatMessageView::new_text(role, text, cx));
         let prev_len = self.messages.len();
         self.messages.push(msg.clone());
         self.splice_appended(prev_len);
@@ -242,7 +284,7 @@ impl ChatPanel {
         args: String,
         cx: &mut Context<Self>,
     ) -> Entity<ChatMessageView> {
-        let msg = cx.new(|_cx| ChatMessageView::new_tool_call(internal_id, name, args));
+        let msg = cx.new(|cx| ChatMessageView::new_tool_call(internal_id, name, args, cx));
         let prev_len = self.messages.len();
         self.messages.push(msg.clone());
         self.splice_appended(prev_len);
@@ -252,6 +294,7 @@ impl ChatPanel {
     /// Finalize streaming state and persist the session.
     fn finalize_stream(&mut self, cx: &mut Context<Self>) {
         self.streaming = false;
+        self.stream_task = None;
         self.streaming_thinking = None;
         self.streaming_assistant = None;
         self.streaming_tool_calls.clear();
@@ -259,18 +302,76 @@ impl ChatPanel {
         cx.notify();
     }
 
-    /// Send the current input. Routes to the agent loop when an agent is
-    /// available, otherwise falls back to direct LLM streaming.
-    fn do_send(&mut self, cx: &mut Context<Self>) {
-        let text = self.input_field.read(cx).content.trim().to_string();
-        if text.is_empty() || self.streaming {
+    fn stop_stream(&mut self, cx: &mut Context<Self>) {
+        self.stream_task.take();
+        if let Some(msg) = self.streaming_assistant.clone() {
+            msg.update(cx, |m, cx| m.append_text("\n[Cancelled]", cx));
+        }
+        self.finalize_stream(cx);
+    }
+
+    /// Re-run the user turn at or before `msg_entity_id`.
+    /// If the clicked message is itself a User message, replays it directly.
+    /// Otherwise walks backwards to find the nearest preceding User message.
+    fn retry_message(&mut self, msg_entity_id: EntityId, cx: &mut Context<Self>) {
+        if self.streaming {
+            tracing::debug!("retry_message suppressed: stream in progress");
             return;
         }
 
-        // Clear input and record the user message immediately.
+        let msg_idx = match self.messages.iter().position(|m| m.entity_id() == msg_entity_id) {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        let user_idx = if self.messages[msg_idx].read(cx).role == ChatMessageRole::User {
+            msg_idx
+        } else {
+            match (0..msg_idx).rev().find(|&i| {
+                self.messages[i].read(cx).role == ChatMessageRole::User
+            }) {
+                Some(idx) => idx,
+                None => return,
+            }
+        };
+
+        let user_text = self.messages[user_idx].read(cx).text().to_string();
+
+        // Truncate from the user message onward (inclusive); send_with_text re-pushes it.
+        self.messages.truncate(user_idx);
+        self.list_state.reset(self.messages.len());
+
+        self.send_with_text(user_text, cx);
+    }
+
+    /// Send the current input. Routes to the agent loop when an agent is
+    /// available, otherwise falls back to direct LLM streaming.
+    fn do_send(&mut self, cx: &mut Context<Self>) {
+        if self.streaming {
+            return;
+        }
+        let has_provider = self.chat_provider.is_some() || self.agent.is_some();
+        if !has_provider {
+            if !self.connecting {
+                cx.emit(ConnectRequested);
+            }
+            return;
+        }
+        let text = self.input_field.read(cx).content.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
         self.input_field.update(cx, |field, cx| {
             field.set_content("", cx);
         });
+        self.send_with_text(text, cx);
+    }
+
+    /// Core send path. Pushes the user message, sets streaming state, and
+    /// spawns the agent or direct stream. Used by both `do_send` and
+    /// `retry_message`.
+    fn send_with_text(&mut self, text: String, cx: &mut Context<Self>) {
+        // Record the user message immediately.
         self.push_text_message(ChatMessageRole::User, text.clone(), cx);
         self.streaming = true;
         cx.notify();
@@ -314,7 +415,7 @@ impl ChatPanel {
             };
             let tokio_rt = self.tokio_rt.clone();
 
-            cx.spawn(async move |this, cx| {
+            let task = cx.spawn(async move |this, cx| {
                 // Get the mpsc::Receiver on the background executor.
                 let mut rx = cx
                     .background_executor()
@@ -424,8 +525,8 @@ impl ChatPanel {
                         }
                     }
                 }
-            })
-            .detach();
+            });
+            self.stream_task = Some(task);
             return;
         }
 
@@ -471,7 +572,7 @@ impl ChatPanel {
         let tokio_rt = self.tokio_rt.clone();
 
         // Spawn a background task to drive the stream.
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let rx = cx
                 .background_executor()
                 .spawn(async move {
@@ -550,8 +651,8 @@ impl ChatPanel {
                     }
                 }
             }
-        })
-        .detach();
+        });
+        self.stream_task = Some(task);
     }
 
     /// Label for the currently selected model (or a placeholder).
@@ -693,7 +794,7 @@ impl ChatPanel {
             Ok(msgs) => {
                 self.messages = msgs
                     .into_iter()
-                    .map(|m| cx.new(|_cx| ChatMessageView::from_stored(m)))
+                    .map(|m| cx.new(|cx| ChatMessageView::from_stored(m, cx)))
                     .collect();
                 self.current_session_id = Some(session_id.to_string());
                 self.history_dropdown_open = false;
@@ -704,6 +805,25 @@ impl ChatPanel {
                 eprintln!("Failed to load chat session: {e}");
             }
         }
+    }
+
+    /// Delete the message at `ix` from the current session.
+    ///
+    /// No-op while streaming — the last message during streaming is the
+    /// in-flight assistant response; allowing delete mid-stream would race
+    /// with `append_text`. The button is also not rendered when streaming.
+    fn delete_message_at(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.streaming {
+            tracing::debug!(ix, "delete_message_at suppressed: stream in progress");
+            return;
+        }
+        if ix >= self.messages.len() {
+            return;
+        }
+        self.messages.remove(ix);
+        self.list_state.reset(self.messages.len());
+        self.save_current_session(cx);
+        cx.notify();
     }
 
     /// Delete a session from history. If it's the current session, clear the chat.
@@ -745,8 +865,10 @@ impl Render for ChatPanel {
         let render_start = Instant::now();
         let enter_to_submit = self.enter_to_submit;
         let streaming = self.streaming;
+        let connecting = self.connecting;
+        let connect_error = self.connect_error.clone();
         let model_dropdown_open = self.model_dropdown_open;
-        let has_provider = self.chat_provider.is_some();
+        let has_provider = self.chat_provider.is_some() || self.agent.is_some();
         let model_label = self.selected_model_label();
         let history_dropdown_open = self.history_dropdown_open;
         let history_label = self.session_title();
@@ -763,22 +885,50 @@ impl Render for ChatPanel {
                 };
                 let is_current =
                     panel.current_session_id.as_deref() == Some(&session.id);
+                let is_hovered = panel.hovered_history_ix == Some(ix);
                 let entity_load = history_list_entity.clone();
                 let sid_load = session.id.clone();
                 let entity_del = history_list_entity.clone();
                 let sid_del = session.id.clone();
+                let entity_hover = history_list_entity.clone();
                 let title = session.title.clone();
+
+                // Both gradient stops share the same hue (only alpha differs)
+                // so the gradient is invisible over empty space and only masks
+                // text that actually overflows. Colours are pre-composited
+                // equivalents of the semi-transparent row backgrounds:
+                //   selected: rgba(0x45475a88) over #313244 ≈ #3C3D50
+                //   hovered:  rgba(0x45475a66) over #313244 ≈ #393A4D
+                let (gradient_start, gradient_end) = if is_current {
+                    (rgba(0x3c3d5000), rgba(0x3c3d50ff))
+                } else if is_hovered {
+                    (rgba(0x393a4d00), rgba(0x393a4dff))
+                } else {
+                    (rgba(0x31324400), rgba(0x313244ff))
+                };
 
                 div()
                     .id(("hist", ix))
+                    .relative()
+                    .w_full()
+                    .overflow_x_hidden()
                     .flex()
                     .flex_row()
                     .items_center()
                     .h(px(24.0))
                     .px_2()
-                    .when(is_current, |el| el.bg(rgba(0x45475a88)))
-                    .hover(|s| s.bg(rgba(0x45475a66)))
+                    .when(is_current, |el| el.bg(rgb(0x3c3d50)))
+                    .hover(|s| s.bg(rgb(0x393a4d)))
+                    .on_hover(move |is_hov, _window, cx| {
+                        entity_hover.update(cx, |this, cx| {
+                            this.hovered_history_ix = if *is_hov { Some(ix) } else { None };
+                            cx.notify();
+                        });
+                    })
                     .child({
+                        // No `relative()` here — keeping the title static avoids
+                        // a separate stacking context that confuses the row's
+                        // on_hover hit-testing when the cursor descends from above.
                         let mut title_el = div()
                             .id(("hist-title", ix))
                             .flex()
@@ -805,6 +955,23 @@ impl Render for ChatPanel {
                         title_el.style().flex_shrink = Some(1.0);
                         title_el
                     })
+                    // Gradient is a row-level absolute child so it doesn't
+                    // interfere with the title's hit-box. right(26) aligns its
+                    // right edge with the delete button's left edge
+                    // (8 px padding + 18 px button = 26 px from outer right).
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(26.0))
+                            .top_0()
+                            .h_full()
+                            .w(px(28.0))
+                            .bg(linear_gradient(
+                                90.,
+                                linear_color_stop(gradient_start, 0.0),
+                                linear_color_stop(gradient_end, 1.0),
+                            )),
+                    )
                     .child(
                         div()
                             .id(("hist-del", ix))
@@ -843,10 +1010,151 @@ impl Render for ChatPanel {
             move |ix, _window, cx: &mut App| {
                 let _span = tracing::trace_span!("chat_panel::list_item", ix).entered();
                 let panel = list_entity.read(cx);
-                match panel.messages.get(ix) {
-                    Some(msg) => msg.clone().into_any_element(),
-                    None => div().into_any_element(),
+                let Some(msg) = panel.messages.get(ix).cloned() else {
+                    return div().into_any_element();
+                };
+                let is_last = ix + 1 == panel.messages.len();
+                let is_streaming = panel.streaming;
+                let role = msg.read(cx).role;
+                let can_retry = !is_streaming
+                    && matches!(role, ChatMessageRole::User | ChatMessageRole::Assistant);
+                let show_delete = is_last && !is_streaming;
+
+                let mut row = div()
+                    .id(("msg-row", ix))
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(msg.clone());
+
+                // Right-click anywhere on the row to open the context menu.
+                // Resolve copy text at click time (not render time) so an active
+                // drag-selection in the body is captured — selection changes in
+                // the body's TextFieldView only notify that entity, not the panel,
+                // so a render-time snapshot would be stale.
+                let ctx_entity = list_entity.clone();
+                let msg_for_ctx = msg.clone();
+                row = row.on_mouse_down(
+                    MouseButton::Right,
+                    move |event: &MouseDownEvent, _window, cx: &mut App| {
+                        let pos = event.position;
+                        let text = msg_for_ctx.read(cx).copy_text_for_context(cx);
+                        ctx_entity.update(cx, |panel, cx| {
+                            panel.context_menu =
+                                Some(ContextMenuState { position: pos, text });
+                            cx.notify();
+                        });
+                    },
+                );
+
+                if can_retry || show_delete {
+                    let del_entity = list_entity.clone();
+                    let retry_entity = list_entity.clone();
+                    let copy_entity = list_entity.clone();
+                    let msg_entity_id = panel.messages[ix].entity_id();
+                    let msg_for_copy = msg.clone();
+
+                    let bubble_bg = match role {
+                        ChatMessageRole::User => rgb(0x313244),
+                        ChatMessageRole::Thinking => rgb(0x181825),
+                        ChatMessageRole::Assistant | ChatMessageRole::ToolCall => rgb(0x1e1e2e),
+                    };
+
+                    let mut action_bar = div()
+                        .id(("action-bar", ix))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap_1()
+                        .px_2()
+                        .py(px(2.0))
+                        .bg(bubble_bg);
+
+                    if can_retry {
+                        action_bar = action_bar.child(
+                            div()
+                                .id(("retry", ix))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .text_xs()
+                                .text_color(rgba(0x6c708688))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_, _, cx: &mut App| {
+                                        retry_entity.update(cx, |this, cx| {
+                                            this.retry_message(msg_entity_id, cx);
+                                        });
+                                    },
+                                )
+                                .child("⟳"),
+                        );
+                    }
+
+                    // Copy button — always shown in the action bar.
+                    action_bar = action_bar.child(
+                        div()
+                            .id(("copy", ix))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .text_xs()
+                            .text_color(rgba(0x6c708688))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                move |_, _, cx: &mut App| {
+                                    let text =
+                                        msg_for_copy.read(cx).copy_text_for_context(cx);
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                    copy_entity.update(cx, |panel, cx| {
+                                        panel.context_menu = None;
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .child("⎘"),
+                    );
+
+                    if show_delete {
+                        action_bar = action_bar.child(
+                            div()
+                                .id(("del", ix))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .rounded(px(2.0))
+                                .text_xs()
+                                .text_color(rgba(0x6c708688))
+                                .cursor_pointer()
+                                .hover(|s| {
+                                    s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_, _, cx: &mut App| {
+                                        del_entity.update(cx, |this, cx| {
+                                            let last = this.messages.len().saturating_sub(1);
+                                            this.delete_message_at(last, cx);
+                                        });
+                                    },
+                                )
+                                .child("x"),
+                        );
+                    }
+
+                    row = row.child(action_bar);
                 }
+                row.into_any_element()
             },
         );
 
@@ -895,6 +1203,31 @@ impl Render for ChatPanel {
         } else {
             Vec::new()
         };
+
+        // ── Context menu state (captured before root building) ────────────────
+        let ctx_pos = self.context_menu.as_ref().map(|m| m.position);
+        let ctx_text = self
+            .context_menu
+            .as_ref()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        let input_field_paste = self.input_field.clone();
+        let ctx_copy_listener = cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(ctx_text.clone()));
+            this.context_menu = None;
+            cx.notify();
+        });
+        let ctx_paste_listener = cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+            if let Some(clip) = cx.read_from_clipboard() {
+                if let Some(text) = clip.text() {
+                    input_field_paste.update(cx, |tf, cx| {
+                        tf.insert_at_cursor(&text, cx);
+                    });
+                }
+            }
+            this.context_menu = None;
+            cx.notify();
+        });
 
         let root = div()
             .id("chat-panel")
@@ -1017,9 +1350,17 @@ impl Render for ChatPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            let mut changed = false;
                             if this.history_dropdown_open || this.model_dropdown_open {
                                 this.history_dropdown_open = false;
                                 this.model_dropdown_open = false;
+                                changed = true;
+                            }
+                            if this.context_menu.is_some() {
+                                this.context_menu = None;
+                                changed = true;
+                            }
+                            if changed {
                                 cx.notify();
                             }
                         }),
@@ -1060,10 +1401,36 @@ impl Render for ChatPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            let mut changed = false;
                             if this.history_dropdown_open {
                                 this.history_dropdown_open = false;
+                                changed = true;
+                            }
+                            if this.context_menu.is_some() {
+                                this.context_menu = None;
+                                changed = true;
+                            }
+                            if changed {
                                 cx.notify();
                             }
+                        }),
+                    )
+                    // Right-click anywhere in the input area opens the context
+                    // menu. Copy text = current selection in the input field (or
+                    // empty, leaving only Paste useful). Message rows install
+                    // their own Right handler that captures per-row text.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                            let pos = event.position;
+                            let text = this
+                                .input_field
+                                .read(cx)
+                                .selected_text()
+                                .unwrap_or_default();
+                            this.context_menu =
+                                Some(ContextMenuState { position: pos, text });
+                            cx.notify();
                         }),
                     )
                     .border_color(rgb(0x313244))
@@ -1130,39 +1497,62 @@ impl Render for ChatPanel {
                                 field_container.style().flex_basis = Some(relative(0.).into());
                                 field_container
                             })
-                            .child(
+                            .child({
+                                #[derive(Clone, Copy)]
+                                enum BtnState { Connect, Connecting, Send, Stop }
+                                let btn_state = if streaming {
+                                    BtnState::Stop
+                                } else if connecting {
+                                    BtnState::Connecting
+                                } else if !has_provider {
+                                    BtnState::Connect
+                                } else {
+                                    BtnState::Send
+                                };
+                                let (label, bg, fg) = match btn_state {
+                                    BtnState::Connect    => ("Connect",     rgb(0xf9e2af_u32), rgba(0x1e1e2eff_u32)),
+                                    BtnState::Connecting => ("Connecting…", rgb(0x45475a_u32), rgba(0x6c7086ff_u32)),
+                                    BtnState::Send       => ("Send",        rgb(0x89b4fa_u32), rgba(0x1e1e2eff_u32)),
+                                    BtnState::Stop       => ("Stop",        rgb(0xf38ba8_u32), rgba(0x1e1e2eff_u32)),
+                                };
                                 div()
                                     .id("send-btn")
                                     .flex()
                                     .flex_none()
                                     .items_center()
                                     .justify_center()
-                                    .w(px(56.0))
+                                    .w(px(88.0))
                                     .h(px(28.0))
-                                    .bg(if streaming {
-                                        rgb(0x45475a)
-                                    } else {
-                                        rgb(0x89b4fa)
-                                    })
+                                    .bg(bg)
                                     .rounded(px(3.0))
                                     .text_xs()
-                                    .text_color(if streaming {
-                                        rgba(0x6c7086ff)
-                                    } else {
-                                        rgba(0x1e1e2eff)
-                                    })
+                                    .text_color(fg)
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
-                                            |this, _: &MouseDownEvent, _window, cx| {
-                                                this.do_send(cx);
+                                            move |this, _: &MouseDownEvent, _window, cx| {
+                                                match btn_state {
+                                                    BtnState::Connect => cx.emit(ConnectRequested),
+                                                    BtnState::Connecting => {}
+                                                    BtnState::Send => this.do_send(cx),
+                                                    BtnState::Stop => this.stop_stream(cx),
+                                                }
                                             },
                                         ),
                                     )
-                                    .child("Send"),
-                            ),
+                                    .child(label)
+                            }),
                     )
+                    .when_some(connect_error, |el, err| {
+                        el.child(
+                            div()
+                                .id("connect-error")
+                                .text_xs()
+                                .text_color(rgba(0xf38ba8ff))
+                                .child(err),
+                        )
+                    })
                     .child(
                         div()
                             .id("model-selector-row")
@@ -1232,6 +1622,53 @@ impl Render for ChatPanel {
                             }),
                     ),
             );
+        // ── Right-click context menu overlay ─────────────────────────────────
+        let root = root.when_some(ctx_pos, |root, pos| {
+            root.child(deferred(
+                anchored()
+                    .position(pos)
+                    .anchor(Corner::TopLeft)
+                    .child(
+                        div()
+                            .id("ctx-menu")
+                            .w(px(140.0))
+                            .bg(rgb(0x313244))
+                            .border_1()
+                            .border_color(rgb(0x45475a))
+                            .rounded(px(3.0))
+                            .child(
+                                div()
+                                    .id("ctx-copy")
+                                    .flex()
+                                    .items_center()
+                                    .h(px(24.0))
+                                    .px_3()
+                                    .text_xs()
+                                    .text_color(rgba(0xcdd6f4ff))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(MouseButton::Left, ctx_copy_listener)
+                                    .child("Copy"),
+                            )
+                            .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                            .child(
+                                div()
+                                    .id("ctx-paste")
+                                    .flex()
+                                    .items_center()
+                                    .h(px(24.0))
+                                    .px_3()
+                                    .text_xs()
+                                    .text_color(rgba(0xcdd6f4ff))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(MouseButton::Left, ctx_paste_listener)
+                                    .child("Paste"),
+                            ),
+                    ),
+            ))
+        });
+
         self.last_render_us = render_start.elapsed().as_micros() as u64;
         root
     }

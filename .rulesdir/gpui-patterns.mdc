@@ -148,3 +148,54 @@ The 60-frame average uses `FrameTimeRing` (`[u64; 60]` circular buffer in `app_v
 - **Never hand a multi-kilobyte `SharedString` to a div child unless the message is likely to stay in view.** The collapse-by-default on `Thinking` blocks exists partly for this reason — a collapsed block renders only a header line, so only that line shapes on scroll-in instead of hundreds.
 - When adding any new text-heavy view (log viewer, diff display, long node descriptions), default to collapsed or paginated to bound the cold-shape cost per scroll-in. The ShapePlan cache amortises the per-word plan cost but does not eliminate the per-line layout cost for lines that have never been seen before.
 - **Do not mix large text rendering with `cx.notify()` hot paths.** Streaming tokens call `notify()` on the target `ChatMessageView` only; all sibling messages are not dirtied. If you restructure the streaming path so that a parent entity notifies, all visible chat messages will re-shape every token — catastrophic at 50 tok/s.
+
+---
+
+## Render-site action bar pattern (no per-message subscriptions)
+
+When a list container needs action buttons (retry, delete, copy) on its child entities, render those buttons **in the list item builder of the parent**, not inside the child entity's `render` method.
+
+- Child emits events + parent subscribes per child → N subscriptions, `Vec<gpui::Subscription>` lifetime management, stale callbacks on truncation/delete.
+- Parent reads child state at render time and calls child methods directly via entity update → zero subscriptions, always consistent with current list state.
+
+Applied to `ChatPanel`: the action bar (⟳ retry, × delete, ⎘ copy) is built in the list item closure in `chat_panel.rs`, not inside `ChatMessageView::render`. The closure captures a `WeakEntity<ChatPanel>` and calls `retry_message`, `delete_message_at`, etc. via `handle.update(cx, ...)`.
+
+**Rule:** Future per-message actions should follow this render-site pattern. Do NOT reintroduce a `msg_subscriptions: Vec<gpui::Subscription>` vector.
+
+---
+
+## Stale-capture bug in click handlers
+
+If a click handler captures a **computed value** at render time from a nested entity (e.g. `msg.read(cx).copy_text_for_context(cx)`), and that value depends on state inside the nested entity that does NOT notify the parent — the captured value will be stale by click time.
+
+**Symptom:** Right-click copy returns old text even though the selection changed.
+
+**Fix:** Capture the `Entity<T>` itself (clone it into the closure), then call the accessor **at click time** inside the handler:
+
+```rust
+let msg = msg.clone();
+on_click(move |_, window, cx| {
+    let text = msg.read(cx).copy_text_for_context(cx);
+    window.write_to_clipboard(ClipboardItem::new_string(text));
+})
+```
+
+This applies to any closure that reads from a child entity whose notifications do not propagate to the parent. In the chat panel, `TextFieldView` selection changes notify only `TextFieldView` — not `ChatPanel` — so any render-time capture of selection-dependent state from `ChatMessageView` will be stale.
+
+---
+
+## Context menu — deferred+anchored overlay with comprehensive dismissal
+
+GPUI 0.2.2 has no built-in context menu widget. Pattern used in `TextFieldView` and `ChatPanel`:
+
+1. Store `context_menu_pos: Option<Point<Pixels>>` in view state.
+2. On right-click (`on_mouse_down(MouseButton::Right, ...)`): set `context_menu_pos = Some(event.position)`, `cx.stop_propagation()`, `cx.notify()`.
+3. Render via `deferred(anchored().position(pos).child(menu_div))` inside the element tree. `deferred()` paints after all siblings so the menu floats above them.
+4. **Dismiss triggers — all four are required:**
+   - `on_mouse_down_out` (capture phase) — clears `context_menu_pos` before the click is processed elsewhere. Prevents stale menus when right-clicking a different field.
+   - Left-click inside the field — clears menu before handling the click.
+   - Focus loss (`on_focus_change` / focus-transition block in `render`) — clears menu.
+   - `Escape` key in `on_key_down` — clears menu, checked before Ctrl shortcuts.
+5. Menu item clicks must call `cx.stop_propagation()` after handling to prevent the click from re-triggering dismiss handlers.
+
+**Empty menu shortcut:** if there would be no visible items (e.g. read-only field with no selection → no Copy, no Paste), return early from the right-click handler WITHOUT calling `cx.stop_propagation()`. This lets outer containers (e.g. the chat row) receive the event and open their own menu.
