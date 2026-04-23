@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    anchored, deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px, rems,
-    rgb, rgba, relative, App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter,
+    anchored, deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px, relative,
+    rems, rgb, rgba, App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter,
     ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Window,
 };
-use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
+use u_forge_agent::{select_history_window, GraphAgent, HistoryMessage};
 use u_forge_core::{
     lemonade::{LemonadeChatProvider, SelectedModel},
     ChatMessage, ChatRequest, StreamToken,
@@ -193,11 +193,7 @@ impl ChatPanel {
             tokio_rt,
             submit_sub,
             list_state: ListState::new(msg_count, ListAlignment::Bottom, px(200.0)),
-            history_list_state: ListState::new(
-                session_list.len(),
-                ListAlignment::Top,
-                px(200.0),
-            ),
+            history_list_state: ListState::new(session_list.len(), ListAlignment::Top, px(200.0)),
             history_store,
             current_session_id,
             session_list,
@@ -319,7 +315,11 @@ impl ChatPanel {
             return;
         }
 
-        let msg_idx = match self.messages.iter().position(|m| m.entity_id() == msg_entity_id) {
+        let msg_idx = match self
+            .messages
+            .iter()
+            .position(|m| m.entity_id() == msg_entity_id)
+        {
             Some(idx) => idx,
             None => return,
         };
@@ -327,9 +327,10 @@ impl ChatPanel {
         let user_idx = if self.messages[msg_idx].read(cx).role == ChatMessageRole::User {
             msg_idx
         } else {
-            match (0..msg_idx).rev().find(|&i| {
-                self.messages[i].read(cx).role == ChatMessageRole::User
-            }) {
+            match (0..msg_idx)
+                .rev()
+                .find(|&i| self.messages[i].read(cx).role == ChatMessageRole::User)
+            {
                 Some(idx) => idx,
                 None => return,
             }
@@ -409,7 +410,9 @@ impl ChatPanel {
         // with streaming output. Tool calls appear as collapsible entries.
         if let Some(agent) = self.agent.clone() {
             let model_id = if !self.available_models.is_empty() {
-                self.available_models[self.selected_model_idx].model_id.clone()
+                self.available_models[self.selected_model_idx]
+                    .model_id
+                    .clone()
             } else {
                 String::new()
             };
@@ -473,7 +476,11 @@ impl ChatPanel {
                             })
                             .ok();
                         }
-                        Some(AgentStreamEvent::ToolCallStart { internal_id, name, args_display }) => {
+                        Some(AgentStreamEvent::ToolCallStart {
+                            internal_id,
+                            name,
+                            args_display,
+                        }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 let msg = view.push_tool_call_message(
                                     internal_id.clone(),
@@ -489,9 +496,14 @@ impl ChatPanel {
                             })
                             .ok();
                         }
-                        Some(AgentStreamEvent::ToolResult { internal_id, content }) => {
+                        Some(AgentStreamEvent::ToolResult {
+                            internal_id,
+                            content,
+                        }) => {
                             this.update(cx, |view: &mut ChatPanel, _cx| {
-                                if let Some(msg) = view.streaming_tool_calls.get(&internal_id).cloned() {
+                                if let Some(msg) =
+                                    view.streaming_tool_calls.get(&internal_id).cloned()
+                                {
                                     msg.update(_cx, |m, cx| m.set_tool_result(content, cx));
                                 }
                             })
@@ -559,7 +571,11 @@ impl ChatPanel {
 
         // Determine model override if user selected a different model.
         let model_override = if !self.available_models.is_empty() {
-            Some(self.available_models[self.selected_model_idx].model_id.clone())
+            Some(
+                self.available_models[self.selected_model_idx]
+                    .model_id
+                    .clone(),
+            )
         } else {
             None
         };
@@ -575,9 +591,7 @@ impl ChatPanel {
         let task = cx.spawn(async move |this, cx| {
             let rx = cx
                 .background_executor()
-                .spawn(async move {
-                    tokio_rt.block_on(async { provider.complete_stream(req) })
-                })
+                .spawn(async move { tokio_rt.block_on(async { provider.complete_stream(req) }) })
                 .await;
 
             // Consume tokens from the stream.
@@ -883,8 +897,7 @@ impl Render for ChatPanel {
                 let Some(session) = panel.session_list.get(ix).cloned() else {
                     return div().into_any_element();
                 };
-                let is_current =
-                    panel.current_session_id.as_deref() == Some(&session.id);
+                let is_current = panel.current_session_id.as_deref() == Some(&session.id);
                 let is_hovered = panel.hovered_history_ix == Some(ix);
                 let entity_load = history_list_entity.clone();
                 let sid_load = session.id.clone();
@@ -983,7 +996,7 @@ impl Render for ChatPanel {
                             .h(px(18.0))
                             .rounded(px(2.0))
                             .text_sm()
-                            .text_color(rgba(0x6c708688))
+                            .text_color(rgba(0xf38ba8aa))
                             .cursor_pointer()
                             .hover(|s| s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66)))
                             .on_mouse_down(
@@ -1005,158 +1018,145 @@ impl Render for ChatPanel {
         // Each item is its own `Entity<ChatMessageView>` — streaming token
         // deltas only invalidate the target entity, not this panel.
         let list_entity = cx.entity().clone();
-        let list_el = list(
-            self.list_state.clone(),
-            move |ix, _window, cx: &mut App| {
-                let _span = tracing::trace_span!("chat_panel::list_item", ix).entered();
-                let panel = list_entity.read(cx);
-                let Some(msg) = panel.messages.get(ix).cloned() else {
-                    return div().into_any_element();
-                };
-                let is_last = ix + 1 == panel.messages.len();
-                let is_streaming = panel.streaming;
-                let role = msg.read(cx).role;
-                let can_retry = !is_streaming
-                    && matches!(role, ChatMessageRole::User | ChatMessageRole::Assistant);
-                let show_delete = is_last && !is_streaming;
+        let list_el = list(self.list_state.clone(), move |ix, _window, cx: &mut App| {
+            let _span = tracing::trace_span!("chat_panel::list_item", ix).entered();
+            let panel = list_entity.read(cx);
+            let Some(msg) = panel.messages.get(ix).cloned() else {
+                return div().into_any_element();
+            };
+            let is_last = ix + 1 == panel.messages.len();
+            let is_streaming = panel.streaming;
+            let role = msg.read(cx).role;
+            let can_retry =
+                !is_streaming && matches!(role, ChatMessageRole::User | ChatMessageRole::Assistant);
+            let show_delete = is_last && !is_streaming;
 
-                let mut row = div()
-                    .id(("msg-row", ix))
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .child(msg.clone());
+            let mut row = div()
+                .id(("msg-row", ix))
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(msg.clone());
 
-                // Right-click anywhere on the row to open the context menu.
-                // Resolve copy text at click time (not render time) so an active
-                // drag-selection in the body is captured — selection changes in
-                // the body's TextFieldView only notify that entity, not the panel,
-                // so a render-time snapshot would be stale.
-                let ctx_entity = list_entity.clone();
-                let msg_for_ctx = msg.clone();
-                row = row.on_mouse_down(
-                    MouseButton::Right,
-                    move |event: &MouseDownEvent, _window, cx: &mut App| {
-                        let pos = event.position;
-                        let text = msg_for_ctx.read(cx).copy_text_for_context(cx);
-                        ctx_entity.update(cx, |panel, cx| {
-                            panel.context_menu =
-                                Some(ContextMenuState { position: pos, text });
-                            cx.notify();
+            // Right-click anywhere on the row to open the context menu.
+            // Resolve copy text at click time (not render time) so an active
+            // drag-selection in the body is captured — selection changes in
+            // the body's TextFieldView only notify that entity, not the panel,
+            // so a render-time snapshot would be stale.
+            let ctx_entity = list_entity.clone();
+            let msg_for_ctx = msg.clone();
+            row = row.on_mouse_down(
+                MouseButton::Right,
+                move |event: &MouseDownEvent, _window, cx: &mut App| {
+                    let pos = event.position;
+                    let text = msg_for_ctx.read(cx).copy_text_for_context(cx);
+                    ctx_entity.update(cx, |panel, cx| {
+                        panel.context_menu = Some(ContextMenuState {
+                            position: pos,
+                            text,
                         });
-                    },
-                );
+                        cx.notify();
+                    });
+                },
+            );
 
-                if can_retry || show_delete {
-                    let del_entity = list_entity.clone();
-                    let retry_entity = list_entity.clone();
-                    let copy_entity = list_entity.clone();
-                    let msg_entity_id = panel.messages[ix].entity_id();
-                    let msg_for_copy = msg.clone();
+            if can_retry || show_delete {
+                let del_entity = list_entity.clone();
+                let retry_entity = list_entity.clone();
+                let copy_entity = list_entity.clone();
+                let msg_entity_id = panel.messages[ix].entity_id();
+                let msg_for_copy = msg.clone();
 
-                    let bubble_bg = match role {
-                        ChatMessageRole::User => rgb(0x313244),
-                        ChatMessageRole::Thinking => rgb(0x181825),
-                        ChatMessageRole::Assistant | ChatMessageRole::ToolCall => rgb(0x1e1e2e),
-                    };
+                let bubble_bg = match role {
+                    ChatMessageRole::User => rgb(0x313244),
+                    ChatMessageRole::Thinking => rgb(0x181825),
+                    ChatMessageRole::Assistant | ChatMessageRole::ToolCall => rgb(0x1e1e2e),
+                };
 
-                    let mut action_bar = div()
-                        .id(("action-bar", ix))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap_1()
-                        .px_2()
-                        .py(px(2.0))
-                        .bg(bubble_bg);
+                let mut action_bar = div()
+                    .id(("action-bar", ix))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_1()
+                    .px_2()
+                    .py(px(2.0))
+                    .bg(bubble_bg);
 
-                    if can_retry {
-                        action_bar = action_bar.child(
-                            div()
-                                .id(("retry", ix))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(rems(1.0))
-                                .h(rems(1.0))
-                                .text_sm()
-                                .text_color(rgba(0x6c708688))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    move |_, _, cx: &mut App| {
-                                        retry_entity.update(cx, |this, cx| {
-                                            this.retry_message(msg_entity_id, cx);
-                                        });
-                                    },
-                                )
-                                .child("⟳"),
-                        );
-                    }
-
-                    // Copy button — always shown in the action bar.
+                if can_retry {
                     action_bar = action_bar.child(
                         div()
-                            .id(("copy", ix))
+                            .id(("retry", ix))
                             .flex()
                             .items_center()
                             .justify_center()
                             .w(rems(1.0))
                             .h(rems(1.0))
-                            .text_sm()
+                            .text_base()
                             .text_color(rgba(0x6c708688))
                             .cursor_pointer()
                             .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                move |_, _, cx: &mut App| {
-                                    let text =
-                                        msg_for_copy.read(cx).copy_text_for_context(cx);
-                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                                    copy_entity.update(cx, |panel, cx| {
-                                        panel.context_menu = None;
-                                        cx.notify();
-                                    });
-                                },
-                            )
-                            .child("⎘"),
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                                retry_entity.update(cx, |this, cx| {
+                                    this.retry_message(msg_entity_id, cx);
+                                });
+                            })
+                            .child("⟳"),
                     );
-
-                    if show_delete {
-                        action_bar = action_bar.child(
-                            div()
-                                .id(("del", ix))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(rems(1.0))
-                                .h(rems(1.0))
-                                .rounded(px(2.0))
-                                .text_sm()
-                                .text_color(rgba(0x6c708688))
-                                .cursor_pointer()
-                                .hover(|s| {
-                                    s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66))
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    move |_, _, cx: &mut App| {
-                                        del_entity.update(cx, |this, cx| {
-                                            let last = this.messages.len().saturating_sub(1);
-                                            this.delete_message_at(last, cx);
-                                        });
-                                    },
-                                )
-                                .child("x"),
-                        );
-                    }
-
-                    row = row.child(action_bar);
                 }
-                row.into_any_element()
-            },
-        );
+
+                // Copy button — always shown in the action bar.
+                action_bar = action_bar.child(
+                    div()
+                        .id(("copy", ix))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(rems(1.0))
+                        .h(rems(1.0))
+                        .text_base()
+                        .text_color(rgba(0x6c708688))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgba(0xcdd6f4ff)))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                            let text = msg_for_copy.read(cx).copy_text_for_context(cx);
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            copy_entity.update(cx, |panel, cx| {
+                                panel.context_menu = None;
+                                cx.notify();
+                            });
+                        })
+                        .child("⎘"),
+                );
+
+                if show_delete {
+                    action_bar = action_bar.child(
+                        div()
+                            .id(("del", ix))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(rems(1.0))
+                            .h(rems(1.0))
+                            .rounded(px(2.0))
+                            .text_base()
+                            .text_color(rgba(0xf38ba8aa))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                                del_entity.update(cx, |this, cx| {
+                                    let last = this.messages.len().saturating_sub(1);
+                                    this.delete_message_at(last, cx);
+                                });
+                            })
+                            .child("x"),
+                    );
+                }
+
+                row = row.child(action_bar);
+            }
+            row.into_any_element()
+        });
 
         // Model dropdown items.
         let model_items: Vec<_> = if model_dropdown_open {
@@ -1275,13 +1275,11 @@ impl Render for ChatPanel {
                                     .overflow_x_hidden()
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(
-                                            |this, _: &MouseDownEvent, _window, cx| {
-                                                this.history_dropdown_open =
-                                                    !this.history_dropdown_open;
-                                                cx.notify();
-                                            },
-                                        ),
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.history_dropdown_open =
+                                                !this.history_dropdown_open;
+                                            cx.notify();
+                                        }),
                                     )
                                     .child(history_label),
                             )
@@ -1306,11 +1304,9 @@ impl Render for ChatPanel {
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(
-                                            |this, _: &MouseDownEvent, _window, cx| {
-                                                this.new_session(cx);
-                                            },
-                                        ),
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.new_session(cx);
+                                        }),
                                     )
                                     .child("New"),
                             ),
@@ -1428,8 +1424,10 @@ impl Render for ChatPanel {
                                 .read(cx)
                                 .selected_text()
                                 .unwrap_or_default();
-                            this.context_menu =
-                                Some(ContextMenuState { position: pos, text });
+                            this.context_menu = Some(ContextMenuState {
+                                position: pos,
+                                text,
+                            });
                             cx.notify();
                         }),
                     )
@@ -1456,20 +1454,16 @@ impl Render for ChatPanel {
                                     .border_color(rgb(0x45475a))
                                     .rounded(px(2.0))
                                     .cursor_pointer()
-                                    .when(enter_to_submit, |el| {
-                                        el.bg(rgba(0x89b4faff))
-                                    })
+                                    .when(enter_to_submit, |el| el.bg(rgba(0x89b4faff)))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(
-                                            |this, _: &MouseDownEvent, _window, cx| {
-                                                this.enter_to_submit = !this.enter_to_submit;
-                                                this.input_field.update(cx, |field, _cx| {
-                                                    field.submit_on_enter = this.enter_to_submit;
-                                                });
-                                                cx.notify();
-                                            },
-                                        ),
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.enter_to_submit = !this.enter_to_submit;
+                                            this.input_field.update(cx, |field, _cx| {
+                                                field.submit_on_enter = this.enter_to_submit;
+                                            });
+                                            cx.notify();
+                                        }),
                                     ),
                             )
                             .child(
@@ -1499,7 +1493,12 @@ impl Render for ChatPanel {
                             })
                             .child({
                                 #[derive(Clone, Copy)]
-                                enum BtnState { Connect, Connecting, Send, Stop }
+                                enum BtnState {
+                                    Connect,
+                                    Connecting,
+                                    Send,
+                                    Stop,
+                                }
                                 let btn_state = if streaming {
                                     BtnState::Stop
                                 } else if connecting {
@@ -1510,10 +1509,18 @@ impl Render for ChatPanel {
                                     BtnState::Send
                                 };
                                 let (label, bg, fg) = match btn_state {
-                                    BtnState::Connect    => ("Connect",     rgb(0xf9e2af_u32), rgba(0x1e1e2eff_u32)),
-                                    BtnState::Connecting => ("Connecting…", rgb(0x45475a_u32), rgba(0x6c7086ff_u32)),
-                                    BtnState::Send       => ("Send",        rgb(0x89b4fa_u32), rgba(0x1e1e2eff_u32)),
-                                    BtnState::Stop       => ("Stop",        rgb(0xf38ba8_u32), rgba(0x1e1e2eff_u32)),
+                                    BtnState::Connect => {
+                                        ("Connect", rgb(0xf9e2af_u32), rgba(0x1e1e2eff_u32))
+                                    }
+                                    BtnState::Connecting => {
+                                        ("Connecting…", rgb(0x45475a_u32), rgba(0x6c7086ff_u32))
+                                    }
+                                    BtnState::Send => {
+                                        ("Send", rgb(0x89b4fa_u32), rgba(0x1e1e2eff_u32))
+                                    }
+                                    BtnState::Stop => {
+                                        ("Stop", rgb(0xf38ba8_u32), rgba(0x1e1e2eff_u32))
+                                    }
                                 };
                                 div()
                                     .id("send-btn")
@@ -1525,7 +1532,7 @@ impl Render for ChatPanel {
                                     .h(px(28.0))
                                     .bg(bg)
                                     .rounded(px(3.0))
-                                    .text_sm()
+                                    .text_base()
                                     .text_color(fg)
                                     .cursor_pointer()
                                     .on_mouse_down(
@@ -1548,7 +1555,7 @@ impl Render for ChatPanel {
                         el.child(
                             div()
                                 .id("connect-error")
-                                .text_sm()
+                                .text_base()
                                 .text_color(rgba(0xf38ba8ff))
                                 .child(err),
                         )
@@ -1625,47 +1632,44 @@ impl Render for ChatPanel {
         // ── Right-click context menu overlay ─────────────────────────────────
         let root = root.when_some(ctx_pos, |root, pos| {
             root.child(deferred(
-                anchored()
-                    .position(pos)
-                    .anchor(Corner::TopLeft)
-                    .child(
-                        div()
-                            .id("ctx-menu")
-                            .w(px(140.0))
-                            .bg(rgb(0x313244))
-                            .border_1()
-                            .border_color(rgb(0x45475a))
-                            .rounded(px(3.0))
-                            .child(
-                                div()
-                                    .id("ctx-copy")
-                                    .flex()
-                                    .items_center()
-                                    .h(px(24.0))
-                                    .px_3()
-                                    .text_sm()
-                                    .text_color(rgba(0xcdd6f4ff))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgba(0x45475a88)))
-                                    .on_mouse_down(MouseButton::Left, ctx_copy_listener)
-                                    .child("Copy"),
-                            )
-                            .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
-                            .child(
-                                div()
-                                    .id("ctx-paste")
-                                    .flex()
-                                    .items_center()
-                                    .h(px(24.0))
-                                    .px_3()
-                                    .text_sm()
-                                    .text_color(rgba(0xcdd6f4ff))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgba(0x45475a88)))
-                                    .on_mouse_down(MouseButton::Left, ctx_paste_listener)
-                                    .child("Paste"),
-                            ),
-                    ),
+                anchored().position(pos).anchor(Corner::TopLeft).child(
+                    div()
+                        .id("ctx-menu")
+                        .w(px(140.0))
+                        .bg(rgb(0x313244))
+                        .border_1()
+                        .border_color(rgb(0x45475a))
+                        .rounded(px(3.0))
+                        .child(
+                            div()
+                                .id("ctx-copy")
+                                .flex()
+                                .items_center()
+                                .h(px(24.0))
+                                .px_3()
+                                .text_sm()
+                                .text_color(rgba(0xcdd6f4ff))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgba(0x45475a88)))
+                                .on_mouse_down(MouseButton::Left, ctx_copy_listener)
+                                .child("Copy"),
+                        )
+                        .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                        .child(
+                            div()
+                                .id("ctx-paste")
+                                .flex()
+                                .items_center()
+                                .h(px(24.0))
+                                .px_3()
+                                .text_sm()
+                                .text_color(rgba(0xcdd6f4ff))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgba(0x45475a88)))
+                                .on_mouse_down(MouseButton::Left, ctx_paste_listener)
+                                .child("Paste"),
+                        ),
+                ),
             ))
         });
 
