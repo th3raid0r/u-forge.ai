@@ -5,12 +5,13 @@
 //! input field, dropdowns, and sibling messages don't re-render per token.
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, Context, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Render, SharedString, Styled, Window,
+    div, prelude::*, px, rgb, rgba, App, Context, Entity, Hsla, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Render, SharedString, Styled, Window,
 };
 use tracing::trace_span;
 
 use crate::chat_history::{StoredChatMessage, StoredRole, StoredToolCall};
+use crate::text_field::TextFieldView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatMessageRole {
@@ -37,11 +38,24 @@ pub(crate) struct ChatMessageView {
     tool_internal_id: Option<String>,
     /// Whether the block body is collapsed. Defaults true for Thinking blocks.
     collapsed: bool,
+    /// Read-only selectable body for User/Assistant/Thinking messages.
+    /// ToolCall messages keep plain div rendering and have no body entity.
+    body: Option<Entity<TextFieldView>>,
 }
 
 impl ChatMessageView {
-    pub(crate) fn new_text(role: ChatMessageRole, text: String) -> Self {
+    pub(crate) fn new_text(
+        role: ChatMessageRole,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let is_thinking = role == ChatMessageRole::Thinking;
+        let body_color = if is_thinking {
+            Hsla::from(rgba(0x6c7086ff))
+        } else {
+            Hsla::from(rgba(0xcdd6f4ff))
+        };
+        let body = cx.new(|cx| TextFieldView::new_read_only(&text, body_color, cx));
         Self {
             role,
             text: SharedString::new(text),
@@ -49,10 +63,16 @@ impl ChatMessageView {
             tool_result: None,
             tool_internal_id: None,
             collapsed: is_thinking,
+            body: Some(body),
         }
     }
 
-    pub(crate) fn new_tool_call(internal_id: String, name: String, args: String) -> Self {
+    pub(crate) fn new_tool_call(
+        internal_id: String,
+        name: String,
+        args: String,
+        _cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             role: ChatMessageRole::ToolCall,
             text: SharedString::new(name),
@@ -60,10 +80,11 @@ impl ChatMessageView {
             tool_result: None,
             tool_internal_id: Some(internal_id),
             collapsed: true,
+            body: None,
         }
     }
 
-    pub(crate) fn from_stored(msg: StoredChatMessage) -> Self {
+    pub(crate) fn from_stored(msg: StoredChatMessage, cx: &mut Context<Self>) -> Self {
         let role = match msg.role {
             StoredRole::User => ChatMessageRole::User,
             StoredRole::Assistant => ChatMessageRole::Assistant,
@@ -76,6 +97,16 @@ impl ChatMessageView {
             } else {
                 (None, None, None, role == ChatMessageRole::Thinking)
             };
+        let body = if role != ChatMessageRole::ToolCall {
+            let body_color = if role == ChatMessageRole::Thinking {
+                Hsla::from(rgba(0x6c7086ff))
+            } else {
+                Hsla::from(rgba(0xcdd6f4ff))
+            };
+            Some(cx.new(|cx| TextFieldView::new_read_only(&msg.text, body_color, cx)))
+        } else {
+            None
+        };
         Self {
             role,
             text: SharedString::new(msg.text),
@@ -83,6 +114,7 @@ impl ChatMessageView {
             tool_result,
             tool_internal_id,
             collapsed,
+            body,
         }
     }
 
@@ -114,6 +146,24 @@ impl ChatMessageView {
         &self.text
     }
 
+    pub(crate) fn copy_text(&self) -> String {
+        match self.role {
+            ChatMessageRole::ToolCall => {
+                let mut buf = self.text.to_string();
+                if let Some(args) = &self.tool_args {
+                    buf.push_str("\nArgs:\n");
+                    buf.push_str(args);
+                }
+                if let Some(result) = &self.tool_result {
+                    buf.push_str("\nResult:\n");
+                    buf.push_str(result);
+                }
+                buf
+            }
+            _ => self.text.to_string(),
+        }
+    }
+
     /// Hot path: called on every streamed token. Only this entity notifies.
     /// Rebuilds the SharedString once here so render's clone is O(1).
     pub(crate) fn append_text(&mut self, delta: &str, cx: &mut Context<Self>) {
@@ -126,7 +176,12 @@ impl ChatMessageView {
         let mut buf = String::with_capacity(self.text.len() + delta.len());
         buf.push_str(&self.text);
         buf.push_str(delta);
-        self.text = SharedString::new(buf);
+        self.text = SharedString::new(buf.clone());
+        if let Some(ref body) = self.body {
+            body.update(cx, |tf, cx| {
+                tf.replace_content_preserving_selection(&buf, cx);
+            });
+        }
         cx.notify();
     }
 
@@ -139,8 +194,23 @@ impl ChatMessageView {
         let mut buf = String::with_capacity(self.text.len() + msg.len());
         buf.push_str(&self.text);
         buf.push_str(msg);
-        self.text = SharedString::new(buf);
+        self.text = SharedString::new(buf.clone());
+        if let Some(ref body) = self.body {
+            body.update(cx, |tf, cx| {
+                tf.replace_content_preserving_selection(&buf, cx);
+            });
+        }
         cx.notify();
+    }
+
+    /// Returns selected text from the body if any, otherwise the full copyable text.
+    pub(crate) fn copy_text_for_context(&self, cx: &App) -> String {
+        if let Some(ref body) = self.body {
+            if let Some(sel) = body.read(cx).selected_text() {
+                return sel;
+            }
+        }
+        self.copy_text()
     }
 
     fn toggle_collapsed(&mut self, cx: &mut Context<Self>) {
@@ -165,7 +235,17 @@ impl ChatMessageView {
             ChatMessageRole::Thinking | ChatMessageRole::ToolCall => unreachable!(),
         };
 
-        let text = self.text.clone();
+        let body_el = self
+            .body
+            .clone()
+            .map(|b| b.into_any_element())
+            .unwrap_or_else(|| {
+                div()
+                    .text_xs()
+                    .text_color(text_color)
+                    .child(self.text.clone())
+                    .into_any_element()
+            });
 
         div()
             .flex()
@@ -181,7 +261,7 @@ impl ChatMessageView {
                     .pb(px(2.0))
                     .child(label),
             )
-            .child(div().text_xs().text_color(text_color).child(text))
+            .child(body_el)
     }
 
     /// Collapsible thinking block. Collapsed by default so the virtual list
@@ -229,14 +309,19 @@ impl ChatMessageView {
             );
 
         if !collapsed {
-            let text = self.text.clone();
-            el = el.child(
-                div()
-                    .text_xs()
-                    .text_color(rgba(0x6c7086ff))
-                    .mt_1()
-                    .child(text),
-            );
+            let body_el = self
+                .body
+                .clone()
+                .map(|b| b.into_any_element())
+                .unwrap_or_else(|| {
+                    div()
+                        .text_xs()
+                        .text_color(rgba(0x6c7086ff))
+                        .mt_1()
+                        .child(self.text.clone())
+                        .into_any_element()
+                });
+            el = el.child(body_el);
         }
 
         el

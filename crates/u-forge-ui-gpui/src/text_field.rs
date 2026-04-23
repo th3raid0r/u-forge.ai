@@ -1,10 +1,10 @@
 use std::ops::Range;
 
 use gpui::{
-    canvas, div, fill, font, point, prelude::*, px, rgba, size, App, Bounds, Context,
-    ElementInputHandler, EntityInputHandler, FocusHandle, Focusable, Hsla, KeyDownEvent,
-    MouseButton, MouseDownEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Task, TextAlign, TextRun, UTF16Selection, Window, WrappedLine,
+    canvas, div, fill, font, point, prelude::*, px, rgba, size, App, Bounds, ClipboardItem,
+    Context, ElementInputHandler, EntityInputHandler, FocusHandle, Focusable, Hsla, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, SharedString, Task, TextAlign, TextRun, UTF16Selection, Window, WrappedLine,
 };
 
 /// Single-line text field height (px).
@@ -72,6 +72,12 @@ pub(crate) struct TextFieldView {
     h_scroll_offset: f32,
     /// Visible width of the text area (bounds width minus padding), updated each paint.
     visible_width: f32,
+    /// When true, the field does not accept edits — selection and Ctrl+C still work.
+    pub(crate) read_only: bool,
+    /// Byte offset where the current mouse drag started (for selection anchoring).
+    drag_anchor: Option<usize>,
+    /// Text color for painted content. Defaults to Catppuccin text (#cdd6f4).
+    text_color: Hsla,
 }
 
 impl TextFieldView {
@@ -97,6 +103,43 @@ impl TextFieldView {
             scroll_offset: 0.0,
             h_scroll_offset: 0.0,
             visible_width: 0.0,
+            read_only: false,
+            drag_anchor: None,
+            text_color: Hsla::from(rgba(0xcdd6f4ff)),
+        }
+    }
+
+    /// Read-only variant used for chat message bodies: supports drag selection and
+    /// Ctrl+C, but suppresses all editing. No border or background styling.
+    pub(crate) fn new_read_only(
+        text: &str,
+        color: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            content: text.to_string(),
+            cursor: 0,
+            selection: None,
+            marked_range: None,
+            focus: cx.focus_handle(),
+            multiline: true,
+            submit_on_enter: false,
+            placeholder: String::new(),
+            cursor_visible: false,
+            blink_task: None,
+            was_focused: false,
+            measured_line_h: 19.0,
+            field_origin_x: 0.0,
+            field_origin_y: 0.0,
+            shaped_layout: None,
+            content_height: 0.0,
+            visible_height: 0.0,
+            scroll_offset: 0.0,
+            h_scroll_offset: 0.0,
+            visible_width: 0.0,
+            read_only: true,
+            drag_anchor: None,
+            text_color: color,
         }
     }
 
@@ -256,6 +299,49 @@ impl TextFieldView {
         self.scroll_offset = 0.0;
         self.h_scroll_offset = 0.0;
         self.reset_blink(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn insert_at_cursor(&mut self, text: &str, cx: &mut Context<Self>) {
+        let (start, end) = if let Some(ref sel) = self.selection {
+            (sel.start.min(sel.end), sel.start.max(sel.end))
+        } else {
+            (self.cursor, self.cursor)
+        };
+        let clamped_start = start.min(self.content.len());
+        let clamped_end = end.min(self.content.len());
+        self.content.replace_range(clamped_start..clamped_end, text);
+        self.cursor = clamped_start + text.len();
+        self.selection = None;
+        self.scroll_to_cursor();
+        self.reset_blink(cx);
+        cx.emit(TextChanged(self.content.clone()));
+        cx.notify();
+    }
+
+    /// Returns the selected substring, or None if there is no non-empty selection.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        let start = sel.start.min(sel.end).min(self.content.len());
+        let end = sel.start.max(sel.end).min(self.content.len());
+        if start == end {
+            return None;
+        }
+        Some(self.content[start..end].to_string())
+    }
+
+    /// Update content without resetting the selection — used during streaming so
+    /// a user's active selection is not disrupted by each incoming token.
+    pub(crate) fn replace_content_preserving_selection(
+        &mut self,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ref mut sel) = self.selection {
+            sel.start = sel.start.min(text.len());
+            sel.end = sel.end.min(text.len());
+        }
+        self.content = text.to_string();
         cx.notify();
     }
 
@@ -516,6 +602,9 @@ impl Render for TextFieldView {
         let scroll_offset = self.scroll_offset;
         let h_scroll_offset = self.h_scroll_offset;
         let is_multiline = self.multiline;
+        let is_read_only = self.read_only;
+        let text_color_hsla = self.text_color;
+        let selection = self.selection.clone();
 
         // The main canvas renders text and cursor via shape_line/paint, exactly
         // matching the glyph positions GPUI uses internally — like Zed does.
@@ -532,7 +621,7 @@ impl Render for TextFieldView {
                 let (display, text_hsla) = if content.is_empty() && !is_focused {
                     (placeholder.clone(), Hsla::from(rgba(0x6c7086ff)))
                 } else {
-                    (content.clone(), Hsla::from(rgba(0xcdd6f4ff)))
+                    (content.clone(), text_color_hsla)
                 };
 
                 let pad_x = px(6.0);
@@ -567,6 +656,13 @@ impl Render for TextFieldView {
 
                 let mut stored_lines: Vec<(usize, WrappedLine)> = Vec::new();
 
+                // Normalised selection range (start <= end).
+                let sel_range = selection.as_ref().map(|s| {
+                    let a = s.start.min(s.end);
+                    let b = s.start.max(s.end);
+                    a..b
+                });
+
                 for (line_idx, raw_line) in raw_lines.iter().enumerate() {
                     if !raw_line.is_empty() {
                         let line_text: SharedString = (*raw_line).to_string().into();
@@ -586,6 +682,59 @@ impl Render for TextFieldView {
                             None,
                         ) {
                             for wl in wrapped {
+                                let line_end = byte_offset + raw_line.len();
+
+                                // Paint selection highlight behind text.
+                                if let Some(ref sr) = sel_range {
+                                    if sr.start < line_end && sr.end > byte_offset {
+                                        let in_start =
+                                            sr.start.saturating_sub(byte_offset);
+                                        let in_end =
+                                            (sr.end - byte_offset).min(raw_line.len());
+                                        let start_pos =
+                                            wl.position_for_index(in_start, line_height);
+                                        let end_pos =
+                                            wl.position_for_index(in_end, line_height);
+                                        if let (Some(sp), Some(ep)) = (start_pos, end_pos) {
+                                            let start_row = (f32::from(sp.y)
+                                                / f32::from(line_height))
+                                                .floor()
+                                                as usize;
+                                            let end_row = (f32::from(ep.y)
+                                                / f32::from(line_height))
+                                                .floor()
+                                                as usize;
+                                            for row in start_row..=end_row {
+                                                let row_y = line_height * row as f32;
+                                                let x0 = if row == start_row {
+                                                    sp.x
+                                                } else {
+                                                    px(0.0)
+                                                };
+                                                let x1 = if row == end_row {
+                                                    ep.x
+                                                } else {
+                                                    inner_w
+                                                };
+                                                if x1 > x0 {
+                                                    window.paint_quad(fill(
+                                                        gpui::Bounds::new(
+                                                            point(
+                                                                text_origin.x + x0,
+                                                                text_origin.y
+                                                                    + y_acc
+                                                                    + row_y,
+                                                            ),
+                                                            size(x1 - x0, line_height),
+                                                        ),
+                                                        rgba(0x585b7088),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let paint_origin = text_origin + point(px(0.0), y_acc);
                                 let _ = wl.paint(
                                     paint_origin,
@@ -651,8 +800,8 @@ impl Render for TextFieldView {
                     this.shaped_layout = Some(TextFieldLayout(stored_lines));
                 });
 
-                // Paint the blinking cursor (adjusted for scroll offset).
-                if is_focused && cursor_visible {
+                // Paint the blinking cursor (editable fields only).
+                if !is_read_only && is_focused && cursor_visible {
                     let cp = cursor_pos.unwrap_or(point(px(0.0), px(0.0)));
                     let cursor_origin = text_origin + cp;
                     window.paint_quad(fill(
@@ -681,39 +830,48 @@ impl Render for TextFieldView {
                     this.visible_width = visible_w;
                 });
 
-                // Install the input handler so IME / platform text input works.
-                let focus2 = entity.read(cx).focus.clone();
-                window.handle_input(
-                    &focus2,
-                    ElementInputHandler::new(bounds, entity.clone()),
-                    cx,
-                );
+                // Install the IME input handler (editable fields only).
+                if !is_read_only {
+                    let focus2 = entity.read(cx).focus.clone();
+                    window.handle_input(
+                        &focus2,
+                        ElementInputHandler::new(bounds, entity.clone()),
+                        cx,
+                    );
+                }
             },
         )
         .size_full();
 
         // Single-line: fixed height. Multiline: grow with content, capped at max.
-        let dynamic_h = if self.multiline {
+        let dynamic_h = if self.read_only {
+            self.content_height.max(0.0)
+        } else if self.multiline {
             self.content_height.clamp(TEXT_FIELD_MIN_H, TEXT_FIELD_MAX_H)
         } else {
             TEXT_FIELD_MIN_H
         };
 
-        let field = div()
+        let mut field = div()
             .id(SharedString::from(format!("tf-{}", cx.entity_id().as_u64())))
             .relative()
             .w_full()
             .h(px(dynamic_h))
-            .bg(gpui::rgb(0x313244))
-            .rounded(px(4.0))
-            .border_1()
-            .border_color(if focused {
-                gpui::rgb(0x89b4fa)
-            } else {
-                gpui::rgb(0x45475a)
-            })
             .overflow_hidden()
             .track_focus(&self.focus);
+
+        // Editable fields get explicit background, border, and rounded corners.
+        if !self.read_only {
+            field = field
+                .bg(gpui::rgb(0x313244))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(if focused {
+                    gpui::rgb(0x89b4fa)
+                } else {
+                    gpui::rgb(0x45475a)
+                });
+        }
 
         field
             .on_mouse_down(
@@ -727,10 +885,55 @@ impl Render for TextFieldView {
                     let local_y = f32::from(event.position.y) - this.field_origin_y
                         - TEXT_FIELD_PAD_Y
                         + if this.multiline { this.scroll_offset } else { 0.0 };
-                    this.cursor = this.cursor_for_click(local_x, local_y);
-                    this.selection = None;
-                    this.scroll_to_cursor();
-                    this.reset_blink(cx);
+                    let byte = this.cursor_for_click(local_x, local_y);
+                    this.drag_anchor = Some(byte);
+                    this.selection = Some(byte..byte);
+                    if !this.read_only {
+                        this.cursor = byte;
+                        this.scroll_to_cursor();
+                        this.reset_blink(cx);
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if !event.dragging() || this.drag_anchor.is_none() {
+                    return;
+                }
+                let anchor = this.drag_anchor.unwrap();
+                let local_x = f32::from(event.position.x) - this.field_origin_x - 6.0
+                    + if this.multiline { 0.0 } else { this.h_scroll_offset };
+                let local_y = f32::from(event.position.y) - this.field_origin_y
+                    - TEXT_FIELD_PAD_Y
+                    + if this.multiline { this.scroll_offset } else { 0.0 };
+                let byte = this.cursor_for_click(local_x, local_y);
+                this.selection = Some(anchor..byte);
+                if !this.read_only {
+                    this.cursor = byte;
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    this.drag_anchor = None;
+                    if let Some(ref sel) = this.selection {
+                        if sel.start == sel.end {
+                            this.selection = None;
+                        }
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    this.drag_anchor = None;
+                    if let Some(ref sel) = this.selection {
+                        if sel.start == sel.end {
+                            this.selection = None;
+                        }
+                    }
                     cx.notify();
                 }),
             )
@@ -748,6 +951,42 @@ impl Render for TextFieldView {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 let key = event.keystroke.key.as_str();
+                let ctrl = event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.platform;
+
+                // Ctrl+A — select all (both editable and read-only).
+                if key == "a" && ctrl {
+                    this.selection = Some(0..this.content.len());
+                    if !this.read_only {
+                        this.cursor = this.content.len();
+                    }
+                    cx.notify();
+                    return;
+                }
+
+                // Ctrl+C — copy selection (both editable and read-only).
+                if key == "c" && ctrl {
+                    if let Some(text) = this.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                    return;
+                }
+
+                // Ctrl+V — paste (editable only).
+                if key == "v" && ctrl && !this.read_only {
+                    if let Some(clip) = cx.read_from_clipboard() {
+                        if let Some(text) = clip.text() {
+                            this.insert_at_cursor(&text.clone(), cx);
+                        }
+                    }
+                    return;
+                }
+
+                // All mutation keys are suppressed in read-only mode.
+                if this.read_only {
+                    return;
+                }
+
                 match key {
                     "backspace" => {
                         if !this.delete_selection() && this.cursor > 0 {
