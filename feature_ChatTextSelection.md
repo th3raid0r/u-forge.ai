@@ -10,7 +10,7 @@ Canonical test command: `cargo test --workspace -- --test-threads=1`.
 
 ---
 
-## Status: Phase A + Phase B implemented. Two known bugs remain.
+## Status: Phase A + Phase B + Phase C shipped. Feature complete.
 
 ### What's shipped
 
@@ -64,58 +64,49 @@ Canonical test command: `cargo test --workspace -- --test-threads=1`.
 - Inserts (or replaces selection) at the cursor position and emits
   `TextChanged`. Used by the Paste action in the context menu.
 
----
+**Phase C — Built-in right-click context menu on every `TextFieldView`** ✓
+- Bug 1 and Bug 2 from the prior session are both fixed as side effects of
+  moving the context menu into the widget itself. The chat-panel-level
+  overlay still exists for ToolCall rows (which have no body) and for
+  right-clicks on empty padding around message bodies.
+- `TextFieldView` gains `context_menu_pos: Option<Point<Pixels>>`.
+- Right-click (`on_mouse_down(MouseButton::Right, ...)`) focuses the field,
+  captures the click position, calls `cx.stop_propagation()`, and sets
+  `context_menu_pos`. An "empty menu" case (read-only + no selection) is
+  detected inline: the handler returns early without stopping propagation,
+  so outer containers (chat message rows) can still open their own
+  "copy whole message" menu.
+- Menu items adapt to state:
+  - **Copy** is shown only when there is a non-empty selection.
+  - **Paste** is shown only when the field is editable.
+  - A separator is shown between them only when both are visible.
+- Menu is rendered via `deferred(anchored().position(pos))` inside the
+  field's own element tree, so it floats above siblings at the exact
+  click coords.
+- Dismissal is comprehensive:
+  - `on_mouse_down_out` (capture phase) — clicking anywhere else in the
+    window closes the menu *before* the click is handled elsewhere, so
+    right-clicking a different field never leaves a stale menu behind.
+  - Any left-click inside the field dismisses the menu.
+  - Losing focus dismisses (handled in the focus-transition block of
+    `render`).
+  - `Escape` in `on_key_down` dismisses (checked before Ctrl shortcuts).
+  - Clicking Copy/Paste dismisses and stops propagation.
 
-## Known bugs (next session)
-
-### Bug 1 — Right-click Copy does nothing in the chat panel
-
-**Symptom:** Opening the context menu and clicking "Copy" has no visible
-effect; nothing lands in the clipboard.
-
-**Likely cause:** `copy_text_for_context` is called at right-click time
-(inside the list builder closure, `cx: &mut App`). At that moment the
-body's `TextFieldView` may not yet have focus or the selection might not
-be readable via the shared `App` context in the same frame as the
-right-click event. The captured `ctx_text` in `ContextMenuState` may end
-up as an empty string.
-
-**Investigation starting point:**
-- Add a `tracing::debug!` in `copy_text_for_context` to log what text is
-  captured at right-click time.
-- Check whether `body.read(cx).selected_text()` returns `Some` during
-  a right-click when a selection is visually active.
-- Verify that the `ctx_copy_listener` closure is actually being reached
-  (the menu item fires its `on_mouse_down`).
-
-### Bug 2 — Right-click context menu only appears on chat message rows
-
-**Symptom:** Right-clicking outside the chat message list (e.g. on the
-header area, input field, node editor, etc.) does not open a context menu.
-
-**Root cause:** The right-click handler is only registered on
-`("msg-row", ix)` divs inside the chat panel's list builder. There is no
-global right-click handler.
-
-**Design decision needed:** A global context menu would need to be owned
-by `AppView` (or a new coordinator), with a way to determine the "active
-selectable" under the cursor and what text it contains. This requires
-either:
-- A GPUI focus-based approach: the focused `TextFieldView` is always the
-  selection owner; right-click anywhere routes to it.
-- A mouse-position hit-test approach: walk the element tree to find the
-  `TextFieldView` under the pointer.
-
-The simplest fix: register `on_mouse_down(Right, ...)` on the input field
-wrapper in `chat_panel.rs` render so at least the input box gets a context
-menu. Broader global coverage is a follow-up.
+**Phase C — Chat panel bug fixes** ✓
+- Fix for the stale-capture class of bugs that affected the chat panel's
+  action bar ⎘ button and the legacy per-row right-click handler: both
+  were previously capturing `msg.read(cx).copy_text_for_context(cx)` at
+  render time. Because selection changes in a message body's
+  `TextFieldView` notify only that entity (not the `ChatPanel`), the
+  captured string could be stale by the time the user clicked. Both
+  handlers now clone the `Entity<ChatMessageView>` itself and call
+  `read(cx).copy_text_for_context(cx)` at click time.
 
 ---
 
 ## Remaining work
 
-- [ ] Fix Bug 1 (Copy in context menu)
-- [ ] Fix Bug 2 (right-click coverage beyond message rows)
 - [ ] Double-click to select word (out of scope but easy follow-up)
 - [ ] Shift+Arrow keyboard selection (out of scope)
 - [ ] Cross-message selection (out of scope)
@@ -125,13 +116,17 @@ menu. Broader global coverage is a follow-up.
 
 ## Files touched
 
-- `crates/u-forge-ui-gpui/src/text_field.rs` — `read_only`, `drag_anchor`,
-  `text_color`, `new_read_only`, `replace_content_preserving_selection`,
-  `selected_text`, `insert_at_cursor`, selection paint, mouse-move/up
-  handlers, Ctrl+C/V/A.
+- `crates/u-forge-ui-gpui/src/text_field.rs` — Phase B: `read_only`,
+  `drag_anchor`, `text_color`, `new_read_only`,
+  `replace_content_preserving_selection`, `selected_text`,
+  `insert_at_cursor`, selection paint, mouse-move/up handlers, Ctrl+C/V/A.
+  Phase C: `context_menu_pos`, right-click handler with stop-propagation,
+  `on_mouse_down_out` dismiss, Escape handler, focus-loss dismiss, inline
+  `deferred(anchored)` menu with adaptive Copy/Paste items.
 - `crates/u-forge-ui-gpui/src/chat_message.rs` — `body: Option<Entity<TextFieldView>>`,
   updated constructors, `append_text`/`append_error` routing,
   `copy_text_for_context`, `copy_text`.
-- `crates/u-forge-ui-gpui/src/chat_panel.rs` — action bar copy button,
-  right-click handler on message rows, `ContextMenuState`, context menu
-  overlay, `insert_at_cursor` paste action.
+- `crates/u-forge-ui-gpui/src/chat_panel.rs` — action bar copy button
+  (Phase C: reads live state via cloned `msg` entity), right-click handler
+  on message rows (Phase C: same fix), `ContextMenuState`, context menu
+  overlay, `insert_at_cursor` paste action, right-click on input area.

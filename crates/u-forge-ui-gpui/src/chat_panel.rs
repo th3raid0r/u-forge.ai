@@ -1016,7 +1016,6 @@ impl Render for ChatPanel {
                 let is_last = ix + 1 == panel.messages.len();
                 let is_streaming = panel.streaming;
                 let role = msg.read(cx).role;
-                let copy_text = msg.read(cx).copy_text_for_context(cx);
                 let can_retry = !is_streaming
                     && matches!(role, ChatMessageRole::User | ChatMessageRole::Assistant);
                 let show_delete = is_last && !is_streaming;
@@ -1026,16 +1025,20 @@ impl Render for ChatPanel {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .child(msg);
+                    .child(msg.clone());
 
                 // Right-click anywhere on the row to open the context menu.
+                // Resolve copy text at click time (not render time) so an active
+                // drag-selection in the body is captured — selection changes in
+                // the body's TextFieldView only notify that entity, not the panel,
+                // so a render-time snapshot would be stale.
                 let ctx_entity = list_entity.clone();
-                let copy_for_ctx = copy_text.clone();
+                let msg_for_ctx = msg.clone();
                 row = row.on_mouse_down(
                     MouseButton::Right,
                     move |event: &MouseDownEvent, _window, cx: &mut App| {
                         let pos = event.position;
-                        let text = copy_for_ctx.clone();
+                        let text = msg_for_ctx.read(cx).copy_text_for_context(cx);
                         ctx_entity.update(cx, |panel, cx| {
                             panel.context_menu =
                                 Some(ContextMenuState { position: pos, text });
@@ -1049,7 +1052,7 @@ impl Render for ChatPanel {
                     let retry_entity = list_entity.clone();
                     let copy_entity = list_entity.clone();
                     let msg_entity_id = panel.messages[ix].entity_id();
-                    let copy_text_btn = copy_text.clone();
+                    let msg_for_copy = msg.clone();
 
                     let bubble_bg = match role {
                         ChatMessageRole::User => rgb(0x313244),
@@ -1108,9 +1111,9 @@ impl Render for ChatPanel {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 move |_, _, cx: &mut App| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_text_btn.clone(),
-                                    ));
+                                    let text =
+                                        msg_for_copy.read(cx).copy_text_for_context(cx);
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                                     copy_entity.update(cx, |panel, cx| {
                                         panel.context_menu = None;
                                         cx.notify();
@@ -1410,6 +1413,24 @@ impl Render for ChatPanel {
                             if changed {
                                 cx.notify();
                             }
+                        }),
+                    )
+                    // Right-click anywhere in the input area opens the context
+                    // menu. Copy text = current selection in the input field (or
+                    // empty, leaving only Paste useful). Message rows install
+                    // their own Right handler that captures per-row text.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                            let pos = event.position;
+                            let text = this
+                                .input_field
+                                .read(cx)
+                                .selected_text()
+                                .unwrap_or_default();
+                            this.context_menu =
+                                Some(ContextMenuState { position: pos, text });
+                            cx.notify();
                         }),
                     )
                     .border_color(rgb(0x313244))

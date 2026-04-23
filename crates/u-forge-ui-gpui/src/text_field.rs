@@ -1,10 +1,11 @@
 use std::ops::Range;
 
 use gpui::{
-    canvas, div, fill, font, point, prelude::*, px, rgba, size, App, Bounds, ClipboardItem,
-    Context, ElementInputHandler, EntityInputHandler, FocusHandle, Focusable, Hsla, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta,
-    ScrollWheelEvent, SharedString, Task, TextAlign, TextRun, UTF16Selection, Window, WrappedLine,
+    anchored, canvas, deferred, div, fill, font, point, prelude::*, px, rgb, rgba, size, App,
+    Bounds, ClipboardItem, Context, Corner, ElementInputHandler, EntityInputHandler, FocusHandle,
+    Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Task, TextAlign, TextRun,
+    UTF16Selection, Window, WrappedLine,
 };
 
 /// Single-line text field height (px).
@@ -78,6 +79,9 @@ pub(crate) struct TextFieldView {
     drag_anchor: Option<usize>,
     /// Text color for painted content. Defaults to Catppuccin text (#cdd6f4).
     text_color: Hsla,
+    /// Window-coord position of an open right-click context menu, if any.
+    /// Rendered via `deferred(anchored(...))` so it floats above siblings.
+    context_menu_pos: Option<Point<Pixels>>,
 }
 
 impl TextFieldView {
@@ -106,6 +110,7 @@ impl TextFieldView {
             read_only: false,
             drag_anchor: None,
             text_color: Hsla::from(rgba(0xcdd6f4ff)),
+            context_menu_pos: None,
         }
     }
 
@@ -140,6 +145,7 @@ impl TextFieldView {
             read_only: true,
             drag_anchor: None,
             text_color: color,
+            context_menu_pos: None,
         }
     }
 
@@ -583,13 +589,16 @@ impl Render for TextFieldView {
         let entity = cx.entity().clone();
         let paint_entity = cx.entity().clone();
 
-        // Start or stop the blink cycle when focus changes.
+        // Start or stop the blink cycle when focus changes. Losing focus also
+        // dismisses any open context menu so it doesn't linger after the user
+        // clicks a different field.
         if focused != self.was_focused {
             self.was_focused = focused;
             if focused {
                 self.reset_blink(cx);
             } else {
                 self.stop_blinking();
+                self.context_menu_pos = None;
             }
         }
 
@@ -878,6 +887,8 @@ impl Render for TextFieldView {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus);
+                    // Any left click inside the field dismisses an open context menu.
+                    this.context_menu_pos = None;
                     // Convert window coordinates to text-area-local coordinates.
                     // Subtract element origin and padding, add scroll offset.
                     let local_x = f32::from(event.position.x) - this.field_origin_x - 6.0
@@ -896,6 +907,36 @@ impl Render for TextFieldView {
                     cx.notify();
                 }),
             )
+            // Right-click opens the Copy/Paste context menu. Stopping propagation
+            // prevents outer containers (e.g. chat message rows) from installing
+            // their own competing menu on the same event. A read-only field with
+            // no selection has nothing to show — in that case we let the event
+            // bubble so an outer handler (e.g. "copy whole message") can take over.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    let has_selection =
+                        this.selection.as_ref().is_some_and(|s| s.start != s.end);
+                    let has_any_item = has_selection || !this.read_only;
+                    if !has_any_item {
+                        return;
+                    }
+                    window.focus(&this.focus);
+                    this.context_menu_pos = Some(event.position);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            // Clicking outside the field dismisses the menu. Using `on_mouse_down_out`
+            // (capture phase, hit-test outside this element) means any click elsewhere
+            // in the window — even on a neighbouring text field — closes this menu
+            // before that click is handled.
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                if this.context_menu_pos.is_some() {
+                    this.context_menu_pos = None;
+                    cx.notify();
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 if !event.dragging() || this.drag_anchor.is_none() {
                     return;
@@ -953,6 +994,13 @@ impl Render for TextFieldView {
                 let key = event.keystroke.key.as_str();
                 let ctrl = event.keystroke.modifiers.control
                     || event.keystroke.modifiers.platform;
+
+                // Escape closes an open context menu first (if any).
+                if key == "escape" && this.context_menu_pos.is_some() {
+                    this.context_menu_pos = None;
+                    cx.notify();
+                    return;
+                }
 
                 // Ctrl+A — select all (both editable and read-only).
                 if key == "a" && ctrl {
@@ -1077,5 +1125,82 @@ impl Render for TextFieldView {
                 }
             }))
             .child(text_canvas)
+            .when_some(self.context_menu_pos, |el, pos| {
+                let has_selection = self.selection.as_ref().is_some_and(|s| s.start != s.end);
+                let is_read_only = self.read_only;
+                el.child(deferred(
+                    anchored()
+                        .position(pos)
+                        .anchor(Corner::TopLeft)
+                        .child(
+                            div()
+                                .id("tf-ctx-menu")
+                                .w(px(140.0))
+                                .bg(rgb(0x313244))
+                                .border_1()
+                                .border_color(rgb(0x45475a))
+                                .rounded(px(3.0))
+                                .when(has_selection, |m| {
+                                    m.child(
+                                        div()
+                                            .id("tf-ctx-copy")
+                                            .flex()
+                                            .items_center()
+                                            .h(px(24.0))
+                                            .px_3()
+                                            .text_xs()
+                                            .text_color(rgba(0xcdd6f4ff))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                                                    if let Some(text) = this.selected_text() {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(text),
+                                                        );
+                                                    }
+                                                    this.context_menu_pos = None;
+                                                    cx.stop_propagation();
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child("Copy"),
+                                    )
+                                })
+                                .when(has_selection && !is_read_only, |m| {
+                                    m.child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                                })
+                                .when(!is_read_only, |m| {
+                                    m.child(
+                                        div()
+                                            .id("tf-ctx-paste")
+                                            .flex()
+                                            .items_center()
+                                            .h(px(24.0))
+                                            .px_3()
+                                            .text_xs()
+                                            .text_color(rgba(0xcdd6f4ff))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                                                    if let Some(clip) = cx.read_from_clipboard() {
+                                                        if let Some(text) = clip.text() {
+                                                            this.insert_at_cursor(&text, cx);
+                                                        }
+                                                    }
+                                                    this.context_menu_pos = None;
+                                                    cx.stop_propagation();
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child("Paste"),
+                                    )
+                                }),
+                        ),
+                ))
+            })
     }
 }
