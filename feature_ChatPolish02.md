@@ -226,7 +226,7 @@ drives the state machine.
 
 ---
 
-## Feature C — Inline delete button on the last message ("Back button")
+## Feature C — Inline delete button on the last message ("Back button") ✓ DONE
 
 ### Intent
 A small 🗑 icon appears on **whichever message is currently the tail** of
@@ -237,9 +237,17 @@ so the user can chain-click to walk backwards through history.
 This is an undo / "back button" for conversation tail, used to trim
 before a retry (or instead of one).
 
-### Current state
-`delete_session` exists (`chat_panel.rs:714`) but deletes the entire
-session. No per-message delete. The last-message slot has no affordance.
+### Status — DONE
+- `delete_message_at` added to `ChatPanel` (`chat_panel.rs:825`).
+- Virtual-list item builder wraps each message in a `div` that conditionally
+  appends the 🗑 button when `is_last && !is_streaming`.
+- `msg_subscriptions.remove(ix)` in sync with `messages.remove(ix)`.
+- `list_state.reset(len)` + `save_current_session` called on every delete.
+- `cargo check -p u-forge-ui-gpui` and full workspace tests pass clean.
+
+### Current state (pre-implementation)
+`delete_session` existed (`chat_panel.rs:714`) but deleted the entire
+session. No per-message delete. The last-message slot had no affordance.
 
 ### Design notes (from user direction)
 

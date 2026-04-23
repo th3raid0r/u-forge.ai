@@ -822,6 +822,26 @@ impl ChatPanel {
         }
     }
 
+    /// Delete the message at `ix` from the current session.
+    ///
+    /// No-op while streaming — the last message during streaming is the
+    /// in-flight assistant response; allowing delete mid-stream would race
+    /// with `append_text`. The button is also not rendered when streaming.
+    fn delete_message_at(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.streaming {
+            tracing::debug!(ix, "delete_message_at suppressed: stream in progress");
+            return;
+        }
+        if ix >= self.messages.len() {
+            return;
+        }
+        self.messages.remove(ix);
+        let _ = self.msg_subscriptions.remove(ix);
+        self.list_state.reset(self.messages.len());
+        self.save_current_session(cx);
+        cx.notify();
+    }
+
     /// Delete a session from history. If it's the current session, clear the chat.
     ///
     /// Deleting the **active** session while streaming is suppressed (it would
@@ -962,10 +982,59 @@ impl Render for ChatPanel {
             move |ix, _window, cx: &mut App| {
                 let _span = tracing::trace_span!("chat_panel::list_item", ix).entered();
                 let panel = list_entity.read(cx);
-                match panel.messages.get(ix) {
-                    Some(msg) => msg.clone().into_any_element(),
-                    None => div().into_any_element(),
+                let Some(msg) = panel.messages.get(ix).cloned() else {
+                    return div().into_any_element();
+                };
+                let is_last = ix + 1 == panel.messages.len();
+                let is_streaming = panel.streaming;
+                let entity = list_entity.clone();
+
+                let mut row = div()
+                    .id(("msg-row", ix))
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(msg);
+
+                if is_last && !is_streaming {
+                    row = row.child(
+                        div()
+                            .id(("del-row", ix))
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .px_2()
+                            .py(px(2.0))
+                            .child(
+                                div()
+                                    .id(("del", ix))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(18.0))
+                                    .h(px(18.0))
+                                    .rounded(px(2.0))
+                                    .text_xs()
+                                    .text_color(rgba(0x6c708688))
+                                    .cursor_pointer()
+                                    .hover(|s| {
+                                        s.text_color(rgba(0xf38ba8ff)).bg(rgba(0x45475a66))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_, _, cx: &mut App| {
+                                            entity.update(cx, |this, cx| {
+                                                let last =
+                                                    this.messages.len().saturating_sub(1);
+                                                this.delete_message_at(last, cx);
+                                            });
+                                        },
+                                    )
+                                    .child("🗑"),
+                            ),
+                    );
                 }
+                row.into_any_element()
             },
         );
 
