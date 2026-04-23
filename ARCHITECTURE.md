@@ -229,6 +229,15 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 
 **Two-pass JSONL import** (`data.rs`): collect all nodes → create objects with name→ID map → resolve edge names → create edges. `create_objects` deduplicates by type+name (existing node ID reused). `resolve_node_id` calls `find_by_name_only` as a storage fallback, allowing edges to reference nodes from prior import sessions.
 
+**Two ingestion entry points:**
+- `setup_and_index(graph, schema_dir, data_file)` — loads schemas AND imports data. Used for a full fresh setup only.
+- `import_data_only(graph, data_file)` — data import + FTS5 indexing with **no schema side-effects**. The UI's "Import Data…" action uses this so importing data never overwrites or clears loaded schemas.
+
+**Separate clear operations on `KnowledgeGraph`:**
+- `clear_data()` — deletes nodes/edges/chunks/vectors; schemas intact. Used by "Clear Data".
+- `clear_schemas()` — iterates `SchemaManager::list_schemas()` and calls `delete_schema` for each; node data intact. Used by "Clear Schema".
+- `clear_all()` — still exists; wipes everything. Not exposed in the UI.
+
 **Per-node re-chunking** (`embedding.rs`): `rechunk_and_embed(graph, queue, hq_queue, object_id)` — delete old chunks (cascades FTS5 + vector indexes) → flatten via `flatten_for_embedding()` → create new chunks → embed standard (768-dim) → embed HQ (4096-dim) if `hq_queue` provided. Blocks until all embeddings are stored. Write tools and UI save both call this to guarantee immediate searchability after the call returns.
 
 `EmbeddingPlan` is the declarative UI entry point: `EmbeddingPlan::rechunk(ids)` for per-node re-chunk + embed, `EmbeddingPlan::embed_all()` for bulk unembedded sweep. `AppView::run_embedding_plan(plan, cx)` is the single UI call site — owns status formatting, epoch-based poller cancellation, and the background tokio task. The spawned future is attached to an `info_span!("embedding_plan", plan_kind)` before detaching; `do_init_lemonade` uses the same `.instrument(info_span!(...))` pattern.
@@ -260,6 +269,19 @@ AppView
 **`TextFieldView` serves two roles.** The same widget is used as the editable chat input (bottom) and as the read-only, selectable body of User/Assistant/Thinking messages. Construct with `TextFieldView::new_read_only(text, color, cx)` for message bodies. ToolCall rows skip the body entity and render plain divs.
 
 **`ConnectRequested` event bridges `ChatPanel` → `AppView`.** `ChatPanel` cannot call `do_init_lemonade` directly (it doesn't hold the full app state). Instead it emits `ConnectRequested`; `AppView` subscribes, calls `do_init_lemonade`, and calls `ChatPanel::set_connecting(false)` on completion or `set_connect_failed(msg)` on failure.
+
+### File menu and path picker
+
+The File menu exposes six operations in order: Save → Import Schema… → Import Data… → Export Data… → Clear Schema → Clear Data.
+
+"Import Schema…", "Import Data…", and "Export Data…" each open `PathPickerModal` (`src/path_picker.rs`) — a custom in-app dialog (see `.rulesdir/gpui-patterns.mdc` — "Modal overlay") pre-populated from `AppConfig`. On confirm, the chosen path is used directly; there is no separate "Choose…" step.
+
+`AppState.schema_loaded: bool` — initialized from the DB at startup (true if any non-default schema exists), set to `true` on successful schema import, `false` on `clear_schemas()`. Drives menu grey-out:
+- "Import Data…" — greyed when `!schema_loaded`
+- "Export Data…" and "Clear Data" — greyed when `node_count == 0`
+- "Clear Schema" — greyed when `!schema_loaded`
+
+The graph starts empty on a fresh install; there is no startup auto-import. Users import explicitly via the menu.
 
 **Send button is four-state, width-pinned.** States: Connect (yellow) / Connecting… (grey) / Send (blue) / Stop (red). Width is pinned to 88 px so the input row doesn't reflow on state change.
 

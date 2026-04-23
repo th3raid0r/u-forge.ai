@@ -391,6 +391,17 @@ impl KnowledgeGraphStorage {
         .context("Failed to clear knowledge graph")
     }
 
+    /// Delete all node data (nodes, edges via cascade, chunks, vectors) but leave schemas intact.
+    pub fn clear_data_only(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch(
+            "DELETE FROM nodes;
+             DELETE FROM chunks_vec;
+             DELETE FROM chunks_vec_hq;",
+        )
+        .context("Failed to clear node data")
+    }
+
     // ── Statistics ────────────────────────────────────────────────────────────
 
     /// Return aggregate graph statistics.

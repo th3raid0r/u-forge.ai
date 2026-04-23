@@ -24,6 +24,8 @@ pub(crate) struct AppState {
     pub(crate) inference_queue: Option<InferenceQueue>,
     /// High-quality embedding queue (None when HQ embedding is disabled or unavailable).
     pub(crate) hq_queue: Option<InferenceQueue>,
+    /// True when at least one non-default schema is present in the graph DB.
+    pub(crate) schema_loaded: bool,
     /// Status message displayed in the status bar during/after data operations.
     pub(crate) data_status: Option<String>,
     /// Embedding progress/completion message shown in the status bar.
@@ -56,6 +58,11 @@ impl AppState {
         app_config: Arc<AppConfig>,
         tokio_rt: Arc<tokio::runtime::Runtime>,
     ) -> Self {
+        let schema_loaded = graph
+            .get_schema_manager()
+            .list_schemas()
+            .map(|names| names.iter().any(|n| n != "default"))
+            .unwrap_or(false);
         Self {
             graph,
             snapshot,
@@ -63,6 +70,7 @@ impl AppState {
             schema_dir,
             app_config,
             tokio_rt,
+            schema_loaded,
             inference_queue: None,
             hq_queue: None,
             data_status: None,

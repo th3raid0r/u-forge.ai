@@ -149,6 +149,20 @@ impl KnowledgeGraph {
         self.storage.clear_all()
     }
 
+    /// Delete node data only (nodes, edges, chunks, vectors) — schemas are preserved.
+    pub fn clear_data(&self) -> Result<()> {
+        self.storage.clear_data_only()
+    }
+
+    /// Delete all schemas from the graph — node data is preserved.
+    pub fn clear_schemas(&self) -> Result<()> {
+        let mgr = self.get_schema_manager();
+        for name in mgr.list_schemas()? {
+            mgr.delete_schema(&name)?;
+        }
+        Ok(())
+    }
+
     // ── Edge / relationship operations ────────────────────────────────────────
 
     /// Create a typed relationship between two objects.

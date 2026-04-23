@@ -184,6 +184,67 @@ This applies to any closure that reads from a child entity whose notifications d
 
 ---
 
+## Modal overlay — centered blocking dialog
+
+Use `deferred()` to float a modal above all sibling panels. The backdrop is a full-screen absolute div; `deferred()` ensures it paints after all siblings.
+
+```rust
+// In Render impl — append after the main content tree
+deferred(
+    div()
+        .id("modal-backdrop")
+        .absolute().top_0().left_0()
+        .w_full().h_full()
+        .flex().items_center().justify_center()
+        .bg(rgba(0x0000008c))
+        .child(dialog_div),
+)
+```
+
+Dialog structure: fixed-width `div` (~520 px) with a dark title bar row, a body row (inputs), and a footer row (Cancel + Confirm). Keep the entity stored as `Option<(Kind, Entity<Modal>)>` in `AppView`; drop (set to `None`) on cancel or confirm.
+
+`PathPickerModal` (`src/path_picker.rs`) is the canonical example — reusable in-app file/folder picker that pre-populates a `TextFieldView` from a configured path and offers a "…" browse button that calls `cx.prompt_for_paths()`.
+
+```rust
+// Conditionally render the modal
+.when(self.path_picker.is_some(), |root| {
+    root.child(self.path_picker.as_ref().unwrap().1.clone())
+})
+```
+
+**Why not the native picker alone:** `cx.prompt_for_paths(PathPromptOptions { … })` on Linux (ashpd XDG portal) has no initial-directory parameter. The custom modal pre-populates a path field from config and lets the user edit it directly, then optionally invoke the native picker to browse from scratch.
+
+---
+
+## Conditional menu item grey-out (no disabled widget)
+
+GPUI 0.2.2 has no built-in disabled state. Pattern: build the base element outside an `if/else`, then conditionally attach interactivity.
+
+```rust
+.child({
+    let el = div()
+        .id("import-data-item")
+        .flex().items_center()
+        .h(px(28.0)).px_3().text_sm();
+    if has_schema {
+        el.text_color(rgba(0xcdd6f4ff))
+          .cursor_pointer()
+          .hover(|s| s.bg(rgba(0x45475a88)))
+          .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, window, cx| {
+              this.file_menu_open = false;
+              this.do_import_data_picker(window, cx);
+          }))
+    } else {
+        el.text_color(rgba(0xcdd6f450))   // 50% alpha — visually dimmed
+    }
+    .child("Import Data…")
+})
+```
+
+The disabled branch omits `.cursor_pointer()`, `.hover()`, and `.on_mouse_down()` — the item renders but accepts no clicks. Use `rgba(color, 0x50)` (50% alpha) for the dim text. Applied in `app_view/render.rs` for Import Data (greyed when `!schema_loaded`), Export Data (greyed when `node_count == 0`), Clear Schema (greyed when `!schema_loaded`), Clear Data (greyed when `node_count == 0`).
+
+---
+
 ## Context menu — deferred+anchored overlay with comprehensive dismissal
 
 GPUI 0.2.2 has no built-in context menu widget. Pattern used in `TextFieldView` and `ChatPanel`:
