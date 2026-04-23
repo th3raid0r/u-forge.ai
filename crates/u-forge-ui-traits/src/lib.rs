@@ -152,6 +152,8 @@ const EDGE_WIDTH: f32 = 1.0;
 /// Produce draw commands from a graph snapshot and viewport.
 ///
 /// - `selected_idx`: index into `snapshot.nodes` of the currently selected node, if any.
+/// - `font_scale`: multiplier applied to node label font size clamp bounds
+///   (`rem_size / 16.0` keeps labels proportional to the configured UI font size).
 ///
 /// This is the main rendering pipeline — it handles viewport culling,
 /// LOD selection, and command generation. The result is consumed by
@@ -160,6 +162,7 @@ pub fn generate_draw_commands(
     snapshot: &GraphSnapshot,
     viewport: &Viewport,
     selected_idx: Option<usize>,
+    font_scale: f32,
 ) -> DrawCommands {
     let (world_min, world_max) = viewport.world_rect();
     let lod = viewport.lod_level();
@@ -222,7 +225,8 @@ pub fn generate_draw_commands(
         // Node label — rendered inside the squircle when the node is large enough on screen.
         if lod != LodLevel::Dot && screen_radius > 10.0 {
             // Font size proportional to node screen size, clamped to a readable range.
-            let font_size = (screen_radius * 0.75).clamp(7.0, 12.0);
+            // Clamp bounds scale with font_scale so labels stay proportional to the UI font size.
+            let font_size = (screen_radius * 0.75).clamp(7.0 * font_scale, 16.0 * font_scale);
             // Approximate max chars that fit horizontally inside the squircle.
             let max_chars = ((screen_radius * 2.0 * 0.8) / (font_size * 0.55)) as usize;
             let max_chars = max_chars.max(2);

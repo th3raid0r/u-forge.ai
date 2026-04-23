@@ -516,6 +516,40 @@ impl Default for DataConfig {
     }
 }
 
+// ── UiConfig ──────────────────────────────────────────────────────────────────
+
+/// UI / display settings.
+///
+/// Corresponds to the `[ui]` section of `u-forge.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// Base font size in pixels, used as the rem unit for all UI text.
+    ///
+    /// GPUI's semantic text sizes (`text_xs`, `text_sm`, etc.) scale relative
+    /// to this value:
+    /// - `text_xs` = 0.75 × font_size  (labels, timestamps, captions)
+    /// - `text_sm` = 0.875 × font_size (body, menu items, panel headers)
+    ///
+    /// Defaults to `16.0` (standard web/desktop baseline).  Increase for
+    /// high-DPI displays or accessibility; decrease for a more compact UI.
+    #[serde(default = "UiConfig::default_font_size")]
+    pub font_size: f32,
+}
+
+impl UiConfig {
+    fn default_font_size() -> f32 {
+        18.0
+    }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            font_size: Self::default_font_size(),
+        }
+    }
+}
+
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 /// Top-level application configuration.
@@ -543,6 +577,10 @@ pub struct AppConfig {
     /// Data import settings.
     #[serde(default)]
     pub data: DataConfig,
+
+    /// UI / display settings.
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 impl AppConfig {

@@ -127,7 +127,7 @@ impl Render for NodePanel {
                 .border_b_1()
                 .border_color(rgb(0x313244))
                 .text_color(rgba(0xcdd6f4ff))
-                .text_xs()
+                .text_base()
                 .child("NODES"),
         );
 
@@ -168,7 +168,7 @@ impl Render for NodePanel {
                     .h(px(24.0))
                     .px_2()
                     .flex_none()
-                    .text_xs()
+                    .text_base()
                     // Collapse/expand label (left side) — clicking toggles collapse.
                     .child(
                         div()
@@ -244,7 +244,7 @@ impl Render for NodePanel {
                             .pl(px(20.0))
                             .pr(px(4.0))
                             .flex_none()
-                            .text_xs()
+                            .text_base()
                             .cursor_pointer()
                             .text_color(if is_selected {
                                 rgba(0xffffffff)

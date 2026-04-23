@@ -101,7 +101,7 @@ Window-space: window_pos = screen + bounds.origin
 3. `ShapedLine::x_for_index` / `WrappedLineLayout::position_for_index(byte_idx, line_h)` for pixel-exact cursor position
 4. `ShapedLine::closest_index_for_x` / `WrappedLineLayout::closest_index_for_position(point, line_h)` for click-to-cursor
 
-Key metrics: font size = `window.rem_size() * 0.75` (matches `text_xs()` = 0.75 rem); line height = `font_size * 1.618` (GPUI's `phi()` default). The hardcoded 16px that was there before was wrong.
+Key metrics: font size = `window.rem_size() * 1.0` (matches `text_base()` = 1.0 rem); line height = `font_size * 1.618` (GPUI's `phi()` default). The hardcoded 16px that was there before was wrong.
 
 Single-line mode: `wrap_width = None`, track `h_scroll_offset: f32`, mouse click adds `h_scroll_offset` to `local_x` before hit-testing. Multiline: `wrap_width = Some(inner_w)`, grows up to 120 px cap, `overflow_hidden()` clips.
 

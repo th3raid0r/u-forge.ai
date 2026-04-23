@@ -98,7 +98,7 @@ impl TextFieldView {
             cursor_visible: true,
             blink_task: None,
             was_focused: false,
-            measured_line_h: 19.0,
+            measured_line_h: 29.0,
             field_origin_x: 0.0,
             field_origin_y: 0.0,
             shaped_layout: None,
@@ -133,7 +133,7 @@ impl TextFieldView {
             cursor_visible: false,
             blink_task: None,
             was_focused: false,
-            measured_line_h: 19.0,
+            measured_line_h: 29.0,
             field_origin_x: 0.0,
             field_origin_y: 0.0,
             shaped_layout: None,
@@ -622,7 +622,7 @@ impl Render for TextFieldView {
             |_, _, _| {},
             move |bounds, (), window, cx| {
                 let rem_size = window.rem_size();
-                let font_size = rem_size * 0.75; // text_xs = 0.75rem
+                let font_size = rem_size; // text_base = 1.0rem
                 let line_height = (font_size * 1.618_034).round();
                 let mono_font = font(".SystemUIMonospacedFont");
 

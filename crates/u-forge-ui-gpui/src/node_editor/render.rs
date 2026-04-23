@@ -52,7 +52,7 @@ impl Render for NodeEditorPanel {
                 .justify_center()
                 .child(
                     div()
-                        .text_sm()
+                        .text_base()
                         .text_color(rgba(0x6c7086ff))
                         .child("Select a node to view details"),
                 );
@@ -93,7 +93,7 @@ impl Render for NodeEditorPanel {
                 .h_full()
                 .px(px(8.0))
                 .gap(px(4.0))
-                .text_xs()
+                .text_base()
                 .cursor_pointer()
                 .text_color(if is_active {
                     rgba(0xcdd6f4ff)
@@ -114,7 +114,7 @@ impl Render for NodeEditorPanel {
             let pin_label: SharedString = if is_pinned { "P".into() } else { "o".into() };
             let pin_btn = div()
                 .id(("tab-pin", i))
-                .text_xs()
+                .text_base()
                 .text_color(if is_pinned {
                     rgba(0xf9e2afff)
                 } else {
@@ -149,7 +149,7 @@ impl Render for NodeEditorPanel {
             // Close button
             let close_btn = div()
                 .id(("tab-close", i))
-                .text_xs()
+                .text_base()
                 .text_color(rgba(0x6c7086ff))
                 .cursor_pointer()
                 .on_mouse_down(
@@ -197,7 +197,7 @@ impl Render for NodeEditorPanel {
                 .items_center()
                 .px(px(10.0))
                 .h_full()
-                .text_xs()
+                .text_base()
                 .cursor_pointer()
                 .text_color(if props_active {
                     rgba(0xcdd6f4ff)
@@ -230,7 +230,7 @@ impl Render for NodeEditorPanel {
                 .items_center()
                 .px(px(10.0))
                 .h_full()
-                .text_xs()
+                .text_base()
                 .cursor_pointer()
                 .text_color(if edges_active {
                     rgba(0xcdd6f4ff)
@@ -341,7 +341,7 @@ impl Render for NodeEditorPanel {
                 };
 
                 let label = div()
-                    .text_xs()
+                    .text_base()
                     .text_color(rgba(0xa6adc8ff))
                     .child(label_text);
 
@@ -390,13 +390,13 @@ impl Render for NodeEditorPanel {
                                     })
                                     .when(checked, |el| {
                                         el.child(
-                                            div().text_xs().text_color(rgb(0x1e1e2e)).child("v"),
+                                            div().text_base().text_color(rgb(0x1e1e2e)).child("v"),
                                         )
                                     }),
                             )
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_base()
                                     .text_color(rgba(0xcdd6f4ff))
                                     .child(if checked { "true" } else { "false" }),
                             )
@@ -431,7 +431,7 @@ impl Render for NodeEditorPanel {
                             .rounded(px(4.0))
                             .border_1()
                             .border_color(rgb(0x45475a))
-                            .text_xs()
+                            .text_base()
                             .text_color(rgba(0xcdd6f4ff))
                             .cursor_pointer()
                             .on_mouse_down(
@@ -449,7 +449,7 @@ impl Render for NodeEditorPanel {
                                 }),
                             )
                             .child(current_val)
-                            .child(div().text_xs().text_color(rgba(0x6c7086ff)).child("v"));
+                            .child(div().text_base().text_color(rgba(0x6c7086ff)).child("v"));
 
                         enum_div = enum_div.child(select_btn);
 
@@ -482,7 +482,7 @@ impl Render for NodeEditorPanel {
                                         .items_center()
                                         .h(px(24.0))
                                         .px(px(6.0))
-                                        .text_xs()
+                                        .text_base()
                                         .text_color(rgba(0xcdd6f4ff))
                                         .cursor_pointer()
                                         .hover(|style| style.bg(rgba(0x45475a88)))
@@ -561,7 +561,7 @@ impl Render for NodeEditorPanel {
                                     .h(px(22.0))
                                     .bg(rgb(0x45475a))
                                     .rounded(px(3.0))
-                                    .text_xs()
+                                    .text_base()
                                     .text_color(rgba(0xcdd6f4ff))
                                     .child(item_label)
                                     .child(
@@ -570,7 +570,7 @@ impl Render for NodeEditorPanel {
                                                 "arr-rm-{}-{}",
                                                 spec.key, item_idx
                                             )))
-                                            .text_xs()
+                                            .text_base()
                                             .text_color(rgba(0xf38ba8ff))
                                             .cursor_pointer()
                                             .on_mouse_down(
@@ -631,7 +631,7 @@ impl Render for NodeEditorPanel {
                                     .h(px(22.0))
                                     .bg(rgba(0x89b4fa33))
                                     .rounded(px(3.0))
-                                    .text_xs()
+                                    .text_base()
                                     .text_color(rgb(0x89b4fa))
                                     .cursor_pointer()
                                     .on_mouse_down(
@@ -680,7 +680,7 @@ impl Render for NodeEditorPanel {
                                 .px(px(6.0))
                                 .bg(rgb(0x313244))
                                 .rounded(px(4.0))
-                                .text_xs()
+                                .text_base()
                                 .text_color(rgba(0xcdd6f4ff))
                                 .child(display)
                                 .into_any_element()
@@ -740,7 +740,7 @@ impl Render for NodeEditorPanel {
                         .h(px(24.0))
                         .bg(rgba(0x313244dd))
                         .rounded(px(4.0))
-                        .text_xs()
+                        .text_base()
                         .text_color(rgba(0xcdd6f4ff))
                         .cursor_pointer()
                         .on_mouse_down(
@@ -771,7 +771,7 @@ impl Render for NodeEditorPanel {
                         .h(px(24.0))
                         .bg(rgba(0x313244dd))
                         .rounded(px(4.0))
-                        .text_xs()
+                        .text_base()
                         .text_color(rgba(0xcdd6f4ff))
                         .cursor_pointer()
                         .on_mouse_down(
@@ -848,7 +848,7 @@ impl NodeEditorPanel {
                 .h(px(EDGE_SECTION_HEADER_H))
                 .border_b_1()
                 .border_color(rgb(0x313244))
-                .text_xs()
+                .text_base()
                 .text_color(rgba(0xa6adc8ff))
                 .child(format!(
                     "EDGES{}",
@@ -904,7 +904,7 @@ impl NodeEditorPanel {
             let arrow = div()
                 .flex()
                 .items_center()
-                .text_xs()
+                .text_base()
                 .text_color(rgba(0x6c7086ff))
                 .child("\u{2192}"); // →
 
@@ -923,7 +923,7 @@ impl NodeEditorPanel {
                 } else {
                     rgb(0x45475a)
                 })
-                .text_xs()
+                .text_base()
                 .text_color(if to_has_value {
                     rgba(0xcdd6f4ff)
                 } else {
@@ -951,7 +951,7 @@ impl NodeEditorPanel {
                 .h(px(22.0))
                 .rounded(px(3.0))
                 .cursor_pointer()
-                .text_xs()
+                .text_base()
                 .text_color(rgba(0xf38ba8aa))
                 .hover(|style| style.bg(rgba(0xf38ba822)).text_color(rgba(0xf38ba8ff)))
                 .on_mouse_down(
@@ -988,7 +988,7 @@ impl NodeEditorPanel {
             .px(px(8.0))
             .bg(rgba(0x89b4fa1a))
             .rounded(px(4.0))
-            .text_xs()
+            .text_base()
             .text_color(rgb(0x89b4fa))
             .cursor_pointer()
             .hover(|style: gpui::StyleRefinement| style.bg(rgba(0x89b4fa33)))
@@ -1080,7 +1080,7 @@ impl NodeEditorPanel {
                         .items_center()
                         .h(px(24.0))
                         .px(px(6.0))
-                        .text_xs()
+                        .text_base()
                         .text_color(rgba(0x6c7086ff))
                         .child("No matching nodes"),
                 );
@@ -1112,7 +1112,7 @@ impl NodeEditorPanel {
                         .justify_between()
                         .h(px(26.0))
                         .px(px(6.0))
-                        .text_xs()
+                        .text_base()
                         .text_color(rgba(0xcdd6f4ff))
                         .cursor_pointer()
                         .hover(|style: gpui::StyleRefinement| style.bg(rgba(0x45475a88)))
@@ -1125,7 +1125,7 @@ impl NodeEditorPanel {
                         .child(display_name)
                         .child(
                             div()
-                                .text_xs()
+                                .text_base()
                                 .text_color(rgba(0x6c7086aa))
                                 .child(type_badge),
                         );

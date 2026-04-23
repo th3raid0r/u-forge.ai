@@ -285,6 +285,24 @@ The graph starts empty on a fresh install; there is no startup auto-import. User
 
 **Send button is four-state, width-pinned.** States: Connect (yellow) / Connecting… (grey) / Send (blue) / Stop (red). Width is pinned to 88 px so the input row doesn't reflow on state change.
 
+### UI text size hierarchy
+
+All font sizes are relative to a single rem base configured via `[ui] font_size` in `u-forge.toml` (default 18 px). `AppView::render` calls `window.set_rem_size(px(font_size))` on every frame, so every GPUI semantic size method and every `window.rem_size()` call in canvas painters reflects the user's choice.
+
+| GPUI size | Rem multiplier | Used for |
+|-----------|---------------|----------|
+| `text_xs()` | 0.75 rem | Menu bar buttons ("File", "View"), dropdown items, tiny hints ("Enter to submit") |
+| `text_sm()` | 0.875 rem | Status bar, chat chrome (history list, model selector, send/new buttons), action bar icons (⟳ ⎘ ×), graph canvas legend |
+| `text_base()` | 1.0 rem | **Main content** — node editor fields/values, search results, node panel, chat message bodies |
+
+**Canvas painters must read `window.rem_size()` directly** — they bypass GPUI's layout text-size inheritance. Multipliers to use:
+
+- `TextFieldView`: `rem_size * 1.0` (text_base)
+- Graph node labels: `(screen_radius * 0.75).clamp(7.0 * font_scale, 16.0 * font_scale)` where `font_scale = rem_size / 16.0` — label size is proportional to zoom, capped at text_base
+- Graph canvas legend: `rem_size * 0.875` (text_sm)
+
+**To add a new canvas text element**, use the appropriate rem multiplier from the table above rather than a hardcoded pixel value. Never use `px(N)` for font sizes in canvas paint closures.
+
 ---
 
 ## Design Decisions — Questionable / Still Open
