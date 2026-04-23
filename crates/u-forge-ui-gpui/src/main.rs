@@ -7,7 +7,8 @@ use gpui::{
 use u_forge_core::AppConfig;
 use u_forge_graph_view::build_snapshot;
 use u_forge_ui_gpui::{
-    AppView, ClearData, ImportData, SaveLayout, TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
+    AppView, ClearData, ExportData, ImportData, ImportSchema, SaveLayout, TogglePerfOverlay,
+    ToggleRightPanel, ToggleSidebar,
 };
 
 fn main() {
@@ -29,54 +30,6 @@ fn main() {
                 u_forge_core::KnowledgeGraph::new(&data_dir)
                     .expect("failed to open knowledge graph"),
             );
-
-            let stats = graph.get_stats().expect("failed to get stats");
-            if stats.node_count == 0 {
-                // Import schemas first so they're present before data.
-                if std::path::Path::new(&schema_dir).exists() {
-                    match u_forge_core::SchemaIngestion::load_schemas_from_directory(
-                        &schema_dir,
-                        "imported_schemas",
-                        "1.0.0",
-                    ) {
-                        Ok(schema_def) => {
-                            let mgr = graph.get_schema_manager();
-                            if let Err(e) = mgr.save_schema(&schema_def).await {
-                                eprintln!("Warning: could not save schemas: {e}");
-                            } else {
-                                // Clean up any stale default placeholder.
-                                let _ = mgr.delete_schema("default");
-                            }
-                        }
-                        Err(e) => eprintln!("Warning: could not load schemas: {e}"),
-                    }
-                }
-
-                if data_file.exists() {
-                    let mut ingestion = u_forge_core::DataIngestion::new(&graph);
-                    ingestion
-                        .import_json_data(&data_file)
-                        .await
-                        .expect("failed to import data");
-                    let stats = graph.get_stats().expect("failed to get stats");
-                    eprintln!(
-                        "Imported {} nodes, {} edges from {}",
-                        stats.node_count,
-                        stats.edge_count,
-                        data_file.display()
-                    );
-                } else {
-                    eprintln!(
-                        "Warning: import file '{}' not found, using empty graph",
-                        data_file.display()
-                    );
-                }
-            } else {
-                eprintln!(
-                    "Loaded existing graph: {} nodes, {} edges",
-                    stats.node_count, stats.edge_count
-                );
-            }
 
             // Pre-load schemas into the synchronous cache so the node editor
             // can call get_object_type_schema() without async.
@@ -130,7 +83,10 @@ fn main() {
                 items: vec![
                     MenuItem::action("Save", SaveLayout),
                     MenuItem::separator(),
-                    MenuItem::action("Import Data", ImportData),
+                    MenuItem::action("Import Data…", ImportData),
+                    MenuItem::action("Import Schema…", ImportSchema),
+                    MenuItem::action("Export Data…", ExportData),
+                    MenuItem::separator(),
                     MenuItem::action("Clear Data", ClearData),
                 ],
             },

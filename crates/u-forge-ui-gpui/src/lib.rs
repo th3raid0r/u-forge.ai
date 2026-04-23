@@ -1,4 +1,5 @@
 pub mod app_view;
+pub mod path_picker;
 pub mod chat_history;
 pub mod chat_message;
 pub mod chat_panel;
@@ -12,4 +13,4 @@ pub mod node_panel;
 pub use app_view::AppView;
 
 use gpui::actions;
-actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ImportData, ExportData, TogglePerfOverlay]);
+actions!([SaveLayout, ToggleSidebar, ToggleRightPanel, ClearData, ImportData, ImportSchema, ExportData, TogglePerfOverlay]);

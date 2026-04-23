@@ -29,6 +29,9 @@ use state::AppState;
 use crate::chat_panel::{AvailableModel, ChatPanel, ConnectRequested};
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
+use crate::path_picker::{
+    PathCancelled, PathConfirmed, PathPickerKind, PathPickerModal, PickerMode,
+};
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
@@ -171,6 +174,11 @@ pub struct AppView {
     pub(crate) editor_ratio: f32,
     /// Current right panel width in pixels (user-resizable).
     pub(crate) right_panel_width: f32,
+    // ── Path picker modal ─────────────────────────────────────────────────────
+    /// Active path-picker dialog and which field it's editing, or None.
+    pub(crate) path_picker: Option<(PathPickerKind, Entity<PathPickerModal>)>,
+    /// Subscriptions for the active path picker's confirm/cancel events.
+    _path_picker_subs: Vec<Subscription>,
     // ── GPUI bookkeeping ──────────────────────────────────────────────────────
     /// Subscriptions kept alive so handlers fire (node events, chat connect).
     _node_subs: Vec<Subscription>,
@@ -284,6 +292,8 @@ impl AppView {
             sidebar_width: DEFAULT_SIDEBAR_W,
             editor_ratio: DEFAULT_EDITOR_RATIO,
             right_panel_width: DEFAULT_RIGHT_PANEL_W,
+            path_picker: None,
+            _path_picker_subs: vec![],
             _node_subs: vec![node_sub_create, node_sub_delete, connect_sub],
             perf_enabled: false,
             last_frame_cost_us: 0,
@@ -368,6 +378,113 @@ impl AppView {
                 }
             })
             .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn do_import_data_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let initial = self.state.data_file.to_string_lossy().into_owned();
+        self.open_path_picker(PathPickerKind::DataFile, PickerMode::File, "Import Data", "Import Data", &initial, window, cx);
+    }
+
+    pub(crate) fn do_import_schema_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let initial = self.state.schema_dir.to_string_lossy().into_owned();
+        self.open_path_picker(PathPickerKind::SchemaDir, PickerMode::Directory, "Import Schema", "Import Schema", &initial, window, cx);
+    }
+
+    fn open_path_picker(
+        &mut self,
+        kind: PathPickerKind,
+        mode: PickerMode,
+        title: &str,
+        confirm_label: &str,
+        initial_path: &str,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|cx| PathPickerModal::new(mode, title, confirm_label, initial_path, cx));
+
+        let confirm_sub = cx.subscribe(
+            &modal,
+            |this, _modal, event: &PathConfirmed, cx| {
+                let path = event.0.clone();
+                match this.path_picker.as_ref().map(|(k, _)| k) {
+                    Some(PathPickerKind::DataFile) => {
+                        this.state.data_file = path;
+                        this.path_picker = None;
+                        this._path_picker_subs.clear();
+                        this.do_import_data(cx);
+                    }
+                    Some(PathPickerKind::SchemaDir) => {
+                        this.state.schema_dir = path.clone();
+                        this.path_picker = None;
+                        this._path_picker_subs.clear();
+                        this.do_reload_schemas_from(path, cx);
+                    }
+                    Some(PathPickerKind::ExportDir) => {
+                        this.path_picker = None;
+                        this._path_picker_subs.clear();
+                        this.do_run_export(path, cx);
+                    }
+                    None => {}
+                }
+                cx.notify();
+            },
+        );
+
+        let cancel_sub = cx.subscribe(
+            &modal,
+            |this, _modal, _: &PathCancelled, cx| {
+                this.path_picker = None;
+                this._path_picker_subs.clear();
+                cx.notify();
+            },
+        );
+
+        // Focus the text field so the user can start typing immediately.
+        window.focus(&modal.read(cx).path_field.read(cx).focus);
+
+        self.path_picker = Some((kind, modal));
+        self._path_picker_subs = vec![confirm_sub, cancel_sub];
+        cx.notify();
+    }
+
+    pub(crate) fn do_reload_schemas_from(
+        &mut self,
+        dir: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let graph = self.state.graph.clone();
+        self.state.data_status = Some("Loading schemas…".to_string());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            match u_forge_core::SchemaIngestion::load_schemas_from_directory(
+                &dir,
+                "imported_schemas",
+                "1.0.0",
+            ) {
+                Ok(schema_def) => {
+                    let mgr = graph.get_schema_manager();
+                    let result = mgr.save_schema(&schema_def).await;
+                    let _ = mgr.delete_schema("default");
+                    this.update(cx, |view, cx| {
+                        view.state.data_status = match result {
+                            Ok(_) => Some("Schema directory loaded".to_string()),
+                            Err(e) => Some(format!("Schema load failed: {e}")),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    this.update(cx, |view, cx| {
+                        view.state.data_status = Some(format!("Schema load failed: {e}"));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
         })
         .detach();
     }
@@ -823,9 +940,17 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn do_export_data(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn do_export_data_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let initial = self.state.data_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_string_lossy()
+            .into_owned();
+        self.open_path_picker(PathPickerKind::ExportDir, PickerMode::Directory, "Export Data", "Export Data", &initial, window, cx);
+    }
+
+    pub(crate) fn do_run_export(&mut self, out_dir: std::path::PathBuf, cx: &mut Context<Self>) {
         let graph = self.state.graph.clone();
-        let data_file = self.state.data_file.clone();
 
         self.state.data_status = Some("Exporting…".to_string());
         cx.notify();
@@ -878,9 +1003,6 @@ impl AppView {
                         lines.push(serde_json::to_string(&entry)?);
                     }
 
-                    let out_dir = data_file
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
                     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
                     let out_path = out_dir.join(format!("export_{timestamp}.jsonl"));
                     std::fs::write(&out_path, lines.join("\n"))?;

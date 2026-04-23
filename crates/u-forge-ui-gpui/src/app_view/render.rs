@@ -6,8 +6,8 @@ use gpui::{
 };
 
 use crate::{
-    ClearData, ExportData, ImportData, SaveLayout, TogglePerfOverlay, ToggleRightPanel,
-    ToggleSidebar,
+    ClearData, ExportData, ImportData, ImportSchema, SaveLayout, TogglePerfOverlay,
+    ToggleRightPanel, ToggleSidebar,
 };
 
 use super::{
@@ -90,11 +90,14 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ClearData, _window, cx| {
                 this.do_clear_data(cx);
             }))
-            .on_action(cx.listener(|this, _: &ImportData, _window, cx| {
-                this.do_import_data(cx);
+            .on_action(cx.listener(|this, _: &ImportData, window, cx| {
+                this.do_import_data_picker(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ExportData, _window, cx| {
-                this.do_export_data(cx);
+            .on_action(cx.listener(|this, _: &ImportSchema, window, cx| {
+                this.do_import_schema_picker(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportData, window, cx| {
+                this.do_export_data_picker(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TogglePerfOverlay, _window, cx| {
                 this.perf_enabled = !this.perf_enabled;
@@ -668,13 +671,35 @@ impl Render for AppView {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
+                                                |this, _: &MouseDownEvent, window, cx| {
                                                     this.file_menu_open = false;
-                                                    this.do_import_data(cx);
+                                                    this.do_import_data_picker(window, cx);
                                                 },
                                             ),
                                         )
-                                        .child("Import Data"),
+                                        .child("Import Data…"),
+                                )
+                                .child(
+                                    div()
+                                        .id("import-schema-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |this, _: &MouseDownEvent, window, cx| {
+                                                    this.file_menu_open = false;
+                                                    this.do_import_schema_picker(window, cx);
+                                                },
+                                            ),
+                                        )
+                                        .child("Import Schema…"),
                                 )
                                 .child(
                                     div()
@@ -690,13 +715,13 @@ impl Render for AppView {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
+                                                |this, _: &MouseDownEvent, window, cx| {
                                                     this.file_menu_open = false;
-                                                    this.do_export_data(cx);
+                                                    this.do_export_data_picker(window, cx);
                                                 },
                                             ),
                                         )
-                                        .child("Export Data"),
+                                        .child("Export Data…"),
                                 )
                                 .child(
                                     div()
@@ -801,6 +826,10 @@ impl Render for AppView {
                                 ),
                         ),
                 ))
+            })
+            // ── Path picker modal ─────────────────────────────────────────────
+            .when(self.path_picker.is_some(), |root| {
+                root.child(self.path_picker.as_ref().unwrap().1.clone())
             })
             // ── Frame-cost timing canvas ──────────────────────────────────────
             // Zero-size absolute element; its paint closure fires after GPUI
