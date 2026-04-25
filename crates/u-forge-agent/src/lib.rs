@@ -110,6 +110,98 @@ impl From<anyhow::Error> for ToolError {
     }
 }
 
+// ── Tool argument validation ───────────────────────────────────────────────────
+
+pub(crate) mod tool_validation {
+    use schemars::schema_for;
+    use std::sync::LazyLock;
+
+    use super::{
+        FtsSearchArgs, HybridSearchArgs, SemanticSearchArgs, ToolError, UpsertEdgeArgs,
+        UpsertNodeArgs,
+    };
+
+    // Schema values are compiled once and cached for the lifetime of the process.
+    // Validators reference these statics so they don't borrow from local values.
+    static FTS_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+        serde_json::to_value(schema_for!(FtsSearchArgs)).expect("FtsSearchArgs schema is valid JSON")
+    });
+    static FTS_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+        jsonschema::validator_for(&FTS_SCHEMA).expect("FtsSearchArgs validator compiles")
+    });
+
+    static SEMANTIC_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+        serde_json::to_value(schema_for!(SemanticSearchArgs))
+            .expect("SemanticSearchArgs schema is valid JSON")
+    });
+    static SEMANTIC_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+        jsonschema::validator_for(&SEMANTIC_SCHEMA).expect("SemanticSearchArgs validator compiles")
+    });
+
+    static HYBRID_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+        serde_json::to_value(schema_for!(HybridSearchArgs))
+            .expect("HybridSearchArgs schema is valid JSON")
+    });
+    static HYBRID_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+        jsonschema::validator_for(&HYBRID_SCHEMA).expect("HybridSearchArgs validator compiles")
+    });
+
+    static UPSERT_NODE_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+        serde_json::to_value(schema_for!(UpsertNodeArgs))
+            .expect("UpsertNodeArgs schema is valid JSON")
+    });
+    static UPSERT_NODE_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+        jsonschema::validator_for(&UPSERT_NODE_SCHEMA).expect("UpsertNodeArgs validator compiles")
+    });
+
+    static UPSERT_EDGE_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+        serde_json::to_value(schema_for!(UpsertEdgeArgs))
+            .expect("UpsertEdgeArgs schema is valid JSON")
+    });
+    static UPSERT_EDGE_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+        jsonschema::validator_for(&UPSERT_EDGE_SCHEMA).expect("UpsertEdgeArgs validator compiles")
+    });
+
+    /// Validate `raw` JSON args against the tool's declared JSON Schema.
+    ///
+    /// Returns `Ok(())` when valid. On failure, returns a `ToolError` whose
+    /// message names up to three offending field paths so the LLM can self-correct.
+    pub(crate) fn validate_tool_args(
+        tool_name: &'static str,
+        raw: &serde_json::Value,
+    ) -> Result<(), ToolError> {
+        let validator = match tool_name {
+            "search_fts" => &*FTS_VALIDATOR,
+            "search_semantic" => &*SEMANTIC_VALIDATOR,
+            "search_hybrid" => &*HYBRID_VALIDATOR,
+            "upsert_node" => &*UPSERT_NODE_VALIDATOR,
+            "upsert_edge" => &*UPSERT_EDGE_VALIDATOR,
+            other => {
+                return Err(ToolError(format!(
+                    "no validator registered for tool '{other}'"
+                )));
+            }
+        };
+
+        if validator.is_valid(raw) {
+            return Ok(());
+        }
+
+        let formatted: String = validator
+            .iter_errors(raw)
+            .take(3)
+            .map(|err| format!("{} — {}", err.instance_path, err))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        tracing::warn!(tool = tool_name, errors = %formatted, "tool arg validation failed");
+
+        Err(ToolError(format!(
+            "Tool args invalid for {tool_name}: {formatted}"
+        )))
+    }
+}
+
 // ── FTS5 sanitisation (mirrors search/sanitize.rs — not exported from core) ──
 
 /// Strip characters that cause FTS5 syntax errors from a free-text query.
@@ -199,6 +291,7 @@ fn format_node_result(result: &NodeSearchResult, index: usize) -> String {
 
 /// Arguments for [`FtsSearchTool`].
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FtsSearchArgs {
     /// Keywords or phrase to search for. Natural language is fine — punctuation
     /// is automatically stripped before the FTS5 query is executed.
@@ -226,7 +319,7 @@ impl Tool for FtsSearchTool {
     const NAME: &'static str = "search_fts";
 
     type Error = ToolError;
-    type Args = FtsSearchArgs;
+    type Args = serde_json::Value;
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
@@ -241,7 +334,10 @@ impl Tool for FtsSearchTool {
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+        tool_validation::validate_tool_args(Self::NAME, &raw)?;
+        let args: FtsSearchArgs = serde_json::from_value(raw)
+            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
         let limit = args.limit.unwrap_or(5);
         let sanitized = fts5_sanitize(&args.query).ok_or_else(|| {
             ToolError("Query contains no searchable terms after removing punctuation.".to_string())
@@ -308,6 +404,7 @@ impl Tool for FtsSearchTool {
 
 /// Arguments for [`SemanticSearchTool`].
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticSearchArgs {
     /// Natural-language query. The query is embedded and used for
     /// approximate nearest-neighbour search over stored chunk vectors.
@@ -337,7 +434,7 @@ impl Tool for SemanticSearchTool {
     const NAME: &'static str = "search_semantic";
 
     type Error = ToolError;
-    type Args = SemanticSearchArgs;
+    type Args = serde_json::Value;
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
@@ -352,7 +449,10 @@ impl Tool for SemanticSearchTool {
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+        tool_validation::validate_tool_args(Self::NAME, &raw)?;
+        let args: SemanticSearchArgs = serde_json::from_value(raw)
+            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
         let limit = args.limit.unwrap_or(5);
 
         let query_vec = self
@@ -427,6 +527,7 @@ impl Tool for SemanticSearchTool {
 
 /// Arguments for [`HybridSearchTool`].
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HybridSearchArgs {
     /// Natural-language query. Searched via both FTS5 keyword matching and
     /// semantic embedding ANN, then results are merged and optionally reranked.
@@ -461,7 +562,7 @@ impl Tool for HybridSearchTool {
     const NAME: &'static str = "search_hybrid";
 
     type Error = ToolError;
-    type Args = HybridSearchArgs;
+    type Args = serde_json::Value;
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
@@ -478,7 +579,10 @@ impl Tool for HybridSearchTool {
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+        tool_validation::validate_tool_args(Self::NAME, &raw)?;
+        let args: HybridSearchArgs = serde_json::from_value(raw)
+            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
         let config = HybridSearchConfig {
             limit: args.limit.unwrap_or(3),
             alpha: args.alpha.unwrap_or(0.5).clamp(0.0, 1.0),
@@ -516,6 +620,7 @@ impl Tool for HybridSearchTool {
 
 /// Arguments for [`UpsertNodeTool`].
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertNodeArgs {
     /// UUID of an existing node to update. Omit when creating.
     pub node_id: Option<String>,
@@ -560,7 +665,7 @@ impl Tool for UpsertNodeTool {
     const NAME: &'static str = "upsert_node";
 
     type Error = ToolError;
-    type Args = UpsertNodeArgs;
+    type Args = serde_json::Value;
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
@@ -576,7 +681,10 @@ impl Tool for UpsertNodeTool {
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+        tool_validation::validate_tool_args(Self::NAME, &raw)?;
+        let args: UpsertNodeArgs = serde_json::from_value(raw)
+            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
         // Single DB read: verify existence and load metadata in one step.
         let (object_id, is_update, mut meta) = if let Some(ref id_str) = args.node_id {
             let oid = ObjectId::parse_str(id_str)
@@ -672,6 +780,7 @@ impl Tool for UpsertNodeTool {
 
 /// Arguments for [`UpsertEdgeTool`].
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertEdgeArgs {
     /// Exact name or UUID of the source node.
     pub source: String,
@@ -744,7 +853,7 @@ impl Tool for UpsertEdgeTool {
     const NAME: &'static str = "upsert_edge";
 
     type Error = ToolError;
-    type Args = UpsertEdgeArgs;
+    type Args = serde_json::Value;
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
@@ -760,7 +869,10 @@ impl Tool for UpsertEdgeTool {
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+        tool_validation::validate_tool_args(Self::NAME, &raw)?;
+        let args: UpsertEdgeArgs = serde_json::from_value(raw)
+            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
         let source_id = resolve_node(&self.graph, &args.source)?;
         let target_id = resolve_node(&self.graph, &args.target)?;
 
@@ -915,6 +1027,7 @@ pub struct GraphAgent {
     hq_queue: Option<Arc<InferenceQueue>>,
     system_prompt: String,
     params: AgentParams,
+    cached_additional_params: Option<serde_json::Value>,
 }
 
 impl GraphAgent {
@@ -953,6 +1066,8 @@ impl GraphAgent {
             format!("{base_prompt}\n\n{tool_guidance}\n\n{schema_summary}")
         };
 
+        let cached_additional_params = Self::build_additional_params(&params);
+
         Ok(Self {
             client,
             graph,
@@ -960,38 +1075,39 @@ impl GraphAgent {
             hq_queue,
             system_prompt: full_prompt,
             params,
+            cached_additional_params,
         })
     }
 
-    /// Build `additional_params` JSON from the non-standard sampling knobs.
+    /// Compute `additional_params` JSON from sampling knobs once at construction.
     ///
     /// Rig's OpenAI provider flattens this into the request body, so keys like
     /// `frequency_penalty`, `top_p`, `seed`, etc. end up as top-level fields
     /// in the OpenAI-compatible `/chat/completions` request.
-    fn additional_params(&self) -> Option<serde_json::Value> {
+    fn build_additional_params(params: &AgentParams) -> Option<serde_json::Value> {
         let mut map = serde_json::Map::new();
-        if let Some(v) = self.params.top_p {
+        if let Some(v) = params.top_p {
             map.insert("top_p".into(), serde_json::json!(v));
         }
-        if let Some(v) = self.params.top_k {
+        if let Some(v) = params.top_k {
             map.insert("top_k".into(), serde_json::json!(v));
         }
-        if let Some(v) = self.params.min_p {
+        if let Some(v) = params.min_p {
             map.insert("min_p".into(), serde_json::json!(v));
         }
-        if let Some(v) = self.params.frequency_penalty {
+        if let Some(v) = params.frequency_penalty {
             map.insert("frequency_penalty".into(), serde_json::json!(v));
         }
-        if let Some(v) = self.params.presence_penalty {
+        if let Some(v) = params.presence_penalty {
             map.insert("presence_penalty".into(), serde_json::json!(v));
         }
-        if let Some(v) = self.params.repetition_penalty {
+        if let Some(v) = params.repetition_penalty {
             map.insert("repetition_penalty".into(), serde_json::json!(v));
         }
-        if let Some(v) = self.params.seed {
+        if let Some(v) = params.seed {
             map.insert("seed".into(), serde_json::json!(v));
         }
-        if let Some(ref v) = self.params.stop {
+        if let Some(ref v) = params.stop {
             map.insert("stop".into(), serde_json::json!(v));
         }
         if map.is_empty() {
@@ -999,6 +1115,10 @@ impl GraphAgent {
         } else {
             Some(serde_json::Value::Object(map))
         }
+    }
+
+    fn additional_params(&self) -> Option<serde_json::Value> {
+        self.cached_additional_params.clone()
     }
 
     /// Build a rig agent configured with all sampling params and tools.
@@ -1227,3 +1347,108 @@ impl GraphAgent {
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use rig;
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::tool_validation::validate_tool_args;
+    use serde_json::json;
+
+    // FtsSearchTool validation
+
+    #[test]
+    fn fts_rejects_type_mismatch() {
+        let raw = json!({"query": "test", "limit": "ten"});
+        let err = validate_tool_args("search_fts", &raw)
+            .expect_err("should reject string for numeric field");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("limit") || msg.contains("/limit"),
+            "error should name the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn fts_rejects_missing_required() {
+        let raw = json!({"limit": 5});
+        let err = validate_tool_args("search_fts", &raw)
+            .expect_err("should reject missing required 'query' field");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("query"),
+            "error should name missing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn fts_rejects_unknown_field() {
+        let raw = json!({"query": "test", "qury": "typo"});
+        let err = validate_tool_args("search_fts", &raw)
+            .expect_err("should reject unknown field with additionalProperties: false");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("qury") || msg.to_lowercase().contains("additional"),
+            "error should signal unknown field: {msg}"
+        );
+    }
+
+    #[test]
+    fn fts_accepts_valid_args() {
+        validate_tool_args("search_fts", &json!({"query": "Gandalf", "limit": 5}))
+            .expect("valid args should pass");
+        validate_tool_args("search_fts", &json!({"query": "Aragorn"}))
+            .expect("optional limit omitted should pass");
+    }
+
+    // UpsertNodeTool validation (write path with the most complex schema)
+
+    #[test]
+    fn upsert_node_rejects_missing_required() {
+        // both `name` and `object_type` are required
+        let raw = json!({"object_type": "character"});
+        let err = validate_tool_args("upsert_node", &raw)
+            .expect_err("should reject missing required 'name'");
+        let msg = err.to_string();
+        assert!(msg.contains("name"), "error should name missing field: {msg}");
+    }
+
+    #[test]
+    fn upsert_node_rejects_unknown_field() {
+        let raw = json!({"name": "Gandalf", "object_type": "character", "typo_field": "oops"});
+        let err = validate_tool_args("upsert_node", &raw)
+            .expect_err("should reject unknown field");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typo_field") || msg.to_lowercase().contains("additional"),
+            "error should signal unknown field: {msg}"
+        );
+    }
+
+    #[test]
+    fn upsert_node_accepts_valid_args() {
+        validate_tool_args(
+            "upsert_node",
+            &json!({"name": "Gandalf", "object_type": "character"}),
+        )
+        .expect("minimal valid args should pass");
+
+        validate_tool_args(
+            "upsert_node",
+            &json!({
+                "name": "Gandalf",
+                "object_type": "character",
+                "node_id": "00000000-0000-0000-0000-000000000001",
+                "properties": {"description": "A wizard"}
+            }),
+        )
+        .expect("full valid args should pass");
+    }
+
+    #[test]
+    fn unknown_tool_name_returns_error() {
+        let err = validate_tool_args("nonexistent_tool", &json!({}))
+            .expect_err("unregistered tool name should return error");
+        assert!(err.to_string().contains("nonexistent_tool"));
+    }
+}

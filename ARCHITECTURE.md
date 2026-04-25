@@ -221,6 +221,12 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 
 `KnowledgeGraph::schema_prompt_summary_all()` merges all persisted schemas and returns `prompt_summary()` output — used by `GraphAgent::new` to inject schema context into the system prompt.
 
+---
+
+## Agent Tool Dispatch (`crates/u-forge-agent`)
+
+Tool arguments emitted by the LLM are validated against each tool's JSON Schema (derived via `schemars::JsonSchema` and strict against unknown fields via `#[serde(deny_unknown_fields)]`) before deserialization. Each tool accepts `serde_json::Value` as its rig `Args` type, calls `tool_validation::validate_tool_args` first, and only then runs `serde_json::from_value` into the typed struct. Validators are compiled once per process via `std::sync::LazyLock` and reused across all calls. Validation failures return a `ToolError` whose message names the offending field path (JSON Pointer format), so the LLM can self-correct without burning extra turns. See `crates/u-forge-agent/src/lib.rs` — `tool_validation` module.
+
 `SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and adds 24 common TTRPG edge types automatically.
 
 ---

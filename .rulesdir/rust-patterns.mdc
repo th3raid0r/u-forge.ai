@@ -229,3 +229,9 @@ fields manually via `Span::current().record(...)` after the fact (e.g. recording
 For spawned tasks that outlive the calling frame, attach a span with
 `.instrument(tracing::info_span!("task_name"))` on the future before detaching.
 See `app_view/mod.rs::run_embedding_plan` and `do_init_lemonade`.
+
+---
+
+## Agent Tool Arg Validation
+
+Tool args in `u-forge-agent` are validated against JSON Schema before deserialization. Do not call `serde_json::from_value` directly on a raw tool arg payload — call `tool_validation::validate_tool_args(tool_name, &raw)?` first. The validated value is then safe to deserialize into the typed Args struct.
