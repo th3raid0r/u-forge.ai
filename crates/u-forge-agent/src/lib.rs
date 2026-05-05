@@ -190,7 +190,7 @@ pub(crate) mod tool_validation {
         let formatted: String = validator
             .iter_errors(raw)
             .take(3)
-            .map(|err| format!("{} — {}", err.instance_path, err))
+            .map(|err| format!("{} — {}", err.instance_path(), err))
             .collect::<Vec<_>>()
             .join("; ");
 
@@ -716,7 +716,7 @@ impl Tool for UpsertNodeTool {
         meta.name = args.name;
         meta.object_type = args.object_type;
         if let Some(props) = args.properties {
-            if let (serde_json::Value::Object(incoming), serde_json::Value::Object(ref mut existing)) =
+            if let (serde_json::Value::Object(incoming), serde_json::Value::Object(existing)) =
                 (props, &mut meta.properties)
             {
                 // Merge: caller-supplied keys win; null/omitted keys are preserved.
