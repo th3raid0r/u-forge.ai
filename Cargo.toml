@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*"]
-resolver = "2"
+resolver = "3"
 
 [patch.crates-io]
 # Backport of the ShapePlan cache from cosmic-text 0.17.1 into 0.14.2.

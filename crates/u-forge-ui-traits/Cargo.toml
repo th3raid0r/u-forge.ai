@@ -1,8 +1,8 @@
 [package]
 name = "u-forge-ui-traits"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-glam = "0.29"
+glam = "0.32"
 u-forge-graph-view = { path = "../u-forge-graph-view" }

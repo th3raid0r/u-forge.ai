@@ -10,8 +10,8 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 name = "cosmic-text"
 version = "0.14.2"
 authors = ["Jeremy Soller <jeremy@system76.com>"]

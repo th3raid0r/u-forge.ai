@@ -610,7 +610,7 @@ impl Render for NodeEditorPanel {
                             .is_some_and(|(k, _, _)| k == &key);
 
                         if is_adding {
-                            let (_, ref add_entity, _) = self.array_add_field.as_ref().unwrap();
+                            let (_, add_entity, _) = self.array_add_field.as_ref().unwrap();
                             array_div = array_div.child(
                                 div()
                                     .id(SharedString::from(format!("arr-adding-{}", spec.key)))
