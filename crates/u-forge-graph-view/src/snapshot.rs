@@ -68,7 +68,7 @@ impl GraphSnapshot {
         use rstar::AABB;
         let envelope = AABB::from_corners([min.x, min.y], [max.x, max.y]);
         self.spatial_index
-            .locate_in_envelope(&envelope)
+            .locate_in_envelope(envelope)
             .filter_map(|entry| self.id_to_idx.get(&entry.id).copied())
             .collect()
     }

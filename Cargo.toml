@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["crates/cosmic-text-patched"]
 resolver = "3"
 
 [patch.crates-io]

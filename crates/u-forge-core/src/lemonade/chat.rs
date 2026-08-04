@@ -408,29 +408,15 @@ impl LemonadeChatProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::require_integration_url;
+    use crate::test_helpers::{GPU_CPU_TEST_LLM_MODEL, require_integration_url};
 
-    fn smallest_downloaded_llm(
+    fn downloaded_test_llm(
         catalog: &crate::lemonade::LemonadeServerCatalog,
     ) -> Option<&crate::lemonade::CatalogModel> {
         catalog
             .models
             .iter()
-            .filter(|model| {
-                model.downloaded
-                    && (model.recipe == "llamacpp" || model.recipe == "flm")
-                    && !model.labels.contains("embeddings")
-                    && !model.labels.contains("reranking")
-                    && !model.labels.contains("audio")
-                    && !model.labels.contains("transcription")
-                    && !model.labels.contains("tts")
-            })
-            .min_by(|a, b| {
-                a.size_gb
-                    .unwrap_or(f64::INFINITY)
-                    .partial_cmp(&b.size_gb.unwrap_or(f64::INFINITY))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .find(|model| model.downloaded && model.id == GPU_CPU_TEST_LLM_MODEL)
     }
 
     #[tokio::test]
@@ -439,8 +425,8 @@ mod tests {
         let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
             .await
             .unwrap();
-        let Some(llm) = smallest_downloaded_llm(&catalog) else {
-            eprintln!("SKIP: No downloaded LLM model found in catalog");
+        let Some(llm) = downloaded_test_llm(&catalog) else {
+            eprintln!("SKIP: {GPU_CPU_TEST_LLM_MODEL} is not downloaded");
             return;
         };
         let gpu = GpuResourceManager::new();
@@ -463,15 +449,12 @@ mod tests {
         let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
             .await
             .unwrap();
-        let cfg = crate::config::AppConfig::default();
-        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let llm = selector
-            .select_llm_models()
-            .into_iter()
-            .next()
-            .expect("No LLM model found in catalog");
+        let Some(llm) = downloaded_test_llm(&catalog) else {
+            eprintln!("SKIP: {GPU_CPU_TEST_LLM_MODEL} is not downloaded");
+            return;
+        };
         let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::new(&url, &llm.model_id, Some(gpu));
+        let chat = LemonadeChatProvider::new(&url, &llm.id, Some(gpu));
 
         let req = ChatRequest::new(vec![ChatMessage::user("Count to three.")])
             .with_max_tokens(64)

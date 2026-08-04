@@ -28,5 +28,6 @@ narrow changes that preserve existing module boundaries. Use `rg` for searches.
 Keep prescriptive implementation plans out of shared descriptive docs.
 
 Run `make fmt-check`, `make check`, and `make test` before handing off a
-substantial change. `make clippy` is the strict lint target and excludes the
-vendored `cosmic-text` workspace member while still checking project crates.
+substantial change. `make clippy` is the strict lint target for project crates.
+The vendored `cosmic-text` patch is excluded from workspace resolution but is
+formatted and tested separately by the canonical Makefile targets.

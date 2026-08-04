@@ -85,6 +85,12 @@ Under the hood, `test_helpers::integration_test_url()` delegates to the
 production `crate::lemonade::resolve_lemonade_url()` for the default (unset)
 case — so tests and the app follow the same discovery logic.
 
+Live GPU/CPU LLM tests are pinned to `Gemma-4-E4B-it-GGUF` and skip when it is
+not downloaded; they must not fall back to the production model preference
+order because that can load a much larger model during the serial test flow.
+Use `gemma4-it-e4b-FLM` for any live NPU LLM test. Embedding and STT integration
+tests already use comparatively small capability-specific models.
+
 ---
 
 ## What each storage layer test must cover
