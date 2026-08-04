@@ -1,6 +1,12 @@
 # Phase 2 — Search Observability & HQ Backfill
 
-**Status (2026-08-03): Open.** Retained from the audit for follow-up. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+**Status (2026-08-04): Partially implemented.** H3 now has a core `SearchResponse` with capability flags and degradation reasons, and hybrid search falls back to FTS5 when an embedding lane is unavailable or fails fingerprint validation. It is not complete: an embedding request that fails after capability detection is still only logged, and SearchPanel currently discards the response metadata instead of rendering a degradation hint. M11 remains open. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+
+**Reconciliation note:** The implemented response uses
+`degraded_reasons: Vec<String>` rather than the originally proposed
+`fts_only`/`semantic_failed` fields so it can describe standard semantic, HQ,
+and reranking capability independently. Preserve that broader contract when
+finishing H3.
 
 **Source findings:** H3, M11
 

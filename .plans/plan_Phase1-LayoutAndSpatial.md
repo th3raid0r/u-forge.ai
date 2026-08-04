@@ -1,6 +1,6 @@
 # Phase 1 — Layout & Spatial Stability
 
-**Status (2026-08-03): Open.** Retained from the audit for follow-up. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+**Status (2026-08-04): Open.** PR #33 added `Viewport::fit_points` and a graph-specific Fit Graph action, but it did not change force-layout collision handling, convergence, R-tree removal, or NaN hit-testing. C5, C6, M7, and M12 therefore remain open. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
 
 **Source findings:** C5, C6, M7, M12 (graph-view), plus L6 if not folded
 into the mechanical sweep.

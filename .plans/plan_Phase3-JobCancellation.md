@@ -1,6 +1,6 @@
 # Phase 3 — Job Cancellation & Window Lifecycle
 
-**Status (2026-08-03): Open.** Retained from the audit for follow-up. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+**Status (2026-08-04): Open.** SearchPanel now owns and replaces its GPUI search task, but this is local stale-result prevention rather than F7: queued embedding, transcription, TTS, generation, and reranking jobs still have no public cancellation token or handle. F9 window-blur dismissal also remains open. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
 
 **Source findings:** F7, F9
 
