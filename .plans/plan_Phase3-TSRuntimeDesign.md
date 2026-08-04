@@ -1,6 +1,6 @@
 # Phase 3 — TS Agent Sandbox Runtime Design
 
-**Status (2026-08-03): Open.** Retained from the audit for follow-up. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+**Status (2026-08-04): Open.** The `LemonadeRuntime` added in PR #33 coordinates server-global LLM model/reasoning reloads and is unrelated to `u-forge-ts-runtime`. The TypeScript agent sandbox remains a stub and F2 remains open. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
 
 **Source findings:** D1, F2
 

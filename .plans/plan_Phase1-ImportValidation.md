@@ -1,6 +1,11 @@
 # Phase 1 — Import Validation & Edge Resolution Correctness
 
-**Status (2026-08-03): Partially implemented.** Strict schema-backed import now drops undeclared properties, skips unknown types, enforces required properties at the import boundary, validates edge types/endpoints, and emits JSONL diagnostics. Cross-type name ambiguity (C2) and broader schema-manager coercion policy remain open. Paths and symbols are authoritative; line references below describe the audit snapshot.
+**Status (2026-08-04): Partially implemented.** Strict schema-backed import drops undeclared properties, skips unknown types, enforces required properties, validates edge types/endpoints, and emits JSONL diagnostics. PR #33 extended that authority to all `KnowledgeGraph` object/edge writes and made import node/edge batches atomic per phase. Cross-type name ambiguity (C2), the agent resolution message (H1), and broader coercion policy remain open. Paths and symbols are authoritative; line references below describe the audit snapshot.
+
+**Reconciliation note:** `GraphMutation` is now the typed public command
+surface and committed writes emit `GraphChange`. This strengthens C1/H2 beyond
+the import boundary, but it does not resolve ambiguous unqualified names or
+change the import record-reference format proposed for C2.
 
 **Source findings:** C1, C2, H1, H2
 

@@ -952,12 +952,13 @@ impl Render for ChatPanel {
         let reasoning_enabled = self.reasoning_enabled;
         let has_provider = self.chat_provider.is_some() || self.agent.is_some();
         let model_label = self.selected_model_label();
-        let _history_label = self.session_title();
+        let history_dropdown_open = self.history_dropdown_open;
+        let history_label = self.session_title();
 
         // Virtualized history dropdown list — only renders visible rows so the
         // dropdown stays cheap even with hundreds of accumulated sessions.
         let history_list_entity = cx.entity().clone();
-        let _history_list_el = list(
+        let history_list_el = list(
             self.history_list_state.clone(),
             move |ix, _window, cx: &mut App| {
                 let panel = history_list_entity.read(cx);
@@ -1308,48 +1309,102 @@ impl Render for ChatPanel {
             .bg(rgb(0x181825))
             .border_l_1()
             .border_color(rgb(0x313244))
-            // Zed-aligned chat header. Session persistence remains internal;
-            // chat-history navigation is intentionally not exposed.
+            // ── Header: chat history selector ────────────────────────────────
             .child(
                 div()
                     .id("chat-header")
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .flex_none()
                     .w_full()
-                    .items_center()
                     .border_b_1()
                     .border_color(rgb(0x313244))
                     .px_2()
                     .py_1()
-                    .child(div().text_sm().text_color(rgba(0xcdd6f4ff)).child("Chat"))
-                    .child({
-                        let mut spacer = div();
-                        spacer.style().flex_grow = Some(1.0);
-                        spacer
-                    })
                     .child(
                         div()
-                            .id("new-chat-btn")
+                            .id("history-selector-row")
                             .flex()
-                            .flex_none()
+                            .flex_row()
                             .items_center()
-                            .justify_center()
-                            .px_2()
-                            .h(px(22.0))
-                            .rounded(px(3.0))
-                            .text_sm()
-                            .text_color(rgba(0xa6adc8ff))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x313244)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                    this.new_session(cx);
-                                }),
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .id("history-selector-btn")
+                                    .flex()
+                                    .items_center()
+                                    .px_2()
+                                    .h(px(22.0))
+                                    .bg(rgb(0x313244))
+                                    .border_1()
+                                    .border_color(rgb(0x45475a))
+                                    .rounded(px(3.0))
+                                    .text_sm()
+                                    .text_color(rgba(0xcdd6f4ff))
+                                    .cursor_pointer()
+                                    .overflow_x_hidden()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.history_dropdown_open =
+                                                !this.history_dropdown_open;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(history_label),
                             )
-                            .child("New chat"),
-                    ),
+                            .child({
+                                let mut spacer = div();
+                                spacer.style().flex_grow = Some(1.0);
+                                spacer
+                            })
+                            .child(
+                                div()
+                                    .id("new-chat-btn")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .px_2()
+                                    .h(px(22.0))
+                                    .bg(rgb(0xa6e3a1))
+                                    .rounded(px(3.0))
+                                    .text_sm()
+                                    .text_color(rgba(0x1e1e2eff))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.new_session(cx);
+                                        }),
+                                    )
+                                    .child("New"),
+                            ),
+                    )
+                    .when(history_dropdown_open, |header| {
+                        header.child(
+                            div()
+                                .id("history-dropdown")
+                                .flex()
+                                .flex_col()
+                                .flex_none()
+                                .w_full()
+                                .bg(rgb(0x313244))
+                                .border_1()
+                                .border_color(rgb(0x45475a))
+                                .rounded(px(3.0))
+                                .mt_1()
+                                .h(px(200.0))
+                                .overflow_hidden()
+                                .child({
+                                    let mut el = history_list_el;
+                                    el.style().flex_grow = Some(1.0);
+                                    el.style().flex_shrink = Some(1.0);
+                                    el.style().flex_basis = Some(relative(0.).into());
+                                    el
+                                }),
+                        )
+                    }),
             )
             // ── Message area (virtualized list) ──────────────────────────────
             .child({

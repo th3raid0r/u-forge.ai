@@ -1,6 +1,11 @@
 # Phase 2 — CI & Test Coverage
 
-**Status (2026-08-03): Partially implemented.** M6 is resolved with dimension-mismatch coverage for configured SQLite vector lanes. CI and example coverage remain open. Paths and symbols are authoritative; line references below describe the audit snapshot.
+**Status (2026-08-04): Partially implemented.** M6 and M9 are resolved. `.github/workflows/ci.yml` installs the Linux GPUI dependencies and runs the root `Makefile` targets for formatting, check, strict clippy, and canonical tests on pushes and pull requests. D2 remains open: `convert_memorymesh` is not explicitly checked by the workflow and no representative-input run was added. Paths and symbols are authoritative; line references below describe the audit snapshot.
+
+**Reconciliation note:** The workflow deliberately delegates policy to the
+root `Makefile`, including the separate vendored `cosmic-text` formatting and
+test targets. Completing D2 still requires an explicit example check and the
+documented representative-input verification below.
 
 **Source findings:** M9, M6, D2
 

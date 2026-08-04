@@ -1,6 +1,10 @@
 # Phase 1 — UI Async & Paint Hygiene
 
-**Status (2026-08-03): Open.** Retained from the audit for follow-up. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+**Status (2026-08-04): Partially implemented.** The SearchPanel half of H4 is complete: it owns its `gpui::Task`, cancels the prior task, and rejects stale generations. `PathPickerModal::browse` still detaches its task. C4, H7, and M10 also remain open; the embedding plan still uses both an epoch and an atomic cancel flag, and chat list mutation still lacks the proposed named helpers. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+
+**Adjacent work:** PR #33 also coalesces committed core graph changes into one
+snapshot refresh per frame-sized window and adds panel contracts. Those changes
+improve UI consistency but do not close the remaining findings in this plan.
 
 **Source findings:** C4, H4, H7, M10
 
