@@ -7,7 +7,7 @@ use gpui::{
 use u_forge_core::AppConfig;
 use u_forge_graph_view::build_snapshot;
 use u_forge_ui_gpui::{
-    AppView, ClearData, ClearSchema, ExportData, ImportData, ImportSchema, SaveLayout,
+    AppView, ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, SaveLayout,
     TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
 };
 
@@ -73,6 +73,7 @@ fn main() {
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("ctrl-j", ToggleRightPanel, None),
             KeyBinding::new("ctrl-shift-p", TogglePerfOverlay, None),
+            KeyBinding::new("ctrl-shift-0", FitGraph, None),
         ]);
 
         // Register native application menu (macOS menu bar; no-op on Linux).
@@ -95,6 +96,7 @@ fn main() {
                 items: vec![
                     MenuItem::action("Toggle Left Panel", ToggleSidebar),
                     MenuItem::action("Toggle Right Panel", ToggleRightPanel),
+                    MenuItem::action("Fit Graph", FitGraph),
                     MenuItem::separator(),
                     MenuItem::action("Toggle Perf Overlay", TogglePerfOverlay),
                 ],

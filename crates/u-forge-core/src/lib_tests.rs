@@ -5,7 +5,9 @@ use tempfile::TempDir;
 
 use crate::graph::MAX_CHUNK_TOKENS;
 use crate::types::{ChunkType, EdgeType};
-use crate::{KnowledgeGraph, ObjectBuilder, ObjectTypeSchema, PropertySchema};
+use crate::{
+    EmbeddingTarget, GraphChange, KnowledgeGraph, ObjectBuilder, ObjectTypeSchema, PropertySchema,
+};
 
 fn create_test_graph() -> (KnowledgeGraph, TempDir) {
     let temp_dir = TempDir::new().unwrap();
@@ -298,4 +300,72 @@ async fn test_validation_failure() {
 
     let insert_result = graph.add_object_validated(bad).await;
     assert!(insert_result.is_err());
+}
+
+#[tokio::test]
+async fn mutation_boundary_rejects_unknown_properties_once_schema_is_loaded() {
+    let (graph, _tmp) = create_test_graph_async().await;
+    graph
+        .get_schema_manager()
+        .load_schema("default")
+        .await
+        .unwrap();
+
+    let object = ObjectBuilder::character("Strict".to_string())
+        .with_property("not_declared".to_string(), "value".to_string())
+        .build();
+    let error = graph.add_object(object).unwrap_err().to_string();
+    assert!(error.contains("not defined in schema"), "{error}");
+}
+
+#[tokio::test]
+async fn committed_mutations_emit_graph_changes() {
+    let (graph, _tmp) = create_test_graph_async().await;
+    let mut changes = graph.subscribe_changes();
+    let object = ObjectBuilder::character("Observed".to_string()).build();
+    let id = graph.add_object(object).unwrap();
+
+    assert_eq!(
+        changes.recv().await.unwrap(),
+        GraphChange::ObjectUpserted { id, created: true }
+    );
+}
+
+#[tokio::test]
+async fn mutation_boundary_rejects_unknown_edges_once_schema_is_loaded() {
+    let (graph, _tmp) = create_test_graph_async().await;
+    graph
+        .get_schema_manager()
+        .load_schema("default")
+        .await
+        .unwrap();
+    let first = graph
+        .add_object(ObjectBuilder::character("First".to_string()).build())
+        .unwrap();
+    let second = graph
+        .add_object(ObjectBuilder::character("Second".to_string()).build())
+        .unwrap();
+
+    let error = graph
+        .connect_objects_str(first, second, "invented_edge")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Unknown edge type"), "{error}");
+}
+
+#[test]
+fn embedding_lane_rejects_a_different_model_fingerprint() {
+    let (graph, _tmp) = create_test_graph();
+    graph
+        .ensure_embedding_space(EmbeddingTarget::Standard, "model-a@768")
+        .unwrap();
+    graph
+        .ensure_embedding_space(EmbeddingTarget::Standard, "model-a@768")
+        .unwrap();
+
+    let error = graph
+        .ensure_embedding_space(EmbeddingTarget::Standard, "model-b@768")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("embedding space mismatch"), "{error}");
 }

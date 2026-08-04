@@ -258,6 +258,24 @@ pub struct SearchSources {
     pub rerank_score: Option<f32>,
 }
 
+/// Capability and degradation metadata returned with structured search output.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchCapabilities {
+    pub standard_semantic: bool,
+    pub high_quality_semantic: bool,
+    pub reranking: bool,
+}
+
+/// Structured hybrid-search response for UI and API consumers.
+#[derive(Debug, Clone)]
+pub struct SearchResponse {
+    pub query: String,
+    pub results: Vec<NodeSearchResult>,
+    pub capabilities: SearchCapabilities,
+    /// Human-readable reasons a requested stage was unavailable.
+    pub degraded_reasons: Vec<String>,
+}
+
 impl SearchSources {
     /// Human-readable bracketed label indicating which paths contributed.
     ///
@@ -376,6 +394,20 @@ pub async fn search_hybrid(
     tracing::Span::current().record("query", query);
 
     let alpha = config.alpha.clamp(0.0, 1.0);
+    let standard_space_valid = queue.has_embedding()
+        && queue
+            .embedding_space_fingerprint()
+            .is_some_and(|fingerprint| {
+                match graph
+                    .ensure_embedding_space(crate::ingest::EmbeddingTarget::Standard, fingerprint)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "Standard semantic lane disabled for this search");
+                        false
+                    }
+                }
+            });
 
     // ── Stage 1: FTS5 search (sync, sub-millisecond) ──────────────────────────
     // Always run first — it is instant and does not need the embedding RTT.
@@ -403,7 +435,7 @@ pub async fn search_hybrid(
     // ── Stage 2+3: Embed query then ANN search ────────────────────────────────
     // Skip when alpha == 0.0 (pure FTS) or when no embedding worker exists.
 
-    let semantic_results = if alpha > 0.0 && queue.has_embedding() {
+    let semantic_results = if alpha > 0.0 && standard_space_valid {
         debug!("Embedding query for semantic ANN search");
         match queue.embed(query).await {
             Err(e) => {
@@ -448,7 +480,22 @@ pub async fn search_hybrid(
                 info!("HQ semantic search skipped — no embedding workers in hq_queue.");
                 Vec::new()
             }
-            Some(hq_q) => {
+            Some(hq_q)
+                if hq_q
+                    .embedding_space_fingerprint()
+                    .is_some_and(|fingerprint| {
+                        match graph.ensure_embedding_space(
+                            crate::ingest::EmbeddingTarget::HighQuality,
+                            fingerprint,
+                        ) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                warn!(%error, "HQ semantic lane disabled for this search");
+                                false
+                            }
+                        }
+                    }) =>
+            {
                 debug!("Embedding query for HQ semantic ANN search");
                 match hq_q.embed(query).await {
                     Err(e) => {
@@ -470,6 +517,7 @@ pub async fn search_hybrid(
                     }
                 }
             }
+            Some(_) => Vec::new(),
         }
     } else {
         Vec::new()
@@ -965,6 +1013,57 @@ pub async fn search_hybrid(
     Ok(results)
 }
 
+/// Run hybrid search and retain capability/degradation information alongside
+/// the ranked nodes.
+pub async fn search_hybrid_response(
+    graph: &KnowledgeGraph,
+    queue: &InferenceQueue,
+    hq_queue: Option<&InferenceQueue>,
+    query: &str,
+    config: &HybridSearchConfig,
+) -> Result<SearchResponse> {
+    let standard_semantic = queue.has_embedding()
+        && queue
+            .embedding_space_fingerprint()
+            .is_some_and(|fingerprint| {
+                graph
+                    .ensure_embedding_space(crate::ingest::EmbeddingTarget::Standard, fingerprint)
+                    .is_ok()
+            });
+    let high_quality_semantic = hq_queue.is_some_and(|queue| {
+        queue.has_embedding()
+            && queue
+                .embedding_space_fingerprint()
+                .is_some_and(|fingerprint| {
+                    graph
+                        .ensure_embedding_space(
+                            crate::ingest::EmbeddingTarget::HighQuality,
+                            fingerprint,
+                        )
+                        .is_ok()
+                })
+    });
+    let reranking = queue.has_reranking();
+    let mut degraded_reasons = Vec::new();
+    if config.alpha > 0.0 && !standard_semantic && !high_quality_semantic {
+        degraded_reasons.push("semantic embedding space unavailable; used FTS5".to_string());
+    }
+    if config.rerank && !reranking {
+        degraded_reasons.push("reranker unavailable; used reciprocal-rank scores".to_string());
+    }
+    let results = search_hybrid(graph, queue, hq_queue, query, config).await?;
+    Ok(SearchResponse {
+        query: query.to_string(),
+        results,
+        capabilities: SearchCapabilities {
+            standard_semantic,
+            high_quality_semantic,
+            reranking,
+        },
+        degraded_reasons,
+    })
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn parse_uuid(s: &str, label: &str) -> Result<ObjectId> {
@@ -1157,6 +1256,12 @@ mod tests {
 
         // Populate the vec index with deterministic mock embeddings so that the
         // semantic ANN path has data to query against.
+        graph
+            .ensure_embedding_space(
+                crate::ingest::EmbeddingTarget::Standard,
+                "mock-embed@unknown",
+            )
+            .unwrap();
         for oid in [wizard_id, hobbit_id, shire_id, city_id] {
             for chunk in graph.get_text_chunks(oid).unwrap() {
                 let seed = chunk.content.len() as f32

@@ -7,8 +7,8 @@ use gpui::{
 };
 
 use crate::{
-    ClearData, ClearSchema, ExportData, ImportData, ImportSchema, SaveLayout, TogglePerfOverlay,
-    ToggleRightPanel, ToggleSidebar,
+    ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, SaveLayout,
+    TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
 };
 
 use super::{
@@ -80,6 +80,10 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &SaveLayout, _window, cx| {
                 this.do_save(cx);
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &FitGraph, _window, cx| {
+                this.graph_canvas
+                    .update(cx, |canvas, cx| canvas.fit_graph(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
                 this.sidebar_open = !this.sidebar_open;

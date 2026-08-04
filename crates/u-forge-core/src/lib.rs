@@ -23,6 +23,7 @@ pub mod error;
 pub mod graph;
 pub mod ingest;
 pub mod lemonade;
+pub mod mutation;
 pub mod queue;
 pub mod rag;
 pub mod schema;
@@ -40,7 +41,7 @@ pub use config::{
     AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig,
     ModelConfig, ModelLoadParams, StorageConfig, UiConfig,
 };
-pub use error::EmbeddingDimensionMismatch;
+pub use error::{EmbeddingDimensionMismatch, EmbeddingSpaceMismatch, UnidentifiedEmbeddingSpace};
 pub use graph::{
     DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS, GraphStats,
     HIGH_QUALITY_EMBEDDING_DIMENSIONS, KnowledgeGraphStorage, MAX_CHUNK_TOKENS,
@@ -52,17 +53,20 @@ pub use ingest::{
 };
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
-    GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth, LemonadeSttProvider,
-    LemonadeTtsProvider, LlmGuard, LoadedModelEntry, ModelLoadOptions, RerankDocument,
-    RerankProvider, StreamToken, SttGuard, TranscriptionResult, load_model,
+    GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth, LemonadeRuntime,
+    LemonadeRuntimeProfile, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, LoadedModelEntry,
+    ModelLoadOptions, RerankDocument, RerankProvider, StreamToken, SttGuard, TranscriptionResult,
+    load_model, reload_model,
 };
+pub use mutation::{GraphChange, GraphMutation};
 pub use rag::{RagContext, build_rag_messages, format_search_context};
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertyIssue, PropertySchema, PropertyType,
     SchemaDefinition, SchemaIngestion, SchemaManager, SchemaStats, ValidationResult,
 };
 pub use search::{
-    ConnectedNode, HybridSearchConfig, MatchedChunk, NodeSearchResult, SearchSources, search_hybrid,
+    ConnectedNode, HybridSearchConfig, MatchedChunk, NodeSearchResult, SearchCapabilities,
+    SearchResponse, SearchSources, search_hybrid, search_hybrid_response,
 };
 pub use types::*;
 
@@ -100,6 +104,7 @@ use text::split_text_with_counts;
 pub struct KnowledgeGraph {
     storage: Arc<KnowledgeGraphStorage>,
     schema_manager: Arc<SchemaManager>,
+    changes: tokio::sync::broadcast::Sender<GraphChange>,
 }
 
 impl KnowledgeGraph {
@@ -110,9 +115,11 @@ impl KnowledgeGraph {
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let storage = Arc::new(KnowledgeGraphStorage::new(db_path.as_ref())?);
         let schema_manager = Arc::new(SchemaManager::new(storage.clone()));
+        let (changes, _) = tokio::sync::broadcast::channel(256);
         Ok(Self {
             storage,
             schema_manager,
+            changes,
         })
     }
 
@@ -127,10 +134,67 @@ impl KnowledgeGraph {
             config.high_quality_embedding_dimensions,
         )?);
         let schema_manager = Arc::new(SchemaManager::new(storage.clone()));
+        let (changes, _) = tokio::sync::broadcast::channel(256);
         Ok(Self {
             storage,
             schema_manager,
+            changes,
         })
+    }
+
+    /// Subscribe to successfully committed graph changes. A lagged receiver
+    /// should rebuild its read model from storage before resuming.
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<GraphChange> {
+        self.changes.subscribe()
+    }
+
+    fn emit_change(&self, change: GraphChange) {
+        let _ = self.changes.send(change);
+    }
+
+    /// Apply one typed mutation through the same validation, persistence, and
+    /// event boundary used by the convenience CRUD methods.
+    pub fn apply_mutation(&self, mutation: GraphMutation) -> Result<GraphChange> {
+        match mutation {
+            GraphMutation::UpsertObject(metadata) => {
+                let id = metadata.id;
+                let created = self.get_object(id)?.is_none();
+                self.add_object(metadata)?;
+                Ok(GraphChange::ObjectUpserted { id, created })
+            }
+            GraphMutation::DeleteObject(id) => {
+                self.delete_object(id)?;
+                Ok(GraphChange::ObjectDeleted { id })
+            }
+            GraphMutation::UpsertEdge(edge) => {
+                self.upsert_edge_validated(edge.clone())?;
+                Ok(GraphChange::EdgeUpserted(edge))
+            }
+            GraphMutation::DeleteEdge {
+                from,
+                to,
+                edge_type,
+            } => {
+                self.delete_edge(from, to, &edge_type)?;
+                Ok(GraphChange::EdgeDeleted {
+                    from,
+                    to,
+                    edge_type,
+                })
+            }
+            GraphMutation::ClearData => {
+                self.clear_data()?;
+                Ok(GraphChange::DataCleared)
+            }
+            GraphMutation::ClearSchemas => {
+                self.clear_schemas()?;
+                Ok(GraphChange::SchemasCleared)
+            }
+            GraphMutation::ClearAll => {
+                self.clear_all()?;
+                Ok(GraphChange::AllCleared)
+            }
+        }
     }
 
     // ── Node / object operations ──────────────────────────────────────────────
@@ -138,13 +202,30 @@ impl KnowledgeGraph {
     /// Persist a new object, returning its [`ObjectId`].
     pub fn add_object(&self, metadata: ObjectMetadata) -> Result<ObjectId> {
         let id = metadata.id;
+        self.schema_manager
+            .validate_object_cached_strict(&metadata)?;
+        let created = self.storage.get_node(id)?.is_none();
         self.storage.upsert_node(metadata)?;
+        self.emit_change(GraphChange::ObjectUpserted { id, created });
         Ok(id)
     }
 
     pub(crate) fn add_objects(&self, metadata: Vec<ObjectMetadata>) -> Result<()> {
-        for node in metadata {
-            self.storage.upsert_node(node)?;
+        for node in &metadata {
+            self.schema_manager.validate_object_cached_strict(node)?;
+        }
+        let changes = metadata
+            .iter()
+            .map(|node| {
+                Ok(GraphChange::ObjectUpserted {
+                    id: node.id,
+                    created: self.storage.get_node(node.id)?.is_none(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.storage.upsert_nodes(&metadata)?;
+        for change in changes {
+            self.emit_change(change);
         }
         Ok(())
     }
@@ -161,23 +242,35 @@ impl KnowledgeGraph {
 
     /// Overwrite an existing object's metadata (updates `updated_at`).
     pub fn update_object(&self, mut metadata: ObjectMetadata) -> Result<()> {
+        self.schema_manager
+            .validate_object_cached_strict(&metadata)?;
+        let id = metadata.id;
+        let created = self.storage.get_node(id)?.is_none();
         metadata.touch();
-        self.storage.upsert_node(metadata)
+        self.storage.upsert_node(metadata)?;
+        self.emit_change(GraphChange::ObjectUpserted { id, created });
+        Ok(())
     }
 
     /// Delete an object and, via `ON DELETE CASCADE`, all its edges and chunks.
     pub fn delete_object(&self, id: ObjectId) -> Result<()> {
-        self.storage.delete_node(id)
+        self.storage.delete_node(id)?;
+        self.emit_change(GraphChange::ObjectDeleted { id });
+        Ok(())
     }
 
     /// Delete all data from the graph (nodes, edges, chunks, schemas, vectors).
     pub fn clear_all(&self) -> Result<()> {
-        self.storage.clear_all()
+        self.storage.clear_all()?;
+        self.emit_change(GraphChange::AllCleared);
+        Ok(())
     }
 
     /// Delete node data only (nodes, edges, chunks, vectors) — schemas are preserved.
     pub fn clear_data(&self) -> Result<()> {
-        self.storage.clear_data_only()
+        self.storage.clear_data_only()?;
+        self.emit_change(GraphChange::DataCleared);
+        Ok(())
     }
 
     /// Delete all schemas from the graph — node data is preserved.
@@ -186,6 +279,7 @@ impl KnowledgeGraph {
         for name in mgr.list_schemas()? {
             mgr.delete_schema(&name)?;
         }
+        self.emit_change(GraphChange::SchemasCleared);
         Ok(())
     }
 
@@ -193,18 +287,21 @@ impl KnowledgeGraph {
 
     /// Create a typed relationship between two objects.
     pub fn connect_objects(&self, from: ObjectId, to: ObjectId, edge_type: EdgeType) -> Result<()> {
-        self.storage.upsert_edge(Edge::new(from, to, edge_type))
+        self.upsert_edge_validated(Edge::new(from, to, edge_type))
     }
 
     /// Create a relationship using a plain string edge type.
     pub fn connect_objects_str(&self, from: ObjectId, to: ObjectId, edge_type: &str) -> Result<()> {
-        self.storage
-            .upsert_edge(Edge::new(from, to, EdgeType::new(edge_type)))
+        self.upsert_edge_validated(Edge::new(from, to, EdgeType::new(edge_type)))
     }
 
     pub(crate) fn connect_edges(&self, edges: Vec<Edge>) -> Result<()> {
+        for edge in &edges {
+            self.validate_edge_for_mutation(edge)?;
+        }
+        self.storage.upsert_edges(&edges)?;
         for edge in edges {
-            self.storage.upsert_edge(edge)?;
+            self.emit_change(GraphChange::EdgeUpserted(edge));
         }
         Ok(())
     }
@@ -217,8 +314,7 @@ impl KnowledgeGraph {
         edge_type: EdgeType,
         weight: f32,
     ) -> Result<()> {
-        self.storage
-            .upsert_edge(Edge::new(from, to, edge_type).with_weight(weight))
+        self.upsert_edge_validated(Edge::new(from, to, edge_type).with_weight(weight))
     }
 
     /// Create a weighted relationship using a plain string edge type.
@@ -229,8 +325,29 @@ impl KnowledgeGraph {
         edge_type: &str,
         weight: f32,
     ) -> Result<()> {
-        self.storage
-            .upsert_edge(Edge::new(from, to, EdgeType::new(edge_type)).with_weight(weight))
+        self.upsert_edge_validated(
+            Edge::new(from, to, EdgeType::new(edge_type)).with_weight(weight),
+        )
+    }
+
+    fn validate_edge_for_mutation(&self, edge: &Edge) -> Result<()> {
+        let source = self
+            .storage
+            .get_node(edge.from)?
+            .ok_or_else(|| anyhow::anyhow!("Edge source node '{}' does not exist", edge.from))?;
+        let target = self
+            .storage
+            .get_node(edge.to)?
+            .ok_or_else(|| anyhow::anyhow!("Edge target node '{}' does not exist", edge.to))?;
+        self.schema_manager
+            .validate_edge_cached_strict(edge, &source, &target)
+    }
+
+    fn upsert_edge_validated(&self, edge: Edge) -> Result<()> {
+        self.validate_edge_for_mutation(&edge)?;
+        self.storage.upsert_edge(edge.clone())?;
+        self.emit_change(GraphChange::EdgeUpserted(edge));
+        Ok(())
     }
 
     /// All edges incident to `id` (both outgoing and incoming).
@@ -274,7 +391,13 @@ impl KnowledgeGraph {
     ///
     /// This is idempotent — deleting a non-existent edge succeeds silently.
     pub fn delete_edge(&self, from: ObjectId, to: ObjectId, edge_type: &str) -> Result<()> {
-        self.storage.delete_edge(from, to, edge_type)
+        self.storage.delete_edge(from, to, edge_type)?;
+        self.emit_change(GraphChange::EdgeDeleted {
+            from,
+            to,
+            edge_type: edge_type.to_string(),
+        });
+        Ok(())
     }
 
     /// Return a page of nodes ordered by name.
@@ -394,6 +517,15 @@ impl KnowledgeGraph {
     /// `embedding.len()` must equal [`EMBEDDING_DIMENSIONS`] (currently 256).
     pub fn upsert_chunk_embedding(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
         self.storage.upsert_chunk_embedding(chunk_id, embedding)
+    }
+
+    /// Verify or initialize the provider identity for one embedding lane.
+    pub fn ensure_embedding_space(&self, target: EmbeddingTarget, fingerprint: &str) -> Result<()> {
+        let lane = match target {
+            EmbeddingTarget::Standard => "standard",
+            EmbeddingTarget::HighQuality => "high_quality",
+        };
+        self.storage.ensure_embedding_space(lane, fingerprint)
     }
 
     pub(crate) fn upsert_chunk_embeddings(
@@ -580,9 +712,7 @@ impl KnowledgeGraph {
                 result.errors
             ));
         }
-        let id = metadata.id;
-        self.storage.upsert_node(metadata)?;
-        Ok(id)
+        self.add_object(metadata)
     }
 
     /// Register a new object type in the `"default"` schema.

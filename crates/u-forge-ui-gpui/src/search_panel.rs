@@ -5,7 +5,8 @@ use gpui::{
 };
 use tracing::Instrument;
 use u_forge_core::{
-    AppConfig, HybridSearchConfig, KnowledgeGraph, ObjectId, queue::InferenceQueue, search_hybrid,
+    AppConfig, EmbeddingTarget, HybridSearchConfig, KnowledgeGraph, ObjectId,
+    queue::InferenceQueue, search_hybrid_response,
 };
 use u_forge_ui_traits::node_color_for_type;
 
@@ -39,6 +40,11 @@ pub(crate) struct SearchPanel {
     results: Vec<SearchResult>,
     searching: bool,
     error: Option<String>,
+    /// Monotonically identifies the latest requested search so a slower prior
+    /// request cannot overwrite newer results.
+    search_generation: u64,
+    /// Retaining the task lets a new search cancel its predecessor promptly.
+    search_task: Option<gpui::Task<()>>,
     search_limit: usize,
     inference_queue: Option<InferenceQueue>,
     hq_queue: Option<InferenceQueue>,
@@ -72,6 +78,8 @@ impl SearchPanel {
             results: Vec::new(),
             searching: false,
             error: None,
+            search_generation: 0,
+            search_task: None,
             search_limit,
             inference_queue: None,
             hq_queue: None,
@@ -96,7 +104,12 @@ impl SearchPanel {
 
         // Validate queue availability for modes that need it.
         match self.mode {
-            SearchMode::Semantic | SearchMode::Hybrid if self.inference_queue.is_none() => {
+            SearchMode::Semantic
+                if !self
+                    .inference_queue
+                    .as_ref()
+                    .is_some_and(InferenceQueue::has_embedding) =>
+            {
                 self.error = Some("Lemonade not available — use FTS5".to_string());
                 cx.notify();
                 return;
@@ -107,6 +120,9 @@ impl SearchPanel {
         self.searching = true;
         self.error = None;
         self.results.clear();
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        self.search_task.take();
         cx.notify();
 
         let graph = self.graph.clone();
@@ -123,7 +139,7 @@ impl SearchPanel {
             SearchMode::Hybrid => "hybrid",
         };
 
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let result: Result<Vec<ObjectId>, anyhow::Error> = cx
                 .background_executor()
                 .spawn(
@@ -155,9 +171,30 @@ impl SearchPanel {
                                     let raw: Vec<(_, ObjectId, _, _)> = if let Some(hq_q) =
                                         hq_queue.as_ref()
                                     {
+                                        let fingerprint = hq_q
+                                            .embedding_space_fingerprint()
+                                            .ok_or_else(|| {
+                                                anyhow::anyhow!(
+                                                    "HQ embedding model identity unavailable"
+                                                )
+                                            })?;
+                                        graph.ensure_embedding_space(
+                                            EmbeddingTarget::HighQuality,
+                                            fingerprint,
+                                        )?;
                                         let embedding: Vec<f32> = hq_q.embed(&query).await?;
                                         graph.search_chunks_semantic_hq(&embedding, limit * 4)?
                                     } else {
+                                        let fingerprint =
+                                            q.embedding_space_fingerprint().ok_or_else(|| {
+                                                anyhow::anyhow!(
+                                                    "Embedding model identity unavailable"
+                                                )
+                                            })?;
+                                        graph.ensure_embedding_space(
+                                            EmbeddingTarget::Standard,
+                                            fingerprint,
+                                        )?;
                                         let embedding: Vec<f32> = q.embed(&query).await?;
                                         graph.search_chunks_semantic(&embedding, limit * 4)?
                                     };
@@ -187,10 +224,19 @@ impl SearchPanel {
                                         limit,
                                         hq_semantic_boost: app_config.chat.hq_semantic_boost,
                                     };
-                                    let results =
-                                        search_hybrid(&graph, q, hq_queue.as_ref(), &query, &cfg)
-                                            .await?;
-                                    Ok(results.into_iter().map(|r| r.node.id).collect::<Vec<_>>())
+                                    let response = search_hybrid_response(
+                                        &graph,
+                                        q,
+                                        hq_queue.as_ref(),
+                                        &query,
+                                        &cfg,
+                                    )
+                                    .await?;
+                                    Ok(response
+                                        .results
+                                        .into_iter()
+                                        .map(|result| result.node.id)
+                                        .collect::<Vec<_>>())
                                 }
                             };
                             r
@@ -205,6 +251,9 @@ impl SearchPanel {
                 .await;
 
             this.update(cx, |panel, cx| {
+                if panel.search_generation != generation {
+                    return;
+                }
                 panel.searching = false;
                 match result {
                     Ok(node_ids) => {
@@ -232,8 +281,8 @@ impl SearchPanel {
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
+        self.search_task = Some(task);
     }
 }
 

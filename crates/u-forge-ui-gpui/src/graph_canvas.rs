@@ -106,6 +106,23 @@ impl GraphCanvas {
             eprintln!("Layout saved.");
         }
     }
+
+    /// Fit the complete graph into the current canvas while preserving its
+    /// force-directed layout.
+    pub(crate) fn fit_graph(&mut self, cx: &mut Context<Self>) {
+        let (canvas_size, _) = self.canvas_metrics();
+        let positions = self
+            .snapshot
+            .read()
+            .nodes
+            .iter()
+            .map(|node| node.position)
+            .collect::<Vec<_>>();
+        let viewport = Viewport::fit_points(&positions, canvas_size, 48.0);
+        self.camera = viewport.center;
+        self.zoom = viewport.zoom;
+        cx.notify();
+    }
 }
 
 /// Convert draw-command color `[u8;4]` → gpui `rgb` u32 (ignores alpha).
