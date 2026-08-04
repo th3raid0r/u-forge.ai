@@ -35,34 +35,34 @@ pub mod types;
 pub use ai::embeddings::{
     EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType, LemonadeProvider,
 };
-pub use error::EmbeddingDimensionMismatch;
 pub use builder::ObjectBuilder;
 pub use config::{
     AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig,
     ModelConfig, ModelLoadParams, StorageConfig, UiConfig,
 };
+pub use error::EmbeddingDimensionMismatch;
 pub use graph::{
-    GraphStats, KnowledgeGraphStorage, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS,
-    HIGH_QUALITY_EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS,
+    DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS, GraphStats,
+    HIGH_QUALITY_EMBEDDING_DIMENSIONS, KnowledgeGraphStorage, MAX_CHUNK_TOKENS,
 };
 pub use ingest::{
-    build_hq_embed_queue, embed_all_chunks, rechunk_and_embed, setup_and_index, DataIngestion,
-    EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, EmbeddingResult, EmbeddingTarget,
-    IngestionStats, SetupResult,
+    DataIngestion, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, EmbeddingResult,
+    EmbeddingTarget, IngestionStats, SetupResult, build_hq_embed_queue, embed_all_chunks,
+    import_schemas_and_data, rechunk_and_embed, setup_and_index,
 };
 pub use lemonade::{
-    load_model, ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage,
-    GpuResourceManager, GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth,
-    LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, LoadedModelEntry, ModelLoadOptions,
-    StreamToken, SttGuard, TranscriptionResult,
+    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
+    GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth, LemonadeSttProvider,
+    LemonadeTtsProvider, LlmGuard, LoadedModelEntry, ModelLoadOptions, RerankDocument,
+    RerankProvider, StreamToken, SttGuard, TranscriptionResult, load_model,
 };
-pub use rag::{build_rag_messages, format_search_context, RagContext};
+pub use rag::{RagContext, build_rag_messages, format_search_context};
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertyIssue, PropertySchema, PropertyType,
     SchemaDefinition, SchemaIngestion, SchemaManager, SchemaStats, ValidationResult,
 };
 pub use search::{
-    search_hybrid, ConnectedNode, HybridSearchConfig, NodeSearchResult, SearchSources,
+    ConnectedNode, HybridSearchConfig, MatchedChunk, NodeSearchResult, SearchSources, search_hybrid,
 };
 pub use types::*;
 
@@ -72,8 +72,10 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::info;
 
-use text::split_text;
+use text::split_text_with_counts;
 
 /// Central knowledge graph interface.
 ///
@@ -114,6 +116,23 @@ impl KnowledgeGraph {
         })
     }
 
+    /// Open a SQLite knowledge graph using configured retrieval dimensions.
+    ///
+    /// [`Self::new`] remains the convenience constructor using the built-in
+    /// 768/4096 defaults.
+    pub fn with_storage_config(config: &StorageConfig) -> Result<Self> {
+        let storage = Arc::new(KnowledgeGraphStorage::new_with_embedding_dimensions(
+            &config.db_path,
+            config.embedding_dimensions,
+            config.high_quality_embedding_dimensions,
+        )?);
+        let schema_manager = Arc::new(SchemaManager::new(storage.clone()));
+        Ok(Self {
+            storage,
+            schema_manager,
+        })
+    }
+
     // ── Node / object operations ──────────────────────────────────────────────
 
     /// Persist a new object, returning its [`ObjectId`].
@@ -121,6 +140,13 @@ impl KnowledgeGraph {
         let id = metadata.id;
         self.storage.upsert_node(metadata)?;
         Ok(id)
+    }
+
+    pub(crate) fn add_objects(&self, metadata: Vec<ObjectMetadata>) -> Result<()> {
+        for node in metadata {
+            self.storage.upsert_node(node)?;
+        }
+        Ok(())
     }
 
     /// Retrieve an object by its [`ObjectId`], or `None` if it does not exist.
@@ -174,6 +200,13 @@ impl KnowledgeGraph {
     pub fn connect_objects_str(&self, from: ObjectId, to: ObjectId, edge_type: &str) -> Result<()> {
         self.storage
             .upsert_edge(Edge::new(from, to, EdgeType::new(edge_type)))
+    }
+
+    pub(crate) fn connect_edges(&self, edges: Vec<Edge>) -> Result<()> {
+        for edge in edges {
+            self.storage.upsert_edge(edge)?;
+        }
+        Ok(())
     }
 
     /// Create a weighted relationship.
@@ -272,13 +305,50 @@ impl KnowledgeGraph {
         content: String,
         chunk_type: ChunkType,
     ) -> Result<Vec<ChunkId>> {
-        let pieces = split_text(&content);
+        let pieces = split_text_with_counts(&content);
         let mut ids = Vec::with_capacity(pieces.len());
-        for piece in pieces {
-            let chunk = TextChunk::new(object_id, piece, chunk_type.clone());
+        for (piece, token_count) in pieces {
+            let chunk =
+                TextChunk::with_token_count(object_id, piece, chunk_type.clone(), token_count);
             ids.push(chunk.id);
             self.storage.upsert_chunk(chunk)?;
         }
+        Ok(ids)
+    }
+
+    /// Attach multiple text payloads using the same splitting rules as
+    /// [`Self::add_text_chunk`].
+    pub fn add_text_chunks(
+        &self,
+        inputs: Vec<(ObjectId, String, ChunkType)>,
+    ) -> Result<Vec<ChunkId>> {
+        let start = Instant::now();
+        let input_count = inputs.len();
+        let mut ids = Vec::new();
+        let split_start = Instant::now();
+        let mut chunks = Vec::new();
+        for (object_id, content, chunk_type) in inputs {
+            for (piece, token_count) in split_text_with_counts(&content) {
+                let chunk =
+                    TextChunk::with_token_count(object_id, piece, chunk_type.clone(), token_count);
+                ids.push(chunk.id);
+                chunks.push(chunk);
+            }
+        }
+        let split_and_build_duration_ms = split_start.elapsed().as_millis() as u64;
+        let chunk_count = chunks.len();
+        let storage_start = Instant::now();
+        for chunk in chunks {
+            self.storage.upsert_chunk(chunk)?;
+        }
+        info!(
+            inputs = input_count,
+            chunks = chunk_count,
+            split_and_build_duration_ms,
+            storage_duration_ms = storage_start.elapsed().as_millis() as u64,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "Text chunk batch add finished"
+        );
         Ok(ids)
     }
 
@@ -299,7 +369,7 @@ impl KnowledgeGraph {
         chunk_type: ChunkType,
         embedding: &[f32],
     ) -> Result<ChunkId> {
-        let pieces = split_text(&content);
+        let pieces = split_text_with_counts(&content);
         if pieces.len() > 1 {
             return Err(anyhow::anyhow!(
                 "add_text_chunk_with_embedding: content splits into {} chunks \
@@ -309,8 +379,8 @@ impl KnowledgeGraph {
                 MAX_CHUNK_TOKENS,
             ));
         }
-        let text = pieces.into_iter().next().unwrap_or_default();
-        let chunk = TextChunk::new(object_id, text, chunk_type);
+        let (text, token_count) = pieces.into_iter().next().unwrap_or_default();
+        let chunk = TextChunk::with_token_count(object_id, text, chunk_type, token_count);
         let chunk_id = chunk.id;
         self.storage.upsert_chunk(chunk)?;
         self.storage.upsert_chunk_embedding(chunk_id, embedding)?;
@@ -324,6 +394,16 @@ impl KnowledgeGraph {
     /// `embedding.len()` must equal [`EMBEDDING_DIMENSIONS`] (currently 256).
     pub fn upsert_chunk_embedding(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
         self.storage.upsert_chunk_embedding(chunk_id, embedding)
+    }
+
+    pub(crate) fn upsert_chunk_embeddings(
+        &self,
+        embeddings: Vec<(ChunkId, Vec<f32>)>,
+    ) -> Result<()> {
+        for (chunk_id, embedding) in embeddings {
+            self.storage.upsert_chunk_embedding(chunk_id, &embedding)?;
+        }
+        Ok(())
     }
 
     /// All text chunks belonging to `object_id`.
@@ -411,6 +491,17 @@ impl KnowledgeGraph {
     /// `embedding.len()` must equal [`HIGH_QUALITY_EMBEDDING_DIMENSIONS`].
     pub fn upsert_chunk_embedding_hq(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
         self.storage.upsert_chunk_embedding_hq(chunk_id, embedding)
+    }
+
+    pub(crate) fn upsert_chunk_embeddings_hq(
+        &self,
+        embeddings: Vec<(ChunkId, Vec<f32>)>,
+    ) -> Result<()> {
+        for (chunk_id, embedding) in embeddings {
+            self.storage
+                .upsert_chunk_embedding_hq(chunk_id, &embedding)?;
+        }
+        Ok(())
     }
 
     /// Approximate nearest-neighbour search over the high-quality embedding index.

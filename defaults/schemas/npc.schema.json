@@ -23,6 +23,7 @@
       "required": true,
       "relationship": {
         "edgeType": "located_in",
+        "targetType": "location",
         "description": "The current location of the NPC"
       }
     },
@@ -57,6 +58,7 @@
       "required": false,
       "relationship": {
         "edgeType": "originates_from",
+        "targetType": "location",
         "description": "The origin location of the NPC"
       }
     },

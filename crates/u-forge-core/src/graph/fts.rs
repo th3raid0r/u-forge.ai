@@ -1,7 +1,7 @@
 //! Full-text and semantic search methods for KnowledgeGraphStorage.
 
-use super::storage::{self, *};
-use anyhow::{anyhow, Context, Result};
+use super::storage::*;
+use anyhow::{Context, Result, anyhow};
 use rusqlite::params;
 
 use crate::types::{ChunkId, ObjectId};
@@ -64,13 +64,13 @@ impl KnowledgeGraphStorage {
     ///
     /// # Errors
     /// * `chunk_id` does not exist in the `chunks` table.
-    /// * `embedding.len() != EMBEDDING_DIMENSIONS`.
+    /// * `embedding.len()` does not match the configured standard index width.
     pub fn upsert_chunk_embedding(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
-        if embedding.len() != EMBEDDING_DIMENSIONS {
+        if embedding.len() != self.embedding_dimensions {
             return Err(anyhow!(
-                "Embedding dimension mismatch: expected {EMBEDDING_DIMENSIONS}, got {}. \
-                 Ensure the embedding model matches the vec0 table configuration \
-                 (EMBEDDING_DIMENSIONS constant in storage.rs).",
+                "Embedding dimension mismatch: expected {}, got {}. \
+                 Ensure the embedding model matches the configured vec0 table dimensions.",
+                self.embedding_dimensions,
                 embedding.len()
             ));
         }
@@ -124,6 +124,14 @@ impl KnowledgeGraphStorage {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
+        if query_embedding.len() != self.embedding_dimensions {
+            return Err(anyhow!(
+                "Embedding dimension mismatch: expected {}, got {}.",
+                self.embedding_dimensions,
+                query_embedding.len()
+            ));
+        }
+
         let bytes: Vec<u8> = query_embedding
             .iter()
             .flat_map(|f| f.to_le_bytes())
@@ -169,17 +177,17 @@ impl KnowledgeGraphStorage {
         Ok(results)
     }
 
-    // ── High-quality (4096-dim) embedding methods ───────────────────────────
+    // ── High-quality embedding methods ──────────────────────────────────────
 
     /// Store or update the high-quality embedding vector for an existing chunk.
     ///
     /// Identical to [`upsert_chunk_embedding`] but writes to the `chunks_vec_hq`
-    /// table (4096-dim) instead of `chunks_vec` (768-dim).
+    /// table instead of `chunks_vec`.
     pub fn upsert_chunk_embedding_hq(&self, chunk_id: ChunkId, embedding: &[f32]) -> Result<()> {
-        if embedding.len() != storage::HIGH_QUALITY_EMBEDDING_DIMENSIONS {
+        if embedding.len() != self.high_quality_embedding_dimensions {
             return Err(anyhow!(
                 "HQ embedding dimension mismatch: expected {}, got {}.",
-                storage::HIGH_QUALITY_EMBEDDING_DIMENSIONS,
+                self.high_quality_embedding_dimensions,
                 embedding.len()
             ));
         }
@@ -213,12 +221,20 @@ impl KnowledgeGraphStorage {
     /// Approximate nearest-neighbour search over the high-quality embedding index.
     ///
     /// Identical to [`search_chunks_semantic`] but queries `chunks_vec_hq`
-    /// (4096-dim) instead of `chunks_vec` (768-dim).
+    /// instead of `chunks_vec`.
     pub fn search_chunks_semantic_hq(
         &self,
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
+        if query_embedding.len() != self.high_quality_embedding_dimensions {
+            return Err(anyhow!(
+                "HQ embedding dimension mismatch: expected {}, got {}.",
+                self.high_quality_embedding_dimensions,
+                query_embedding.len()
+            ));
+        }
+
         let bytes: Vec<u8> = query_embedding
             .iter()
             .flat_map(|f| f.to_le_bytes())

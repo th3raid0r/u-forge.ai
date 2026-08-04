@@ -12,15 +12,15 @@
 //! This is the canonical race-free pattern from the Tokio `Notify` docs.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use tracing::debug;
 
 use crate::ai::embeddings::EmbeddingProvider;
 use crate::ai::transcription::TranscriptionProvider;
-use crate::lemonade::{LemonadeChatProvider, LemonadeRerankProvider, LemonadeTtsProvider};
+use crate::lemonade::{LemonadeChatProvider, LemonadeTtsProvider, RerankProvider};
 
 use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
 use super::weighted::WeightedEmbedDispatcher;
@@ -89,11 +89,11 @@ pub(super) async fn run_llm_worker(
 
 pub(super) async fn run_rerank_worker(
     queue: Arc<WorkQueue<RerankJob>>,
-    provider: LemonadeRerankProvider,
+    provider: Arc<dyn RerankProvider>,
     device_name: String,
 ) {
     run_worker_loop(queue, move |job| {
-        let provider = provider.clone();
+        let provider = Arc::clone(&provider);
         let device_name = device_name.clone();
         async move {
             let start = std::time::Instant::now();
@@ -257,7 +257,6 @@ pub(super) async fn run_transcribe_worker(
     })
     .await;
 }
-
 
 pub(super) async fn run_tts_worker(
     queue: Arc<WorkQueue<SynthesizeJob>>,

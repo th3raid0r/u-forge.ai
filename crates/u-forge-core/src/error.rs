@@ -12,11 +12,11 @@
 //! `anyhow`-returning functions once the axum dependency is wired.
 
 /// Returned by [`crate::graph::KnowledgeGraphStorage::new`] when the
-/// on-disk embedding dimensions differ from the compiled-in constants.
+/// on-disk embedding dimensions differ from the configured dimensions.
 ///
 /// This indicates the embedding model was changed without recreating the
-/// database.  The caller should either re-index the database or pin the
-/// old model — no auto-migration is performed.
+/// database.  The caller should either re-index the database or use the
+/// previous configured dimensions — no auto-migration is performed.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "embedding dimension mismatch for vec table '{table}': \
@@ -28,7 +28,7 @@ pub struct EmbeddingDimensionMismatch {
     pub table: String,
     /// Dimensions recorded in the database at creation time.
     pub stored: usize,
-    /// Dimensions expected by the current compile-time constant.
+    /// Dimensions expected by the current configuration.
     pub expected: usize,
 }
 

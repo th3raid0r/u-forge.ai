@@ -28,8 +28,8 @@ use crate::ai::transcription::TranscriptionProvider;
 use super::chat::LemonadeChatProvider;
 use super::embedding::LemonadeProvider;
 use super::gpu_manager::GpuResourceManager;
-use super::load::{load_model, ModelLoadOptions};
-use super::rerank::LemonadeRerankProvider;
+use super::load::{ModelLoadOptions, load_model};
+use super::rerank::{LemonadeRerankProvider, RerankProvider};
 use super::selector::SelectedModel;
 use super::stt::LemonadeSttProvider;
 use super::transcription::LemonadeTranscriptionProvider;
@@ -57,14 +57,14 @@ pub enum Capability {
 ///
 /// The variants mirror the five [`Capability`] values.  Trait-object variants
 /// (`Embedding`, `Transcription`) allow multiple concrete implementations to
-/// share a slot; the concrete-type variants (`Chat`, `Tts`, `Rerank`) avoid
-/// an unnecessary allocation where there is only one implementation.
+/// share a slot; concrete-type variants (`Chat`, `Tts`) avoid an unnecessary
+/// allocation where there is only one implementation.
 pub enum ProviderSlot {
     Embedding(Arc<dyn EmbeddingProvider>),
     Transcription(Arc<dyn TranscriptionProvider>),
     Chat(LemonadeChatProvider),
     Tts(Box<LemonadeTtsProvider>),
-    Rerank(LemonadeRerankProvider),
+    Rerank(Arc<dyn RerankProvider>),
 }
 
 // ── BuiltProvider ─────────────────────────────────────────────────────────────
@@ -125,14 +125,45 @@ impl ProviderFactory {
         let name = Self::provider_name(selected);
 
         let provider = match capability {
-            Capability::Embedding => Self::build_embedding(base_url, model_id, &load_opts, already_loaded, &name).await?,
-            Capability::Reranking => Self::build_reranker(base_url, model_id, &load_opts, already_loaded, &name).await?,
-            Capability::Transcription => Self::build_stt(base_url, model_id, &load_opts, &selected.recipe, gpu_manager, already_loaded, &name).await?,
-            Capability::TextGeneration => Self::build_llm(base_url, model_id, &load_opts, selected, gpu_manager, already_loaded, &name).await?,
+            Capability::Embedding => {
+                Self::build_embedding(base_url, model_id, &load_opts, already_loaded, &name).await?
+            }
+            Capability::Reranking => {
+                Self::build_reranker(base_url, model_id, &load_opts, already_loaded, &name).await?
+            }
+            Capability::Transcription => {
+                Self::build_stt(
+                    base_url,
+                    model_id,
+                    &load_opts,
+                    &selected.recipe,
+                    gpu_manager,
+                    already_loaded,
+                    &name,
+                )
+                .await?
+            }
+            Capability::TextGeneration => {
+                Self::build_llm(
+                    base_url,
+                    model_id,
+                    &load_opts,
+                    selected,
+                    gpu_manager,
+                    already_loaded,
+                    &name,
+                )
+                .await?
+            }
             Capability::TextToSpeech => Self::build_tts(base_url, model_id, &name),
         };
 
-        Ok(BuiltProvider { name, capability, provider, weight })
+        Ok(BuiltProvider {
+            name,
+            capability,
+            provider,
+            weight,
+        })
     }
 
     // ── Private build helpers ─────────────────────────────────────────────────
@@ -144,7 +175,8 @@ impl ProviderFactory {
         already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
-        let provider = LemonadeProvider::new_with_load(base_url, model_id, load_opts, already_loaded).await?;
+        let provider =
+            LemonadeProvider::new_with_load(base_url, model_id, load_opts, already_loaded).await?;
         info!(model = model_id, name, dimensions = ?provider.dimensions(), "Embedding provider built");
         Ok(ProviderSlot::Embedding(Arc::new(provider)))
     }
@@ -159,20 +191,18 @@ impl ProviderFactory {
         let provider = LemonadeRerankProvider::new(base_url, model_id);
         provider.load(load_opts, already_loaded).await?;
         info!(model = model_id, name, "Reranker provider built");
-        Ok(ProviderSlot::Rerank(provider))
+        Ok(ProviderSlot::Rerank(Arc::new(provider)))
     }
 
     async fn build_stt(
         base_url: &str,
         model_id: &str,
-        load_opts: &ModelLoadOptions,
+        _load_opts: &ModelLoadOptions,
         recipe: &str,
         gpu_manager: Option<Arc<GpuResourceManager>>,
-        already_loaded: &[String],
+        _already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
-        load_model(base_url, model_id, load_opts, already_loaded).await?;
-
         // whispercpp with a GPU manager → GPU-locked STT (enforces sharing policy).
         // flm (NPU) or whispercpp without a GPU manager → simple provider, no lock.
         let provider: Arc<dyn TranscriptionProvider> = if recipe == "whispercpp" {
@@ -185,7 +215,10 @@ impl ProviderFactory {
             }
         } else {
             // FLM (NPU) or any other recipe — no GPU contention.
-            info!(model = model_id, name, "STT provider built (NPU/CPU, no GPU lock)");
+            info!(
+                model = model_id,
+                name, "STT provider built (NPU/CPU, no GPU lock)"
+            );
             Arc::new(LemonadeTranscriptionProvider::new(base_url, model_id))
         };
 
@@ -203,9 +236,18 @@ impl ProviderFactory {
     ) -> Result<ProviderSlot> {
         load_model(base_url, model_id, load_opts, already_loaded).await?;
 
-        let gpu = if Self::backend_uses_gpu(selected) { gpu_manager } else { None };
+        let gpu = if Self::backend_uses_gpu(selected) {
+            gpu_manager
+        } else {
+            None
+        };
         let provider = LemonadeChatProvider::new(base_url, model_id, gpu);
-        info!(model = model_id, name, gpu_locked = provider.gpu.is_some(), "LLM provider built");
+        info!(
+            model = model_id,
+            name,
+            gpu_locked = provider.gpu.is_some(),
+            "LLM provider built"
+        );
         Ok(ProviderSlot::Chat(provider))
     }
 
@@ -310,29 +352,48 @@ mod tests {
     #[test]
     fn test_name_whispercpp_uses_recipe() {
         let s = sel("Whisper-Large-v3-Turbo", "whispercpp", None);
-        assert_eq!(ProviderFactory::provider_name(&s), "whispercpp/Whisper-Large-v3-Turbo");
+        assert_eq!(
+            ProviderFactory::provider_name(&s),
+            "whispercpp/Whisper-Large-v3-Turbo"
+        );
     }
 
     // ── backend_uses_gpu ──────────────────────────────────────────────────────
 
     #[test]
     fn test_gpu_llamacpp_rocm() {
-        assert!(ProviderFactory::backend_uses_gpu(&sel("m", "llamacpp", Some("rocm"))));
+        assert!(ProviderFactory::backend_uses_gpu(&sel(
+            "m",
+            "llamacpp",
+            Some("rocm")
+        )));
     }
 
     #[test]
     fn test_gpu_llamacpp_vulkan() {
-        assert!(ProviderFactory::backend_uses_gpu(&sel("m", "llamacpp", Some("vulkan"))));
+        assert!(ProviderFactory::backend_uses_gpu(&sel(
+            "m",
+            "llamacpp",
+            Some("vulkan")
+        )));
     }
 
     #[test]
     fn test_gpu_llamacpp_metal() {
-        assert!(ProviderFactory::backend_uses_gpu(&sel("m", "llamacpp", Some("metal"))));
+        assert!(ProviderFactory::backend_uses_gpu(&sel(
+            "m",
+            "llamacpp",
+            Some("metal")
+        )));
     }
 
     #[test]
     fn test_no_gpu_llamacpp_cpu() {
-        assert!(!ProviderFactory::backend_uses_gpu(&sel("m", "llamacpp", Some("cpu"))));
+        assert!(!ProviderFactory::backend_uses_gpu(&sel(
+            "m",
+            "llamacpp",
+            Some("cpu")
+        )));
     }
 
     #[test]
@@ -342,19 +403,28 @@ mod tests {
 
     #[test]
     fn test_no_gpu_whispercpp() {
-        assert!(!ProviderFactory::backend_uses_gpu(&sel("m", "whispercpp", None)));
+        assert!(!ProviderFactory::backend_uses_gpu(&sel(
+            "m",
+            "whispercpp",
+            None
+        )));
     }
 
     #[test]
     fn test_no_gpu_kokoro() {
-        assert!(!ProviderFactory::backend_uses_gpu(&sel("m", "kokoro", None)));
+        assert!(!ProviderFactory::backend_uses_gpu(&sel(
+            "m", "kokoro", None
+        )));
     }
 
     // ── merge_backend ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_merge_backend_injects_backend() {
-        let opts = ModelLoadOptions { ctx_size: Some(4096), ..Default::default() };
+        let opts = ModelLoadOptions {
+            ctx_size: Some(4096),
+            ..Default::default()
+        };
         let merged = ProviderFactory::merge_backend(&opts, Some("rocm"));
         assert_eq!(merged.ctx_size, Some(4096));
         assert_eq!(merged.llamacpp_backend.as_deref(), Some("rocm"));
@@ -362,7 +432,10 @@ mod tests {
 
     #[test]
     fn test_merge_backend_none_leaves_unset() {
-        let opts = ModelLoadOptions { ctx_size: Some(2048), ..Default::default() };
+        let opts = ModelLoadOptions {
+            ctx_size: Some(2048),
+            ..Default::default()
+        };
         let merged = ProviderFactory::merge_backend(&opts, None);
         assert_eq!(merged.ctx_size, Some(2048));
         assert!(merged.llamacpp_backend.is_none());
@@ -390,9 +463,15 @@ mod tests {
     #[tokio::test]
     async fn test_build_embedding_provider() {
         let url = crate::test_helpers::require_integration_url!();
-        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
+            .await
+            .unwrap();
 
-        let Some(model) = catalog.downloaded_models_with_label("embeddings").into_iter().next() else {
+        let Some(model) = catalog
+            .downloaded_models_with_label("embeddings")
+            .into_iter()
+            .next()
+        else {
             eprintln!("SKIP: no downloaded embedding model");
             return;
         };

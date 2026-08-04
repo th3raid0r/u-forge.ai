@@ -24,6 +24,7 @@
 
 pub mod catalog;
 pub mod chat;
+pub(crate) mod client;
 pub mod duplicate_guard;
 pub mod embedding;
 pub mod gpu_manager;
@@ -36,27 +37,26 @@ pub mod stt;
 pub mod system_info;
 pub mod transcription;
 pub mod tts;
-pub(crate) mod client;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use catalog::{CatalogModel, InstalledBackend, LemonadeServerCatalog, LoadedModel};
-pub use duplicate_guard::DuplicateGuard;
-pub use provider_factory::{BuiltProvider, Capability, ProviderFactory, ProviderSlot};
-pub use selector::{ModelSelector, QualityTier, SelectedModel};
 pub use chat::{
-    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest,
-    ChatUsage, LemonadeChatProvider, StreamToken,
+    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, LemonadeChatProvider,
+    StreamToken,
 };
-pub use client::{make_lemonade_openai_client, LemonadeHttpClient};
+pub use client::{LemonadeHttpClient, make_lemonade_openai_client};
+pub use duplicate_guard::DuplicateGuard;
 pub use embedding::LemonadeProvider;
-pub use transcription::LemonadeTranscriptionProvider;
-pub use health::{LemonadeHealth, LoadedModelEntry};
 pub use gpu_manager::{GpuResourceManager, GpuWorkload, LlmGuard, SttGuard};
-pub use load::{load_model, ModelLoadOptions};
-pub use rerank::{LemonadeRerankProvider, RerankDocument};
+pub use health::{LemonadeHealth, LoadedModelEntry};
+pub use load::{ModelLoadOptions, load_model};
+pub use provider_factory::{BuiltProvider, Capability, ProviderFactory, ProviderSlot};
+pub use rerank::{LemonadeRerankProvider, RerankDocument, RerankProvider};
+pub use selector::{ModelSelector, QualityTier, SelectedModel};
 pub use stt::{LemonadeSttProvider, TranscriptionResult};
 pub use system_info::{RecipeBackendInfo, SystemDeviceInfo, SystemInfo};
+pub use transcription::LemonadeTranscriptionProvider;
 pub use tts::{KokoroVoice, LemonadeTtsProvider};
 
 // ── URL resolution utilities ──────────────────────────────────────────────────

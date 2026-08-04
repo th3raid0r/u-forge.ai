@@ -1,6 +1,9 @@
-use super::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, EdgeTypeSchema, ValidationRule, RelationshipDefinition, Cardinality};
+use super::{
+    Cardinality, EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType,
+    RelationshipDefinition, SchemaDefinition, ValidationRule,
+};
 use anyhow::{Context, Result};
-use serde_json::{Value, Map};
+use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,8 +23,8 @@ impl SchemaIngestion {
     ///
     /// Uses UFORGE_SCHEMA_DIR environment variable if set, otherwise defaults to ./defaults/schemas
     pub fn load_default_schemas() -> Result<SchemaDefinition> {
-        let schema_dir = std::env::var("UFORGE_SCHEMA_DIR")
-            .unwrap_or_else(|_| "./defaults/schemas".to_string());
+        let schema_dir =
+            std::env::var("UFORGE_SCHEMA_DIR").unwrap_or_else(|_| "./defaults/schemas".to_string());
 
         println!("Attempting to load schemas from: {}", schema_dir);
 
@@ -43,7 +46,10 @@ impl SchemaIngestion {
     ) -> Result<SchemaDefinition> {
         let dir_path = directory.as_ref();
         if !dir_path.exists() {
-            return Err(anyhow::anyhow!("Schema directory does not exist: {:?}", dir_path));
+            return Err(anyhow::anyhow!(
+                "Schema directory does not exist: {:?}",
+                dir_path
+            ));
         }
 
         let mut schema_definition = SchemaDefinition::new(
@@ -53,8 +59,7 @@ impl SchemaIngestion {
         );
 
         // Read all .json files in the directory
-        let entries = fs::read_dir(dir_path)
-            .context("Failed to read schema directory")?;
+        let entries = fs::read_dir(dir_path).context("Failed to read schema directory")?;
 
         let mut loaded_schemas = Vec::new();
 
@@ -81,10 +86,15 @@ impl SchemaIngestion {
             schema_definition.add_object_type(object_type_name, object_type_schema);
         }
 
-        // Add common edge types that appear in the schemas
-        Self::add_common_edge_types(&mut schema_definition);
+        // Derive edge type constraints from relationship properties declared
+        // in the schema files. The owning object type is the edge source; an
+        // optional relationship.targetType narrows the target endpoint.
+        Self::add_relationship_edge_types(&mut schema_definition);
 
-        println!("✅ Loaded {} object types from schema directory", schema_definition.object_types.len());
+        println!(
+            "✅ Loaded {} object types from schema directory",
+            schema_definition.object_types.len()
+        );
 
         Ok(schema_definition)
     }
@@ -97,20 +107,24 @@ impl SchemaIngestion {
         let json: Value = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse JSON in file: {:?}", file_path.as_ref()))?;
 
-        let obj = json.as_object()
+        let obj = json
+            .as_object()
             .ok_or_else(|| anyhow::anyhow!("JSON file must contain an object"))?;
 
-        let name = obj.get("name")
+        let name = obj
+            .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'name' field"))?
             .to_string();
 
-        let description = obj.get("description")
+        let description = obj
+            .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("No description")
             .to_string();
 
-        let properties = obj.get("properties")
+        let properties = obj
+            .get("properties")
             .and_then(|v| v.as_object())
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'properties' field"))?
             .clone();
@@ -128,21 +142,27 @@ impl SchemaIngestion {
         let mut object_schema = ObjectTypeSchema::new(object_type_name, json_schema.description);
 
         for (prop_name, prop_value) in json_schema.properties {
-            let prop_obj = prop_value.as_object()
+            let prop_obj = prop_value
+                .as_object()
                 .ok_or_else(|| anyhow::anyhow!("Property '{}' must be an object", prop_name))?;
 
-            let property_schema = Self::convert_json_property_to_schema(prop_name.clone(), prop_obj)?;
+            let property_schema =
+                Self::convert_json_property_to_schema(prop_name.clone(), prop_obj)?;
 
             // Check if this property is required
-            if prop_obj.get("required").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if prop_obj
+                .get("required")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 object_schema = object_schema.with_required_property(prop_name.clone());
             }
 
             // Add any relationship edge types as allowed edges
-            if let Some(relationship) = prop_obj.get("relationship") {
-                if let Some(edge_type) = relationship.get("edgeType").and_then(|v| v.as_str()) {
-                    object_schema = object_schema.with_allowed_edge(edge_type.to_string());
-                }
+            if let Some(relationship) = prop_obj.get("relationship")
+                && let Some(edge_type) = relationship.get("edgeType").and_then(|v| v.as_str())
+            {
+                object_schema = object_schema.with_allowed_edge(edge_type.to_string());
             }
 
             object_schema = object_schema.with_property(prop_name, property_schema);
@@ -152,12 +172,17 @@ impl SchemaIngestion {
     }
 
     /// Convert a JSON property definition to a PropertySchema
-    fn convert_json_property_to_schema(prop_name: String, prop_obj: &Map<String, Value>) -> Result<PropertySchema> {
-        let prop_type = prop_obj.get("type")
+    fn convert_json_property_to_schema(
+        prop_name: String,
+        prop_obj: &Map<String, Value>,
+    ) -> Result<PropertySchema> {
+        let prop_type = prop_obj
+            .get("type")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Property '{}' missing type", prop_name))?;
 
-        let description = prop_obj.get("description")
+        let description = prop_obj
+            .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("No description")
             .to_string();
@@ -186,7 +211,7 @@ impl SchemaIngestion {
                 } else {
                     PropertyType::Array(Box::new(PropertyType::String))
                 }
-            },
+            }
             _ => PropertyType::String, // Default to string for unknown types
         };
 
@@ -197,25 +222,29 @@ impl SchemaIngestion {
         let mut has_validation = false;
 
         // Handle enum values
-        if let Some(enum_values) = prop_obj.get("enum") {
-            if let Some(enum_array) = enum_values.as_array() {
-                let enum_strings: Vec<String> = enum_array
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect();
+        if let Some(enum_values) = prop_obj.get("enum")
+            && let Some(enum_array) = enum_values.as_array()
+        {
+            let enum_strings: Vec<String> = enum_array
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect();
 
-                if !enum_strings.is_empty() {
-                    // Update property type to enum
-                    property_schema.property_type = PropertyType::Enum(enum_strings.clone());
-                    validation_rule = validation_rule.with_allowed_values(enum_strings);
-                    has_validation = true;
-                }
+            if !enum_strings.is_empty() {
+                // Update property type to enum
+                property_schema.property_type = PropertyType::Enum(enum_strings.clone());
+                validation_rule = validation_rule.with_allowed_values(enum_strings);
+                has_validation = true;
             }
         }
 
         // Mark as required if specified
-        if prop_obj.get("required").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if prop_obj
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             validation_rule.required = true;
             has_validation = true;
         }
@@ -225,23 +254,29 @@ impl SchemaIngestion {
         }
 
         // Add relationship information if present
-        if let Some(relationship) = prop_obj.get("relationship") {
-            if let Some(relationship_obj) = relationship.as_object() {
-                let edge_type = relationship_obj.get("edgeType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("related_to")
-                    .to_string();
+        if let Some(relationship) = prop_obj.get("relationship")
+            && let Some(relationship_obj) = relationship.as_object()
+        {
+            let edge_type = relationship_obj
+                .get("edgeType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("related_to")
+                .to_string();
 
-                let rel_description = relationship_obj.get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Related entity")
-                    .to_string();
+            let rel_description = relationship_obj
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Related entity")
+                .to_string();
 
-                let relationship_def = RelationshipDefinition::new(edge_type, rel_description)
-                    .with_cardinality(Cardinality::ManyToMany);
+            let mut relationship_def = RelationshipDefinition::new(edge_type, rel_description)
+                .with_cardinality(Cardinality::ManyToMany);
 
-                property_schema = property_schema.with_relationship(relationship_def);
+            if let Some(target_type) = relationship_obj.get("targetType").and_then(|v| v.as_str()) {
+                relationship_def = relationship_def.with_target_type(target_type.to_string());
             }
+
+            property_schema = property_schema.with_relationship(relationship_def);
         }
 
         Ok(property_schema)
@@ -250,47 +285,58 @@ impl SchemaIngestion {
     /// Extract object type name from schema name (e.g., "add_npc" -> "npc")
     fn extract_object_type_name(schema_name: &str) -> String {
         if schema_name.starts_with("add_") {
-            schema_name.strip_prefix("add_").unwrap_or(schema_name).to_string()
+            schema_name
+                .strip_prefix("add_")
+                .unwrap_or(schema_name)
+                .to_string()
         } else {
             schema_name.to_string()
         }
     }
 
-    /// Add common edge types found in the schemas
-    fn add_common_edge_types(schema_definition: &mut SchemaDefinition) {
-        let edge_types = vec![
-            ("owned_by", "Ownership relationship", vec!["artifact", "currency", "inventory", "transportation"], vec!["player_character", "npc", "faction"]),
-            ("led_by", "Leadership relationship", vec!["faction"], vec!["player_character", "npc"]),
-            ("allied_with", "Alliance relationship", vec!["faction"], vec!["faction"]),
-            ("rival_of", "Rivalry relationship", vec!["faction"], vec!["faction"]),
-            ("subfaction_of", "Sub-organization relationship", vec!["faction"], vec!["faction"]),
-            ("a_part_of", "Containment relationship", vec!["location"], vec!["location"]),
-            ("contains", "Contains relationship", vec!["location"], vec!["location", "artifact"]),
-            ("present_in", "Presence relationship", vec!["player_character", "npc"], vec!["location"]),
-            ("takes_place_in", "Event location relationship", vec!["quest"], vec!["location"]),
-            ("located_at", "Item location relationship", vec!["artifact"], vec!["location"]),
-            ("controlled_by", "Control relationship", vec!["location"], vec!["faction", "player_character", "npc"]),
-            ("occurred_at", "Event occurrence relationship", vec!["temporal"], vec!["location"]),
-            ("located_in", "Current location relationship", vec!["npc", "player_character"], vec!["location"]),
-            ("originates_from", "Origin relationship", vec!["npc", "player_character"], vec!["location"]),
-            ("member_of", "Membership relationship", vec!["player_character", "npc"], vec!["faction"]),
-            ("player_can", "Player ability relationship", vec!["player_character"], vec!["skills"]),
-            ("npc_can", "NPC ability relationship", vec!["npc"], vec!["skills"]),
-            ("sourced_from", "Source reference relationship", vec!["skills"], vec!["system_reference"]),
-            ("applies_to", "Application relationship", vec!["system_reference", "setting_reference"], vec!["player_character", "npc", "location", "faction"]),
-            ("modifies_source", "Modification relationship", vec!["setting_reference"], vec!["system_reference"]),
-            ("associated_with", "General association", vec!["quest"], vec!["artifact"]),
-            ("found_at", "Discovery location", vec!["artifact"], vec!["location"]),
-            ("subquest_of", "Sub-quest relationship", vec!["quest"], vec!["quest"]),
-            ("affects_faction", "Faction impact relationship", vec!["quest"], vec!["faction"]),
-        ];
+    /// Add edge types declared by relationship properties in the object schemas.
+    fn add_relationship_edge_types(schema_definition: &mut SchemaDefinition) {
+        let mut relationship_sources: Vec<_> = schema_definition
+            .object_types
+            .iter()
+            .flat_map(|(object_type, object_schema)| {
+                object_schema
+                    .properties
+                    .values()
+                    .filter_map(|property_schema| property_schema.relationship.clone())
+                    .map(|relationship| (object_type.clone(), relationship))
+            })
+            .collect();
+        relationship_sources.sort_by(|(left_type, left_rel), (right_type, right_rel)| {
+            left_rel
+                .edge_type
+                .cmp(&right_rel.edge_type)
+                .then_with(|| left_type.cmp(right_type))
+        });
 
-        for (edge_name, description, source_types, target_types) in edge_types {
-            let edge_schema = EdgeTypeSchema::new(edge_name.to_string(), description.to_string())
-                .with_source_types(source_types.into_iter().map(|s| s.to_string()).collect())
-                .with_target_types(target_types.into_iter().map(|s| s.to_string()).collect());
+        for (object_type, relationship) in relationship_sources {
+            let edge_schema = schema_definition
+                .edge_types
+                .entry(relationship.edge_type.clone())
+                .or_insert_with(|| {
+                    EdgeTypeSchema::new(
+                        relationship.edge_type.clone(),
+                        relationship.description.clone(),
+                    )
+                });
 
-            schema_definition.add_edge_type(edge_name.to_string(), edge_schema);
+            if !edge_schema.allowed_source_types.contains(&object_type) {
+                edge_schema.allowed_source_types.push(object_type);
+            }
+
+            if let Some(target_type) = relationship.target_type
+                && !edge_schema.allowed_target_types.contains(&target_type)
+            {
+                edge_schema.allowed_target_types.push(target_type);
+            }
+
+            edge_schema.allowed_source_types.sort();
+            edge_schema.allowed_target_types.sort();
         }
     }
 
@@ -301,8 +347,7 @@ impl SchemaIngestion {
             return Ok(Vec::new());
         }
 
-        let entries = fs::read_dir(dir_path)
-            .context("Failed to read schema directory")?;
+        let entries = fs::read_dir(dir_path).context("Failed to read schema directory")?;
 
         let mut schema_files = Vec::new();
 
@@ -337,9 +382,9 @@ impl SchemaIngestion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs::File;
     use std::io::Write;
+    use tempfile::TempDir;
 
     fn create_test_schema_file(dir: &Path, name: &str, content: &str) -> Result<()> {
         let file_path = dir.join(format!("{}.json", name));
@@ -370,11 +415,9 @@ mod tests {
 
         create_test_schema_file(temp_dir.path(), "test_object", schema_content).unwrap();
 
-        let schema = SchemaIngestion::load_schemas_from_directory(
-            temp_dir.path(),
-            "test_schema",
-            "1.0.0"
-        ).unwrap();
+        let schema =
+            SchemaIngestion::load_schemas_from_directory(temp_dir.path(), "test_schema", "1.0.0")
+                .unwrap();
 
         assert_eq!(schema.name, "test_schema");
         assert!(schema.object_types.contains_key("test_object"));
@@ -383,7 +426,11 @@ mod tests {
         assert_eq!(object_type.name, "test_object");
         assert!(object_type.properties.contains_key("name"));
         assert!(object_type.properties.contains_key("value"));
-        assert!(object_type.required_properties.contains(&"name".to_string()));
+        assert!(
+            object_type
+                .required_properties
+                .contains(&"name".to_string())
+        );
     }
 
     #[test]
@@ -404,11 +451,9 @@ mod tests {
 
         create_test_schema_file(temp_dir.path(), "quest", schema_content).unwrap();
 
-        let schema = SchemaIngestion::load_schemas_from_directory(
-            temp_dir.path(),
-            "test_schema",
-            "1.0.0"
-        ).unwrap();
+        let schema =
+            SchemaIngestion::load_schemas_from_directory(temp_dir.path(), "test_schema", "1.0.0")
+                .unwrap();
 
         let quest_type = &schema.object_types["quest"];
         let status_prop = &quest_type.properties["status"];
@@ -436,6 +481,7 @@ mod tests {
                     "description": "Character location",
                     "relationship": {
                         "edgeType": "located_in",
+                        "targetType": "location",
                         "description": "Current location"
                     }
                 }
@@ -444,11 +490,9 @@ mod tests {
 
         create_test_schema_file(temp_dir.path(), "character", schema_content).unwrap();
 
-        let schema = SchemaIngestion::load_schemas_from_directory(
-            temp_dir.path(),
-            "test_schema",
-            "1.0.0"
-        ).unwrap();
+        let schema =
+            SchemaIngestion::load_schemas_from_directory(temp_dir.path(), "test_schema", "1.0.0")
+                .unwrap();
 
         let character_type = &schema.object_types["character"];
         let location_prop = &character_type.properties["location"];
@@ -456,7 +500,55 @@ mod tests {
         assert!(location_prop.relationship.is_some());
         let relationship = location_prop.relationship.as_ref().unwrap();
         assert_eq!(relationship.edge_type, "located_in");
-        assert!(character_type.allowed_edges.contains(&"located_in".to_string()));
+        assert_eq!(relationship.target_type.as_deref(), Some("location"));
+        assert!(
+            character_type
+                .allowed_edges
+                .contains(&"located_in".to_string())
+        );
+    }
+
+    #[test]
+    fn test_located_in_allows_location_sources() {
+        let temp_dir = TempDir::new().unwrap();
+        let schema_content = r#"{
+            "name": "add_location",
+            "description": "A location object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Location name",
+                    "required": true
+                },
+                "parentLocation": {
+                    "type": "string",
+                    "description": "Parent location",
+                    "relationship": {
+                        "edgeType": "located_in",
+                        "targetType": "location",
+                        "description": "Parent location"
+                    }
+                }
+            }
+        }"#;
+
+        create_test_schema_file(temp_dir.path(), "location", schema_content).unwrap();
+
+        let schema =
+            SchemaIngestion::load_schemas_from_directory(temp_dir.path(), "test_schema", "1.0.0")
+                .unwrap();
+
+        let located_in = &schema.edge_types["located_in"];
+        assert!(
+            located_in
+                .allowed_source_types
+                .contains(&"location".to_string())
+        );
+        assert!(
+            located_in
+                .allowed_target_types
+                .contains(&"location".to_string())
+        );
     }
 
     #[test]
@@ -478,11 +570,9 @@ mod tests {
 
         create_test_schema_file(temp_dir.path(), "inventory", schema_content).unwrap();
 
-        let schema = SchemaIngestion::load_schemas_from_directory(
-            temp_dir.path(),
-            "test_schema",
-            "1.0.0"
-        ).unwrap();
+        let schema =
+            SchemaIngestion::load_schemas_from_directory(temp_dir.path(), "test_schema", "1.0.0")
+                .unwrap();
 
         let inventory_type = &schema.object_types["inventory"];
         let items_prop = &inventory_type.properties["items"];
@@ -490,7 +580,7 @@ mod tests {
         match &items_prop.property_type {
             PropertyType::Array(element_type) => {
                 match element_type.as_ref() {
-                    PropertyType::String => {}, // Expected
+                    PropertyType::String => {} // Expected
                     _ => panic!("Expected string array element type"),
                 }
             }

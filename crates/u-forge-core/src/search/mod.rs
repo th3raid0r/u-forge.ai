@@ -5,8 +5,8 @@
 //!
 //! [`search_hybrid`] is the main entry point. It uses chunk-level search
 //! signals to identify the most relevant knowledge graph **nodes**, then
-//! returns each winning node with its full content (all text chunks), attached
-//! edges, and lightweight summaries of connected nodes.
+//! returns each winning node with full UI context plus a compact set of matched
+//! chunks for LLM retrieval context.
 //!
 //! This design provides complete node context for downstream consumers:
 //!
@@ -36,9 +36,11 @@
 //! 3. Aggregate chunk scores per parent node — nodes with more matching
 //!    chunks, or chunks found by both search paths, naturally rank higher.
 //! 4. Select the top-N nodes (default 3).
-//! 5. For each winning node, load full metadata, all text chunks, all edges,
-//!    and connected node summaries.
-//! 6. Optionally rerank the winning nodes using concatenated chunk content.
+//! 5. For each winning node, load metadata, all text chunks for UI display, all
+//!    edges, connected node summaries, and the matched chunks that contributed
+//!    retrieval evidence.
+//! 6. Optionally rerank the winning nodes using metadata, edge summaries, and
+//!    matched chunks rather than every chunk attached to the node.
 //!
 //! # Merge Strategy: Reciprocal Rank Fusion (RRF)
 //!
@@ -71,9 +73,9 @@ use std::collections::HashMap;
 use anyhow::Result;
 use tracing::{debug, info, instrument, warn};
 
+use crate::KnowledgeGraph;
 use crate::queue::InferenceQueue;
 use crate::types::{Edge, ObjectId, ObjectMetadata, TextChunk};
-use crate::KnowledgeGraph;
 
 use sanitize::fts5_sanitize;
 
@@ -147,10 +149,10 @@ impl Default for HybridSearchConfig {
 
 /// A single node result from [`search_hybrid`].
 ///
-/// Contains the complete context for one knowledge graph node: its metadata,
-/// all text chunks, all incident edges, and lightweight summaries of the
-/// nodes on the other end of those edges.  This gives downstream consumers
-/// (LLMs, UI search results) everything they need about the node in one shot.
+/// Contains the context for one knowledge graph node. Full chunks remain
+/// available for UI display, while [`Self::matched_chunks`] gives LLM callers a
+/// smaller retrieval-focused context made only from chunks that matched FTS or
+/// vector search.
 #[derive(Debug, Clone)]
 pub struct NodeSearchResult {
     /// Full metadata for the matched knowledge graph node.
@@ -158,6 +160,10 @@ pub struct NodeSearchResult {
 
     /// All text chunks belonging to this node, in storage order.
     pub chunks: Vec<TextChunk>,
+
+    /// Chunks that directly contributed retrieval evidence for this result,
+    /// sorted by descending chunk-level RRF score.
+    pub matched_chunks: Vec<MatchedChunk>,
 
     /// All edges incident on this node (both incoming and outgoing).
     pub edges: Vec<Edge>,
@@ -183,6 +189,36 @@ impl NodeSearchResult {
     pub fn total_tokens(&self) -> usize {
         self.chunks.iter().map(|c| c.token_count).sum()
     }
+
+    /// Total token count across chunks that actually matched the query.
+    pub fn matched_tokens(&self) -> usize {
+        self.matched_chunks.iter().map(|c| c.token_count).sum()
+    }
+}
+
+/// A chunk that contributed retrieval evidence for a [`NodeSearchResult`].
+#[derive(Debug, Clone)]
+pub struct MatchedChunk {
+    /// Chunk identifier.
+    pub id: crate::types::ChunkId,
+
+    /// Chunk text returned by the search backend.
+    pub content: String,
+
+    /// Conservative token estimate for the matched chunk content.
+    pub token_count: usize,
+
+    /// Chunk-level RRF score after merging all contributing search paths.
+    pub score: f32,
+
+    /// FTS5 rank position if this chunk matched the keyword path.
+    pub fts_rank: Option<usize>,
+
+    /// Standard semantic distance if this chunk matched the semantic path.
+    pub semantic_distance: Option<f32>,
+
+    /// High-quality semantic distance if this chunk matched the HQ path.
+    pub hq_semantic_distance: Option<f32>,
 }
 
 /// Lightweight summary of a node connected via an edge.
@@ -254,6 +290,10 @@ impl SearchSources {
 struct ChunkMerge {
     /// Object (node) this chunk belongs to, as a UUID string.
     object_id_str: String,
+    /// Matched chunk id, as a UUID string.
+    chunk_id_str: String,
+    /// Chunk content returned by retrieval.
+    content: String,
     /// Accumulated RRF score for this chunk.
     rrf_score: f32,
     /// FTS5 rank position, if this chunk was found by FTS.
@@ -277,6 +317,8 @@ struct NodeAccumulator {
     best_hq_semantic_distance: Option<f32>,
     /// Number of distinct chunks that contributed to this node's score.
     matching_chunk_count: usize,
+    /// Matched chunks sorted by relevance after chunk-level RRF.
+    matched_chunks: Vec<MatchedChunk>,
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -403,9 +445,7 @@ pub async fn search_hybrid(
         match hq_queue {
             None => Vec::new(),
             Some(hq_q) if !hq_q.has_embedding() => {
-                info!(
-                    "HQ semantic search skipped — no embedding workers in hq_queue."
-                );
+                info!("HQ semantic search skipped — no embedding workers in hq_queue.");
                 Vec::new()
             }
             Some(hq_q) => {
@@ -445,11 +485,18 @@ pub async fn search_hybrid(
     // ── Diagnostic: Stage 1 (FTS5) results ──────────────────────────────────
     {
         use std::fmt::Write as _;
-        let mut buf = format!("── HYBRID STAGE 1: FTS5 ({} chunks) ──\n", fts_results.len());
+        let mut buf = format!(
+            "── HYBRID STAGE 1: FTS5 ({} chunks) ──\n",
+            fts_results.len()
+        );
         for (rank, (chunk_id, obj_id, content)) in fts_results.iter().enumerate() {
             let snippet: String = content.chars().take(80).collect();
-            let _ = writeln!(buf, "  FTS[{rank}] chunk={} obj={} content={snippet:?}…",
-                chunk_id.hyphenated(), obj_id.hyphenated());
+            let _ = writeln!(
+                buf,
+                "  FTS[{rank}] chunk={} obj={} content={snippet:?}…",
+                chunk_id.hyphenated(),
+                obj_id.hyphenated()
+            );
         }
         debug!("{buf}");
     }
@@ -457,11 +504,18 @@ pub async fn search_hybrid(
     // ── Diagnostic: Stage 2+3 (Semantic ANN) results ────────────────────────
     {
         use std::fmt::Write as _;
-        let mut buf = format!("── HYBRID STAGE 2+3: Semantic ANN ({} chunks) ──\n", semantic_results.len());
+        let mut buf = format!(
+            "── HYBRID STAGE 2+3: Semantic ANN ({} chunks) ──\n",
+            semantic_results.len()
+        );
         for (rank, (chunk_id, obj_id, content, distance)) in semantic_results.iter().enumerate() {
             let snippet: String = content.chars().take(80).collect();
-            let _ = writeln!(buf, "  SEM[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
-                chunk_id.hyphenated(), obj_id.hyphenated());
+            let _ = writeln!(
+                buf,
+                "  SEM[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
+                chunk_id.hyphenated(),
+                obj_id.hyphenated()
+            );
         }
         debug!("{buf}");
     }
@@ -469,11 +523,19 @@ pub async fn search_hybrid(
     // ── Diagnostic: Stage 2b+3b (HQ Semantic ANN) results ───────────────────
     {
         use std::fmt::Write as _;
-        let mut buf = format!("── HYBRID STAGE 2b+3b: HQ Semantic ANN ({} chunks) ──\n", hq_semantic_results.len());
-        for (rank, (chunk_id, obj_id, content, distance)) in hq_semantic_results.iter().enumerate() {
+        let mut buf = format!(
+            "── HYBRID STAGE 2b+3b: HQ Semantic ANN ({} chunks) ──\n",
+            hq_semantic_results.len()
+        );
+        for (rank, (chunk_id, obj_id, content, distance)) in hq_semantic_results.iter().enumerate()
+        {
             let snippet: String = content.chars().take(80).collect();
-            let _ = writeln!(buf, "  HQ[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
-                chunk_id.hyphenated(), obj_id.hyphenated());
+            let _ = writeln!(
+                buf,
+                "  HQ[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
+                chunk_id.hyphenated(),
+                obj_id.hyphenated()
+            );
         }
         debug!("{buf}");
     }
@@ -486,47 +548,66 @@ pub async fn search_hybrid(
 
     let mut chunk_merge: HashMap<String, ChunkMerge> = HashMap::new();
 
-    for (rank, (chunk_id, obj_id, _content)) in fts_results.into_iter().enumerate() {
+    for (rank, (chunk_id, obj_id, content)) in fts_results.into_iter().enumerate() {
+        let chunk_id_str = chunk_id.hyphenated().to_string();
         let score = (1.0 - alpha) / (K + rank as f32);
         let entry = chunk_merge
-            .entry(chunk_id.hyphenated().to_string())
+            .entry(chunk_id_str.clone())
             .or_insert_with(|| ChunkMerge {
                 object_id_str: obj_id.hyphenated().to_string(),
+                chunk_id_str,
+                content: content.clone(),
                 rrf_score: 0.0,
                 fts_rank: None,
                 semantic_distance: None,
                 hq_semantic_distance: None,
             });
+        if entry.content.is_empty() {
+            entry.content = content;
+        }
         entry.rrf_score += score;
         entry.fts_rank = Some(rank);
     }
 
-    for (rank, (chunk_id, obj_id, _content, distance)) in semantic_results.into_iter().enumerate() {
+    for (rank, (chunk_id, obj_id, content, distance)) in semantic_results.into_iter().enumerate() {
+        let chunk_id_str = chunk_id.hyphenated().to_string();
         let score = alpha / (K + rank as f32);
         let entry = chunk_merge
-            .entry(chunk_id.hyphenated().to_string())
+            .entry(chunk_id_str.clone())
             .or_insert_with(|| ChunkMerge {
                 object_id_str: obj_id.hyphenated().to_string(),
+                chunk_id_str,
+                content: content.clone(),
                 rrf_score: 0.0,
                 fts_rank: None,
                 semantic_distance: None,
                 hq_semantic_distance: None,
             });
+        if entry.content.is_empty() {
+            entry.content = content;
+        }
         entry.rrf_score += score;
         entry.semantic_distance = Some(distance);
     }
 
-    for (rank, (chunk_id, obj_id, _content, distance)) in hq_semantic_results.into_iter().enumerate() {
+    for (rank, (chunk_id, obj_id, content, distance)) in hq_semantic_results.into_iter().enumerate()
+    {
+        let chunk_id_str = chunk_id.hyphenated().to_string();
         let score = alpha * config.hq_semantic_boost / (K + rank as f32);
         let entry = chunk_merge
-            .entry(chunk_id.hyphenated().to_string())
+            .entry(chunk_id_str.clone())
             .or_insert_with(|| ChunkMerge {
                 object_id_str: obj_id.hyphenated().to_string(),
+                chunk_id_str,
+                content: content.clone(),
                 rrf_score: 0.0,
                 fts_rank: None,
                 semantic_distance: None,
                 hq_semantic_distance: None,
             });
+        if entry.content.is_empty() {
+            entry.content = content;
+        }
         entry.rrf_score += score;
         entry.hq_semantic_distance = Some(distance);
     }
@@ -535,11 +616,21 @@ pub async fn search_hybrid(
     {
         use std::fmt::Write as _;
         let mut sorted_chunks: Vec<_> = chunk_merge.iter().collect();
-        sorted_chunks.sort_by(|a, b| b.1.rrf_score.partial_cmp(&a.1.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
-        let mut buf = format!("── HYBRID STAGE 4: RRF chunk merge ({} unique chunks) ──\n", chunk_merge.len());
+        sorted_chunks.sort_by(|a, b| {
+            b.1.rrf_score
+                .partial_cmp(&a.1.rrf_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut buf = format!(
+            "── HYBRID STAGE 4: RRF chunk merge ({} unique chunks) ──\n",
+            chunk_merge.len()
+        );
         for (chunk_key, cm) in &sorted_chunks {
-            let _ = writeln!(buf, "  RRF chunk={chunk_key} obj={} score={:.6} fts_rank={:?} sem_dist={:?}",
-                cm.object_id_str, cm.rrf_score, cm.fts_rank, cm.semantic_distance);
+            let _ = writeln!(
+                buf,
+                "  RRF chunk={chunk_key} obj={} score={:.6} fts_rank={:?} sem_dist={:?}",
+                cm.object_id_str, cm.rrf_score, cm.fts_rank, cm.semantic_distance
+            );
         }
         debug!("{buf}");
     }
@@ -552,10 +643,33 @@ pub async fn search_hybrid(
 
     let mut node_accum: HashMap<String, NodeAccumulator> = HashMap::new();
 
-    for (_chunk_key, cm) in chunk_merge {
+    let mut merged_chunks: Vec<ChunkMerge> = chunk_merge.into_values().collect();
+    merged_chunks.sort_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for cm in merged_chunks {
         let acc = node_accum.entry(cm.object_id_str).or_default();
         acc.total_score += cm.rrf_score;
         acc.matching_chunk_count += 1;
+        let content = cm.content;
+        let token_count = crate::text::count_tokens(&content).max(1);
+        acc.matched_chunks.push(MatchedChunk {
+            id: crate::types::ChunkId::parse_str(&cm.chunk_id_str).map_err(|e| {
+                anyhow::anyhow!(
+                    "Invalid chunk UUID '{}' in hybrid search result: {e}",
+                    cm.chunk_id_str
+                )
+            })?,
+            content,
+            token_count,
+            score: cm.rrf_score,
+            fts_rank: cm.fts_rank,
+            semantic_distance: cm.semantic_distance,
+            hq_semantic_distance: cm.hq_semantic_distance,
+        });
         if let Some(rank) = cm.fts_rank {
             acc.best_fts_rank = Some(acc.best_fts_rank.map_or(rank, |prev| prev.min(rank)));
         }
@@ -577,11 +691,25 @@ pub async fn search_hybrid(
     {
         use std::fmt::Write as _;
         let mut sorted_nodes: Vec<_> = node_accum.iter().collect();
-        sorted_nodes.sort_by(|a, b| b.1.total_score.partial_cmp(&a.1.total_score).unwrap_or(std::cmp::Ordering::Equal));
-        let mut buf = format!("── HYBRID STAGE 5: Node aggregation ({} nodes, before sort) ──\n", node_accum.len());
+        sorted_nodes.sort_by(|a, b| {
+            b.1.total_score
+                .partial_cmp(&a.1.total_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut buf = format!(
+            "── HYBRID STAGE 5: Node aggregation ({} nodes, before sort) ──\n",
+            node_accum.len()
+        );
         for (obj_id, acc) in &sorted_nodes {
-            let _ = writeln!(buf, "  NODE obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
-                acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance, acc.best_hq_semantic_distance);
+            let _ = writeln!(
+                buf,
+                "  NODE obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
+                acc.total_score,
+                acc.matching_chunk_count,
+                acc.best_fts_rank,
+                acc.best_semantic_distance,
+                acc.best_hq_semantic_distance
+            );
         }
         debug!("{buf}");
     }
@@ -609,10 +737,20 @@ pub async fn search_hybrid(
     // ── Diagnostic: Stage 5 (after sort + truncate) ───────────────────────────
     {
         use std::fmt::Write as _;
-        let mut buf = format!("── HYBRID STAGE 5: After sort + truncate to {} ──\n", config.limit);
+        let mut buf = format!(
+            "── HYBRID STAGE 5: After sort + truncate to {} ──\n",
+            config.limit
+        );
         for (obj_id, acc) in &ranked_nodes {
-            let _ = writeln!(buf, "  KEPT obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
-                acc.total_score, acc.matching_chunk_count, acc.best_fts_rank, acc.best_semantic_distance, acc.best_hq_semantic_distance);
+            let _ = writeln!(
+                buf,
+                "  KEPT obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
+                acc.total_score,
+                acc.matching_chunk_count,
+                acc.best_fts_rank,
+                acc.best_semantic_distance,
+                acc.best_hq_semantic_distance
+            );
         }
         debug!("{buf}");
     }
@@ -675,6 +813,7 @@ pub async fn search_hybrid(
         results.push(NodeSearchResult {
             node,
             chunks,
+            matched_chunks: acc.matched_chunks,
             edges,
             connected_node_names,
             score: acc.total_score,
@@ -692,9 +831,15 @@ pub async fn search_hybrid(
         use std::fmt::Write as _;
         let mut buf = format!("── HYBRID STAGE 6: Hydrated nodes ({}) ──\n", results.len());
         for (i, r) in results.iter().enumerate() {
-            let _ = writeln!(buf, "  HYDRATED[{i}] name={:?} type={:?} score={:.6} fts_rank={:?} sem_dist={:?}",
-                r.node.name, r.node.object_type, r.score,
-                r.sources.fts_rank, r.sources.semantic_distance);
+            let _ = writeln!(
+                buf,
+                "  HYDRATED[{i}] name={:?} type={:?} score={:.6} fts_rank={:?} sem_dist={:?}",
+                r.node.name,
+                r.node.object_type,
+                r.score,
+                r.sources.fts_rank,
+                r.sources.semantic_distance
+            );
         }
         debug!("{buf}");
     }
@@ -713,9 +858,8 @@ pub async fn search_hybrid(
     if do_rerank {
         debug!("Submitting {} nodes to reranker", results.len());
 
-        // Build one document per node using the full flattened node representation.
-        // This gives the cross-encoder the complete node context (name, type,
-        // description, all properties, tags, and edges) rather than isolated chunk snippets.
+        // Build one document per node from metadata, edge summaries, and only
+        // chunks that directly matched retrieval.
         let documents: Vec<String> = results
             .iter()
             .map(|r| {
@@ -733,17 +877,33 @@ pub async fn search_hybrid(
                         } else {
                             r.connected_node_names.get(&e.to)?.name.clone()
                         };
-                        Some(format!("{} {} {}", from_name, e.edge_type.as_str(), to_name))
+                        Some(format!(
+                            "{} {} {}",
+                            from_name,
+                            e.edge_type.as_str(),
+                            to_name
+                        ))
                     })
                     .collect();
-                r.node.flatten_for_embedding(&edge_lines)
+                let mut document = r.node.flatten_for_embedding(&edge_lines);
+                if !r.matched_chunks.is_empty() {
+                    document.push_str("\nMatched content:");
+                    for chunk in &r.matched_chunks {
+                        document.push('\n');
+                        document.push_str(&chunk.content);
+                    }
+                }
+                document
             })
             .collect();
 
         // ── Diagnostic: Stage 7 (Rerank input) ─────────────────────────────
         {
             use std::fmt::Write as _;
-            let mut buf = format!("── HYBRID STAGE 7: Rerank input ({} docs) ──\n", documents.len());
+            let mut buf = format!(
+                "── HYBRID STAGE 7: Rerank input ({} docs) ──\n",
+                documents.len()
+            );
             for (i, doc) in documents.iter().enumerate() {
                 let snippet: String = doc.chars().take(120).collect();
                 let _ = writeln!(buf, "  RERANK_IN[{i}] ({} chars) {snippet:?}…", doc.len());
@@ -781,10 +941,16 @@ pub async fn search_hybrid(
                     use std::fmt::Write as _;
                     let mut buf = String::from("── HYBRID STAGE 7: Rerank output ──\n");
                     for (i, r) in results.iter().enumerate() {
-                        let _ = writeln!(buf, "  RERANK_OUT[{i}] name={:?} type={:?} score={:.6} rerank_score={:?} fts_rank={:?} sem_dist={:?}",
-                            r.node.name, r.node.object_type,
-                            r.score, r.sources.rerank_score,
-                            r.sources.fts_rank, r.sources.semantic_distance);
+                        let _ = writeln!(
+                            buf,
+                            "  RERANK_OUT[{i}] name={:?} type={:?} score={:.6} rerank_score={:?} fts_rank={:?} sem_dist={:?}",
+                            r.node.name,
+                            r.node.object_type,
+                            r.score,
+                            r.sources.rerank_score,
+                            r.sources.fts_rank,
+                            r.sources.semantic_distance
+                        );
                     }
                     debug!("{buf}");
                 }
@@ -817,7 +983,9 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
-    use crate::lemonade::{BuiltProvider, Capability, ProviderSlot};
+    use crate::lemonade::{
+        BuiltProvider, Capability, ProviderSlot, RerankDocument, RerankProvider,
+    };
     use crate::queue::InferenceQueueBuilder;
     use crate::types::ChunkType;
     use crate::{KnowledgeGraph, ObjectBuilder};
@@ -857,6 +1025,44 @@ mod tests {
         }
         fn model_info(&self) -> Option<EmbeddingModelInfo> {
             None
+        }
+    }
+
+    struct KeywordRerankProvider {
+        keyword: &'static str,
+    }
+
+    #[async_trait]
+    impl RerankProvider for KeywordRerankProvider {
+        async fn rerank(
+            &self,
+            _query: &str,
+            documents: Vec<String>,
+            top_n: Option<usize>,
+        ) -> anyhow::Result<Vec<RerankDocument>> {
+            let keyword = self.keyword.to_ascii_lowercase();
+            let mut ranked: Vec<RerankDocument> = documents
+                .into_iter()
+                .enumerate()
+                .map(|(index, document)| RerankDocument {
+                    index,
+                    score: if document.to_ascii_lowercase().contains(&keyword) {
+                        1.0
+                    } else {
+                        0.1
+                    },
+                    document: Some(document),
+                })
+                .collect();
+            ranked.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if let Some(limit) = top_n {
+                ranked.truncate(limit);
+            }
+            Ok(ranked)
         }
     }
 
@@ -922,6 +1128,13 @@ mod tests {
             .unwrap();
         graph
             .add_text_chunk(
+                wizard_id,
+                "Gandalf later studied old maps and weathered travel journals.".to_string(),
+                ChunkType::UserNote,
+            )
+            .unwrap();
+        graph
+            .add_text_chunk(
                 hobbit_id,
                 "Frodo carried the One Ring on a perilous journey to Mount Doom.".to_string(),
                 ChunkType::Description,
@@ -970,6 +1183,16 @@ mod tests {
 
     fn make_queue_no_workers() -> InferenceQueue {
         InferenceQueueBuilder::new().build()
+    }
+
+    fn make_keyword_rerank_queue(keyword: &'static str) -> InferenceQueue {
+        let built = BuiltProvider {
+            name: "mock-rerank".to_string(),
+            capability: Capability::Reranking,
+            provider: ProviderSlot::Rerank(Arc::new(KeywordRerankProvider { keyword })),
+            weight: 100,
+        };
+        InferenceQueueBuilder::new().with_provider(built).build()
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1028,6 +1251,10 @@ mod tests {
 
         // Gandalf should have chunks (the description chunk we added).
         assert!(!gandalf.chunks.is_empty(), "Expected chunks for Gandalf");
+        assert!(
+            !gandalf.matched_chunks.is_empty(),
+            "Expected matched chunks for Gandalf"
+        );
 
         // Gandalf should have edges (mentors → Frodo).
         assert!(!gandalf.edges.is_empty(), "Expected edges for Gandalf");
@@ -1132,9 +1359,15 @@ mod tests {
             ..Default::default()
         };
 
-        let results = search_hybrid(&graph, &queue, None, "hobbit homeland hills peaceful", &config)
-            .await
-            .unwrap();
+        let results = search_hybrid(
+            &graph,
+            &queue,
+            None,
+            "hobbit homeland hills peaceful",
+            &config,
+        )
+        .await
+        .unwrap();
 
         // Every result must come from semantic search (no fts_rank populated).
         for r in &results {
@@ -1176,6 +1409,83 @@ mod tests {
             unique.len(),
             "Duplicate node IDs found in hybrid search results"
         );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_tracks_matched_chunks_separately_from_full_context() {
+        let (graph, _tmp) = make_graph_with_data();
+        let queue = make_queue_no_workers();
+
+        let config = HybridSearchConfig {
+            alpha: 0.0,
+            rerank: false,
+            limit: 1,
+            ..Default::default()
+        };
+
+        let results = search_hybrid(&graph, &queue, None, "wizard staff", &config)
+            .await
+            .unwrap();
+
+        let gandalf = results
+            .iter()
+            .find(|result| result.node.name == "Gandalf")
+            .expect("Expected Gandalf in FTS results");
+
+        assert!(gandalf.chunks.len() > gandalf.matched_chunks.len());
+        assert_eq!(gandalf.matched_chunks.len(), 1);
+        assert!(gandalf.matched_chunks[0].content.contains("wizard staff"));
+        assert!(gandalf.matched_tokens() < gandalf.total_tokens());
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_hybrid_search_applies_reranking() {
+        let tmp = TempDir::new().unwrap();
+        let graph = KnowledgeGraph::new(tmp.path()).unwrap();
+
+        let archivist = ObjectBuilder::character("Foundation Archivist".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph
+            .add_text_chunk(
+                archivist,
+                "Foundation records describe public Encyclopedia planning.".to_string(),
+                ChunkType::Imported,
+            )
+            .unwrap();
+
+        let vault_keeper = ObjectBuilder::character("Vault Keeper".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph
+            .add_text_chunk(
+                vault_keeper,
+                "Foundation vault protocol protects the hidden crisis archive.".to_string(),
+                ChunkType::Imported,
+            )
+            .unwrap();
+
+        let queue = make_keyword_rerank_queue("vault protocol");
+        let results = search_hybrid(
+            &graph,
+            &queue,
+            None,
+            "Foundation",
+            &HybridSearchConfig {
+                alpha: 0.0,
+                rerank: true,
+                fts_limit: 10,
+                limit: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].node.id, vault_keeper);
+        assert_eq!(results[0].sources.rerank_score, Some(1.0));
+        assert_eq!(results[1].sources.rerank_score, Some(0.1));
     }
 
     #[tokio::test]
@@ -1290,7 +1600,9 @@ mod tests {
                 ..Default::default()
             };
 
-            let results = search_hybrid(&graph, &queue, None, "the", &config).await.unwrap();
+            let results = search_hybrid(&graph, &queue, None, "the", &config)
+                .await
+                .unwrap();
 
             assert!(
                 results.len() <= limit,

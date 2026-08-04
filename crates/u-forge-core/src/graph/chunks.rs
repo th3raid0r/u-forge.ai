@@ -40,7 +40,7 @@ impl KnowledgeGraphStorage {
         Ok(())
     }
 
-    /// Return all chunks that do not yet have a 768-dim embedding in `chunks_vec`.
+    /// Return all chunks that do not yet have a standard embedding in `chunks_vec`.
     ///
     /// The LEFT JOIN on `chunks_vec` returns only rows where no matching vector
     /// rowid exists — i.e. chunks that have never been embedded via
@@ -82,7 +82,7 @@ impl KnowledgeGraphStorage {
         Ok(chunks)
     }
 
-    /// Return all chunks that do not yet have a 4096-dim embedding in `chunks_vec_hq`.
+    /// Return all chunks that do not yet have a high-quality embedding in `chunks_vec_hq`.
     pub fn get_unembedded_chunks_hq(&self) -> Result<Vec<TextChunk>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(

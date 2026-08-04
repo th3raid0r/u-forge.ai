@@ -28,7 +28,18 @@
       "required": false,
       "relationship": {
         "edgeType": "a_part_of",
+        "targetType": "location",
         "description": "A part of this parent location."
+      }
+    },
+    "locatedIn": {
+      "type": "string",
+      "description": "The location that contains or geographically situates this location.",
+      "required": false,
+      "relationship": {
+        "edgeType": "located_in",
+        "targetType": "location",
+        "description": "The location this location is located in."
       }
     },
     "atmosphere": {

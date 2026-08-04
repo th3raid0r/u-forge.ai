@@ -1,11 +1,12 @@
 //! Cross-encoder reranking via Lemonade Server.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use super::client::LemonadeHttpClient;
-use super::load::{load_model, ModelLoadOptions};
+use super::load::{ModelLoadOptions, load_model};
 
 /// A single ranked document returned by [`LemonadeRerankProvider::rerank`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +18,22 @@ pub struct RerankDocument {
     /// The original document text, if the server echoed it back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document: Option<String>,
+}
+
+/// Provider abstraction for document reranking.
+///
+/// The production implementation calls Lemonade Server, while tests can inject
+/// deterministic in-memory providers through the normal [`InferenceQueue`]
+/// worker path.
+#[async_trait]
+pub trait RerankProvider: Send + Sync {
+    /// Rank `documents` by relevance to `query`.
+    async fn rerank(
+        &self,
+        query: &str,
+        documents: Vec<String>,
+        top_n: Option<usize>,
+    ) -> Result<Vec<RerankDocument>>;
 }
 
 /// Reranker via `POST /api/v1/reranking` on Lemonade Server.
@@ -137,5 +154,17 @@ impl LemonadeRerankProvider {
         );
 
         Ok(results)
+    }
+}
+
+#[async_trait]
+impl RerankProvider for LemonadeRerankProvider {
+    async fn rerank(
+        &self,
+        query: &str,
+        documents: Vec<String>,
+        top_n: Option<usize>,
+    ) -> Result<Vec<RerankDocument>> {
+        LemonadeRerankProvider::rerank(self, query, documents, top_n).await
     }
 }

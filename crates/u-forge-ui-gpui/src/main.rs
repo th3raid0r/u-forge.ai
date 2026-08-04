@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    prelude::*, size, App, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBounds,
-    WindowOptions, px,
+    App, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBounds, WindowOptions, prelude::*,
+    px, size,
 };
 use u_forge_core::AppConfig;
 use u_forge_graph_view::build_snapshot;
@@ -18,7 +18,6 @@ fn main() {
         .init();
 
     let cfg = Arc::new(AppConfig::load_default());
-    let data_dir = cfg.storage.db_path.clone();
     let data_file = cfg.data.import_file.clone();
     let schema_dir = cfg.data.schema_dir.clone();
 
@@ -27,7 +26,7 @@ fn main() {
     let (snapshot, graph, schema_mgr) = {
         rt.block_on(async {
             let graph = Arc::new(
-                u_forge_core::KnowledgeGraph::new(&data_dir)
+                u_forge_core::KnowledgeGraph::with_storage_config(&cfg.storage)
                     .expect("failed to open knowledge graph"),
             );
 
@@ -110,7 +109,9 @@ fn main() {
             },
             |_, cx| {
                 cx.new(|cx| {
-                    AppView::new(snapshot, graph, schema_mgr, data_file, schema_dir, cfg, rt, cx)
+                    AppView::new(
+                        snapshot, graph, schema_mgr, data_file, schema_dir, cfg, rt, cx,
+                    )
                 })
             },
         )

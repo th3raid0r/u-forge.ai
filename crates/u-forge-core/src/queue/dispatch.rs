@@ -2,11 +2,14 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
 use tracing::instrument;
 
-use crate::lemonade::{ChatCompletionResponse, ChatRequest, KokoroVoice, LemonadeChatProvider, RerankDocument, StreamToken};
+use crate::lemonade::{
+    ChatCompletionResponse, ChatRequest, KokoroVoice, LemonadeChatProvider, RerankDocument,
+    StreamToken,
+};
 
 use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
 use super::weighted::WeightedEmbedDispatcher;
@@ -72,7 +75,10 @@ impl InferenceQueue {
     /// - No embedding-capable device is registered.
     /// - The worker task was dropped before completing the job (internal error).
     /// - The underlying embedding provider returned an error.
-    #[instrument(skip(self, text), fields(text_len, pending_jobs, selected_worker_id, duration_us))]
+    #[instrument(
+        skip(self, text),
+        fields(text_len, pending_jobs, selected_worker_id, duration_us)
+    )]
     pub async fn embed(&self, text: impl Into<String>) -> Result<Vec<f32>> {
         if self.embedding_workers == 0 {
             return Err(anyhow!(
@@ -89,11 +95,14 @@ impl InferenceQueue {
 
         let t0 = std::time::Instant::now();
         let (tx, rx) = oneshot::channel();
-        let worker_id = self.embed_dispatcher.submit(EmbedJob { text, response: tx });
+        let worker_id = self
+            .embed_dispatcher
+            .submit(EmbedJob { text, response: tx });
         span.record("selected_worker_id", worker_id);
 
-        let result = rx.await
-            .map_err(|_| anyhow!("InferenceQueue: embedding worker dropped the response channel"))?;
+        let result = rx.await.map_err(|_| {
+            anyhow!("InferenceQueue: embedding worker dropped the response channel")
+        })?;
         span.record("duration_us", t0.elapsed().as_micros() as u64);
         result
     }
@@ -256,7 +265,10 @@ impl InferenceQueue {
     ///
     /// Returns an error immediately if no LLM-capable device is registered.
     /// Stream-level errors are sent as `Err(_)` items through the receiver.
-    pub fn generate_stream(&self, request: ChatRequest) -> Result<mpsc::Receiver<Result<StreamToken>>> {
+    pub fn generate_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<mpsc::Receiver<Result<StreamToken>>> {
         if self.llm_workers == 0 {
             return Err(anyhow!(
                 "InferenceQueue: no LLM-capable device is registered."
@@ -529,7 +541,12 @@ mod tests {
             let dispatcher = Arc::clone(&embed_dispatcher);
             tokio::spawn(async move {
                 run_embed_worker(
-                    embed_q, provider, "mock-npu".to_string(), embed_idle, embed_ewma, dispatcher,
+                    embed_q,
+                    provider,
+                    "mock-npu".to_string(),
+                    embed_idle,
+                    embed_ewma,
+                    dispatcher,
                 )
                 .await;
             });
@@ -874,7 +891,9 @@ mod tests {
     async fn test_queue_embed_via_provider_factory() {
         let url = require_integration_url!();
 
-        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
+            .await
+            .unwrap();
         let cfg = crate::config::AppConfig::default();
         let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
         let embed_sel = selector
@@ -882,7 +901,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("No embedding model found in catalog");
-        let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
+        let already_loaded: Vec<String> = catalog
+            .loaded
+            .iter()
+            .map(|m| m.model_name.clone())
+            .collect();
         let built = crate::lemonade::ProviderFactory::build(
             &embed_sel,
             crate::lemonade::Capability::Embedding,
@@ -908,37 +931,82 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_queue_transcribe_via_provider_factory() {
-        let url = require_integration_url!();
-
-        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+    async fn build_live_transcription_queue_for_recipe(
+        url: &str,
+        recipe: &str,
+        workers: usize,
+    ) -> Option<InferenceQueue> {
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
+            .await
+            .unwrap();
         let cfg = crate::config::AppConfig::default();
         let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let stt_selections = selector.select_stt_models();
-        if stt_selections.is_empty() {
-            eprintln!("SKIP: No STT model available in catalog");
-            return;
-        }
-        let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
-        let built = crate::lemonade::ProviderFactory::build(
-            &stt_selections[0],
-            crate::lemonade::Capability::Transcription,
-            &url,
-            100,
-            None,
-            &already_loaded,
-        )
-        .await
-        .expect("Failed to build transcription provider");
+        let Some(selected) = selector
+            .select_stt_models()
+            .into_iter()
+            .find(|model| model.recipe == recipe)
+        else {
+            eprintln!("SKIP: No {recipe} transcription model available in catalog");
+            return None;
+        };
+        let already_loaded: Vec<String> = catalog
+            .loaded
+            .iter()
+            .map(|m| m.model_name.clone())
+            .collect();
 
-        let queue = InferenceQueueBuilder::new().with_provider(built).build();
+        let mut builder = InferenceQueueBuilder::new();
+        for index in 0..workers {
+            let built = crate::lemonade::ProviderFactory::build(
+                &selected,
+                crate::lemonade::Capability::Transcription,
+                url,
+                100,
+                None,
+                &already_loaded,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to build {recipe} transcription provider {index} for '{}': {err}",
+                    selected.model_id
+                )
+            });
+            builder = builder.with_provider(built);
+        }
+
+        Some(builder.build())
+    }
+
+    #[tokio::test]
+    async fn test_queue_transcribe_via_provider_factory_flm() {
+        let url = require_integration_url!();
+        let Some(queue) = build_live_transcription_queue_for_recipe(&url, "flm", 1).await else {
+            return;
+        };
 
         let wav = make_test_silence_wav(1.0);
         let result = queue.transcribe(wav, "silence.wav").await;
         assert!(
             result.is_ok(),
-            "transcribe() failed: {:?}",
+            "FLM transcribe() failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_queue_transcribe_via_provider_factory_llamacpp() {
+        let url = require_integration_url!();
+        let Some(queue) = build_live_transcription_queue_for_recipe(&url, "llamacpp", 1).await
+        else {
+            return;
+        };
+
+        let wav = make_test_silence_wav(1.0);
+        let result = queue.transcribe(wav, "silence.wav").await;
+        assert!(
+            result.is_ok(),
+            "llamacpp transcribe() failed: {:?}",
             result.err()
         );
     }
@@ -946,42 +1014,9 @@ mod tests {
     #[tokio::test]
     async fn test_queue_two_transcription_workers_compete() {
         let url = require_integration_url!();
-
-        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
-        let cfg = crate::config::AppConfig::default();
-        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let stt_selections = selector.select_stt_models();
-        if stt_selections.is_empty() {
-            eprintln!("SKIP: No STT model available in catalog");
+        let Some(queue) = build_live_transcription_queue_for_recipe(&url, "flm", 2).await else {
             return;
-        }
-
-        let already_loaded: Vec<String> = catalog.loaded.iter().map(|m| m.model_name.clone()).collect();
-        let b1 = crate::lemonade::ProviderFactory::build(
-            &stt_selections[0],
-            crate::lemonade::Capability::Transcription,
-            &url,
-            100,
-            None,
-            &already_loaded,
-        )
-        .await
-        .expect("Failed to build provider 1");
-        let b2 = crate::lemonade::ProviderFactory::build(
-            &stt_selections[0],
-            crate::lemonade::Capability::Transcription,
-            &url,
-            100,
-            None,
-            &already_loaded,
-        )
-        .await
-        .expect("Failed to build provider 2");
-
-        let queue = InferenceQueueBuilder::new()
-            .with_provider(b1)
-            .with_provider(b2)
-            .build();
+        };
 
         assert_eq!(
             queue.transcription_worker_count(),
