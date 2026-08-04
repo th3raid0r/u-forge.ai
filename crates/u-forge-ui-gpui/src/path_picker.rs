@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    deferred, div, prelude::*, px, rgb, rgba, App, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent,
+    Window, deferred, div, prelude::*, px, rgb, rgba,
 };
 
 use crate::text_field::TextFieldView;
@@ -187,11 +187,9 @@ impl Render for PathPickerModal {
                                         .hover(|s| s.bg(rgb(0x585b70)))
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
-                                                    this.browse(cx);
-                                                },
-                                            ),
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.browse(cx);
+                                            }),
                                         )
                                         .child("…"),
                                 ),
@@ -225,11 +223,9 @@ impl Render for PathPickerModal {
                                         .hover(|s| s.bg(rgb(0x45475a)))
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
-                                                    this.cancel(cx);
-                                                },
-                                            ),
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.cancel(cx);
+                                            }),
                                         )
                                         .child("Cancel"),
                                 )
@@ -248,11 +244,9 @@ impl Render for PathPickerModal {
                                         .hover(|s| s.bg(rgb(0xa6d0fd)))
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
-                                                    this.confirm(cx);
-                                                },
-                                            ),
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.confirm(cx);
+                                            }),
                                         )
                                         .child(confirm_label),
                                 ),

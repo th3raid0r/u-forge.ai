@@ -7,8 +7,8 @@ description: Development workflow and setup guide
 ## Quick Reference
 
 ```bash
-cargo build --workspace                                        # Build all crates
-cargo test --workspace -- --test-threads=1                     # Run all tests
+make build                                                     # Build all crates
+make test                                                      # Run all tests
 cargo run -p u-forge-ui-gpui                                   # Run the desktop app
 ```
 
@@ -25,8 +25,8 @@ cargo run -p u-forge-ui-gpui                                   # Run the desktop
    (`gcc`, `clang`, or MSVC) — needed for `openssl-sys` (reqwest TLS).
 2. *(Optional)* Install [Lemonade Server](https://github.com/lemonade-sdk/lemonade)
    for AI features. See `environment-config.mdc` for pulls.
-3. `cargo build --workspace` — first build is ~30 s (bundled SQLite compilation).
-4. `cargo test --workspace -- --test-threads=1` — 220+ tests pass with no
+3. `make build` — first build is ~30 s (bundled SQLite compilation).
+4. `make test` — tests pass with no
    server required.
 5. `cargo run -p u-forge-ui-gpui` — launch the desktop app.
 
@@ -87,7 +87,7 @@ The SQLite file is created at `<db_path>/knowledge.db`.
 1. Read the relevant source file and its comments — resolved issues are noted
    inline.
 2. Write a regression test that would have caught the bug.
-3. Fix and verify — `cargo test` must stay green.
+3. Fix and verify — `make test` must stay green.
 
 ---
 
@@ -102,9 +102,9 @@ control variable.
 ## CI commands
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
-cargo test --workspace -- --test-threads=1
+make fmt-check
+make clippy
+make test
 cargo doc --no-deps --workspace
 ```
 

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{Notify, oneshot};
 
 use crate::lemonade::{ChatCompletionResponse, ChatRequest, KokoroVoice, RerankDocument};
 

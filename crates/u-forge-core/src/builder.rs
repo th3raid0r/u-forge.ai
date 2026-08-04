@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 
-use crate::types::{ObjectId, ObjectMetadata};
 use crate::KnowledgeGraph;
+use crate::types::{ObjectId, ObjectMetadata};
 
 /// Fluent builder for constructing [`ObjectMetadata`] with TTRPG-friendly
 /// convenience constructors.
@@ -83,7 +83,6 @@ impl ObjectBuilder {
         self.metadata.add_tag(tag);
         self
     }
-
 
     /// Consume the builder and return the finished [`ObjectMetadata`].
     pub fn build(self) -> ObjectMetadata {

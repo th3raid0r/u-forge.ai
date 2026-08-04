@@ -1,13 +1,16 @@
-use super::{SchemaDefinition, ObjectTypeSchema, PropertySchema, PropertyType, ValidationResult, ValidationError, ValidationErrorType, ValidationWarning, EdgeTypeSchema, ValidationRule};
-use crate::types::{ObjectMetadata, Edge};
+use super::{
+    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType, SchemaDefinition,
+    ValidationError, ValidationErrorType, ValidationResult, ValidationRule, ValidationWarning,
+};
 use crate::graph::KnowledgeGraphStorage;
+use crate::types::{Edge, ObjectMetadata};
 use anyhow::Result;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use parking_lot::RwLock;
-use serde_json::Value;
 
 /// Schema manager for validating objects and managing schemas at runtime
 pub struct SchemaManager {
@@ -36,7 +39,9 @@ impl SchemaManager {
         match self.storage.get_schema(name)? {
             Some(schema) => {
                 let schema_arc = Arc::new(schema);
-                self.schema_cache.write().insert(name.to_string(), schema_arc.clone());
+                self.schema_cache
+                    .write()
+                    .insert(name.to_string(), schema_arc.clone());
                 Ok(schema_arc)
             }
             None => {
@@ -53,7 +58,9 @@ impl SchemaManager {
 
                 self.save_schema(&default_schema).await?;
                 let schema_arc = Arc::new(default_schema);
-                self.schema_cache.write().insert(name.to_string(), schema_arc.clone());
+                self.schema_cache
+                    .write()
+                    .insert(name.to_string(), schema_arc.clone());
                 Ok(schema_arc)
             }
         }
@@ -64,7 +71,9 @@ impl SchemaManager {
         self.storage.save_schema(schema)?;
 
         // Update cache
-        self.schema_cache.write().insert(schema.name.clone(), Arc::new(schema.clone()));
+        self.schema_cache
+            .write()
+            .insert(schema.name.clone(), Arc::new(schema.clone()));
 
         Ok(())
     }
@@ -77,7 +86,11 @@ impl SchemaManager {
     }
 
     /// Validate an object against a specific schema
-    pub fn validate_object_with_schema(&self, object: &ObjectMetadata, schema: &SchemaDefinition) -> Result<ValidationResult> {
+    pub fn validate_object_with_schema(
+        &self,
+        object: &ObjectMetadata,
+        schema: &SchemaDefinition,
+    ) -> Result<ValidationResult> {
         let mut result = ValidationResult::valid();
 
         // Check if object type exists in schema
@@ -100,9 +113,12 @@ impl SchemaManager {
                 continue;
             }
 
-            if !object.properties.as_object()
+            if !object
+                .properties
+                .as_object()
                 .unwrap_or(&serde_json::Map::new())
-                .contains_key(required_prop) {
+                .contains_key(required_prop)
+            {
                 result.add_error(ValidationError {
                     property: required_prop.clone(),
                     message: format!("Missing required property: {}", required_prop),
@@ -115,7 +131,9 @@ impl SchemaManager {
         if let Some(props) = object.properties.as_object() {
             for (key, value) in props {
                 if let Some(prop_schema) = object_schema.properties.get(key) {
-                    if let Err(validation_error) = self.validate_property_value(key, value, prop_schema) {
+                    if let Err(validation_error) =
+                        self.validate_property_value(key, value, prop_schema)
+                    {
                         result.add_error(validation_error);
                     }
                 } else {
@@ -132,13 +150,24 @@ impl SchemaManager {
     }
 
     /// Validate an edge against schema constraints
-    pub async fn validate_edge(&self, edge: &Edge, source_object: &ObjectMetadata, target_object: &ObjectMetadata) -> Result<ValidationResult> {
+    pub async fn validate_edge(
+        &self,
+        edge: &Edge,
+        source_object: &ObjectMetadata,
+        target_object: &ObjectMetadata,
+    ) -> Result<ValidationResult> {
         let schema = self.load_schema("default").await?;
         self.validate_edge_with_schema(edge, source_object, target_object, &schema)
     }
 
     /// Validate an edge against a specific schema
-    pub fn validate_edge_with_schema(&self, edge: &Edge, source_object: &ObjectMetadata, target_object: &ObjectMetadata, schema: &SchemaDefinition) -> Result<ValidationResult> {
+    pub fn validate_edge_with_schema(
+        &self,
+        edge: &Edge,
+        source_object: &ObjectMetadata,
+        target_object: &ObjectMetadata,
+        schema: &SchemaDefinition,
+    ) -> Result<ValidationResult> {
         let mut result = ValidationResult::valid();
 
         let edge_type_str = edge.edge_type.as_str();
@@ -156,8 +185,11 @@ impl SchemaManager {
         };
 
         // Validate source type constraints
-        if !edge_schema.allowed_source_types.is_empty() &&
-           !edge_schema.allowed_source_types.contains(&source_object.object_type) {
+        if !edge_schema.allowed_source_types.is_empty()
+            && !edge_schema
+                .allowed_source_types
+                .contains(&source_object.object_type)
+        {
             result.add_error(ValidationError {
                 property: "source_type".to_string(),
                 message: format!(
@@ -169,8 +201,11 @@ impl SchemaManager {
         }
 
         // Validate target type constraints
-        if !edge_schema.allowed_target_types.is_empty() &&
-           !edge_schema.allowed_target_types.contains(&target_object.object_type) {
+        if !edge_schema.allowed_target_types.is_empty()
+            && !edge_schema
+                .allowed_target_types
+                .contains(&target_object.object_type)
+        {
             result.add_error(ValidationError {
                 property: "target_type".to_string(),
                 message: format!(
@@ -186,7 +221,9 @@ impl SchemaManager {
             if let Some(prop_schema) = edge_schema.properties.get(key) {
                 // Convert string value to JSON for validation
                 let json_value = Value::String(value.clone());
-                if let Err(validation_error) = self.validate_property_value(key, &json_value, prop_schema) {
+                if let Err(validation_error) =
+                    self.validate_property_value(key, &json_value, prop_schema)
+                {
                     result.add_error(validation_error);
                 }
             }
@@ -196,7 +233,12 @@ impl SchemaManager {
     }
 
     /// Register a new object type at runtime
-    pub async fn register_object_type(&self, schema_name: &str, type_name: &str, type_schema: ObjectTypeSchema) -> Result<()> {
+    pub async fn register_object_type(
+        &self,
+        schema_name: &str,
+        type_name: &str,
+        type_schema: ObjectTypeSchema,
+    ) -> Result<()> {
         let mut schema = (*self.load_schema(schema_name).await?).clone();
         schema.add_object_type(type_name.to_string(), type_schema);
         self.save_schema(&schema).await?;
@@ -208,7 +250,12 @@ impl SchemaManager {
     }
 
     /// Register a new edge type at runtime
-    pub async fn register_edge_type(&self, schema_name: &str, edge_name: &str, edge_schema: EdgeTypeSchema) -> Result<()> {
+    pub async fn register_edge_type(
+        &self,
+        schema_name: &str,
+        edge_name: &str,
+        edge_schema: EdgeTypeSchema,
+    ) -> Result<()> {
         let mut schema = (*self.load_schema(schema_name).await?).clone();
         schema.add_edge_type(edge_name.to_string(), edge_schema);
         self.save_schema(&schema).await?;
@@ -238,7 +285,9 @@ impl SchemaManager {
     /// Check whether `type_name` is a valid object type in any cached schema.
     pub fn is_valid_object_type(&self, type_name: &str) -> bool {
         let cache = self.schema_cache.read();
-        cache.values().any(|s| s.object_types.contains_key(type_name))
+        cache
+            .values()
+            .any(|s| s.object_types.contains_key(type_name))
     }
 
     /// Check whether `edge_name` is a valid edge type in any cached schema.
@@ -297,14 +346,21 @@ impl SchemaManager {
             version: schema.version.clone(),
             object_type_count: schema.object_types.len(),
             edge_type_count: schema.edge_types.len(),
-            total_properties: schema.object_types.values()
+            total_properties: schema
+                .object_types
+                .values()
                 .map(|ot| ot.properties.len())
                 .sum(),
         })
     }
 
     /// Validate a property value against its schema
-    fn validate_property_value(&self, property_name: &str, value: &Value, schema: &PropertySchema) -> Result<(), ValidationError> {
+    fn validate_property_value(
+        &self,
+        property_name: &str,
+        value: &Value,
+        schema: &PropertySchema,
+    ) -> Result<(), ValidationError> {
         // Check type compatibility
         let is_type_valid = match (&schema.property_type, value) {
             (PropertyType::String, Value::String(_)) => true,
@@ -344,18 +400,31 @@ impl SchemaManager {
         }
 
         // Validate array elements if it's an array
-        if let (PropertyType::Array(element_type), Value::Array(arr)) = (&schema.property_type, value) {
+        if let (PropertyType::Array(element_type), Value::Array(arr)) =
+            (&schema.property_type, value)
+        {
             for (i, element) in arr.iter().enumerate() {
-                let element_schema = PropertySchema::new((**element_type).clone(), "Array element".to_string());
-                self.validate_property_value(&format!("{}[{}]", property_name, i), element, &element_schema)?;
+                let element_schema =
+                    PropertySchema::new((**element_type).clone(), "Array element".to_string());
+                self.validate_property_value(
+                    &format!("{}[{}]", property_name, i),
+                    element,
+                    &element_schema,
+                )?;
             }
         }
 
         // Validate object properties if it's an object
-        if let (PropertyType::Object(obj_schema), Value::Object(obj)) = (&schema.property_type, value) {
+        if let (PropertyType::Object(obj_schema), Value::Object(obj)) =
+            (&schema.property_type, value)
+        {
             for (key, prop_schema) in obj_schema {
                 if let Some(prop_value) = obj.get(key) {
-                    self.validate_property_value(&format!("{}.{}", property_name, key), prop_value, prop_schema)?;
+                    self.validate_property_value(
+                        &format!("{}.{}", property_name, key),
+                        prop_value,
+                        prop_schema,
+                    )?;
                 }
             }
         }
@@ -364,27 +433,38 @@ impl SchemaManager {
     }
 
     /// Apply validation rules to a property value
-    fn apply_validation_rules(&self, property_name: &str, value: &Value, validation: &ValidationRule) -> Result<(), ValidationError> {
+    fn apply_validation_rules(
+        &self,
+        property_name: &str,
+        value: &Value,
+        validation: &ValidationRule,
+    ) -> Result<(), ValidationError> {
         // String length validation
         if let Value::String(s) = value {
-            if let Some(min_len) = validation.min_length {
-                if s.len() < min_len {
-                    return Err(ValidationError {
-                        property: property_name.to_string(),
-                        message: format!("Property '{}' is too short. Minimum length: {}", property_name, min_len),
-                        error_type: ValidationErrorType::ValidationRuleFailed,
-                    });
-                }
+            if let Some(min_len) = validation.min_length
+                && s.len() < min_len
+            {
+                return Err(ValidationError {
+                    property: property_name.to_string(),
+                    message: format!(
+                        "Property '{}' is too short. Minimum length: {}",
+                        property_name, min_len
+                    ),
+                    error_type: ValidationErrorType::ValidationRuleFailed,
+                });
             }
 
-            if let Some(max_len) = validation.max_length {
-                if s.len() > max_len {
-                    return Err(ValidationError {
-                        property: property_name.to_string(),
-                        message: format!("Property '{}' is too long. Maximum length: {}", property_name, max_len),
-                        error_type: ValidationErrorType::ValidationRuleFailed,
-                    });
-                }
+            if let Some(max_len) = validation.max_length
+                && s.len() > max_len
+            {
+                return Err(ValidationError {
+                    property: property_name.to_string(),
+                    message: format!(
+                        "Property '{}' is too long. Maximum length: {}",
+                        property_name, max_len
+                    ),
+                    error_type: ValidationErrorType::ValidationRuleFailed,
+                });
             }
 
             // Pattern validation
@@ -398,21 +478,27 @@ impl SchemaManager {
                 if !regex.is_match(s) {
                     return Err(ValidationError {
                         property: property_name.to_string(),
-                        message: format!("Property '{}' does not match required pattern: {}", property_name, pattern),
+                        message: format!(
+                            "Property '{}' does not match required pattern: {}",
+                            property_name, pattern
+                        ),
                         error_type: ValidationErrorType::ValidationRuleFailed,
                     });
                 }
             }
 
             // Allowed values validation
-            if let Some(allowed) = &validation.allowed_values {
-                if !allowed.contains(s) {
-                    return Err(ValidationError {
-                        property: property_name.to_string(),
-                        message: format!("Property '{}' has invalid value. Allowed values: {:?}", property_name, allowed),
-                        error_type: ValidationErrorType::ValidationRuleFailed,
-                    });
-                }
+            if let Some(allowed) = &validation.allowed_values
+                && !allowed.contains(s)
+            {
+                return Err(ValidationError {
+                    property: property_name.to_string(),
+                    message: format!(
+                        "Property '{}' has invalid value. Allowed values: {:?}",
+                        property_name, allowed
+                    ),
+                    error_type: ValidationErrorType::ValidationRuleFailed,
+                });
             }
         }
 
@@ -420,24 +506,30 @@ impl SchemaManager {
         if let Value::Number(n) = value {
             let num_val = n.as_f64().unwrap_or(0.0);
 
-            if let Some(min_val) = validation.min_value {
-                if num_val < min_val {
-                    return Err(ValidationError {
-                        property: property_name.to_string(),
-                        message: format!("Property '{}' is too small. Minimum value: {}", property_name, min_val),
-                        error_type: ValidationErrorType::ValidationRuleFailed,
-                    });
-                }
+            if let Some(min_val) = validation.min_value
+                && num_val < min_val
+            {
+                return Err(ValidationError {
+                    property: property_name.to_string(),
+                    message: format!(
+                        "Property '{}' is too small. Minimum value: {}",
+                        property_name, min_val
+                    ),
+                    error_type: ValidationErrorType::ValidationRuleFailed,
+                });
             }
 
-            if let Some(max_val) = validation.max_value {
-                if num_val > max_val {
-                    return Err(ValidationError {
-                        property: property_name.to_string(),
-                        message: format!("Property '{}' is too large. Maximum value: {}", property_name, max_val),
-                        error_type: ValidationErrorType::ValidationRuleFailed,
-                    });
-                }
+            if let Some(max_val) = validation.max_value
+                && num_val > max_val
+            {
+                return Err(ValidationError {
+                    property: property_name.to_string(),
+                    message: format!(
+                        "Property '{}' is too large. Maximum value: {}",
+                        property_name, max_val
+                    ),
+                    error_type: ValidationErrorType::ValidationRuleFailed,
+                });
             }
         }
 
@@ -519,16 +611,14 @@ impl SchemaManager {
                 }
 
                 // Boolean schema + String value: attempt boolean coercion.
-                (PropertyType::Boolean, Value::String(s)) => {
-                    match s.to_lowercase().as_str() {
-                        "true" | "1" | "yes" => coercions.push((key.clone(), Value::Bool(true))),
-                        "false" | "0" | "no" => coercions.push((key.clone(), Value::Bool(false))),
-                        _ => issues.push(PropertyIssue::TypeMismatch {
-                            key: key.clone(),
-                            expected: "boolean".to_string(),
-                        }),
-                    }
-                }
+                (PropertyType::Boolean, Value::String(s)) => match s.to_lowercase().as_str() {
+                    "true" | "1" | "yes" => coercions.push((key.clone(), Value::Bool(true))),
+                    "false" | "0" | "no" => coercions.push((key.clone(), Value::Bool(false))),
+                    _ => issues.push(PropertyIssue::TypeMismatch {
+                        key: key.clone(),
+                        expected: "boolean".to_string(),
+                    }),
+                },
 
                 // All other mismatches.
                 _ => {
@@ -560,7 +650,11 @@ pub enum PropertyIssue {
     /// Property key is not declared in the schema for this object type.
     UnknownProperty { key: String },
     /// String value is not in the enum's allowed list.
-    InvalidEnum { key: String, value: String, allowed: Vec<String> },
+    InvalidEnum {
+        key: String,
+        value: String,
+        allowed: Vec<String>,
+    },
 }
 
 impl fmt::Display for PropertyIssue {
@@ -572,7 +666,11 @@ impl fmt::Display for PropertyIssue {
             PropertyIssue::UnknownProperty { key } => {
                 write!(f, "property '{key}' is not declared in schema")
             }
-            PropertyIssue::InvalidEnum { key, value, allowed } => {
+            PropertyIssue::InvalidEnum {
+                key,
+                value,
+                allowed,
+            } => {
                 write!(
                     f,
                     "property '{key}': '{value}' is not a valid enum value (allowed: {})",
@@ -596,9 +694,8 @@ pub struct SchemaStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ObjectMetadata, Edge, EdgeType};
+    use crate::types::{Edge, EdgeType, ObjectMetadata};
     use tempfile::TempDir;
-
 
     fn create_test_schema_manager() -> (SchemaManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -641,7 +738,8 @@ mod tests {
         assert!(result.valid);
 
         // Create an invalid character (missing required fields)
-        let mut invalid_character = ObjectMetadata::new("character".to_string(), "Incomplete".to_string());
+        let mut invalid_character =
+            ObjectMetadata::new("character".to_string(), "Incomplete".to_string());
         invalid_character.properties = serde_json::json!({
             "species": "Human"
             // Missing other required fields
@@ -662,14 +760,20 @@ mod tests {
 
         let edge = Edge::new(character1.id, character2.id, EdgeType::new("knows"));
 
-        let result = manager.validate_edge(&edge, &character1, &character2).await.unwrap();
+        let result = manager
+            .validate_edge(&edge, &character1, &character2)
+            .await
+            .unwrap();
         assert!(result.valid);
 
         // Test invalid edge (location knows character - not typically allowed)
         let location = ObjectMetadata::new("location".to_string(), "Shire".to_string());
         let invalid_edge = Edge::new(location.id, character1.id, EdgeType::new("knows"));
 
-        let result = manager.validate_edge(&invalid_edge, &location, &character1).await.unwrap();
+        let result = manager
+            .validate_edge(&invalid_edge, &location, &character1)
+            .await
+            .unwrap();
         // This should generate an error or warning depending on schema constraints
         assert!(!result.errors.is_empty() || !result.warnings.is_empty());
     }
@@ -679,12 +783,19 @@ mod tests {
         let (manager, _temp) = create_test_schema_manager();
 
         // Register a new object type
-        let spell_schema = ObjectTypeSchema::new("spell".to_string(), "A magical spell".to_string())
-            .with_property("level".to_string(), PropertySchema::number("Spell level"))
-            .with_property("school".to_string(), PropertySchema::string("School of magic"))
-            .with_required_property("level".to_string());
+        let spell_schema =
+            ObjectTypeSchema::new("spell".to_string(), "A magical spell".to_string())
+                .with_property("level".to_string(), PropertySchema::number("Spell level"))
+                .with_property(
+                    "school".to_string(),
+                    PropertySchema::string("School of magic"),
+                )
+                .with_required_property("level".to_string());
 
-        manager.register_object_type("default", "spell", spell_schema).await.unwrap();
+        manager
+            .register_object_type("default", "spell", spell_schema)
+            .await
+            .unwrap();
 
         // Verify it was added
         let schema = manager.load_schema("default").await.unwrap();
@@ -734,8 +845,12 @@ mod tests {
         let (manager, _temp) = create_test_schema_manager();
 
         let enum_schema = PropertySchema::new(
-            PropertyType::Enum(vec!["red".to_string(), "green".to_string(), "blue".to_string()]),
-            "Color choice".to_string()
+            PropertyType::Enum(vec![
+                "red".to_string(),
+                "green".to_string(),
+                "blue".to_string(),
+            ]),
+            "Color choice".to_string(),
         );
 
         let valid_value = serde_json::Value::String("red".to_string());

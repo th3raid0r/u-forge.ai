@@ -64,10 +64,7 @@ mod tests {
     fn test_fts5_sanitize_converts_hyphen_to_space() {
         // Hyphens become spaces so "Z-Rho" is tokenised as two terms rather
         // than parsed by FTS5 as "Z NOT Rho".
-        assert_eq!(
-            fts5_sanitize("Z-Rho"),
-            Some("Z Rho".to_string())
-        );
+        assert_eq!(fts5_sanitize("Z-Rho"), Some("Z Rho".to_string()));
         assert_eq!(
             fts5_sanitize("well-known mathematician"),
             Some("well known mathematician".to_string())

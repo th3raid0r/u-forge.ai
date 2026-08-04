@@ -95,7 +95,11 @@ impl<'a> ModelSelector<'a> {
         config: &'a ModelConfig,
         embedding: &'a EmbeddingDeviceConfig,
     ) -> Self {
-        Self { catalog, config, embedding }
+        Self {
+            catalog,
+            config,
+            embedding,
+        }
     }
 
     /// Returns embedding models to register as workers, ordered by priority.
@@ -114,7 +118,8 @@ impl<'a> ModelSelector<'a> {
     ///   (e.g. embedgemma + nomic) in the same embedding index.
     pub fn select_embedding_models(&self) -> Vec<SelectedModel> {
         let candidates = self.catalog.downloaded_models_with_label("embeddings");
-        let ordered = self.apply_preference_order(&candidates, &self.config.embedding_model_preferences);
+        let ordered =
+            self.apply_preference_order(&candidates, &self.config.embedding_model_preferences);
 
         let mut result: Vec<SelectedModel> = ordered
             .into_iter()
@@ -180,7 +185,8 @@ impl<'a> ModelSelector<'a> {
     /// Returns the best available reranker (label `"reranking"`).
     pub fn select_reranker(&self) -> Option<SelectedModel> {
         let candidates = self.catalog.downloaded_models_with_label("reranking");
-        let ordered = self.apply_preference_order(&candidates, &self.config.reranker_model_preferences);
+        let ordered =
+            self.apply_preference_order(&candidates, &self.config.reranker_model_preferences);
 
         ordered.into_iter().next().map(|m| SelectedModel {
             model_id: m.id.clone(),
@@ -313,7 +319,7 @@ impl<'a> ModelSelector<'a> {
 
         let mut seen: HashSet<&str> = HashSet::new();
         let mut candidates: Vec<&CatalogModel> = Vec::new();
-        for m in by_recipe.into_iter().chain(by_label.into_iter()) {
+        for m in by_recipe.into_iter().chain(by_label) {
             if seen.insert(m.id.as_str()) {
                 candidates.push(m);
             }
@@ -428,7 +434,10 @@ mod tests {
         }
     }
 
-    fn catalog_with(models: Vec<CatalogModel>, backends: Vec<InstalledBackend>) -> LemonadeServerCatalog {
+    fn catalog_with(
+        models: Vec<CatalogModel>,
+        backends: Vec<InstalledBackend>,
+    ) -> LemonadeServerCatalog {
         LemonadeServerCatalog {
             base_url: String::new(),
             models,
@@ -470,7 +479,10 @@ mod tests {
             vec![installed_backend("flm", "npu", &["amd_npu"])],
         );
         let cfg = ModelConfig::default();
-        let emb = EmbeddingDeviceConfig { npu_enabled: false, ..Default::default() };
+        let emb = EmbeddingDeviceConfig {
+            npu_enabled: false,
+            ..Default::default()
+        };
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         assert!(selector.select_embedding_models().is_empty());
@@ -483,7 +495,10 @@ mod tests {
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );
         let cfg = ModelConfig::default();
-        let emb = EmbeddingDeviceConfig { gpu_enabled: false, ..Default::default() };
+        let emb = EmbeddingDeviceConfig {
+            gpu_enabled: false,
+            ..Default::default()
+        };
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         assert!(selector.select_embedding_models().is_empty());
@@ -503,7 +518,10 @@ mod tests {
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         let results = selector.select_embedding_models();
-        let qwen = results.iter().find(|m| m.model_id == "Qwen3-Embedding-8B-GGUF").unwrap();
+        let qwen = results
+            .iter()
+            .find(|m| m.model_id == "Qwen3-Embedding-8B-GGUF")
+            .unwrap();
         let std_m = results.iter().find(|m| m.model_id == "embed-std").unwrap();
         assert_eq!(qwen.quality_tier, QualityTier::High);
         assert_eq!(std_m.quality_tier, QualityTier::Standard);
@@ -519,7 +537,10 @@ mod tests {
             ],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );
-        let cfg = ModelConfig { embedding_model_preferences: vec!["model-a".to_string()], ..Default::default() };
+        let cfg = ModelConfig {
+            embedding_model_preferences: vec!["model-a".to_string()],
+            ..Default::default()
+        };
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
@@ -564,7 +585,10 @@ mod tests {
             ],
             vec![installed_backend("flm", "npu", &["amd_npu"])],
         );
-        let cfg = ModelConfig { embedding_model_preferences: vec!["embed-gemma-FLM".to_string()], ..Default::default() };
+        let cfg = ModelConfig {
+            embedding_model_preferences: vec!["embed-gemma-FLM".to_string()],
+            ..Default::default()
+        };
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
@@ -590,8 +614,14 @@ mod tests {
 
         let results = selector.select_embedding_models();
         assert_eq!(results.len(), 2, "Standard and HQ occupy separate slots");
-        let hq = results.iter().find(|m| m.quality_tier == QualityTier::High).unwrap();
-        let std = results.iter().find(|m| m.quality_tier == QualityTier::Standard).unwrap();
+        let hq = results
+            .iter()
+            .find(|m| m.quality_tier == QualityTier::High)
+            .unwrap();
+        let std = results
+            .iter()
+            .find(|m| m.quality_tier == QualityTier::Standard)
+            .unwrap();
         assert_eq!(hq.model_id, "Qwen3-Embedding-8B-GGUF");
         assert_eq!(std.model_id, "embed-std-GGUF");
     }
@@ -683,7 +713,11 @@ mod tests {
         let catalog = catalog_with(vec![], vec![]);
         let cfg = ModelConfig::default();
         let emb = default_embedding_cfg();
-        assert!(ModelSelector::new(&catalog, &cfg, &emb).select_reranker().is_none());
+        assert!(
+            ModelSelector::new(&catalog, &cfg, &emb)
+                .select_reranker()
+                .is_none()
+        );
     }
 
     // ── STT selection ─────────────────────────────────────────────────────────
@@ -710,7 +744,11 @@ mod tests {
     fn test_select_stt_deduplicates_audio_and_transcription_labels() {
         // A model carrying both "audio" and "transcription" must appear only once.
         let catalog = catalog_with(
-            vec![model("Whisper-Large-v3-Turbo", "whispercpp", &["audio", "transcription"])],
+            vec![model(
+                "Whisper-Large-v3-Turbo",
+                "whispercpp",
+                &["audio", "transcription"],
+            )],
             vec![],
         );
         let cfg = ModelConfig::default();
@@ -721,6 +759,36 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
+    #[test]
+    fn test_select_stt_keeps_flm_models_with_realtime_transcription_label() {
+        let catalog = catalog_with(
+            vec![
+                model(
+                    "whisper-v3-turbo-FLM",
+                    "flm",
+                    &["realtime-transcription", "transcription"],
+                ),
+                model(
+                    "Whisper-Large-v3-Turbo",
+                    "whispercpp",
+                    &["audio", "transcription"],
+                ),
+            ],
+            vec![installed_backend("flm", "npu", &["amd_npu"])],
+        );
+        let cfg = ModelConfig::default();
+        let emb = default_embedding_cfg();
+        let selector = ModelSelector::new(&catalog, &cfg, &emb);
+
+        let results = selector.select_stt_models();
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect();
+        assert!(ids.contains(&"whisper-v3-turbo-FLM"));
+        assert!(ids.contains(&"Whisper-Large-v3-Turbo"));
+    }
+
     // ── LLM selection ─────────────────────────────────────────────────────────
 
     #[test]
@@ -728,8 +796,8 @@ mod tests {
         let catalog = catalog_with(
             vec![
                 model("Gemma-4-26B-A4B-it-GGUF", "llamacpp", &["tool-calling"]),
-                model("embed-gguf", "llamacpp", &["embeddings"]),     // excluded
-                model("reranker", "llamacpp", &["reranking"]),         // excluded
+                model("embed-gguf", "llamacpp", &["embeddings"]), // excluded
+                model("reranker", "llamacpp", &["reranking"]),    // excluded
                 model("qwen3.5-4B-FLM", "flm", &["reasoning"]),
             ],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
@@ -740,8 +808,14 @@ mod tests {
 
         let results = selector.select_llm_models();
         let ids: Vec<&str> = results.iter().map(|m| m.model_id.as_str()).collect();
-        assert!(ids.contains(&"qwen3.5-4B-FLM"), "FLM LLM should be included");
-        assert!(ids.contains(&"Gemma-4-26B-A4B-it-GGUF"), "GPU LLM should be included");
+        assert!(
+            ids.contains(&"qwen3.5-4B-FLM"),
+            "FLM LLM should be included"
+        );
+        assert!(
+            ids.contains(&"Gemma-4-26B-A4B-it-GGUF"),
+            "GPU LLM should be included"
+        );
         assert!(!ids.contains(&"embed-gguf"), "Embedding must be excluded");
         assert!(!ids.contains(&"reranker"), "Reranker must be excluded");
     }
@@ -774,7 +848,10 @@ mod tests {
             ],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );
-        let cfg = ModelConfig { llm_model_preferences: vec!["Gemma-4-26B-A4B-it-GGUF".to_string()], ..Default::default() };
+        let cfg = ModelConfig {
+            llm_model_preferences: vec!["Gemma-4-26B-A4B-it-GGUF".to_string()],
+            ..Default::default()
+        };
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
@@ -811,12 +888,19 @@ mod tests {
         // Two whispercpp models — only the preferred one wins the "whispercpp" slot.
         let catalog = catalog_with(
             vec![
-                model("Whisper-Large-v3-Turbo", "whispercpp", &["audio", "transcription"]),
+                model(
+                    "Whisper-Large-v3-Turbo",
+                    "whispercpp",
+                    &["audio", "transcription"],
+                ),
                 model("Whisper-Small", "whispercpp", &["audio"]),
             ],
             vec![installed_backend("whispercpp", "cpu", &["cpu"])],
         );
-        let cfg = ModelConfig { stt_model_preferences: vec!["Whisper-Large-v3-Turbo".to_string()], ..Default::default() };
+        let cfg = ModelConfig {
+            stt_model_preferences: vec!["Whisper-Large-v3-Turbo".to_string()],
+            ..Default::default()
+        };
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
@@ -831,7 +915,11 @@ mod tests {
         let catalog = catalog_with(
             vec![
                 model("whisper-v3-turbo-FLM", "flm", &["audio", "transcription"]),
-                model("Whisper-Large-v3-Turbo", "whispercpp", &["audio", "transcription"]),
+                model(
+                    "Whisper-Large-v3-Turbo",
+                    "whispercpp",
+                    &["audio", "transcription"],
+                ),
             ],
             vec![
                 installed_backend("flm", "npu", &["amd_npu"]),
@@ -843,7 +931,11 @@ mod tests {
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         let results = selector.select_stt_models();
-        assert_eq!(results.len(), 2, "NPU and whispercpp STT slots are independent");
+        assert_eq!(
+            results.len(),
+            2,
+            "NPU and whispercpp STT slots are independent"
+        );
         let ids: Vec<&str> = results.iter().map(|m| m.model_id.as_str()).collect();
         assert!(ids.contains(&"whisper-v3-turbo-FLM"));
         assert!(ids.contains(&"Whisper-Large-v3-Turbo"));
@@ -874,6 +966,10 @@ mod tests {
         let catalog = catalog_with(vec![], vec![]);
         let cfg = ModelConfig::default();
         let emb = default_embedding_cfg();
-        assert!(ModelSelector::new(&catalog, &cfg, &emb).select_tts().is_none());
+        assert!(
+            ModelSelector::new(&catalog, &cfg, &emb)
+                .select_tts()
+                .is_none()
+        );
     }
 }

@@ -8,11 +8,11 @@
 //! For GPU-locked STT with resource contention management, see
 //! [`LemonadeSttProvider`](super::stt::LemonadeSttProvider).
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
-use crate::ai::transcription::{TranscriptionProvider, mime_for_filename};
 use super::client::LemonadeHttpClient;
+use crate::ai::transcription::{TranscriptionProvider, mime_for_filename};
 
 // ── LemonadeTranscriptionProvider ─────────────────────────────────────────────
 
@@ -101,4 +101,3 @@ impl TranscriptionProvider for LemonadeTranscriptionProvider {
         &self.model
     }
 }
-

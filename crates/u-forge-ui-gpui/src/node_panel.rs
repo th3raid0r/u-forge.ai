@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, relative, rgb, rgba, Context, Entity, MouseButton, MouseDownEvent, Window,
+    Context, Entity, MouseButton, MouseDownEvent, Window, div, prelude::*, px, relative, rgb, rgba,
 };
 use parking_lot::RwLock;
 use u_forge_core::ObjectId;
@@ -82,12 +82,12 @@ impl NodePanel {
         let mut groups: Vec<TypeGroup> = by_type
             .into_iter()
             .map(|(type_name, mut entries)| {
-                entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                entries.sort_by_key(|a| a.1.to_lowercase());
                 TypeGroup { type_name, entries }
             })
             .collect();
         // BTreeMap already sorts keys, but let's be explicit about case-insensitive sort.
-        groups.sort_by(|a, b| a.type_name.to_lowercase().cmp(&b.type_name.to_lowercase()));
+        groups.sort_by_key(|a| a.type_name.to_lowercase());
         groups
     }
 }

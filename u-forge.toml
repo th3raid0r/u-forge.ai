@@ -8,6 +8,10 @@ font_size = 16.0
 [storage]
 # Path to the SQLite database directory. Defaults to ./data/db if omitted.
 db_path = "./data/db"
+# Vector widths must match the configured embedding models. Existing databases
+# must be rebuilt or re-indexed before changing either value.
+embedding_dimensions = 768
+high_quality_embedding_dimensions = 4096
 
 [data]
 import_file = "./defaults/data/memory.jsonl"

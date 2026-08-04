@@ -59,6 +59,7 @@ pub fn mime_for_filename(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lemonade::{CatalogModel, LemonadeServerCatalog};
     use crate::test_helpers::require_integration_url;
 
     // ── WAV helper ────────────────────────────────────────────────────────────
@@ -178,17 +179,35 @@ mod tests {
 
     // ── Integration tests (require a running Lemonade Server) ─────────────────
 
-    #[tokio::test]
-    async fn test_lemonade_transcribe_silence_wav() {
-        let url = require_integration_url!();
-        let provider = LemonadeTranscriptionProvider::new(&url, "whisper-v3-turbo-FLM");
+    async fn discover_transcription_model(
+        url: &str,
+        recipe: &str,
+    ) -> Option<(LemonadeServerCatalog, CatalogModel)> {
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(url)
+            .await
+            .unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model.downloaded
+                    && model.recipe == recipe
+                    && model.labels.contains("transcription")
+                    && !model.labels.contains("tts")
+            })
+            .cloned();
+        model.map(|model| (catalog, model))
+    }
+
+    async fn assert_transcribes_silence(url: &str, model_id: &str) {
+        let provider = LemonadeTranscriptionProvider::new(url, model_id);
 
         // 1 second of silence — valid WAV, no speech content.
         let wav = make_silence_wav(1.0);
         let result = provider.transcribe(wav, "silence.wav").await;
         assert!(
             result.is_ok(),
-            "transcribe() failed on silence WAV: {:?}",
+            "transcribe() failed for {model_id} on silence WAV: {:?}",
             result.err()
         );
         // May be empty or contain hallucinated noise words — both are acceptable.
@@ -196,9 +215,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_lemonade_transcribe_silence_wav_flm() {
+        let url = require_integration_url!();
+        let Some((_catalog, model)) = discover_transcription_model(&url, "flm").await else {
+            eprintln!("SKIP: No downloaded FLM transcription model available in catalog");
+            return;
+        };
+
+        assert_transcribes_silence(&url, &model.id).await;
+    }
+
+    #[tokio::test]
+    async fn test_lemonade_transcribe_silence_wav_llamacpp() {
+        let url = require_integration_url!();
+        let Some((_catalog, model)) = discover_transcription_model(&url, "llamacpp").await else {
+            eprintln!("SKIP: No downloaded llamacpp transcription model available in catalog");
+            return;
+        };
+
+        assert_transcribes_silence(&url, &model.id).await;
+    }
+
+    #[tokio::test]
     async fn test_lemonade_transcribe_error_on_empty_body() {
         let url = require_integration_url!();
-        let provider = LemonadeTranscriptionProvider::new(&url, "whisper-v3-turbo-FLM");
+        let Some((_catalog, model)) = discover_transcription_model(&url, "flm").await else {
+            eprintln!("SKIP: No downloaded FLM transcription model available in catalog");
+            return;
+        };
+        let provider = LemonadeTranscriptionProvider::new(&url, &model.id);
 
         // Sending an empty byte slice — the server should return an error.
         let result = provider.transcribe(vec![], "empty.wav").await;

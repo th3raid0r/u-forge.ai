@@ -154,7 +154,10 @@ impl ObjectMetadata {
             if description.is_empty() {
                 obj.remove("description");
             } else {
-                obj.insert("description".to_string(), serde_json::Value::String(description));
+                obj.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description),
+                );
             }
         }
         self
@@ -304,10 +307,19 @@ pub enum ChunkType {
 impl TextChunk {
     pub fn new(object_id: ObjectId, content: String, chunk_type: ChunkType) -> Self {
         let token_count = crate::text::count_tokens(&content).max(1);
+        Self::with_token_count(object_id, content, chunk_type, token_count)
+    }
+
+    pub(crate) fn with_token_count(
+        object_id: ObjectId,
+        content: String,
+        chunk_type: ChunkType,
+        token_count: usize,
+    ) -> Self {
         Self {
             id: ChunkId::new_v4(),
             object_id,
-            token_count,
+            token_count: token_count.max(1),
             content,
             created_at: chrono::Utc::now(),
             chunk_type,
@@ -373,12 +385,18 @@ mod tests {
 
         assert_eq!(obj.name, "Gandalf");
         assert_eq!(obj.object_type, "character");
-        assert_eq!(obj.get_property("description"), Some("A wise wizard".to_string()));
+        assert_eq!(
+            obj.get_property("description"),
+            Some("A wise wizard".to_string())
+        );
         assert_eq!(obj.get_property("race"), Some("Maiar".to_string()));
 
         obj.add_tag("wizard".to_string());
         obj.add_tag("wizard".to_string()); // Should not duplicate
-        let tags = obj.get_json_property("tags").and_then(|v| v.as_array()).unwrap();
+        let tags = obj
+            .get_json_property("tags")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].as_str(), Some("wizard"));
     }

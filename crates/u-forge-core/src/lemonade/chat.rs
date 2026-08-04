@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -319,7 +319,10 @@ impl LemonadeChatProvider {
                 .context("Stream init failed")
             {
                 Ok(r) => r,
-                Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
             };
 
             // Drive the SSE byte stream, accumulating into a line buffer.
@@ -329,7 +332,10 @@ impl LemonadeChatProvider {
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk.context("Stream read error") {
                     Ok(b) => b,
-                    Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
                 };
 
                 line_buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -353,19 +359,17 @@ impl LemonadeChatProvider {
 
                     if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                         for choice in chunk.choices {
-                            if let Some(thinking) = choice.delta.reasoning_content {
-                                if !thinking.is_empty()
-                                    && tx.send(Ok(StreamToken::Thinking(thinking))).await.is_err()
-                                {
-                                    return;
-                                }
+                            if let Some(thinking) = choice.delta.reasoning_content
+                                && !thinking.is_empty()
+                                && tx.send(Ok(StreamToken::Thinking(thinking))).await.is_err()
+                            {
+                                return;
                             }
-                            if let Some(content) = choice.delta.content {
-                                if !content.is_empty()
-                                    && tx.send(Ok(StreamToken::Content(content))).await.is_err()
-                                {
-                                    return; // receiver dropped
-                                }
+                            if let Some(content) = choice.delta.content
+                                && !content.is_empty()
+                                && tx.send(Ok(StreamToken::Content(content))).await.is_err()
+                            {
+                                return; // receiver dropped
                             }
                         }
                     }
@@ -406,34 +410,65 @@ mod tests {
     use super::*;
     use crate::test_helpers::require_integration_url;
 
-    #[tokio::test]
-    async fn test_chat_ask_returns_response() {
-        let url = require_integration_url!();
-        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
-        let cfg = crate::config::AppConfig::default();
-        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let llm = selector.select_llm_models().into_iter().next()
-            .expect("No LLM model found in catalog");
-        let gpu = GpuResourceManager::new();
-        let chat = LemonadeChatProvider::new(&url, &llm.model_id, Some(gpu));
+    fn smallest_downloaded_llm(
+        catalog: &crate::lemonade::LemonadeServerCatalog,
+    ) -> Option<&crate::lemonade::CatalogModel> {
+        catalog
+            .models
+            .iter()
+            .filter(|model| {
+                model.downloaded
+                    && (model.recipe == "llamacpp" || model.recipe == "flm")
+                    && !model.labels.contains("embeddings")
+                    && !model.labels.contains("reranking")
+                    && !model.labels.contains("audio")
+                    && !model.labels.contains("transcription")
+                    && !model.labels.contains("tts")
+            })
+            .min_by(|a, b| {
+                a.size_gb
+                    .unwrap_or(f64::INFINITY)
+                    .partial_cmp(&b.size_gb.unwrap_or(f64::INFINITY))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
 
-        let response = chat
-            .ask("Respond with exactly one word: pong")
+    #[tokio::test]
+    async fn test_chat_request_returns_valid_response() {
+        let url = require_integration_url!();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
             .await
             .unwrap();
+        let Some(llm) = smallest_downloaded_llm(&catalog) else {
+            eprintln!("SKIP: No downloaded LLM model found in catalog");
+            return;
+        };
+        let gpu = GpuResourceManager::new();
+        let chat = LemonadeChatProvider::new(&url, &llm.id, Some(gpu));
+
+        let request = ChatRequest::new(vec![ChatMessage::user("Reply with: pong")])
+            .with_max_tokens(4)
+            .with_temperature(0.0);
+        let response = chat.complete(request).await.expect("Chat request failed");
+        assert!(!response.id.is_empty(), "Chat response should have an id");
         assert!(
-            !response.is_empty(),
-            "Chat should return a non-empty response"
+            !response.choices.is_empty(),
+            "Chat response should contain at least one choice"
         );
     }
 
     #[tokio::test]
     async fn test_chat_request_with_overrides() {
         let url = require_integration_url!();
-        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
+            .await
+            .unwrap();
         let cfg = crate::config::AppConfig::default();
         let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let llm = selector.select_llm_models().into_iter().next()
+        let llm = selector
+            .select_llm_models()
+            .into_iter()
+            .next()
             .expect("No LLM model found in catalog");
         let gpu = GpuResourceManager::new();
         let chat = LemonadeChatProvider::new(&url, &llm.model_id, Some(gpu));

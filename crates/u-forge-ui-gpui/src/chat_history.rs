@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -144,9 +144,8 @@ impl ChatHistoryStore {
     /// List all sessions, most-recently-updated first.
     pub fn list_sessions(&self) -> Result<Vec<ChatSessionSummary>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, updated_at FROM chat_sessions ORDER BY updated_at DESC",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT id, title, updated_at FROM chat_sessions ORDER BY updated_at DESC")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(ChatSessionSummary {

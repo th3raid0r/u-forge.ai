@@ -1,6 +1,6 @@
 use cosmic_text::{
-    fontdb, Align, Attrs, AttrsList, BidiParagraphs, Buffer, Family, FontSystem, LayoutLine,
-    Metrics, ShapeLine, Shaping, Weight, Wrap,
+    Align, Attrs, AttrsList, BidiParagraphs, Buffer, Family, FontSystem, LayoutLine, Metrics,
+    ShapeLine, Shaping, Weight, Wrap, fontdb,
 };
 
 // Test for https://github.com/pop-os/cosmic-text/issues/134

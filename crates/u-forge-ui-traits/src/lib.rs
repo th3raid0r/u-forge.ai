@@ -126,11 +126,9 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 /// palette (~75 % / 76 %), so every color looks at home on the dark background.
 pub fn node_color_for_type(object_type: &str) -> [u8; 4] {
     // FNV-1a hash of the type name — fast and well-distributed.
-    let hash = object_type
-        .bytes()
-        .fold(2_166_136_261_u32, |acc, b| {
-            acc.wrapping_mul(16_777_619).wrapping_add(b as u32)
-        });
+    let hash = object_type.bytes().fold(2_166_136_261_u32, |acc, b| {
+        acc.wrapping_mul(16_777_619).wrapping_add(b as u32)
+    });
     // Golden-angle scatter: multiply by φ fractional part, wrap to [0, 1).
     let hue = ((hash as f64 * 0.618_033_988_749_895).fract() * 360.0) as f32;
     let (r, g, b) = hsl_to_rgb(hue, 0.75, 0.76);
@@ -199,7 +197,11 @@ pub fn generate_draw_commands(
     }
 
     // Nodes — squircle shape is handled by the renderer; here we emit circle primitives.
-    let radius = if lod == LodLevel::Dot { DOT_RADIUS } else { NODE_RADIUS };
+    let radius = if lod == LodLevel::Dot {
+        DOT_RADIUS
+    } else {
+        NODE_RADIUS
+    };
     // Screen radius used to gate text visibility.
     let screen_radius = NODE_RADIUS * viewport.zoom;
 
@@ -231,7 +233,11 @@ pub fn generate_draw_commands(
             let max_chars = ((screen_radius * 2.0 * 0.8) / (font_size * 0.55)) as usize;
             let max_chars = max_chars.max(2);
             let display_name = if node.name.chars().count() > max_chars {
-                let mut s: String = node.name.chars().take(max_chars.saturating_sub(1)).collect();
+                let mut s: String = node
+                    .name
+                    .chars()
+                    .take(max_chars.saturating_sub(1))
+                    .collect();
                 s.push('…');
                 s
             } else {

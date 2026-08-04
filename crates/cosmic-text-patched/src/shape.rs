@@ -14,8 +14,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::fallback::FontFallbackIter;
 use crate::{
-    math, Align, AttrsList, CacheKeyFlags, Color, Font, FontSystem, LayoutGlyph, LayoutLine,
-    Metrics, Wrap,
+    Align, AttrsList, CacheKeyFlags, Color, Font, FontSystem, LayoutGlyph, LayoutLine, Metrics,
+    Wrap, math,
 };
 
 /// The shaping strategy of some text.
@@ -86,7 +86,12 @@ pub struct ShapeBuffer {
     /// Cache of compiled rustybuzz ShapePlans, keyed by (font face ID, direction, script).
     /// Creating a ShapePlan requires parsing OpenType layout tables, which is
     /// expensive (~5 ms). Caching avoids recompiling on every cold-cache miss.
-    shape_plan_cache: VecDeque<(fontdb::ID, rustybuzz::Direction, rustybuzz::Script, rustybuzz::ShapePlan)>,
+    shape_plan_cache: VecDeque<(
+        fontdb::ID,
+        rustybuzz::Direction,
+        rustybuzz::Script,
+        rustybuzz::ShapePlan,
+    )>,
 
     /// Buffer for holding unicode text.
     rustybuzz_buffer: Option<rustybuzz::UnicodeBuffer>,
@@ -180,7 +185,9 @@ fn shape_fallback(
         if scratch.shape_plan_cache.len() >= NUM_SHAPE_PLANS {
             scratch.shape_plan_cache.pop_front();
         }
-        scratch.shape_plan_cache.push_back((font_id, direction, script, plan));
+        scratch
+            .shape_plan_cache
+            .push_back((font_id, direction, script, plan));
     }
     let shape_plan = &scratch
         .shape_plan_cache
@@ -1474,13 +1481,7 @@ impl ShapeLine {
         }
 
         // Create the LayoutLines using the ranges inside visual lines
-        let align = align.unwrap_or({
-            if self.rtl {
-                Align::Right
-            } else {
-                Align::Left
-            }
-        });
+        let align = align.unwrap_or({ if self.rtl { Align::Right } else { Align::Left } });
 
         let line_width = match width_opt {
             Some(width) => width,
@@ -1582,7 +1583,9 @@ impl ShapeLine {
                                         .max(1.0)
                                         / glyph_to_match_factor
                                         * font_size;
-                                    log::trace!("Adjusted glyph font size ({font_size} => {glyph_font_size})");
+                                    log::trace!(
+                                        "Adjusted glyph font size ({font_size} => {glyph_font_size})"
+                                    );
                                     glyph_font_size
                                 }
                                 _ => font_size,

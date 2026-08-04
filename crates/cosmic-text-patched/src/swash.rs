@@ -3,8 +3,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::fmt;
-use swash::scale::{image::Content, ScaleContext};
 use swash::scale::{Render, Source, StrikeWith};
+use swash::scale::{ScaleContext, image::Content};
 use swash::zeno::{Format, Vector};
 
 use crate::{CacheKey, CacheKeyFlags, Color, FontSystem, HashMap};

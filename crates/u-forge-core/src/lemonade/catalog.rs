@@ -196,9 +196,9 @@ impl LemonadeServerCatalog {
     /// Returns `true` if any installed backend targets an NPU device
     /// (`"amd_npu"`).
     pub fn has_npu(&self) -> bool {
-        self.backends.iter().any(|b| {
-            b.state == "installed" && b.devices.iter().any(|d| d == "amd_npu")
-        })
+        self.backends
+            .iter()
+            .any(|b| b.state == "installed" && b.devices.iter().any(|d| d == "amd_npu"))
     }
 
     /// Returns `true` if any installed backend targets an integrated GPU
@@ -206,7 +206,9 @@ impl LemonadeServerCatalog {
     pub fn has_gpu(&self) -> bool {
         self.backends.iter().any(|b| {
             b.state == "installed"
-                && b.devices.iter().any(|d| d == "amd_igpu" || d.contains("gpu"))
+                && b.devices
+                    .iter()
+                    .any(|d| d == "amd_igpu" || d.contains("gpu"))
         })
     }
 
@@ -238,9 +240,7 @@ impl LemonadeServerCatalog {
     ///
     /// The system-info endpoint does not use the Bearer token, so a plain
     /// `reqwest::Client` is used here (same approach as `SystemInfo::fetch`).
-    async fn fetch_system_info(
-        base_url: &str,
-    ) -> Result<(Vec<InstalledBackend>, String, f64)> {
+    async fn fetch_system_info(base_url: &str) -> Result<(Vec<InstalledBackend>, String, f64)> {
         let url = format!("{base_url}/system-info");
         let raw: serde_json::Value = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -340,7 +340,10 @@ mod tests {
         }
     }
 
-    fn empty_catalog(models: Vec<CatalogModel>, backends: Vec<InstalledBackend>) -> LemonadeServerCatalog {
+    fn empty_catalog(
+        models: Vec<CatalogModel>,
+        backends: Vec<InstalledBackend>,
+    ) -> LemonadeServerCatalog {
         LemonadeServerCatalog {
             base_url: String::new(),
             models,
@@ -422,10 +425,7 @@ mod tests {
 
     #[test]
     fn test_has_gpu_derives_from_backends() {
-        let with_gpu = empty_catalog(
-            vec![],
-            vec![installed("llamacpp", "rocm", &["amd_igpu"])],
-        );
+        let with_gpu = empty_catalog(vec![], vec![installed("llamacpp", "rocm", &["amd_igpu"])]);
         assert!(with_gpu.has_gpu());
         assert!(!with_gpu.has_npu());
 
@@ -461,13 +461,25 @@ mod tests {
         let url = require_integration_url!();
         let catalog = LemonadeServerCatalog::discover(&url).await.unwrap();
 
-        assert!(!catalog.models.is_empty(), "Catalog must contain at least one model");
+        assert!(
+            !catalog.models.is_empty(),
+            "Catalog must contain at least one model"
+        );
 
         let downloaded: Vec<_> = catalog.models.iter().filter(|m| m.downloaded).collect();
-        assert!(!downloaded.is_empty(), "At least one model should be downloaded");
+        assert!(
+            !downloaded.is_empty(),
+            "At least one model should be downloaded"
+        );
 
-        assert!(!catalog.processor.is_empty(), "Processor string should be non-empty");
+        assert!(
+            !catalog.processor.is_empty(),
+            "Processor string should be non-empty"
+        );
         assert!(catalog.memory_gb > 0.0, "Memory should be > 0 GB");
-        assert!(!catalog.backends.is_empty(), "At least one backend should be present");
+        assert!(
+            !catalog.backends.is_empty(),
+            "At least one backend should be present"
+        );
     }
 }

@@ -54,6 +54,11 @@ export RUST_LOG=u_forge_core::graph::storage=debug,u_forge_core::ai::embeddings=
 `KnowledgeGraph::new(db_path)` opens (or creates) a SQLite database at
 `<db_path>/knowledge.db`. The directory is created automatically.
 
+`[storage].embedding_dimensions` and
+`[storage].high_quality_embedding_dimensions` configure the two sqlite-vec
+lanes (defaults: 768 and 4096). Dimensions are persisted in database metadata;
+changing either value requires rebuilding the database.
+
 The desktop app uses a persistent database. Set `UFORGE_DATA_FILE` /
 `UFORGE_SCHEMA_DIR` to customise import sources.
 
@@ -129,6 +134,6 @@ possible, not ergonomic preference.
 | `Lemonade Server not available` | Run `lemonade-server serve` — `localhost:13305` is auto-discovered |
 | `lemonade-server pull` fails | Check disk space; retry; verify network access |
 | Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
-| Dimension mismatch | Ensure embedding model matches vector column dimensions (768 vs 4096) |
+| Dimension mismatch | Ensure each embedding model matches its configured vector lane; rebuild the database after changing dimensions |
 | Whisper not loaded in RAM | First transcription call triggers load; subsequent calls are fast. `GET /api/v1/health` shows loaded models |
 | Transcription error: "Could not open audio data" | Audio bytes empty or not a valid WAV/MP3/OGG |

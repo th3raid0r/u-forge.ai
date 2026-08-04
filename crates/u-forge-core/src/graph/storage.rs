@@ -17,16 +17,17 @@ use crate::error::EmbeddingDimensionMismatch;
 use crate::schema::SchemaDefinition;
 use crate::types::{ChunkType, ObjectId, ObjectMetadata};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
 use parking_lot::Mutex;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::Path;
 use std::sync::{Arc, Once};
 use tracing::warn;
 
-
 // ─── SQL schema ───────────────────────────────────────────────────────────────
 
-pub(super) const SQL_SCHEMA: &str = r#"
+fn sql_schema(embedding_dimensions: usize, high_quality_embedding_dimensions: usize) -> String {
+    format!(
+        r#"
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
@@ -35,7 +36,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     object_type TEXT NOT NULL,
     schema_name TEXT,
     name        TEXT NOT NULL,
-    properties  TEXT NOT NULL DEFAULT '{}',
+    properties  TEXT NOT NULL DEFAULT '{{}}',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -45,7 +46,7 @@ CREATE TABLE IF NOT EXISTS edges (
     target_id  TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     edge_type  TEXT NOT NULL,
     weight     REAL NOT NULL DEFAULT 1.0,
-    metadata   TEXT NOT NULL DEFAULT '{}',
+    metadata   TEXT NOT NULL DEFAULT '{{}}',
     created_at TEXT NOT NULL,
     UNIQUE(source_id, target_id, edge_type)
 );
@@ -89,11 +90,11 @@ CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
 END;
 
 -- ── ANN vector search (sqlite-vec) ────────────────────────────────────────────
--- Each row maps a chunk rowid → its 256-dim embedding (cosine distance).
+-- Each row maps a chunk rowid → its configured-dim embedding (cosine distance).
 -- Rows are inserted explicitly via upsert_chunk_embedding(); not every chunk
 -- has a vector immediately after creation (embeddings are populated async).
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-    embedding float[768] distance_metric=cosine
+    embedding float[{embedding_dimensions}] distance_metric=cosine
 );
 
 -- Keep chunks_vec clean when a chunk is hard-deleted (via cascade or directly).
@@ -112,10 +113,10 @@ CREATE TABLE IF NOT EXISTS node_positions (
 );
 
 -- ── High-quality ANN vector search (sqlite-vec) ─────────────────────────────
--- 4096-dim index for high-quality embedding models (e.g. Qwen3-Embedding-8B-GGUF).
+-- Configured high-quality index for embedding models (e.g. Qwen3-Embedding-8B-GGUF).
 -- Populated only when high_quality_embedding is enabled in config.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec_hq USING vec0(
-    embedding float[4096] distance_metric=cosine
+    embedding float[{high_quality_embedding_dimensions}] distance_metric=cosine
 );
 
 CREATE TRIGGER IF NOT EXISTS chunks_vec_hq_ad AFTER DELETE ON chunks BEGIN
@@ -125,23 +126,23 @@ END;
 -- ── Embedding schema metadata ─────────────────────────────────────────────────
 -- Records the dimensionality baked into each vec0 virtual table at creation
 -- time.  On open, KnowledgeGraphStorage compares these stored values against
--- the compile-time constants and returns EmbeddingDimensionMismatch if they
+-- the configured dimensions and returns EmbeddingDimensionMismatch if they
 -- diverge — making a model-change failure loud rather than silently corrupt.
 CREATE TABLE IF NOT EXISTS schema_metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-"#;
+"#
+    )
+}
 
 // ─── Constants & process-level init ───────────────────────────────────────────
 
 /// Number of dimensions produced by the active embedding model.
 ///
-/// Must match the `float[N]` declaration in the `chunks_vec` `vec0` virtual
-/// table above.  Currently set for `embed-gemma-300m-FLM` (768-dim).
-///
-/// **If you switch embedding models**, update this constant *and* recreate the
-/// database — `vec0` virtual tables cannot be `ALTER`ed after creation.
+/// This is the default `chunks_vec` width used by [`KnowledgeGraphStorage::new`].
+/// `StorageConfig` can override the value for callers that open storage through
+/// [`KnowledgeGraph::with_storage_config`](crate::KnowledgeGraph::with_storage_config).
 pub const EMBEDDING_DIMENSIONS: usize = 768;
 
 /// Default context window size (in tokens) assumed for the active embedding model.
@@ -167,9 +168,8 @@ pub const MAX_CHUNK_TOKENS: usize = DEFAULT_EMBEDDING_CONTEXT_TOKENS / 2;
 /// Number of dimensions produced by high-quality embedding models
 /// (e.g. `Qwen3-Embedding-8B-GGUF`).
 ///
-/// Must match the `float[N]` declaration in the `chunks_vec_hq` `vec0`
-/// virtual table.  Stored alongside — not replacing — the standard
-/// [`EMBEDDING_DIMENSIONS`] index.
+/// This is the default `chunks_vec_hq` width. Stored alongside — not replacing —
+/// the standard [`EMBEDDING_DIMENSIONS`] index.
 pub const HIGH_QUALITY_EMBEDDING_DIMENSIONS: usize = 4096;
 
 /// Guards the one-time sqlite-vec auto-extension registration.
@@ -188,6 +188,8 @@ pub(super) static SQLITE_VEC_INIT: Once = Once::new();
 /// the struct is cheaply cloneable and safe to share across threads.
 pub struct KnowledgeGraphStorage {
     pub(super) conn: Arc<Mutex<Connection>>,
+    pub(super) embedding_dimensions: usize,
+    pub(super) high_quality_embedding_dimensions: usize,
 }
 
 /// Aggregate statistics about the knowledge graph.
@@ -197,7 +199,7 @@ pub struct GraphStats {
     pub edge_count: usize,
     pub chunk_count: usize,
     pub total_tokens: usize,
-    /// Number of chunks with a stored 768-dim embedding in `chunks_vec`.
+    /// Number of chunks with a stored standard embedding in `chunks_vec`.
     pub embedded_count: usize,
     /// Number of chunks with a stored high-quality embedding in `chunks_vec_hq`.
     pub embedded_hq_count: usize,
@@ -274,10 +276,7 @@ pub(super) fn row_to_metadata(
 /// * If no record exists → insert `expected_dims` (first open after schema creation).
 /// * If a record exists and matches → OK.
 /// * If a record exists but differs → return [`EmbeddingDimensionMismatch`].
-fn check_or_init_embedding_dims(
-    conn: &Connection,
-    checks: &[(&str, usize)],
-) -> Result<()> {
+fn check_or_init_embedding_dims(conn: &Connection, checks: &[(&str, usize)]) -> Result<()> {
     for &(table, expected) in checks {
         let key = format!("{table}_dims");
         let stored: Option<String> = conn
@@ -327,6 +326,23 @@ impl KnowledgeGraphStorage {
     /// virtual table, and triggers) is applied on every open via
     /// `CREATE … IF NOT EXISTS`, so this method is idempotent.
     pub fn new(db_path: &Path) -> Result<Self> {
+        Self::new_with_embedding_dimensions(
+            db_path,
+            EMBEDDING_DIMENSIONS,
+            HIGH_QUALITY_EMBEDDING_DIMENSIONS,
+        )
+    }
+
+    /// Open (or create) a database using explicit retrieval embedding widths.
+    ///
+    /// The dimensions are recorded in `schema_metadata` on first open and
+    /// checked on later opens so a model change cannot silently query the
+    /// wrong vector table layout.
+    pub fn new_with_embedding_dimensions(
+        db_path: &Path,
+        embedding_dimensions: usize,
+        high_quality_embedding_dimensions: usize,
+    ) -> Result<Self> {
         std::fs::create_dir_all(db_path).context("Failed to create database directory")?;
 
         // Register sqlite-vec as a process-wide SQLite auto-extension so that
@@ -354,8 +370,11 @@ impl KnowledgeGraphStorage {
         // Apply WAL mode, FK enforcement, DDL, indexes, FTS triggers, and the
         // chunks_vec vec0 virtual table in one batch.  `execute_batch` uses
         // sqlite3_exec internally and ignores result rows from PRAGMA statements.
-        conn.execute_batch(SQL_SCHEMA)
-            .context("Failed to initialise database schema")?;
+        conn.execute_batch(&sql_schema(
+            embedding_dimensions,
+            high_quality_embedding_dimensions,
+        ))
+        .context("Failed to initialise database schema")?;
 
         // Verify (or record) the embedding dimensions baked into each vec0 table.
         // Returns EmbeddingDimensionMismatch if the model was changed without
@@ -363,13 +382,15 @@ impl KnowledgeGraphStorage {
         check_or_init_embedding_dims(
             &conn,
             &[
-                ("chunks_vec", EMBEDDING_DIMENSIONS),
-                ("chunks_vec_hq", HIGH_QUALITY_EMBEDDING_DIMENSIONS),
+                ("chunks_vec", embedding_dimensions),
+                ("chunks_vec_hq", high_quality_embedding_dimensions),
             ],
         )?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            embedding_dimensions,
+            high_quality_embedding_dimensions,
         })
     }
 
@@ -556,10 +577,12 @@ mod tests {
         assert_eq!(any_type[0].id, node_id);
 
         // Wrong type should produce no results.
-        assert!(storage
-            .find_nodes_by_name("location", "Gandalf")
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage
+                .find_nodes_by_name("location", "Gandalf")
+                .unwrap()
+                .is_empty()
+        );
 
         // Unknown ID returns None.
         assert!(storage.get_node(ObjectId::new_v4()).unwrap().is_none());
@@ -1176,18 +1199,10 @@ mod tests {
             .upsert_edge(Edge::new(id_a, id_b, EdgeType::new("knows")))
             .unwrap();
         storage
-            .upsert_edge(Edge::new(
-                id_b,
-                id_c,
-                EdgeType::new("trusts"),
-            ))
+            .upsert_edge(Edge::new(id_b, id_c, EdgeType::new("trusts")))
             .unwrap();
         storage
-            .upsert_edge(Edge::new(
-                id_a,
-                id_c,
-                EdgeType::new("opposes"),
-            ))
+            .upsert_edge(Edge::new(id_a, id_c, EdgeType::new("opposes")))
             .unwrap();
 
         // Bulk fetch.
@@ -1278,6 +1293,30 @@ mod tests {
     }
 
     #[test]
+    fn test_open_records_configured_dims_in_schema_metadata() {
+        let dir = TempDir::new().unwrap();
+        let storage =
+            KnowledgeGraphStorage::new_with_embedding_dimensions(dir.path(), 16, 32).unwrap();
+        let conn = storage.conn.lock();
+        let std_dims: String = conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'chunks_vec_dims'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("chunks_vec_dims must be recorded");
+        let hq_dims: String = conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'chunks_vec_hq_dims'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("chunks_vec_hq_dims must be recorded");
+        assert_eq!(std_dims, "16");
+        assert_eq!(hq_dims, "32");
+    }
+
+    #[test]
     fn test_open_with_mismatched_dims_returns_error() {
         let dir = TempDir::new().unwrap();
         // First open: initialise with real constants.
@@ -1308,5 +1347,22 @@ mod tests {
             err.downcast_ref::<EmbeddingDimensionMismatch>().is_some(),
             "error must be EmbeddingDimensionMismatch"
         );
+    }
+
+    #[test]
+    fn test_open_with_changed_configured_dims_returns_error() {
+        let dir = TempDir::new().unwrap();
+        KnowledgeGraphStorage::new_with_embedding_dimensions(dir.path(), 16, 32)
+            .expect("first open must succeed");
+
+        let result = KnowledgeGraphStorage::new_with_embedding_dimensions(dir.path(), 24, 32);
+        assert!(result.is_err(), "changed standard dims must fail");
+        let err = result.err().unwrap();
+        let mismatch = err
+            .downcast_ref::<EmbeddingDimensionMismatch>()
+            .expect("error must be EmbeddingDimensionMismatch");
+        assert_eq!(mismatch.table, "chunks_vec");
+        assert_eq!(mismatch.stored, 16);
+        assert_eq!(mismatch.expected, 24);
     }
 }

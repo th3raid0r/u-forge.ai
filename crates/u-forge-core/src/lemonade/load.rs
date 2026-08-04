@@ -55,10 +55,10 @@ fn build_llamacpp_args(opts: &ModelLoadOptions) -> Option<String> {
         }
     }
 
-    if !base.contains("--batch-size") {
-        if let Some(batch) = opts.batch_size {
-            injections.push(format!("--batch-size {batch}"));
-        }
+    if !base.contains("--batch-size")
+        && let Some(batch) = opts.batch_size
+    {
+        injections.push(format!("--batch-size {batch}"));
     }
 
     if injections.is_empty() {
@@ -167,7 +167,10 @@ pub async fn load_model(
     already_loaded: &[String],
 ) -> Result<()> {
     if already_loaded.iter().any(|id| id == model_name) {
-        tracing::debug!(model = model_name, "Model already loaded — skipping load call");
+        tracing::debug!(
+            model = model_name,
+            "Model already loaded — skipping load call"
+        );
         return Ok(());
     }
 
@@ -175,16 +178,16 @@ pub async fn load_model(
 
     // FLM (NPU) models do not use llama-server and will reject llamacpp params.
     let flm = is_flm_model(model_name);
-    let effective_args: Option<String> = if flm {
-        None
-    } else {
-        build_llamacpp_args(opts)
-    };
+    let effective_args: Option<String> = if flm { None } else { build_llamacpp_args(opts) };
 
     let body = LoadRequest {
         model_name,
         ctx_size: opts.ctx_size,
-        llamacpp_backend: if flm { None } else { opts.llamacpp_backend.as_deref() },
+        llamacpp_backend: if flm {
+            None
+        } else {
+            opts.llamacpp_backend.as_deref()
+        },
         llamacpp_args: effective_args.as_deref(),
     };
 
@@ -296,7 +299,10 @@ mod tests {
             ..Default::default()
         };
         let args = build_llamacpp_args(&opts).unwrap();
-        assert!(args.contains("--ubatch-size 8192"), "ubatch not found: {args}");
+        assert!(
+            args.contains("--ubatch-size 8192"),
+            "ubatch not found: {args}"
+        );
         assert!(args.contains("--batch-size 512"), "batch not found: {args}");
     }
 

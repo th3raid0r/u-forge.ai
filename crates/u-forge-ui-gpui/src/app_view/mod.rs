@@ -3,24 +3,24 @@ mod state;
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
-use gpui::{prelude::*, Context, Empty, Entity, Subscription};
-use tracing::Instrument;
+use gpui::{Context, Empty, Entity, Subscription, prelude::*};
 use parking_lot::RwLock;
+use tracing::Instrument;
 use u_forge_agent::{AgentParams, GraphAgent};
 use u_forge_core::{
+    AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, KnowledgeGraph, ObjectMetadata,
+    SchemaManager,
     ingest::build_hq_embed_queue,
     lemonade::{
-        resolve_lemonade_url, Capability, GpuResourceManager, LemonadeServerCatalog, ModelSelector,
-        ProviderFactory, QualityTier,
+        Capability, GpuResourceManager, LemonadeServerCatalog, ModelSelector, ProviderFactory,
+        QualityTier, resolve_lemonade_url,
     },
     queue::InferenceQueueBuilder,
     types::ObjectId,
-    AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, KnowledgeGraph, ObjectMetadata,
-    SchemaManager,
 };
 use u_forge_graph_view::GraphSnapshot;
 
@@ -29,12 +29,12 @@ use state::AppState;
 use crate::chat_panel::{AvailableModel, ChatPanel, ConnectRequested};
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
+use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
 use crate::path_picker::{
     PathCancelled, PathConfirmed, PathPickerKind, PathPickerModal, PickerMode,
 };
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
-use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -310,6 +310,7 @@ impl AppView {
     /// single-mutation events (e.g. agent `UpsertNodeTool`) apply R-tree and
     /// legend deltas in O(delta × log N) instead of rebuilding from scratch.
     pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
+        let snapshot_start = std::time::Instant::now();
         let result = {
             let prev = self.state.snapshot.read();
             if prev.nodes.is_empty() && prev.edges.is_empty() {
@@ -320,6 +321,13 @@ impl AppView {
         };
         match result {
             Ok(snap) => {
+                let duration_ms = snapshot_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    nodes = snap.nodes.len(),
+                    edges = snap.edges.len(),
+                    duration_ms,
+                    "Graph snapshot refreshed"
+                );
                 *self.state.snapshot.write() = snap;
                 self.node_panel
                     .update(cx, |panel, cx| panel.refresh_groups(cx));
@@ -359,27 +367,87 @@ impl AppView {
     }
 
     pub(crate) fn do_import_data(&mut self, cx: &mut Context<Self>) {
+        if !self.state.schema_loaded {
+            self.state.data_status = Some("Import schema before importing data.".to_string());
+            tracing::info!(
+                ui_action = "import_data",
+                phase = "blocked_no_schema",
+                "UI action blocked"
+            );
+            cx.notify();
+            return;
+        }
+
         let graph = self.state.graph.clone();
         let data_file = self.state.data_file.clone();
+        tracing::info!(
+            ui_action = "import_data",
+            phase = "clicked",
+            data_file = %data_file.display(),
+            "UI action started"
+        );
 
         self.state.data_status = Some("Importing…".to_string());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result = u_forge_core::ingest::import_data_only(
-                &graph,
-                data_file.to_str().unwrap_or(""),
-            )
-            .await;
+            let import_start = std::time::Instant::now();
+            let result = u_forge_core::ingest::import_data_only(&graph, &data_file).await;
+            let import_duration_ms = import_start.elapsed().as_millis() as u64;
+            tracing::info!(
+                ui_action = "import_data",
+                phase = "core_import_finished",
+                duration_ms = import_duration_ms,
+                success = result.is_ok(),
+                "UI action phase finished"
+            );
 
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
                     Ok(stats) => {
+                        let reused = if stats.objects_reused > 0 {
+                            format!(", {} nodes reused", stats.objects_reused)
+                        } else {
+                            String::new()
+                        };
+                        let dropped = if stats.dropped_properties > 0 {
+                            format!(", {} fields dropped", stats.dropped_properties)
+                        } else {
+                            String::new()
+                        };
+                        let skipped_nodes = if stats.object_records_skipped > 0 {
+                            format!(", {} nodes skipped", stats.object_records_skipped)
+                        } else {
+                            String::new()
+                        };
+                        let skipped_edges = if stats.edge_records_skipped > 0 {
+                            format!(", {} edges skipped", stats.edge_records_skipped)
+                        } else {
+                            String::new()
+                        };
+                        let diagnostics = stats
+                            .diagnostics_path
+                            .as_ref()
+                            .map(|path| format!(", diagnostics: {}", path.display()))
+                            .unwrap_or_default();
                         view.state.data_status = Some(format!(
-                            "Import done — {} nodes, {} edges",
-                            stats.objects_created, stats.relationships_created
+                            "Import done — {} nodes, {} edges{}{}{}{}{}",
+                            stats.objects_created,
+                            stats.relationships_created,
+                            reused,
+                            dropped,
+                            skipped_nodes,
+                            skipped_edges,
+                            diagnostics
                         ));
+                        let snapshot_start = std::time::Instant::now();
                         view.refresh_snapshot(cx);
+                        tracing::info!(
+                            ui_action = "import_data",
+                            phase = "snapshot_finished",
+                            duration_ms = snapshot_start.elapsed().as_millis() as u64,
+                            "UI action phase finished"
+                        );
                         // Trigger embedding after successful import.
                         view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
                     }
@@ -394,14 +462,36 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn do_import_data_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+    pub(crate) fn do_import_data_picker(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
         let initial = self.state.data_file.to_string_lossy().into_owned();
-        self.open_path_picker(PathPickerKind::DataFile, PickerMode::File, "Import Data", "Import Data", &initial, window, cx);
+        self.open_path_picker(
+            PathPickerKind::DataFile,
+            PickerMode::File,
+            "Import Data",
+            &initial,
+            window,
+            cx,
+        );
     }
 
-    pub(crate) fn do_import_schema_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+    pub(crate) fn do_import_schema_picker(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
         let initial = self.state.schema_dir.to_string_lossy().into_owned();
-        self.open_path_picker(PathPickerKind::SchemaDir, PickerMode::Directory, "Import Schema", "Import Schema", &initial, window, cx);
+        self.open_path_picker(
+            PathPickerKind::SchemaDir,
+            PickerMode::Directory,
+            "Import Schema",
+            &initial,
+            window,
+            cx,
+        );
     }
 
     fn open_path_picker(
@@ -409,49 +499,42 @@ impl AppView {
         kind: PathPickerKind,
         mode: PickerMode,
         title: &str,
-        confirm_label: &str,
         initial_path: &str,
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        let modal = cx.new(|cx| PathPickerModal::new(mode, title, confirm_label, initial_path, cx));
+        let modal = cx.new(|cx| PathPickerModal::new(mode, title, title, initial_path, cx));
 
-        let confirm_sub = cx.subscribe(
-            &modal,
-            |this, _modal, event: &PathConfirmed, cx| {
-                let path = event.0.clone();
-                match this.path_picker.as_ref().map(|(k, _)| k) {
-                    Some(PathPickerKind::DataFile) => {
-                        this.state.data_file = path;
-                        this.path_picker = None;
-                        this._path_picker_subs.clear();
-                        this.do_import_data(cx);
-                    }
-                    Some(PathPickerKind::SchemaDir) => {
-                        this.state.schema_dir = path.clone();
-                        this.path_picker = None;
-                        this._path_picker_subs.clear();
-                        this.do_reload_schemas_from(path, cx);
-                    }
-                    Some(PathPickerKind::ExportDir) => {
-                        this.path_picker = None;
-                        this._path_picker_subs.clear();
-                        this.do_run_export(path, cx);
-                    }
-                    None => {}
+        let confirm_sub = cx.subscribe(&modal, |this, _modal, event: &PathConfirmed, cx| {
+            let path = event.0.clone();
+            match this.path_picker.as_ref().map(|(k, _)| k) {
+                Some(PathPickerKind::DataFile) => {
+                    this.state.data_file = path;
+                    this.path_picker = None;
+                    this._path_picker_subs.clear();
+                    this.do_import_data(cx);
                 }
-                cx.notify();
-            },
-        );
+                Some(PathPickerKind::SchemaDir) => {
+                    this.state.schema_dir = path.clone();
+                    this.path_picker = None;
+                    this._path_picker_subs.clear();
+                    this.do_reload_schemas_from(path, cx);
+                }
+                Some(PathPickerKind::ExportDir) => {
+                    this.path_picker = None;
+                    this._path_picker_subs.clear();
+                    this.do_run_export(path, cx);
+                }
+                None => {}
+            }
+            cx.notify();
+        });
 
-        let cancel_sub = cx.subscribe(
-            &modal,
-            |this, _modal, _: &PathCancelled, cx| {
-                this.path_picker = None;
-                this._path_picker_subs.clear();
-                cx.notify();
-            },
-        );
+        let cancel_sub = cx.subscribe(&modal, |this, _modal, _: &PathCancelled, cx| {
+            this.path_picker = None;
+            this._path_picker_subs.clear();
+            cx.notify();
+        });
 
         // Focus the text field so the user can start typing immediately.
         window.focus(&modal.read(cx).path_field.read(cx).focus);
@@ -467,36 +550,83 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let graph = self.state.graph.clone();
+        tracing::info!(
+            ui_action = "import_schema",
+            phase = "clicked",
+            schema_dir = %dir.display(),
+            "UI action started"
+        );
         self.state.data_status = Some("Loading schemas…".to_string());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            let total_start = std::time::Instant::now();
+            let load_start = std::time::Instant::now();
             match u_forge_core::SchemaIngestion::load_schemas_from_directory(
                 &dir,
                 "imported_schemas",
                 "1.0.0",
             ) {
                 Ok(schema_def) => {
+                    tracing::info!(
+                        ui_action = "import_schema",
+                        phase = "schema_files_loaded",
+                        duration_ms = load_start.elapsed().as_millis() as u64,
+                        object_types = schema_def.object_types.len(),
+                        edge_types = schema_def.edge_types.len(),
+                        "UI action phase finished"
+                    );
                     let mgr = graph.get_schema_manager();
-                    let result = mgr.save_schema(&schema_def).await;
+                    let save_start = std::time::Instant::now();
+                    // Remove the built-in placeholder before saving the imported schema set.
                     let _ = mgr.delete_schema("default");
+                    let result = mgr.save_schema(&schema_def).await;
+                    tracing::info!(
+                        ui_action = "import_schema",
+                        phase = "schema_saved",
+                        duration_ms = save_start.elapsed().as_millis() as u64,
+                        success = result.is_ok(),
+                        "UI action phase finished"
+                    );
                     this.update(cx, |view, cx| {
                         match result {
                             Ok(_) => {
                                 view.state.schema_loaded = true;
-                                view.state.data_status = Some("Schema directory loaded".to_string());
+                                view.state.data_status =
+                                    Some("Schema directory loaded".to_string());
                             }
                             Err(e) => {
                                 view.state.data_status = Some(format!("Schema load failed: {e}"));
                             }
                         }
+                        tracing::info!(
+                            ui_action = "import_schema",
+                            phase = "finished",
+                            duration_ms = total_start.elapsed().as_millis() as u64,
+                            success = view.state.schema_loaded,
+                            "UI action finished"
+                        );
                         cx.notify();
                     })
                     .ok();
                 }
                 Err(e) => {
+                    tracing::info!(
+                        ui_action = "import_schema",
+                        phase = "schema_files_loaded",
+                        duration_ms = load_start.elapsed().as_millis() as u64,
+                        success = false,
+                        "UI action phase finished"
+                    );
                     this.update(cx, |view, cx| {
                         view.state.data_status = Some(format!("Schema load failed: {e}"));
+                        tracing::info!(
+                            ui_action = "import_schema",
+                            phase = "finished",
+                            duration_ms = total_start.elapsed().as_millis() as u64,
+                            success = false,
+                            "UI action finished"
+                        );
                         cx.notify();
                     })
                     .ok();
@@ -641,13 +771,54 @@ impl AppView {
     pub(crate) fn run_embedding_plan(&mut self, plan: EmbeddingPlan, cx: &mut Context<Self>) {
         let queue = match self.state.inference_queue.clone() {
             Some(q) => q,
-            None => return,
+            None => {
+                tracing::info!(
+                    ui_action = "embedding",
+                    phase = "skipped_no_queue",
+                    "UI action skipped"
+                );
+                return;
+            }
         };
         let hq_queue = self.state.hq_queue.clone();
         let graph = self.state.graph.clone();
         let tokio_rt = self.state.tokio_rt.clone();
 
         let plan_kind = plan.kind();
+        match plan.has_pending_work(&graph, hq_queue.as_ref().is_some_and(|q| q.has_embedding())) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.state.embedding_status = None;
+                tracing::info!(
+                    ui_action = "embedding",
+                    phase = "skipped_no_work",
+                    plan_kind,
+                    "UI action skipped"
+                );
+                cx.notify();
+                return;
+            }
+            Err(e) => {
+                self.state.embedding_status = Some(format!("Embedding check failed: {e}"));
+                tracing::info!(
+                    ui_action = "embedding",
+                    phase = "check_failed",
+                    plan_kind,
+                    error = %e,
+                    "UI action failed"
+                );
+                cx.notify();
+                return;
+            }
+        }
+
+        tracing::info!(
+            ui_action = "embedding",
+            phase = "scheduled",
+            plan_kind,
+            hq_enabled = hq_queue.as_ref().is_some_and(|q| q.has_embedding()),
+            "UI action scheduled"
+        );
         self.state.embedding_status = Some(plan.label());
         cx.notify();
 
@@ -709,15 +880,30 @@ impl AppView {
                 .background_executor()
                 .spawn(
                     async move {
-                        tokio_rt.block_on(async move {
-                            plan.execute(
-                                &graph,
-                                &queue,
-                                hq_queue.as_ref(),
-                                move |p| *progress_write.lock() = Some(p),
-                            )
+                        let embedding_start = std::time::Instant::now();
+                        tracing::info!(
+                            ui_action = "embedding",
+                            phase = "started",
+                            plan_kind,
+                            "UI action started"
+                        );
+                        let outcome = tokio_rt.block_on(async move {
+                            plan.execute(&graph, &queue, hq_queue.as_ref(), move |p| {
+                                *progress_write.lock() = Some(p)
+                            })
                             .await
-                        })
+                        });
+                        tracing::info!(
+                            ui_action = "embedding",
+                            phase = "finished",
+                            plan_kind,
+                            duration_ms = embedding_start.elapsed().as_millis() as u64,
+                            stored = outcome.stored,
+                            skipped = outcome.skipped,
+                            hq_stored = outcome.hq_stored,
+                            "UI action finished"
+                        );
+                        outcome
                     }
                     .instrument(tracing::info_span!("embedding_plan", plan_kind)),
                 )
@@ -725,8 +911,7 @@ impl AppView {
 
             this.update(cx, |view: &mut AppView, cx| {
                 // Stop the poller by advancing the epoch.
-                view.state.embedding_plan_epoch =
-                    view.state.embedding_plan_epoch.wrapping_add(1);
+                view.state.embedding_plan_epoch = view.state.embedding_plan_epoch.wrapping_add(1);
                 view.state.embedding_status = Self::format_embedding_outcome(&outcome);
                 cx.notify();
             })
@@ -746,145 +931,164 @@ impl AppView {
                 .background_executor()
                 .spawn(
                     async move {
-                    tokio_rt.block_on(async move {
-                        // Discover Lemonade Server URL.
-                        let url = match resolve_lemonade_url().await {
-                            Some(u) => u,
-                            None => return Err(anyhow::anyhow!("Lemonade Server not reachable")),
-                        };
-                        tracing::debug!("milestone: discover — server reachable at {url}");
-
-                        // Discover available models.
-                        let catalog = LemonadeServerCatalog::discover(&url).await?;
-                        tracing::debug!(
-                            loaded = catalog.loaded.len(),
-                            models = catalog.models.len(),
-                            "milestone: select — catalog fetched"
-                        );
-                        let selector =
-                            ModelSelector::new(&catalog, &app_config.models, &app_config.embedding);
-                        let embed_models = selector.select_embedding_models();
-                        let reranker_sel = selector.select_reranker();
-
-                        let already_loaded: Vec<String> = catalog
-                            .loaded
-                            .iter()
-                            .map(|m| m.model_name.clone())
-                            .collect();
-
-                        // Build provider specs for embedding + optional reranker.
-                        let mut build_futs = Vec::new();
-                        for sel in embed_models
-                            .iter()
-                            .filter(|s| s.quality_tier == QualityTier::Standard)
-                        {
-                            let weight = match sel.recipe.as_str() {
-                                "flm" => app_config.embedding.npu_weight,
-                                "llamacpp" => match sel.backend.as_deref() {
-                                    Some("rocm") | Some("vulkan") | Some("metal") => {
-                                        app_config.embedding.gpu_weight
-                                    }
-                                    _ => app_config.embedding.cpu_weight,
-                                },
-                                _ => app_config.embedding.cpu_weight,
-                            };
-                            build_futs.push((sel.clone(), Capability::Embedding, weight));
-                        }
-                        if let Some(r_sel) = reranker_sel {
-                            build_futs.push((r_sel, Capability::Reranking, 100));
-                        }
-
-                        let gpu_mgr = GpuResourceManager::new();
-                        let url_owned = url.clone();
-                        let loaded = already_loaded.clone();
-
-                        let provider_futs: Vec<_> = build_futs
-                            .iter()
-                            .map(|(sel, cap, weight)| {
-                                let s = sel.clone();
-                                let c = *cap;
-                                let w = *weight;
-                                let base = url_owned.clone();
-                                let ld = loaded.clone();
-                                let gm = Arc::clone(&gpu_mgr);
-                                async move {
-                                    ProviderFactory::build(&s, c, &base, w, Some(gm), &ld).await
+                        tokio_rt.block_on(async move {
+                            // Discover Lemonade Server URL.
+                            let url = match resolve_lemonade_url().await {
+                                Some(u) => u,
+                                None => {
+                                    return Err(anyhow::anyhow!("Lemonade Server not reachable"));
                                 }
-                            })
-                            .collect();
-
-                        let build_results = futures::future::join_all(provider_futs).await;
-                        let providers: Vec<_> = build_results.into_iter().flatten().collect();
-
-                        if providers.is_empty() {
-                            return Err(anyhow::anyhow!("No embedding providers available"));
-                        }
-
-                        let queue = InferenceQueueBuilder::new()
-                            .with_providers(providers)
-                            .with_config((*app_config).clone())
-                            .build();
-                        tracing::debug!(
-                            embedding_workers = queue.embedding_worker_count(),
-                            "milestone: build queue — providers ready"
-                        );
-
-                        // Build optional HQ embedding queue.
-                        let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
-
-                        // Select ALL LLM models for the UI picker (no device-slot dedup).
-                        let all_llm = selector.select_all_llm_models();
-                        let llm_available: Vec<AvailableModel> =
-                            all_llm.iter().map(AvailableModel::from).collect();
-
-                        // Determine the preferred model for initial connection.
-                        // Use the active device config's explicit model override,
-                        // falling back to the first GPU model, then the first model.
-                        let preferred_model_id = app_config
-                            .chat
-                            .active_device_config()
-                            .model
-                            .clone();
-
-                        let preferred_idx = preferred_model_id
-                            .as_ref()
-                            .and_then(|pref| all_llm.iter().position(|m| m.model_id == *pref))
-                            .or_else(|| {
-                                // Fallback: first GPU-backed model in the list.
-                                all_llm.iter().position(|m| {
-                                    matches!(m.backend.as_deref(), Some("rocm") | Some("vulkan") | Some("metal"))
-                                })
-                            })
-                            .unwrap_or(0);
-
-                        let chat_provider = all_llm.get(preferred_idx).map(|sel| {
-                            let gpu = match sel.recipe.as_str() {
-                                "llamacpp" => match sel.backend.as_deref() {
-                                    Some("rocm") | Some("vulkan") | Some("metal") => {
-                                        Some(Arc::clone(&gpu_mgr))
-                                    }
-                                    _ => None,
-                                },
-                                _ => None,
                             };
-                            u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
-                        });
+                            tracing::debug!("milestone: discover — server reachable at {url}");
 
-                        tracing::debug!(
-                            llm_count = all_llm.len(),
-                            preferred_idx,
-                            "milestone: ready — init complete"
-                        );
-                        Ok((url, queue, hq_queue, chat_provider, llm_available, preferred_idx))
-                    })
-                }
-                .instrument(tracing::info_span!("lemonade_init")),
+                            // Discover available models.
+                            let catalog = LemonadeServerCatalog::discover(&url).await?;
+                            tracing::debug!(
+                                loaded = catalog.loaded.len(),
+                                models = catalog.models.len(),
+                                "milestone: select — catalog fetched"
+                            );
+                            let selector = ModelSelector::new(
+                                &catalog,
+                                &app_config.models,
+                                &app_config.embedding,
+                            );
+                            let embed_models = selector.select_embedding_models();
+                            let reranker_sel = selector.select_reranker();
+
+                            let already_loaded: Vec<String> = catalog
+                                .loaded
+                                .iter()
+                                .map(|m| m.model_name.clone())
+                                .collect();
+
+                            // Build provider specs for embedding + optional reranker.
+                            let mut build_futs = Vec::new();
+                            for sel in embed_models
+                                .iter()
+                                .filter(|s| s.quality_tier == QualityTier::Standard)
+                            {
+                                let weight = match sel.recipe.as_str() {
+                                    "flm" => app_config.embedding.npu_weight,
+                                    "llamacpp" => match sel.backend.as_deref() {
+                                        Some("rocm") | Some("vulkan") | Some("metal") => {
+                                            app_config.embedding.gpu_weight
+                                        }
+                                        _ => app_config.embedding.cpu_weight,
+                                    },
+                                    _ => app_config.embedding.cpu_weight,
+                                };
+                                build_futs.push((sel.clone(), Capability::Embedding, weight));
+                            }
+                            if let Some(r_sel) = reranker_sel {
+                                build_futs.push((r_sel, Capability::Reranking, 100));
+                            }
+
+                            let gpu_mgr = GpuResourceManager::new();
+                            let url_owned = url.clone();
+                            let loaded = already_loaded.clone();
+
+                            let provider_futs: Vec<_> = build_futs
+                                .iter()
+                                .map(|(sel, cap, weight)| {
+                                    let s = sel.clone();
+                                    let c = *cap;
+                                    let w = *weight;
+                                    let base = url_owned.clone();
+                                    let ld = loaded.clone();
+                                    let gm = Arc::clone(&gpu_mgr);
+                                    async move {
+                                        ProviderFactory::build(&s, c, &base, w, Some(gm), &ld).await
+                                    }
+                                })
+                                .collect();
+
+                            let build_results = futures::future::join_all(provider_futs).await;
+                            let providers: Vec<_> = build_results.into_iter().flatten().collect();
+
+                            if providers.is_empty() {
+                                return Err(anyhow::anyhow!("No embedding providers available"));
+                            }
+
+                            let queue = InferenceQueueBuilder::new()
+                                .with_providers(providers)
+                                .with_config((*app_config).clone())
+                                .build();
+                            tracing::debug!(
+                                embedding_workers = queue.embedding_worker_count(),
+                                "milestone: build queue — providers ready"
+                            );
+
+                            // Build optional HQ embedding queue.
+                            let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
+
+                            // Select ALL LLM models for the UI picker (no device-slot dedup).
+                            let all_llm = selector.select_all_llm_models();
+                            let llm_available: Vec<AvailableModel> =
+                                all_llm.iter().map(AvailableModel::from).collect();
+
+                            // Determine the preferred model for initial connection.
+                            // Use the active device config's explicit model override,
+                            // falling back to the first GPU model, then the first model.
+                            let preferred_model_id =
+                                app_config.chat.active_device_config().model.clone();
+
+                            let preferred_idx = preferred_model_id
+                                .as_ref()
+                                .and_then(|pref| all_llm.iter().position(|m| m.model_id == *pref))
+                                .or_else(|| {
+                                    // Fallback: first GPU-backed model in the list.
+                                    all_llm.iter().position(|m| {
+                                        matches!(
+                                            m.backend.as_deref(),
+                                            Some("rocm") | Some("vulkan") | Some("metal")
+                                        )
+                                    })
+                                })
+                                .unwrap_or(0);
+
+                            let chat_provider = all_llm.get(preferred_idx).map(|sel| {
+                                let gpu = match sel.recipe.as_str() {
+                                    "llamacpp" => match sel.backend.as_deref() {
+                                        Some("rocm") | Some("vulkan") | Some("metal") => {
+                                            Some(Arc::clone(&gpu_mgr))
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                };
+                                u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
+                            });
+
+                            tracing::debug!(
+                                llm_count = all_llm.len(),
+                                preferred_idx,
+                                "milestone: ready — init complete"
+                            );
+                            Ok((
+                                url,
+                                queue,
+                                hq_queue,
+                                chat_provider,
+                                llm_available,
+                                preferred_idx,
+                            ))
+                        })
+                    }
+                    .instrument(tracing::info_span!("lemonade_init")),
                 )
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
-                    Ok((lemonade_url, queue, hq_queue, chat_provider, llm_models, preferred_idx)) => {
+                    Ok((
+                        lemonade_url,
+                        queue,
+                        hq_queue,
+                        chat_provider,
+                        llm_models,
+                        preferred_idx,
+                    )) => {
                         eprintln!("Lemonade connected — embedding queue ready");
                         view.state.inference_queue = Some(queue.clone());
                         view.state.hq_queue = hq_queue.clone();
@@ -957,13 +1161,26 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn do_export_data_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
-        let initial = self.state.data_file
+    pub(crate) fn do_export_data_picker(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = self
+            .state
+            .data_file
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_string_lossy()
             .into_owned();
-        self.open_path_picker(PathPickerKind::ExportDir, PickerMode::Directory, "Export Data", "Export Data", &initial, window, cx);
+        self.open_path_picker(
+            PathPickerKind::ExportDir,
+            PickerMode::Directory,
+            "Export Data",
+            &initial,
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn do_run_export(&mut self, out_dir: std::path::PathBuf, cx: &mut Context<Self>) {
@@ -1050,5 +1267,4 @@ impl AppView {
         })
         .detach();
     }
-
 }

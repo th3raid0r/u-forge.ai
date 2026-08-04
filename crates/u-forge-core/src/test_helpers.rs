@@ -38,12 +38,10 @@ pub(crate) async fn integration_test_url() -> Option<String> {
             None
         }
         Ok("require") => {
-            let url = crate::lemonade::resolve_lemonade_url()
-                .await
-                .expect(
-                    "UFORGE_INTEGRATION_TESTS=require but no Lemonade Server reachable \
-                     (tried localhost:8000 and LEMONADE_URL)",
-                );
+            let url = crate::lemonade::resolve_lemonade_url().await.expect(
+                "UFORGE_INTEGRATION_TESTS=require but no Lemonade Server reachable \
+                     (tried localhost:13305, 127.0.0.1:13305, and LEMONADE_URL)",
+            );
             Some(url)
         }
         Ok(url) if !url.is_empty() => {
@@ -53,10 +51,7 @@ pub(crate) async fn integration_test_url() -> Option<String> {
                 .build()
                 .unwrap_or_default();
 
-            let health = format!(
-                "{}/health",
-                url.trim_end_matches('/')
-            );
+            let health = format!("{}/health", url.trim_end_matches('/'));
 
             let reachable = client
                 .get(&health)

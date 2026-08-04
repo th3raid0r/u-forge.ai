@@ -454,11 +454,33 @@ pub struct StorageConfig {
     /// Defaults to `./data/db/` relative to the working directory.
     #[serde(default = "StorageConfig::default_db_path")]
     pub db_path: PathBuf,
+
+    /// Standard embedding vector width for the SQLite retrieval index.
+    ///
+    /// Defaults to 768. Changing this requires rebuilding or re-indexing the
+    /// database because sqlite-vec table dimensions are fixed at creation.
+    #[serde(default = "StorageConfig::default_embedding_dimensions")]
+    pub embedding_dimensions: usize,
+
+    /// High-quality embedding vector width for the SQLite retrieval index.
+    ///
+    /// Defaults to 4096 and has the same rebuild requirement as the standard
+    /// embedding lane.
+    #[serde(default = "StorageConfig::default_high_quality_embedding_dimensions")]
+    pub high_quality_embedding_dimensions: usize,
 }
 
 impl StorageConfig {
     fn default_db_path() -> PathBuf {
         PathBuf::from("./data/db")
+    }
+
+    fn default_embedding_dimensions() -> usize {
+        crate::EMBEDDING_DIMENSIONS
+    }
+
+    fn default_high_quality_embedding_dimensions() -> usize {
+        crate::HIGH_QUALITY_EMBEDDING_DIMENSIONS
     }
 }
 
@@ -466,6 +488,8 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             db_path: Self::default_db_path(),
+            embedding_dimensions: Self::default_embedding_dimensions(),
+            high_quality_embedding_dimensions: Self::default_high_quality_embedding_dimensions(),
         }
     }
 }
@@ -744,6 +768,14 @@ mod tests {
         assert_eq!(cfg.embedding.npu_weight, 100);
         assert_eq!(cfg.embedding.gpu_weight, 50);
         assert_eq!(cfg.embedding.cpu_weight, 10);
+        assert_eq!(
+            cfg.storage.embedding_dimensions,
+            crate::EMBEDDING_DIMENSIONS
+        );
+        assert_eq!(
+            cfg.storage.high_quality_embedding_dimensions,
+            crate::HIGH_QUALITY_EMBEDDING_DIMENSIONS
+        );
     }
 
     #[test]
@@ -804,6 +836,11 @@ cpu_enabled  = false
 npu_weight   = 200
 gpu_weight   = 75
 cpu_weight   = 5
+
+[storage]
+db_path = "./tmp/kg"
+embedding_dimensions = 1024
+high_quality_embedding_dimensions = 2048
 "#
         )
         .unwrap();
@@ -815,6 +852,9 @@ cpu_weight   = 5
         assert_eq!(cfg.embedding.npu_weight, 200);
         assert_eq!(cfg.embedding.gpu_weight, 75);
         assert_eq!(cfg.embedding.cpu_weight, 5);
+        assert_eq!(cfg.storage.db_path, PathBuf::from("./tmp/kg"));
+        assert_eq!(cfg.storage.embedding_dimensions, 1024);
+        assert_eq!(cfg.storage.high_quality_embedding_dimensions, 2048);
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! input field, dropdowns, and sibling messages don't re-render per token.
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, App, Context, Entity, Hsla, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, Styled, Window,
+    App, Context, Entity, Hsla, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
+    SharedString, Styled, Window, div, prelude::*, px, rgb, rgba,
 };
 use tracing::trace_span;
 
@@ -44,11 +44,7 @@ pub(crate) struct ChatMessageView {
 }
 
 impl ChatMessageView {
-    pub(crate) fn new_text(
-        role: ChatMessageRole,
-        text: String,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub(crate) fn new_text(role: ChatMessageRole, text: String, cx: &mut Context<Self>) -> Self {
         let is_thinking = role == ChatMessageRole::Thinking;
         let body_color = if is_thinking {
             Hsla::from(rgba(0x6c7086ff))
@@ -91,12 +87,12 @@ impl ChatMessageView {
             StoredRole::Thinking => ChatMessageRole::Thinking,
             StoredRole::ToolCall => ChatMessageRole::ToolCall,
         };
-        let (tool_args, tool_result, tool_internal_id, collapsed) =
-            if let Some(tc) = msg.tool_call {
-                (Some(tc.args), tc.result, Some(tc.internal_id), tc.collapsed)
-            } else {
-                (None, None, None, role == ChatMessageRole::Thinking)
-            };
+        let (tool_args, tool_result, tool_internal_id, collapsed) = if let Some(tc) = msg.tool_call
+        {
+            (Some(tc.args), tc.result, Some(tc.internal_id), tc.collapsed)
+        } else {
+            (None, None, None, role == ChatMessageRole::Thinking)
+        };
         let body = if role != ChatMessageRole::ToolCall {
             let body_color = if role == ChatMessageRole::Thinking {
                 Hsla::from(rgba(0x6c7086ff))
@@ -205,10 +201,10 @@ impl ChatMessageView {
 
     /// Returns selected text from the body if any, otherwise the full copyable text.
     pub(crate) fn copy_text_for_context(&self, cx: &App) -> String {
-        if let Some(ref body) = self.body {
-            if let Some(sel) = body.read(cx).selected_text() {
-                return sel;
-            }
+        if let Some(ref body) = self.body
+            && let Some(sel) = body.read(cx).selected_text()
+        {
+            return sel;
         }
         self.copy_text()
     }
@@ -220,12 +216,7 @@ impl ChatMessageView {
 
     fn render_text(&self, _cx: &mut Context<Self>) -> gpui::Div {
         let (bg, label_color, label, text_color) = match self.role {
-            ChatMessageRole::User => (
-                rgb(0x313244),
-                rgba(0x89b4faff),
-                "You",
-                rgba(0xcdd6f4ff),
-            ),
+            ChatMessageRole::User => (rgb(0x313244), rgba(0x89b4faff), "You", rgba(0xcdd6f4ff)),
             ChatMessageRole::Assistant => (
                 rgb(0x1e1e2e),
                 rgba(0xa6e3a1ff),
@@ -300,12 +291,7 @@ impl ChatMessageView {
                             this.toggle_collapsed(cx);
                         }),
                     )
-                    .child(
-                        div()
-                            .text_base()
-                            .text_color(rgba(0xf9e2afff))
-                            .child(header),
-                    ),
+                    .child(div().text_base().text_color(rgba(0xf9e2afff)).child(header)),
             );
 
         if !collapsed {
@@ -363,18 +349,12 @@ impl ChatMessageView {
                             .child(SharedString::from(header_label)),
                     )
                     .when(has_result, |row| {
-                        row.child(
-                            div()
-                                .text_base()
-                                .text_color(rgba(0xa6e3a188))
-                                .child("✓"),
-                        )
+                        row.child(div().text_base().text_color(rgba(0xa6e3a188)).child("✓"))
                     }),
             );
 
         if !collapsed {
-            let tool_args: SharedString =
-                self.tool_args.clone().unwrap_or_default().into();
+            let tool_args: SharedString = self.tool_args.clone().unwrap_or_default().into();
             el = el.child(
                 div()
                     .mt_1()
@@ -410,12 +390,7 @@ impl ChatMessageView {
                                 .text_color(rgba(0x6c7086ff))
                                 .child("Result:"),
                         )
-                        .child(
-                            div()
-                                .text_base()
-                                .text_color(rgba(0xa6e3a1cc))
-                                .child(result),
-                        ),
+                        .child(div().text_base().text_color(rgba(0xa6e3a1cc)).child(result)),
                 );
             }
         }

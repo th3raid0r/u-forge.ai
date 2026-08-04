@@ -1,6 +1,6 @@
 use gpui::{
-    canvas, div, prelude::*, px, relative, rgb, rgba, Context, MouseButton, MouseDownEvent, Render,
-    SharedString, Window,
+    Context, MouseButton, MouseDownEvent, Render, SharedString, Window, canvas, div, prelude::*,
+    px, relative, rgb, rgba,
 };
 
 use crate::text_field::{TextFieldView, TextSubmit};
@@ -9,11 +9,11 @@ use u_forge_core::PropertyType;
 
 use super::field_spec::SubTab;
 use super::{
+    NodeEditorPanel,
     field_spec::{
         COLUMN_W, DETAIL_TAB_H, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H, PAGE_NAV_H,
         SUBTAB_BAR_H,
     },
-    NodeEditorPanel,
 };
 
 impl Render for NodeEditorPanel {
@@ -213,10 +213,10 @@ impl Render for NodeEditorPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        if let Some(idx) = this.active_tab {
-                            if let Some(t) = this.tabs.get_mut(idx) {
-                                t.active_subtab = SubTab::Properties;
-                            }
+                        if let Some(idx) = this.active_tab
+                            && let Some(t) = this.tabs.get_mut(idx)
+                        {
+                            t.active_subtab = SubTab::Properties;
                         }
                         this.edge_node_dropdown = None;
                         cx.notify();
@@ -246,10 +246,10 @@ impl Render for NodeEditorPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        if let Some(idx) = this.active_tab {
-                            if let Some(t) = this.tabs.get_mut(idx) {
-                                t.active_subtab = SubTab::Edges;
-                            }
+                        if let Some(idx) = this.active_tab
+                            && let Some(t) = this.tabs.get_mut(idx)
+                        {
+                            t.active_subtab = SubTab::Edges;
                         }
                         cx.notify();
                     }),
@@ -361,17 +361,17 @@ impl Render for NodeEditorPanel {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                    if let Some(tab_idx) = this.active_tab {
-                                        if let Some(t) = this.tabs.get_mut(tab_idx) {
-                                            let cur = t
-                                                .edited_values
-                                                .get(&key)
-                                                .and_then(|v| v.as_bool())
-                                                .unwrap_or(false);
-                                            t.edited_values
-                                                .insert(key.clone(), serde_json::Value::Bool(!cur));
-                                            t.recompute_dirty();
-                                        }
+                                    if let Some(tab_idx) = this.active_tab
+                                        && let Some(t) = this.tabs.get_mut(tab_idx)
+                                    {
+                                        let cur = t
+                                            .edited_values
+                                            .get(&key)
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+                                        t.edited_values
+                                            .insert(key.clone(), serde_json::Value::Bool(!cur));
+                                        t.recompute_dirty();
                                     }
                                     cx.notify();
                                 }),
@@ -490,25 +490,24 @@ impl Render for NodeEditorPanel {
                                             MouseButton::Left,
                                             cx.listener(
                                                 move |this, _: &MouseDownEvent, _window, cx| {
-                                                    if let Some(tab_idx) = this.active_tab {
-                                                        if let Some(t) = this.tabs.get_mut(tab_idx)
+                                                    if let Some(tab_idx) = this.active_tab
+                                                        && let Some(t) = this.tabs.get_mut(tab_idx)
+                                                    {
+                                                        t.edited_values.insert(
+                                                            key_inner.clone(),
+                                                            serde_json::Value::String(
+                                                                val_str.clone(),
+                                                            ),
+                                                        );
+                                                        // Also update the text field if it exists
+                                                        if let Some(tf) =
+                                                            t.field_entities.get(&key_inner)
                                                         {
-                                                            t.edited_values.insert(
-                                                                key_inner.clone(),
-                                                                serde_json::Value::String(
-                                                                    val_str.clone(),
-                                                                ),
-                                                            );
-                                                            // Also update the text field if it exists
-                                                            if let Some(tf) =
-                                                                t.field_entities.get(&key_inner)
-                                                            {
-                                                                tf.update(cx, |tf, cx| {
-                                                                    tf.set_content(&val_str, cx);
-                                                                });
-                                                            }
-                                                            t.recompute_dirty();
+                                                            tf.update(cx, |tf, cx| {
+                                                                tf.set_content(&val_str, cx);
+                                                            });
                                                         }
+                                                        t.recompute_dirty();
                                                     }
                                                     this.dropdown_open = None;
                                                     cx.notify();
@@ -577,21 +576,19 @@ impl Render for NodeEditorPanel {
                                                 MouseButton::Left,
                                                 cx.listener(
                                                     move |this, _: &MouseDownEvent, _window, cx| {
-                                                        if let Some(tab_idx) = this.active_tab {
-                                                            if let Some(t) =
+                                                        if let Some(tab_idx) = this.active_tab
+                                                            && let Some(t) =
                                                                 this.tabs.get_mut(tab_idx)
+                                                        {
+                                                            if let Some(arr) = t
+                                                                .edited_values
+                                                                .get_mut(&key_rm)
+                                                                .and_then(|v| v.as_array_mut())
+                                                                && item_idx < arr.len()
                                                             {
-                                                                if let Some(arr) = t
-                                                                    .edited_values
-                                                                    .get_mut(&key_rm)
-                                                                    .and_then(|v| v.as_array_mut())
-                                                                {
-                                                                    if item_idx < arr.len() {
-                                                                        arr.remove(item_idx);
-                                                                    }
-                                                                }
-                                                                t.recompute_dirty();
+                                                                arr.remove(item_idx);
                                                             }
+                                                            t.recompute_dirty();
                                                         }
                                                         cx.notify();
                                                     },
@@ -704,10 +701,7 @@ impl Render for NodeEditorPanel {
 
         // ── Assemble content area based on active sub-tab ────────────────────
 
-        let base = outer
-            .child(measure_canvas)
-            .child(tab_bar)
-            .child(subtab_bar);
+        let base = outer.child(measure_canvas).child(tab_bar).child(subtab_bar);
 
         if active_subtab == SubTab::Properties {
             // ── Properties sub-tab: scrollable form columns + page nav ────────
@@ -746,10 +740,10 @@ impl Render for NodeEditorPanel {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                if let Some(tab_idx) = this.active_tab {
-                                    if let Some(t) = this.tabs.get_mut(tab_idx) {
-                                        t.current_page = t.current_page.saturating_sub(1);
-                                    }
+                                if let Some(tab_idx) = this.active_tab
+                                    && let Some(t) = this.tabs.get_mut(tab_idx)
+                                {
+                                    t.current_page = t.current_page.saturating_sub(1);
                                 }
                                 cx.notify();
                             }),
@@ -777,10 +771,10 @@ impl Render for NodeEditorPanel {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                if let Some(tab_idx) = this.active_tab {
-                                    if let Some(t) = this.tabs.get_mut(tab_idx) {
-                                        t.current_page += 1;
-                                    }
+                                if let Some(tab_idx) = this.active_tab
+                                    && let Some(t) = this.tabs.get_mut(tab_idx)
+                                {
+                                    t.current_page += 1;
                                 }
                                 cx.notify();
                             }),
@@ -1016,7 +1010,8 @@ impl NodeEditorPanel {
             let filter_entity = dd.filter_entity.clone();
             let highlighted = dd.highlighted_idx;
 
-            let anchor_y = EDGE_SECTION_HEADER_H + 4.0 + ei as f32 * (EDGE_ROW_H + 4.0) + EDGE_ROW_H;
+            let anchor_y =
+                EDGE_SECTION_HEADER_H + 4.0 + ei as f32 * (EDGE_ROW_H + 4.0) + EDGE_ROW_H;
 
             // Build filtered node list from snapshot.
             let snap = self.snapshot.read();
@@ -1031,7 +1026,7 @@ impl NodeEditorPanel {
                 .map(|n| (n.id, n.name.clone(), n.object_type.clone()))
                 .collect();
             drop(snap);
-            candidates.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            candidates.sort_by_key(|a| a.1.to_lowercase());
             candidates.truncate(10);
 
             let mut dropdown_div = div()

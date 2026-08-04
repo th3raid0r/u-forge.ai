@@ -3,9 +3,9 @@
 //! Positions are keyed by `node_id` in the `node_positions` table.
 //! `ON DELETE CASCADE` keeps the table clean when nodes are removed.
 
-use std::collections::HashMap;
 use anyhow::{Context, Result};
 use rusqlite::params;
+use std::collections::HashMap;
 
 use crate::types::ObjectId;
 

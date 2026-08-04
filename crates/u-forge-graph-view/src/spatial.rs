@@ -1,4 +1,4 @@
-use rstar::{PointDistance, RTreeObject, AABB};
+use rstar::{AABB, PointDistance, RTreeObject};
 use u_forge_core::ObjectId;
 
 /// Entry in the R-tree spatial index. Stores the node's `ObjectId` and its

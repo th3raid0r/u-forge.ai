@@ -10,10 +10,10 @@
 //! this client because the `/system-info` management endpoint is intentionally
 //! accessed without the Bearer token.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_openai::{Client, config::OpenAIConfig};
 use reqwest::multipart;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// A thin wrapper around [`reqwest::Client`] pre-configured for Lemonade Server.
 ///
@@ -95,15 +95,25 @@ impl LemonadeHttpClient {
         form: multipart::Form,
     ) -> Result<Resp> {
         let url = self.url(path);
-        self.client
+        let response = self
+            .client
             .post(&url)
             .header("Authorization", "Bearer lemonade")
             .multipart(form)
             .send()
             .await
-            .with_context(|| format!("POST {url} (multipart) failed"))?
-            .error_for_status()
-            .with_context(|| format!("POST {url} returned an error status"))?
+            .with_context(|| format!("POST {url} (multipart) failed"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("<failed to read error body: {err}>"));
+            return Err(anyhow!("POST {url} returned {status}: {body}"));
+        }
+
+        response
             .json()
             .await
             .with_context(|| format!("Failed to parse JSON response from POST {url}"))
@@ -178,7 +188,10 @@ mod tests {
     #[test]
     fn test_url_joins_path_with_leading_slash() {
         let client = LemonadeHttpClient::new("http://localhost:13305/api/v1");
-        assert_eq!(client.url("/models"), "http://localhost:13305/api/v1/models");
+        assert_eq!(
+            client.url("/models"),
+            "http://localhost:13305/api/v1/models"
+        );
     }
 
     #[test]

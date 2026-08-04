@@ -1,6 +1,7 @@
 //! Text splitting utility for chunk-size management.
 
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use tiktoken_rs::CoreBPE;
 use tracing::info;
@@ -12,12 +13,23 @@ use crate::graph::MAX_CHUNK_TOKENS;
 /// `o200k_harmony()` parses a ~200 k-entry vocabulary on every call; caching
 /// it here turns repeated `count_tokens` invocations (e.g. inside
 /// [`split_text`]'s per-word loop) from O(N × vocab_parse) into O(N × encode).
-static O200K_BPE: LazyLock<CoreBPE> =
-    LazyLock::new(|| tiktoken_rs::o200k_harmony().expect("o200k_harmony is always available"));
+static O200K_BPE: LazyLock<CoreBPE> = LazyLock::new(|| {
+    let start = Instant::now();
+    let bpe = tiktoken_rs::o200k_harmony().expect("o200k_harmony is always available");
+    info!(
+        duration_ms = start.elapsed().as_millis() as u64,
+        "Tokenizer initialized"
+    );
+    bpe
+});
 
 /// Count tokens in `text` using the o200k_harmony BPE tokenizer.
+///
+/// Domain text chunks do not need special-token recognition. The ordinary path
+/// avoids rebuilding allowed-special handling and scanning for special tokens on
+/// every import-time count.
 pub(crate) fn count_tokens(text: &str) -> usize {
-    O200K_BPE.encode_with_special_tokens(text).len()
+    O200K_BPE.encode_ordinary(text).len()
 }
 
 /// Bisect `word` at character midpoints until every piece fits within
@@ -50,15 +62,28 @@ fn split_oversized_word(word: &str) -> Vec<String> {
 /// Token counts are measured with the o200k_harmony BPE tokenizer so that the
 /// budget is exact and consistent with what is stored in
 /// [`TextChunk::token_count`].
+#[cfg(test)]
 pub(crate) fn split_text(text: &str) -> Vec<String> {
+    split_text_with_counts(text)
+        .into_iter()
+        .map(|(piece, _)| piece)
+        .collect()
+}
+
+/// Split text and return the exact token count for every emitted piece.
+///
+/// This avoids recounting the overwhelmingly common fast path where a whole
+/// object's flattened text fits in one chunk.
+pub(crate) fn split_text_with_counts(text: &str) -> Vec<(String, usize)> {
     let text = text.trim();
     if text.is_empty() {
         return vec![];
     }
 
     // Fast path: entire text fits in one chunk.
-    if count_tokens(text) <= MAX_CHUNK_TOKENS {
-        return vec![text.to_string()];
+    let token_count = count_tokens(text);
+    if token_count <= MAX_CHUNK_TOKENS {
+        return vec![(text.to_string(), token_count.max(1))];
     }
 
     let mut pieces: Vec<String> = Vec::new();
@@ -87,6 +112,12 @@ pub(crate) fn split_text(text: &str) -> Vec<String> {
     }
 
     pieces
+        .into_iter()
+        .map(|piece| {
+            let token_count = count_tokens(&piece).max(1);
+            (piece, token_count)
+        })
+        .collect()
 }
 
 #[cfg(test)]

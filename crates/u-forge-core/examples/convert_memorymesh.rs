@@ -20,7 +20,7 @@
 //!   - Emits a warning for each discarded field
 
 use anyhow::Result;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -104,7 +104,10 @@ fn main() -> Result<()> {
         }
 
         if entry_type != "node" {
-            eprintln!("Line {}: unknown entry type {:?}, skipping", line_num, entry_type);
+            eprintln!(
+                "Line {}: unknown entry type {:?}, skipping",
+                line_num, entry_type
+            );
             continue;
         }
 

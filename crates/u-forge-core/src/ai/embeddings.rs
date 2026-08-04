@@ -74,6 +74,38 @@ mod tests {
     use super::*;
     use crate::test_helpers::require_integration_url;
 
+    async fn live_embedding_provider(url: &str) -> Option<LemonadeProvider> {
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(url)
+            .await
+            .unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
+        let Some(selected) = selector.select_embedding_models().into_iter().next() else {
+            eprintln!("SKIP: No downloaded embedding model available in catalog");
+            return None;
+        };
+        let already_loaded: Vec<String> = catalog
+            .loaded
+            .iter()
+            .map(|model| model.model_name.clone())
+            .collect();
+        Some(
+            LemonadeProvider::new_with_load(
+                url,
+                &selected.model_id,
+                &selected.load_opts,
+                &already_loaded,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to connect to Lemonade embedding model '{}': {err}",
+                    selected.model_id
+                )
+            }),
+        )
+    }
+
     // ── Unit tests (no server required) ──────────────────────────────────────
 
     #[test]
@@ -101,27 +133,23 @@ mod tests {
     #[tokio::test]
     async fn test_lemonade_provider_connect_and_dimensions() {
         let url = require_integration_url!();
-        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM").await;
-        assert!(
-            provider.is_ok(),
-            "Failed to connect to Lemonade Server: {:?}",
-            provider.err()
-        );
-        let provider = provider.unwrap();
+        let Some(provider) = live_embedding_provider(&url).await else {
+            return;
+        };
         let dims = provider.dimensions().unwrap();
         assert!(dims > 0, "Expected non-zero dimensions, got {dims}");
         assert_eq!(provider.provider_type(), EmbeddingProviderType::Lemonade);
         let info = provider.model_info().unwrap();
-        assert_eq!(info.name, "embed-gemma-300m-FLM");
+        assert_eq!(info.name, provider.model);
         assert_eq!(info.dimensions, dims);
     }
 
     #[tokio::test]
     async fn test_lemonade_embed_batch() {
         let url = require_integration_url!();
-        let provider = LemonadeProvider::new(&url, "embed-gemma-300m-FLM")
-            .await
-            .expect("Connect to Lemonade");
+        let Some(provider) = live_embedding_provider(&url).await else {
+            return;
+        };
         let dims = provider.dimensions().unwrap();
 
         let texts = vec![

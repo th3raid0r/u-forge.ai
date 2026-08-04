@@ -1,11 +1,11 @@
 use std::ops::Range;
 
 use gpui::{
-    anchored, canvas, deferred, div, fill, font, point, prelude::*, px, rgb, rgba, size, App,
-    Bounds, ClipboardItem, Context, Corner, ElementInputHandler, EntityInputHandler, FocusHandle,
-    Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Task, TextAlign, TextRun,
-    UTF16Selection, Window, WrappedLine,
+    App, Bounds, ClipboardItem, Context, Corner, ElementInputHandler, EntityInputHandler,
+    FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Task, TextAlign,
+    TextRun, UTF16Selection, Window, WrappedLine, anchored, canvas, deferred, div, fill, font,
+    point, prelude::*, px, rgb, rgba, size,
 };
 
 /// Single-line text field height (px).
@@ -116,11 +116,7 @@ impl TextFieldView {
 
     /// Read-only variant used for chat message bodies: supports drag selection and
     /// Ctrl+C, but suppresses all editing. No border or background styling.
-    pub(crate) fn new_read_only(
-        text: &str,
-        color: Hsla,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub(crate) fn new_read_only(text: &str, color: Hsla, cx: &mut Context<Self>) -> Self {
         Self {
             content: text.to_string(),
             cursor: 0,
@@ -152,20 +148,22 @@ impl TextFieldView {
     /// Show cursor immediately and restart the blink cycle with a 500 ms period.
     fn reset_blink(&mut self, cx: &mut Context<Self>) {
         self.cursor_visible = true;
-        self.blink_task = Some(cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(500))
-                .await;
-            match this.upgrade() {
-                Some(entity) => {
-                    entity
-                        .update(cx, |this, cx| {
-                            this.cursor_visible = !this.cursor_visible;
-                            cx.notify();
-                        })
-                        .ok();
+        self.blink_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                match this.upgrade() {
+                    Some(entity) => {
+                        entity
+                            .update(cx, |this, cx| {
+                                this.cursor_visible = !this.cursor_visible;
+                                cx.notify();
+                            })
+                            .ok();
+                    }
+                    None => break,
                 }
-                None => break,
             }
         }));
     }
@@ -432,8 +430,7 @@ impl EntityInputHandler for TextFieldView {
         let clamped_end = end.min(self.content.len());
         if clamped_start != start || clamped_end != end {
             *adjusted_range = Some(
-                self.utf8_to_utf16_offset(clamped_start)
-                    ..self.utf8_to_utf16_offset(clamped_end),
+                self.utf8_to_utf16_offset(clamped_start)..self.utf8_to_utf16_offset(clamped_end),
             );
         }
         Some(self.content[clamped_start..clamped_end].to_string())
@@ -463,9 +460,9 @@ impl EntityInputHandler for TextFieldView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|r| {
-            self.utf8_to_utf16_offset(r.start)..self.utf8_to_utf16_offset(r.end)
-        })
+        self.marked_range
+            .as_ref()
+            .map(|r| self.utf8_to_utf16_offset(r.start)..self.utf8_to_utf16_offset(r.end))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -537,9 +534,8 @@ impl EntityInputHandler for TextFieldView {
             let sel_start = self.utf16_to_utf8_offset(sel_range.start) + clamped_start;
             let sel_end = self.utf16_to_utf8_offset(sel_range.end) + clamped_start;
             self.cursor = sel_end.min(self.content.len());
-            self.selection = Some(
-                sel_start.min(self.content.len())..sel_end.min(self.content.len()),
-            );
+            self.selection =
+                Some(sel_start.min(self.content.len())..sel_end.min(self.content.len()));
         } else {
             self.cursor = mark_end;
             self.selection = None;
@@ -575,9 +571,17 @@ impl EntityInputHandler for TextFieldView {
         // Convert point (element-local) to text-area-local by subtracting padding,
         // adding scroll offset so IME popup tracks the actual glyph position.
         let local_x = f32::from(point.x) - 6.0
-            + if self.multiline { 0.0 } else { self.h_scroll_offset };
+            + if self.multiline {
+                0.0
+            } else {
+                self.h_scroll_offset
+            };
         let local_y = f32::from(point.y) - 4.0
-            + if self.multiline { self.scroll_offset } else { 0.0 };
+            + if self.multiline {
+                self.scroll_offset
+            } else {
+                0.0
+            };
         let utf8_offset = self.cursor_for_click(local_x, local_y);
         Some(self.utf8_to_utf16_offset(utf8_offset))
     }
@@ -646,11 +650,8 @@ impl Render for TextFieldView {
                     let h_scroll_px = px(h_scroll_offset);
                     bounds.origin + point(pad_x - h_scroll_px, pad_y)
                 };
-                let wrap_width: Option<gpui::Pixels> = if is_multiline {
-                    Some(inner_w)
-                } else {
-                    None
-                };
+                let wrap_width: Option<gpui::Pixels> =
+                    if is_multiline { Some(inner_w) } else { None };
 
                 // Split content by explicit newlines.
                 let raw_lines: Vec<&str> = if display.is_empty() {
@@ -694,51 +695,36 @@ impl Render for TextFieldView {
                                 let line_end = byte_offset + raw_line.len();
 
                                 // Paint selection highlight behind text.
-                                if let Some(ref sr) = sel_range {
-                                    if sr.start < line_end && sr.end > byte_offset {
-                                        let in_start =
-                                            sr.start.saturating_sub(byte_offset);
-                                        let in_end =
-                                            (sr.end - byte_offset).min(raw_line.len());
-                                        let start_pos =
-                                            wl.position_for_index(in_start, line_height);
-                                        let end_pos =
-                                            wl.position_for_index(in_end, line_height);
-                                        if let (Some(sp), Some(ep)) = (start_pos, end_pos) {
-                                            let start_row = (f32::from(sp.y)
-                                                / f32::from(line_height))
-                                                .floor()
-                                                as usize;
-                                            let end_row = (f32::from(ep.y)
-                                                / f32::from(line_height))
-                                                .floor()
-                                                as usize;
-                                            for row in start_row..=end_row {
-                                                let row_y = line_height * row as f32;
-                                                let x0 = if row == start_row {
-                                                    sp.x
-                                                } else {
-                                                    px(0.0)
-                                                };
-                                                let x1 = if row == end_row {
-                                                    ep.x
-                                                } else {
-                                                    inner_w
-                                                };
-                                                if x1 > x0 {
-                                                    window.paint_quad(fill(
-                                                        gpui::Bounds::new(
-                                                            point(
-                                                                text_origin.x + x0,
-                                                                text_origin.y
-                                                                    + y_acc
-                                                                    + row_y,
-                                                            ),
-                                                            size(x1 - x0, line_height),
+                                if let Some(ref sr) = sel_range
+                                    && sr.start < line_end
+                                    && sr.end > byte_offset
+                                {
+                                    let in_start = sr.start.saturating_sub(byte_offset);
+                                    let in_end = (sr.end - byte_offset).min(raw_line.len());
+                                    let start_pos = wl.position_for_index(in_start, line_height);
+                                    let end_pos = wl.position_for_index(in_end, line_height);
+                                    if let (Some(sp), Some(ep)) = (start_pos, end_pos) {
+                                        let start_row = (f32::from(sp.y) / f32::from(line_height))
+                                            .floor()
+                                            as usize;
+                                        let end_row = (f32::from(ep.y) / f32::from(line_height))
+                                            .floor()
+                                            as usize;
+                                        for row in start_row..=end_row {
+                                            let row_y = line_height * row as f32;
+                                            let x0 = if row == start_row { sp.x } else { px(0.0) };
+                                            let x1 = if row == end_row { ep.x } else { inner_w };
+                                            if x1 > x0 {
+                                                window.paint_quad(fill(
+                                                    gpui::Bounds::new(
+                                                        point(
+                                                            text_origin.x + x0,
+                                                            text_origin.y + y_acc + row_y,
                                                         ),
-                                                        rgba(0x585b7088),
-                                                    ));
-                                                }
+                                                        size(x1 - x0, line_height),
+                                                    ),
+                                                    rgba(0x585b7088),
+                                                ));
                                             }
                                         }
                                     }
@@ -824,10 +810,8 @@ impl Render for TextFieldView {
                 let lh_f = f32::from(line_height);
                 let origin_x = f32::from(bounds.origin.x);
                 let origin_y = f32::from(bounds.origin.y);
-                let total_content_h =
-                    (f32::from(y_acc) + TEXT_FIELD_PAD_Y * 2.0).round();
-                let visible_h =
-                    (f32::from(bounds.size.height) - TEXT_FIELD_PAD_Y * 2.0).max(0.0);
+                let total_content_h = (f32::from(y_acc) + TEXT_FIELD_PAD_Y * 2.0).round();
+                let visible_h = (f32::from(bounds.size.height) - TEXT_FIELD_PAD_Y * 2.0).max(0.0);
                 let visible_w = f32::from(inner_w).max(0.0);
 
                 paint_entity.update(cx, |this, _cx| {
@@ -856,13 +840,17 @@ impl Render for TextFieldView {
         let dynamic_h = if self.read_only {
             self.content_height.max(0.0)
         } else if self.multiline {
-            self.content_height.clamp(TEXT_FIELD_MIN_H, TEXT_FIELD_MAX_H)
+            self.content_height
+                .clamp(TEXT_FIELD_MIN_H, TEXT_FIELD_MAX_H)
         } else {
             TEXT_FIELD_MIN_H
         };
 
         let mut field = div()
-            .id(SharedString::from(format!("tf-{}", cx.entity_id().as_u64())))
+            .id(SharedString::from(format!(
+                "tf-{}",
+                cx.entity_id().as_u64()
+            )))
             .relative()
             .w_full()
             .h(px(dynamic_h))
@@ -892,10 +880,18 @@ impl Render for TextFieldView {
                     // Convert window coordinates to text-area-local coordinates.
                     // Subtract element origin and padding, add scroll offset.
                     let local_x = f32::from(event.position.x) - this.field_origin_x - 6.0
-                        + if this.multiline { 0.0 } else { this.h_scroll_offset };
-                    let local_y = f32::from(event.position.y) - this.field_origin_y
-                        - TEXT_FIELD_PAD_Y
-                        + if this.multiline { this.scroll_offset } else { 0.0 };
+                        + if this.multiline {
+                            0.0
+                        } else {
+                            this.h_scroll_offset
+                        };
+                    let local_y =
+                        f32::from(event.position.y) - this.field_origin_y - TEXT_FIELD_PAD_Y
+                            + if this.multiline {
+                                this.scroll_offset
+                            } else {
+                                0.0
+                            };
                     let byte = this.cursor_for_click(local_x, local_y);
                     this.drag_anchor = Some(byte);
                     this.selection = Some(byte..byte);
@@ -915,8 +911,7 @@ impl Render for TextFieldView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    let has_selection =
-                        this.selection.as_ref().is_some_and(|s| s.start != s.end);
+                    let has_selection = this.selection.as_ref().is_some_and(|s| s.start != s.end);
                     let has_any_item = has_selection || !this.read_only;
                     if !has_any_item {
                         return;
@@ -943,10 +938,17 @@ impl Render for TextFieldView {
                 }
                 let anchor = this.drag_anchor.unwrap();
                 let local_x = f32::from(event.position.x) - this.field_origin_x - 6.0
-                    + if this.multiline { 0.0 } else { this.h_scroll_offset };
-                let local_y = f32::from(event.position.y) - this.field_origin_y
-                    - TEXT_FIELD_PAD_Y
-                    + if this.multiline { this.scroll_offset } else { 0.0 };
+                    + if this.multiline {
+                        0.0
+                    } else {
+                        this.h_scroll_offset
+                    };
+                let local_y = f32::from(event.position.y) - this.field_origin_y - TEXT_FIELD_PAD_Y
+                    + if this.multiline {
+                        this.scroll_offset
+                    } else {
+                        0.0
+                    };
                 let byte = this.cursor_for_click(local_x, local_y);
                 this.selection = Some(anchor..byte);
                 if !this.read_only {
@@ -958,10 +960,10 @@ impl Render for TextFieldView {
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
                     this.drag_anchor = None;
-                    if let Some(ref sel) = this.selection {
-                        if sel.start == sel.end {
-                            this.selection = None;
-                        }
+                    if let Some(ref sel) = this.selection
+                        && sel.start == sel.end
+                    {
+                        this.selection = None;
                     }
                     cx.notify();
                 }),
@@ -970,10 +972,10 @@ impl Render for TextFieldView {
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
                     this.drag_anchor = None;
-                    if let Some(ref sel) = this.selection {
-                        if sel.start == sel.end {
-                            this.selection = None;
-                        }
+                    if let Some(ref sel) = this.selection
+                        && sel.start == sel.end
+                    {
+                        this.selection = None;
                     }
                     cx.notify();
                 }),
@@ -992,8 +994,7 @@ impl Render for TextFieldView {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 let key = event.keystroke.key.as_str();
-                let ctrl = event.keystroke.modifiers.control
-                    || event.keystroke.modifiers.platform;
+                let ctrl = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
 
                 // Escape closes an open context menu first (if any).
                 if key == "escape" && this.context_menu_pos.is_some() {
@@ -1022,10 +1023,10 @@ impl Render for TextFieldView {
 
                 // Ctrl+V — paste (editable only).
                 if key == "v" && ctrl && !this.read_only {
-                    if let Some(clip) = cx.read_from_clipboard() {
-                        if let Some(text) = clip.text() {
-                            this.insert_at_cursor(&text.clone(), cx);
-                        }
+                    if let Some(clip) = cx.read_from_clipboard()
+                        && let Some(text) = clip.text()
+                    {
+                        this.insert_at_cursor(&text.clone(), cx);
                     }
                     return;
                 }
@@ -1129,77 +1130,74 @@ impl Render for TextFieldView {
                 let has_selection = self.selection.as_ref().is_some_and(|s| s.start != s.end);
                 let is_read_only = self.read_only;
                 el.child(deferred(
-                    anchored()
-                        .position(pos)
-                        .anchor(Corner::TopLeft)
-                        .child(
-                            div()
-                                .id("tf-ctx-menu")
-                                .w(px(140.0))
-                                .bg(rgb(0x313244))
-                                .border_1()
-                                .border_color(rgb(0x45475a))
-                                .rounded(px(3.0))
-                                .when(has_selection, |m| {
-                                    m.child(
-                                        div()
-                                            .id("tf-ctx-copy")
-                                            .flex()
-                                            .items_center()
-                                            .h(px(24.0))
-                                            .px_3()
-                                            .text_xs()
-                                            .text_color(rgba(0xcdd6f4ff))
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(rgba(0x45475a88)))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _: &MouseDownEvent, _w, cx| {
-                                                    if let Some(text) = this.selected_text() {
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(text),
-                                                        );
-                                                    }
-                                                    this.context_menu_pos = None;
-                                                    cx.stop_propagation();
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child("Copy"),
-                                    )
-                                })
-                                .when(has_selection && !is_read_only, |m| {
-                                    m.child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
-                                })
-                                .when(!is_read_only, |m| {
-                                    m.child(
-                                        div()
-                                            .id("tf-ctx-paste")
-                                            .flex()
-                                            .items_center()
-                                            .h(px(24.0))
-                                            .px_3()
-                                            .text_xs()
-                                            .text_color(rgba(0xcdd6f4ff))
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(rgba(0x45475a88)))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _: &MouseDownEvent, _w, cx| {
-                                                    if let Some(clip) = cx.read_from_clipboard() {
-                                                        if let Some(text) = clip.text() {
-                                                            this.insert_at_cursor(&text, cx);
-                                                        }
-                                                    }
-                                                    this.context_menu_pos = None;
-                                                    cx.stop_propagation();
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child("Paste"),
-                                    )
-                                }),
-                        ),
+                    anchored().position(pos).anchor(Corner::TopLeft).child(
+                        div()
+                            .id("tf-ctx-menu")
+                            .w(px(140.0))
+                            .bg(rgb(0x313244))
+                            .border_1()
+                            .border_color(rgb(0x45475a))
+                            .rounded(px(3.0))
+                            .when(has_selection, |m| {
+                                m.child(
+                                    div()
+                                        .id("tf-ctx-copy")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(24.0))
+                                        .px_3()
+                                        .text_xs()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                                                if let Some(text) = this.selected_text() {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(text),
+                                                    );
+                                                }
+                                                this.context_menu_pos = None;
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child("Copy"),
+                                )
+                            })
+                            .when(has_selection && !is_read_only, |m| {
+                                m.child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                            })
+                            .when(!is_read_only, |m| {
+                                m.child(
+                                    div()
+                                        .id("tf-ctx-paste")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(24.0))
+                                        .px_3()
+                                        .text_xs()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                                                if let Some(clip) = cx.read_from_clipboard()
+                                                    && let Some(text) = clip.text()
+                                                {
+                                                    this.insert_at_cursor(&text, cx);
+                                                }
+                                                this.context_menu_pos = None;
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child("Paste"),
+                                )
+                            }),
+                    ),
                 ))
             })
     }

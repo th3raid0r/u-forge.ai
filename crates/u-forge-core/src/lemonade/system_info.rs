@@ -93,7 +93,13 @@ impl SystemInfo {
             .pointer("/devices/amd_igpu")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-        let info = Self { processor, physical_memory, os_version, npu, igpu };
+        let info = Self {
+            processor,
+            physical_memory,
+            os_version,
+            npu,
+            igpu,
+        };
 
         info!(
             processor = %info.processor,

@@ -87,7 +87,7 @@ Technical details — crate layout, SQLite schema, inference pipeline, embedding
 
 ```bash
 # Run the test suite (no server required)
-cargo test --workspace -- --test-threads=1
+make test
 ```
 
 ---

@@ -1,8 +1,8 @@
 //! [`InferenceQueueBuilder`] — register providers and spawn background tasks.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64},
     Arc,
+    atomic::{AtomicBool, AtomicU64},
 };
 
 use tracing::{debug, warn};

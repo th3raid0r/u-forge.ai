@@ -1,10 +1,13 @@
 //! SQLite-backed knowledge graph storage.
-mod storage;
-mod nodes;
-mod edges;
 mod chunks;
+mod edges;
 mod fts;
-mod traversal;
+mod nodes;
 mod positions;
+mod storage;
+mod traversal;
 
-pub use storage::{KnowledgeGraphStorage, GraphStats, DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS, HIGH_QUALITY_EMBEDDING_DIMENSIONS, MAX_CHUNK_TOKENS};
+pub use storage::{
+    DEFAULT_EMBEDDING_CONTEXT_TOKENS, EMBEDDING_DIMENSIONS, GraphStats,
+    HIGH_QUALITY_EMBEDDING_DIMENSIONS, KnowledgeGraphStorage, MAX_CHUNK_TOKENS,
+};

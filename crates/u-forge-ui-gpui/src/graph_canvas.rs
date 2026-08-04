@@ -1,19 +1,15 @@
-use std::{
-    cell::Cell,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use glam::Vec2;
 use gpui::{
-    canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size, Bounds, Context, Entity,
-    Font, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, TextRun, Window,
+    Bounds, Context, Entity, Font, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, TextRun,
+    Window, canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size,
 };
 use parking_lot::RwLock;
 use u_forge_core::{KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{GraphSnapshot, LodLevel};
-use u_forge_ui_traits::{generate_draw_commands, node_color_for_type, Viewport, NODE_RADIUS};
+use u_forge_ui_traits::{NODE_RADIUS, Viewport, generate_draw_commands, node_color_for_type};
 
 use crate::selection_model::SelectionModel;
 
@@ -56,10 +52,10 @@ impl GraphCanvas {
         let sel_sub = cx.observe(&selection, |this: &mut GraphCanvas, sel, cx| {
             if this.suppress_pan {
                 this.suppress_pan = false;
-            } else if let Some(id) = sel.read(cx).selected_node_id {
-                if let Some(node) = this.snapshot.read().nodes.iter().find(|n| n.id == id) {
-                    this.camera = node.position;
-                }
+            } else if let Some(id) = sel.read(cx).selected_node_id
+                && let Some(node) = this.snapshot.read().nodes.iter().find(|n| n.id == id)
+            {
+                this.camera = node.position;
             }
             cx.notify();
         });
@@ -151,8 +147,10 @@ impl Render for GraphCanvas {
                     let world_pos = this.viewport(canvas_size).screen_to_world(screen_pos);
                     let half_size = NODE_RADIUS * 1.5;
 
-                    if let Some(idx) =
-                        this.snapshot.read().node_at_point_aabb(world_pos, half_size)
+                    if let Some(idx) = this
+                        .snapshot
+                        .read()
+                        .node_at_point_aabb(world_pos, half_size)
                     {
                         let node_id = this.snapshot.read().nodes[idx].id;
                         // Selection originated from the canvas — don't pan.
@@ -237,10 +235,8 @@ impl Render for GraphCanvas {
 
                         window.paint_quad(fill(bounds, rgb(0x1e1e2e)));
 
-                        let canvas_size = Vec2::new(
-                            f32::from(bounds.size.width),
-                            f32::from(bounds.size.height),
-                        );
+                        let canvas_size =
+                            Vec2::new(f32::from(bounds.size.width), f32::from(bounds.size.height));
                         // Offset added to every canvas-local position to get window coordinates.
                         let ox = f32::from(bounds.origin.x);
                         let oy = f32::from(bounds.origin.y);
@@ -271,14 +267,8 @@ impl Render for GraphCanvas {
                             let edge_color = rgb(0x585b70);
 
                             for edge in &commands.edges {
-                                builder.move_to(point(
-                                    px(edge.from.x + ox),
-                                    px(edge.from.y + oy),
-                                ));
-                                builder.line_to(point(
-                                    px(edge.to.x + ox),
-                                    px(edge.to.y + oy),
-                                ));
+                                builder.move_to(point(px(edge.from.x + ox), px(edge.from.y + oy)));
+                                builder.line_to(point(px(edge.to.x + ox), px(edge.to.y + oy)));
                                 count += 1;
 
                                 if count >= EDGE_BATCH_SIZE {
@@ -289,10 +279,10 @@ impl Render for GraphCanvas {
                                     count = 0;
                                 }
                             }
-                            if count > 0 {
-                                if let Ok(path) = builder.build() {
-                                    window.paint_path(path, edge_color);
-                                }
+                            if count > 0
+                                && let Ok(path) = builder.build()
+                            {
+                                window.paint_path(path, edge_color);
                             }
                         }
 
@@ -321,14 +311,12 @@ impl Render for GraphCanvas {
                                         size(hr * 2.0, hr * 2.0),
                                     );
                                     window.paint_quad(
-                                        fill(ring_bounds, rgb(0xffffff))
-                                            .corner_radii(hr * 0.6),
+                                        fill(ring_bounds, rgb(0xffffff)).corner_radii(hr * 0.6),
                                     );
                                 }
 
-                                window.paint_quad(
-                                    fill(node_bounds, rgb(col)).corner_radii(sq_radii),
-                                );
+                                window
+                                    .paint_quad(fill(node_bounds, rgb(col)).corner_radii(sq_radii));
                             }
                         }
 
@@ -358,12 +346,7 @@ impl Render for GraphCanvas {
                             let line_height = font_size * 1.2;
                             let tx = label.position.x + ox - f32::from(shaped.width) / 2.0;
                             let ty = label.position.y + oy - f32::from(line_height) / 2.0;
-                            let _ = shaped.paint(
-                                point(px(tx), px(ty)),
-                                line_height,
-                                window,
-                                cx,
-                            );
+                            let _ = shaped.paint(point(px(tx), px(ty)), line_height, window, cx);
                         }
 
                         // ── Color legend (bottom-right of canvas pane) ───────────────
@@ -372,8 +355,7 @@ impl Render for GraphCanvas {
                             let swatch = 12.0_f32;
                             let pad = 8.0_f32;
                             let legend_w = 160.0_f32;
-                            let legend_h =
-                                legend_types.len() as f32 * entry_h + pad * 2.0;
+                            let legend_h = legend_types.len() as f32 * entry_h + pad * 2.0;
                             // Canvas-local bottom-right, then shifted to window coords.
                             let lx = canvas_size.x - legend_w - pad + ox;
                             let ly = canvas_size.y - legend_h - pad + oy;
@@ -394,17 +376,12 @@ impl Render for GraphCanvas {
                                 let center_y = row_y + entry_h / 2.0;
 
                                 let [r, g, b, _] = node_color_for_type(type_name);
-                                let color_hex = ((r as u32) << 16)
-                                    | ((g as u32) << 8)
-                                    | (b as u32);
+                                let color_hex = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
 
                                 window.paint_quad(
                                     fill(
                                         Bounds::new(
-                                            point(
-                                                px(lx + pad),
-                                                px(center_y - swatch / 2.0),
-                                            ),
+                                            point(px(lx + pad), px(center_y - swatch / 2.0)),
                                             size(px(swatch), px(swatch)),
                                         ),
                                         rgb(color_hex),
@@ -428,12 +405,8 @@ impl Render for GraphCanvas {
                                 );
                                 let text_x = lx + pad + swatch + 6.0;
                                 let text_y = center_y - f32::from(line_h) / 2.0;
-                                let _ = shaped.paint(
-                                    point(px(text_x), px(text_y)),
-                                    line_h,
-                                    window,
-                                    cx,
-                                );
+                                let _ =
+                                    shaped.paint(point(px(text_x), px(text_y)), line_h, window, cx);
                             }
                         }
                     },

@@ -18,13 +18,13 @@ use tiktoken_rs::CoreBPE;
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
 use u_forge_core::ingest::rechunk_and_embed;
-use u_forge_core::search::{search_hybrid, HybridSearchConfig, NodeSearchResult};
+use u_forge_core::search::{HybridSearchConfig, NodeSearchResult, search_hybrid};
 use u_forge_core::types::ObjectMetadata;
-use u_forge_core::{queue::InferenceQueue, types::ObjectId, KnowledgeGraph, PropertyIssue};
+use u_forge_core::{KnowledgeGraph, PropertyIssue, queue::InferenceQueue, types::ObjectId};
 
 // ── History and token counting ────────────────────────────────────────────────
 
@@ -124,7 +124,8 @@ pub(crate) mod tool_validation {
     // Schema values are compiled once and cached for the lifetime of the process.
     // Validators reference these statics so they don't borrow from local values.
     static FTS_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
-        serde_json::to_value(schema_for!(FtsSearchArgs)).expect("FtsSearchArgs schema is valid JSON")
+        serde_json::to_value(schema_for!(FtsSearchArgs))
+            .expect("FtsSearchArgs schema is valid JSON")
     });
     static FTS_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
         jsonschema::validator_for(&FTS_SCHEMA).expect("FtsSearchArgs validator compiles")
@@ -272,15 +273,29 @@ fn format_node_result(result: &NodeSearchResult, index: usize) -> String {
             ));
         }
     }
-    if !result.chunks.is_empty() {
-        s.push_str("  Content:\n");
-        for chunk in result.chunks.iter().take(3) {
-            s.push_str(&format!("    • {}\n", chunk.content));
+    let content_chunks: Vec<&str> = if result.matched_chunks.is_empty() {
+        result
+            .chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect()
+    } else {
+        result
+            .matched_chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect()
+    };
+
+    if !content_chunks.is_empty() {
+        s.push_str("  Matched content:\n");
+        for chunk in content_chunks.iter().take(3) {
+            s.push_str(&format!("    • {chunk}\n"));
         }
-        if result.chunks.len() > 3 {
+        if content_chunks.len() > 3 {
             s.push_str(&format!(
                 "    (… {} more chunks)\n",
-                result.chunks.len() - 3
+                content_chunks.len() - 3
             ));
         }
     }
@@ -336,8 +351,11 @@ impl Tool for FtsSearchTool {
 
     async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
-        let args: FtsSearchArgs = serde_json::from_value(raw)
-            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
+        let args: FtsSearchArgs = serde_json::from_value(raw).map_err(|e| {
+            ToolError(format!(
+                "deserialization failed after validation (bug): {e}"
+            ))
+        })?;
         let limit = args.limit.unwrap_or(5);
         let sanitized = fts5_sanitize(&args.query).ok_or_else(|| {
             ToolError("Query contains no searchable terms after removing punctuation.".to_string())
@@ -451,8 +469,11 @@ impl Tool for SemanticSearchTool {
 
     async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
-        let args: SemanticSearchArgs = serde_json::from_value(raw)
-            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
+        let args: SemanticSearchArgs = serde_json::from_value(raw).map_err(|e| {
+            ToolError(format!(
+                "deserialization failed after validation (bug): {e}"
+            ))
+        })?;
         let limit = args.limit.unwrap_or(5);
 
         let query_vec = self
@@ -581,8 +602,11 @@ impl Tool for HybridSearchTool {
 
     async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
-        let args: HybridSearchArgs = serde_json::from_value(raw)
-            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
+        let args: HybridSearchArgs = serde_json::from_value(raw).map_err(|e| {
+            ToolError(format!(
+                "deserialization failed after validation (bug): {e}"
+            ))
+        })?;
         let config = HybridSearchConfig {
             limit: args.limit.unwrap_or(3),
             alpha: args.alpha.unwrap_or(0.5).clamp(0.0, 1.0),
@@ -683,8 +707,11 @@ impl Tool for UpsertNodeTool {
 
     async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
-        let args: UpsertNodeArgs = serde_json::from_value(raw)
-            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
+        let args: UpsertNodeArgs = serde_json::from_value(raw).map_err(|e| {
+            ToolError(format!(
+                "deserialization failed after validation (bug): {e}"
+            ))
+        })?;
         // Single DB read: verify existence and load metadata in one step.
         let (object_id, is_update, mut meta) = if let Some(ref id_str) = args.node_id {
             let oid = ObjectId::parse_str(id_str)
@@ -715,21 +742,20 @@ impl Tool for UpsertNodeTool {
         // Apply caller-provided fields.
         meta.name = args.name;
         meta.object_type = args.object_type;
-        if let Some(props) = args.properties {
-            if let (serde_json::Value::Object(incoming), serde_json::Value::Object(existing)) =
+        if let Some(props) = args.properties
+            && let (serde_json::Value::Object(incoming), serde_json::Value::Object(existing)) =
                 (props, &mut meta.properties)
-            {
-                // Merge: caller-supplied keys win; null/omitted keys are preserved.
-                // An empty string removes the key.
-                for (k, v) in incoming {
-                    if v.is_null() {
-                        // null means "keep existing" — skip.
-                        continue;
-                    } else if v == serde_json::Value::String(String::new()) {
-                        existing.remove(&k);
-                    } else {
-                        existing.insert(k, v);
-                    }
+        {
+            // Merge: caller-supplied keys win; null/omitted keys are preserved.
+            // An empty string removes the key.
+            for (k, v) in incoming {
+                if v.is_null() {
+                    // null means "keep existing" — skip.
+                    continue;
+                } else if v == serde_json::Value::String(String::new()) {
+                    existing.remove(&k);
+                } else {
+                    existing.insert(k, v);
                 }
             }
         }
@@ -821,10 +847,10 @@ impl UpsertEdgeTool {
 /// Try to parse `input` as a UUID; if that fails, do an exact name lookup.
 fn resolve_node(graph: &KnowledgeGraph, input: &str) -> Result<ObjectId, ToolError> {
     // Try UUID first.
-    if let Ok(oid) = ObjectId::parse_str(input) {
-        if graph.get_object(oid).ok().flatten().is_some() {
-            return Ok(oid);
-        }
+    if let Ok(oid) = ObjectId::parse_str(input)
+        && graph.get_object(oid).ok().flatten().is_some()
+    {
+        return Ok(oid);
     }
     // Fall back to name lookup.
     let matches = graph
@@ -871,8 +897,11 @@ impl Tool for UpsertEdgeTool {
 
     async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
-        let args: UpsertEdgeArgs = serde_json::from_value(raw)
-            .map_err(|e| ToolError(format!("deserialization failed after validation (bug): {e}")))?;
+        let args: UpsertEdgeArgs = serde_json::from_value(raw).map_err(|e| {
+            ToolError(format!(
+                "deserialization failed after validation (bug): {e}"
+            ))
+        })?;
         let source_id = resolve_node(&self.graph, &args.source)?;
         let target_id = resolve_node(&self.graph, &args.target)?;
 
@@ -931,7 +960,7 @@ impl Tool for UpsertEdgeTool {
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::CompletionClient;
-use rig::completion::{message::ToolResultContent, Prompt, PromptError};
+use rig::completion::{Prompt, PromptError, message::ToolResultContent};
 use rig::providers::openai::CompletionsClient;
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
 use tokio::sync::mpsc;
@@ -1122,11 +1151,11 @@ impl GraphAgent {
     }
 
     /// Build a rig agent configured with all sampling params and tools.
-    fn build_agent(&self, model_id: &str) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
-        let mut builder = self
-            .client
-            .agent(model_id)
-            .preamble(&self.system_prompt);
+    fn build_agent(
+        &self,
+        model_id: &str,
+    ) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
+        let mut builder = self.client.agent(model_id).preamble(&self.system_prompt);
         if let Some(temp) = self.params.temperature {
             builder = builder.temperature(temp);
         }
@@ -1235,17 +1264,14 @@ impl GraphAgent {
                             // Full reasoning block (some providers emit this instead of deltas).
                             for chunk in &r.content {
                                 if let rig::completion::message::ReasoningContent::Text {
-                                    text,
-                                    ..
+                                    text, ..
                                 } = chunk
-                                {
-                                    if tx
+                                    && tx
                                         .send(AgentStreamEvent::ReasoningDelta(text.clone()))
                                         .await
                                         .is_err()
-                                    {
-                                        break 'stream;
-                                    }
+                                {
+                                    break 'stream;
                                 }
                             }
                         }
@@ -1410,14 +1436,16 @@ mod tests {
         let err = validate_tool_args("upsert_node", &raw)
             .expect_err("should reject missing required 'name'");
         let msg = err.to_string();
-        assert!(msg.contains("name"), "error should name missing field: {msg}");
+        assert!(
+            msg.contains("name"),
+            "error should name missing field: {msg}"
+        );
     }
 
     #[test]
     fn upsert_node_rejects_unknown_field() {
         let raw = json!({"name": "Gandalf", "object_type": "character", "typo_field": "oops"});
-        let err = validate_tool_args("upsert_node", &raw)
-            .expect_err("should reject unknown field");
+        let err = validate_tool_args("upsert_node", &raw).expect_err("should reject unknown field");
         let msg = err.to_string();
         assert!(
             msg.contains("typo_field") || msg.to_lowercase().contains("additional"),

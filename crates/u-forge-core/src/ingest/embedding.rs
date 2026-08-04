@@ -8,19 +8,19 @@
 //! single-worker [`InferenceQueue`] for the first high-quality embedding model
 //! selected by [`ModelSelector`] from a live [`LemonadeServerCatalog`].
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use tracing::{info, warn};
 
+use crate::HIGH_QUALITY_EMBEDDING_DIMENSIONS;
+use crate::KnowledgeGraph;
 use crate::config::AppConfig;
 use crate::lemonade::catalog::LemonadeServerCatalog;
 use crate::lemonade::provider_factory::{BuiltProvider, Capability, ProviderFactory};
 use crate::lemonade::selector::{ModelSelector, QualityTier};
 use crate::queue::{InferenceQueue, InferenceQueueBuilder};
-use crate::KnowledgeGraph;
-use crate::HIGH_QUALITY_EMBEDDING_DIMENSIONS;
 
 /// Which embedding index to target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +105,22 @@ impl EmbeddingPlan {
         }
     }
 
+    /// Return whether this plan has storage work to do before the UI starts it.
+    ///
+    /// The executor still performs its own checks because storage can change
+    /// between scheduling and execution; this is only a cheap preflight to avoid
+    /// flashing an embedding status when everything is already indexed.
+    pub fn has_pending_work(&self, graph: &KnowledgeGraph, hq_enabled: bool) -> Result<bool> {
+        match &self.task {
+            EmbeddingTask::Rechunk(ids) => Ok(!ids.is_empty()),
+            EmbeddingTask::EmbedAll => {
+                let stats = graph.get_stats()?;
+                Ok(stats.chunk_count > stats.embedded_count
+                    || (hq_enabled && stats.chunk_count > stats.embedded_hq_count))
+            }
+        }
+    }
+
     /// Execute the plan, emitting [`EmbeddingProgress`] events via `on_progress`
     /// as work proceeds.  Returns an [`EmbeddingOutcome`] when complete.
     ///
@@ -158,8 +174,7 @@ impl EmbeddingPlan {
                 }
             }
             EmbeddingTask::EmbedAll => {
-                let std_result =
-                    embed_all_chunks(graph, queue, EmbeddingTarget::Standard).await;
+                let std_result = embed_all_chunks(graph, queue, EmbeddingTarget::Standard).await;
                 let hq_result = if let Some(hq) = hq_queue {
                     Some(embed_all_chunks(graph, hq, EmbeddingTarget::HighQuality).await)
                 } else {
@@ -246,20 +261,21 @@ pub async fn rechunk_and_embed(
     // Retrieve the newly created chunks so we have their content for embedding.
     let chunks = graph.get_text_chunks(object_id)?;
 
-    // Embed every chunk with the standard queue.
+    let mut embeddings = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
-        let vec = queue.embed(&chunk.content).await?;
-        graph.upsert_chunk_embedding(chunk.id, &vec)?;
+        embeddings.push((chunk.id, queue.embed(&chunk.content).await?));
     }
+    graph.upsert_chunk_embeddings(embeddings)?;
 
     // Embed with the HQ queue if available.
-    if let Some(hq) = hq_queue {
-        if hq.has_embedding() {
-            for chunk in &chunks {
-                let hq_vec = hq.embed(&chunk.content).await?;
-                graph.upsert_chunk_embedding_hq(chunk.id, &hq_vec)?;
-            }
+    if let Some(hq) = hq_queue
+        && hq.has_embedding()
+    {
+        let mut hq_embeddings = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            hq_embeddings.push((chunk.id, hq.embed(&chunk.content).await?));
         }
+        graph.upsert_chunk_embeddings_hq(hq_embeddings)?;
     }
 
     tracing::info!(
@@ -328,21 +344,22 @@ pub async fn embed_all_chunks(
             })
         }
         Ok(vecs) => {
-            let mut stored = 0usize;
-            let mut skipped = 0usize;
-            for (chunk, vec) in chunks_to_embed.iter().zip(vecs.iter()) {
-                let result = match target {
-                    EmbeddingTarget::Standard => graph.upsert_chunk_embedding(chunk.id, vec),
-                    EmbeddingTarget::HighQuality => graph.upsert_chunk_embedding_hq(chunk.id, vec),
-                };
-                match result {
-                    Ok(()) => stored += 1,
-                    Err(e) => {
-                        warn!(chunk_id = %chunk.id, %e, "Could not store embedding");
-                        skipped += 1;
-                    }
+            let embeddings = chunks_to_embed
+                .iter()
+                .zip(vecs)
+                .map(|(chunk, vec)| (chunk.id, vec))
+                .collect::<Vec<_>>();
+            let result = match target {
+                EmbeddingTarget::Standard => graph.upsert_chunk_embeddings(embeddings),
+                EmbeddingTarget::HighQuality => graph.upsert_chunk_embeddings_hq(embeddings),
+            };
+            let (stored, skipped) = match result {
+                Ok(()) => (total, 0),
+                Err(e) => {
+                    warn!(%e, target = ?target, "Could not store embedding batch");
+                    (0, total)
                 }
-            }
+            };
             info!(stored, skipped, total, target = ?target, "Embedding complete");
             Ok(EmbeddingResult {
                 stored,
