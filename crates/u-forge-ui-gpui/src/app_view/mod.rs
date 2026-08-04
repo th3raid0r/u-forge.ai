@@ -16,8 +16,8 @@ use u_forge_core::{
     SchemaManager,
     ingest::build_hq_embed_queue,
     lemonade::{
-        Capability, GpuResourceManager, LemonadeServerCatalog, ModelSelector, ProviderFactory,
-        QualityTier, resolve_lemonade_url,
+        Capability, GpuResourceManager, LemonadeRuntime, LemonadeServerCatalog, ModelSelector,
+        ProviderFactory, QualityTier, resolve_lemonade_url,
     },
     queue::InferenceQueueBuilder,
     types::ObjectId,
@@ -182,6 +182,8 @@ pub struct AppView {
     // ── GPUI bookkeeping ──────────────────────────────────────────────────────
     /// Subscriptions kept alive so handlers fire (node events, chat connect).
     _node_subs: Vec<Subscription>,
+    /// Coalesces core mutation events into incremental graph refreshes.
+    _graph_change_task: Option<gpui::Task<()>>,
     // ── Perf overlay ──────────────────────────────────────────────────────────
     /// Whether the perf overlay is visible.
     pub(crate) perf_enabled: bool,
@@ -295,10 +297,42 @@ impl AppView {
             path_picker: None,
             _path_picker_subs: vec![],
             _node_subs: vec![node_sub_create, node_sub_delete, connect_sub],
+            _graph_change_task: None,
             perf_enabled: false,
             last_frame_cost_us: 0,
             frame_times_us: FrameTimeRing::default(),
         };
+
+        let mut graph_changes = view.state.graph.subscribe_changes();
+        view._graph_change_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let (receiver, event) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let event = graph_changes.recv().await;
+                        (graph_changes, event)
+                    })
+                    .await;
+                graph_changes = receiver;
+                if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    return;
+                }
+
+                // Imports and agent tool chains can commit bursts of changes.
+                // One frame-sized debounce turns them into one snapshot refresh.
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                while graph_changes.try_recv().is_ok() {}
+                let Some(this) = this.upgrade() else { return };
+                if this
+                    .update(cx, |view: &mut AppView, cx| view.refresh_snapshot(cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
 
         view.do_init_lemonade(cx);
         view
@@ -328,7 +362,16 @@ impl AppView {
                     duration_ms,
                     "Graph snapshot refreshed"
                 );
+                let selected_still_exists = self
+                    .selection
+                    .read(cx)
+                    .selected_node_id
+                    .is_none_or(|selected| snap.nodes.iter().any(|node| node.id == selected));
                 *self.state.snapshot.write() = snap;
+                if !selected_still_exists {
+                    self.selection
+                        .update(cx, |selection, cx| selection.clear(cx));
+                }
                 self.node_panel
                     .update(cx, |panel, cx| panel.refresh_groups(cx));
                 cx.notify();
@@ -781,6 +824,14 @@ impl AppView {
             }
         };
         let hq_queue = self.state.hq_queue.clone();
+        if !queue.has_embedding() && !hq_queue.as_ref().is_some_and(|q| q.has_embedding()) {
+            tracing::info!(
+                ui_action = "embedding",
+                phase = "skipped_no_provider",
+                "UI action skipped"
+            );
+            return;
+        }
         let graph = self.state.graph.clone();
         let tokio_rt = self.state.tokio_rt.clone();
 
@@ -1004,10 +1055,15 @@ impl AppView {
                                 .collect();
 
                             let build_results = futures::future::join_all(provider_futs).await;
-                            let providers: Vec<_> = build_results.into_iter().flatten().collect();
-
-                            if providers.is_empty() {
-                                return Err(anyhow::anyhow!("No embedding providers available"));
+                            let mut providers = Vec::new();
+                            for build_result in build_results {
+                                match build_result {
+                                    Ok(provider) => providers.push(provider),
+                                    Err(error) => tracing::warn!(
+                                        %error,
+                                        "Lemonade capability provider unavailable"
+                                    ),
+                                }
                             }
 
                             let queue = InferenceQueueBuilder::new()
@@ -1065,6 +1121,7 @@ impl AppView {
                                 preferred_idx,
                                 "milestone: ready — init complete"
                             );
+                            let runtime = Arc::new(LemonadeRuntime::new(url.clone()));
                             Ok((
                                 url,
                                 queue,
@@ -1072,6 +1129,7 @@ impl AppView {
                                 chat_provider,
                                 llm_available,
                                 preferred_idx,
+                                runtime,
                             ))
                         })
                     }
@@ -1088,8 +1146,12 @@ impl AppView {
                         chat_provider,
                         llm_models,
                         preferred_idx,
+                        runtime,
                     )) => {
-                        eprintln!("Lemonade connected — embedding queue ready");
+                        eprintln!("Lemonade connected — capabilities discovered");
+                        let has_embedding = queue.has_embedding()
+                            || hq_queue.as_ref().is_some_and(|q| q.has_embedding());
+                        let has_chat = chat_provider.is_some();
                         view.state.inference_queue = Some(queue.clone());
                         view.state.hq_queue = hq_queue.clone();
 
@@ -1118,33 +1180,41 @@ impl AppView {
                             stop: dev.stop.clone(),
                             max_tool_turns: view.state.app_config.chat.max_tool_turns,
                         };
-                        match GraphAgent::new(
-                            &lemonade_url,
-                            graph,
-                            Arc::new(queue),
-                            hq_arc,
-                            system_prompt,
-                            agent_params,
-                        ) {
-                            Ok(agent) => {
-                                view.chat_panel.update(cx, |panel, _cx| {
-                                    panel.set_agent(agent);
-                                });
-                            }
-                            Err(e) => {
-                                eprintln!("GraphAgent init failed: {e}");
+                        if has_chat {
+                            match GraphAgent::new(
+                                &lemonade_url,
+                                graph,
+                                Arc::new(queue),
+                                hq_arc,
+                                system_prompt,
+                                agent_params,
+                            ) {
+                                Ok(agent) => {
+                                    view.chat_panel.update(cx, |panel, _cx| {
+                                        panel.set_agent(agent);
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("GraphAgent init failed: {e}");
+                                }
                             }
                         }
 
                         // Push chat provider to chat panel (model list + direct streaming fallback).
                         if let Some(provider) = chat_provider {
                             view.chat_panel.update(cx, |panel, _cx| {
-                                panel.set_provider(provider, llm_models, preferred_idx);
+                                panel.set_provider(provider, llm_models, preferred_idx, runtime);
+                            });
+                        } else {
+                            view.chat_panel.update(cx, |panel, _cx| {
+                                panel.set_connect_failed("No downloaded LLM models available");
                             });
                         }
 
                         // Trigger bulk embedding for any unembedded chunks.
-                        view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
+                        if has_embedding {
+                            view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Lemonade init skipped: {e}");

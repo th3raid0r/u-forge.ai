@@ -52,6 +52,8 @@ pub struct InferenceQueue {
     /// Cloned providers used for streaming (bypasses the job queue — the
     /// provider's internal GPU lock handles serialisation).
     pub(super) chat_providers: Arc<Vec<LemonadeChatProvider>>,
+    /// Stable identity of all embedding providers eligible for this lane.
+    pub(super) embedding_space_fingerprint: Option<Arc<str>>,
 
     // Worker counts per capability — presence is derived as `count > 0`.
     pub(super) embedding_workers: usize,
@@ -105,6 +107,11 @@ impl InferenceQueue {
         })?;
         span.record("duration_us", t0.elapsed().as_micros() as u64);
         result
+    }
+
+    /// Stable provider-set identity used to prevent mixing vector spaces.
+    pub fn embedding_space_fingerprint(&self) -> Option<&str> {
+        self.embedding_space_fingerprint.as_deref()
     }
 
     /// Submit a batch of texts for embedding.
@@ -571,6 +578,7 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
+            embedding_space_fingerprint: Some(Arc::from("mock@768")),
             embedding_workers: 1,
             transcription_workers: 2,
             tts_workers: 0,
@@ -696,6 +704,7 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
+            embedding_space_fingerprint: None,
             embedding_workers: 0,
             transcription_workers: 0,
             tts_workers: 0,
@@ -720,6 +729,7 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
+            embedding_space_fingerprint: None,
             embedding_workers: 0,
             transcription_workers: 0,
             tts_workers: 0,
@@ -780,6 +790,7 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
+            embedding_space_fingerprint: Some(Arc::from("slow@768")),
             embedding_workers: 1,
             transcription_workers: 0,
             tts_workers: 0,
@@ -824,6 +835,7 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
+            embedding_space_fingerprint: Some(Arc::from("mock@768")),
             embedding_workers: 1,
             transcription_workers: 2,
             tts_workers: 0,
@@ -854,6 +866,7 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
+            embedding_space_fingerprint: Some(Arc::from("mock@768")),
             embedding_workers: 1,
             transcription_workers: 2,
             tts_workers: 1,
@@ -874,6 +887,7 @@ mod tests {
             generate_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
             chat_providers: Arc::new(Vec::new()),
+            embedding_space_fingerprint: Some(Arc::from("mock@768")),
             embedding_workers: 1,
             transcription_workers: 0,
             tts_workers: 1,

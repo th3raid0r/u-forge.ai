@@ -34,6 +34,11 @@ pub struct KnowledgeGraph {
 
 `KnowledgeGraph` has **no** embedding fields, no `InferenceQueue`, and no server dependency. Storage and schema operations are fully synchronous; AI capabilities are opt-in and constructed separately. This decoupling means the graph works in tests without any running server.
 
+Facade mutations enforce every loaded schema and emit `GraphChange` only
+after storage commits. `subscribe_changes()` drives incremental UI snapshots,
+including agent and import writes. Import node and edge batches are atomic per
+phase.
+
 **Constructor:** `KnowledgeGraph::new(db_path: &Path)` — one argument. Creates `<db_path>/knowledge.db` automatically.
 
 **Bulk access methods** (added for UI performance):
@@ -211,6 +216,11 @@ Graceful degradation at every stage: missing worker → skip that stage with `in
 
 The standard and high-quality vector spaces are independently configurable and incompatible — do not mix model families within a lane. Their configured dimensions are recorded in `schema_metadata`; changing either dimension requires rebuilding the database and is rejected at open time (`EmbeddingDimensionMismatch`) rather than silently corrupting the vector index.
 
+Each lane also records its sorted embedding-provider fingerprint on first use.
+Populated legacy lanes without identity and lanes whose provider set changed
+are excluded from semantic search until re-indexed; hybrid search degrades to
+FTS5 instead of querying incompatible vectors.
+
 ---
 
 ## Schema System (`src/schema/`)
@@ -315,6 +325,7 @@ All font sizes are relative to a single rem base configured via `[ui] font_size`
 ## Design Decisions — Questionable / Still Open
 
 - **`chat.rs` uses hand-crafted HTTP, not `async-openai`** — Lemonade Server's `enable_thinking: bool` parameter is non-standard; `async-openai`'s typed struct has no way to inject it. The other Lemonade endpoints (embeddings, TTS, STT, reranking) remain genuinely OpenAI-compatible and continue using `async-openai`. If Lemonade ever standardises the thinking parameter, `LemonadeChatProvider` can be ported.
+- **LLM runtime profiles are server-global** — `LemonadeRuntime` serializes model, load options, and thinking mode as one identity. Changing any part forces a full `/load` before the next direct or agent request.
 - **`properties` as JSON text** — stored as an opaque string. Filtering inside the blob requires deserializing at the Rust layer, or using `json_set`/`json_extract` for targeted mutations. Acceptable for now; revisit if query patterns demand indexed property access.
 - **Schema naming `add_npc` vs `npc`** — `.schema.json` files are named after MCP tool actions. `SchemaIngestion` strips the `add_` prefix, but the file names leak an external convention.
 - **`save_schema` is `async` but has no `.await`** — called with `.await` by several callers; making it sync would require updating all of them. Minor but misleading.

@@ -86,7 +86,7 @@ fn build_llamacpp_args(opts: &ModelLoadOptions) -> Option<String> {
 ///
 /// See the [Lemonade Server API docs](https://github.com/lemonade-sdk/lemonade)
 /// for the full parameter reference.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ModelLoadOptions {
     /// Context window size in tokens.
     ///
@@ -207,6 +207,13 @@ pub async fn load_model(
     );
 
     Ok(())
+}
+
+/// Force Lemonade to reload a model even when its catalog reports it loaded.
+/// Runtime-profile changes use this because reasoning mode changes require a
+/// full model reload.
+pub async fn reload_model(base_url: &str, model_name: &str, opts: &ModelLoadOptions) -> Result<()> {
+    load_model(base_url, model_name, opts, &[]).await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

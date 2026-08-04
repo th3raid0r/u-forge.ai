@@ -4,7 +4,7 @@ use super::{
 };
 use crate::graph::KnowledgeGraphStorage;
 use crate::types::{Edge, ObjectMetadata};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -282,6 +282,132 @@ impl SchemaManager {
             .and_then(|s| s.object_types.get(type_name).cloned())
     }
 
+    /// Resolve an object type from the loaded schema cache in deterministic
+    /// precedence order. An explicit `schema_name` wins, followed by imported
+    /// schemas, the built-in default, and then any other schema by name.
+    fn cached_schema_for_object_type(
+        &self,
+        object_type: &str,
+        schema_name: Option<&str>,
+    ) -> Option<Arc<SchemaDefinition>> {
+        let cache = self.schema_cache.read();
+        if let Some(name) = schema_name {
+            return cache
+                .get(name)
+                .filter(|schema| schema.object_types.contains_key(object_type))
+                .cloned();
+        }
+
+        let mut names = cache.keys().cloned().collect::<Vec<_>>();
+        names.sort_by_key(|name| match name.as_str() {
+            "imported_schemas" => (0, name.clone()),
+            "default" => (1, name.clone()),
+            _ => (2, name.clone()),
+        });
+        names.into_iter().find_map(|name| {
+            cache
+                .get(&name)
+                .filter(|schema| schema.object_types.contains_key(object_type))
+                .cloned()
+        })
+    }
+
+    /// Strict synchronous validation for mutation boundaries.
+    ///
+    /// An empty cache means no authoritative schema has been loaded yet and is
+    /// intentionally accepted for headless/bootstrap use. Once any schema is
+    /// loaded, unknown types and undeclared properties are hard errors.
+    pub fn validate_object_cached_strict(&self, object: &ObjectMetadata) -> Result<()> {
+        if self.schema_cache.read().is_empty() {
+            return Ok(());
+        }
+        let schema = self
+            .cached_schema_for_object_type(&object.object_type, object.schema_name.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unknown object type '{}' for loaded schemas",
+                    object.object_type
+                )
+            })?;
+        let validation = self.validate_object_with_schema(object, &schema)?;
+        if !validation.valid || !validation.warnings.is_empty() {
+            let mut messages = validation
+                .errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>();
+            messages.extend(
+                validation
+                    .warnings
+                    .into_iter()
+                    .map(|warning| warning.message),
+            );
+            bail!("Object validation failed: {}", messages.join("; "));
+        }
+        Ok(())
+    }
+
+    /// Strict synchronous edge validation against all loaded schemas.
+    pub fn validate_edge_cached_strict(
+        &self,
+        edge: &Edge,
+        source: &ObjectMetadata,
+        target: &ObjectMetadata,
+    ) -> Result<()> {
+        let cache = self.schema_cache.read();
+        if cache.is_empty() {
+            return Ok(());
+        }
+        let mut names = cache.keys().cloned().collect::<Vec<_>>();
+        names.sort_by_key(|name| match name.as_str() {
+            "imported_schemas" => (0, name.clone()),
+            "default" => (1, name.clone()),
+            _ => (2, name.clone()),
+        });
+        let schema = names
+            .into_iter()
+            .find_map(|name| {
+                cache
+                    .get(&name)
+                    .filter(|schema| schema.edge_types.contains_key(edge.edge_type.as_str()))
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unknown edge type '{}' for loaded schemas",
+                    edge.edge_type.as_str()
+                )
+            })?;
+        drop(cache);
+
+        let validation = self.validate_edge_with_schema(edge, source, target, &schema)?;
+        if !validation.valid {
+            let messages = validation
+                .errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>();
+            bail!("Edge validation failed: {}", messages.join("; "));
+        }
+        let edge_schema = schema
+            .edge_types
+            .get(edge.edge_type.as_str())
+            .expect("edge schema was selected above");
+        let unknown = edge
+            .metadata
+            .keys()
+            .filter(|key| !edge_schema.properties.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            bail!(
+                "Edge validation failed: undeclared properties: {}",
+                unknown.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     /// Check whether `type_name` is a valid object type in any cached schema.
     pub fn is_valid_object_type(&self, type_name: &str) -> bool {
         let cache = self.schema_cache.read();
@@ -553,8 +679,12 @@ impl SchemaManager {
         object_type: &str,
         properties: &mut serde_json::Map<String, Value>,
     ) -> Vec<PropertyIssue> {
-        let type_schema = match self.get_object_type_schema("default", object_type) {
-            Some(s) => s,
+        let type_schema = match self.cached_schema_for_object_type(object_type, None) {
+            Some(schema) => schema
+                .object_types
+                .get(object_type)
+                .cloned()
+                .expect("schema was selected for this object type"),
             None => return vec![],
         };
 

@@ -503,7 +503,7 @@ impl Default for StorageConfig {
 pub struct DataConfig {
     /// Path to the JSONL file loaded on startup (and by File > Import Data).
     ///
-    /// Defaults to `./defaults/data/memory.json` relative to the working
+    /// Defaults to `./defaults/data/memory.jsonl` relative to the working
     /// directory.  Override in `u-forge.toml` to point at your own world file.
     ///
     /// # Example
@@ -523,7 +523,7 @@ pub struct DataConfig {
 
 impl DataConfig {
     fn default_import_file() -> PathBuf {
-        PathBuf::from("./defaults/data/memory.json")
+        PathBuf::from("./defaults/data/memory.jsonl")
     }
 
     fn default_schema_dir() -> PathBuf {
@@ -633,9 +633,24 @@ impl AppConfig {
     ///    (or `$HOME/.config/u-forge/config.toml` on Linux)
     /// 3. Built-in defaults
     pub fn load_default() -> Self {
-        for path in Self::candidate_paths() {
+        if let Some(config) = Self::load_from_candidates(Self::candidate_paths()) {
+            return config;
+        }
+
+        info!("AppConfig: no config file found — using defaults");
+        Self::default()
+    }
+
+    /// Load the first existing, valid config in an ordered list of candidates.
+    /// Missing files must be skipped here because [`Self::load`] deliberately
+    /// maps a missing explicitly-requested path to the default configuration.
+    fn load_from_candidates(paths: impl IntoIterator<Item = PathBuf>) -> Option<Self> {
+        for path in paths {
+            if !path.exists() {
+                continue;
+            }
             match Self::load(&path) {
-                Ok(cfg) => return cfg,
+                Ok(cfg) => return Some(cfg),
                 Err(e) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -645,9 +660,7 @@ impl AppConfig {
                 }
             }
         }
-
-        info!("AppConfig: no config file found — using defaults");
-        Self::default()
+        None
     }
 
     /// Ordered list of paths to check when loading the default config.
@@ -776,6 +789,21 @@ mod tests {
             cfg.storage.high_quality_embedding_dimensions,
             crate::HIGH_QUALITY_EMBEDDING_DIMENSIONS
         );
+        assert_eq!(
+            cfg.data.import_file,
+            PathBuf::from("./defaults/data/memory.jsonl")
+        );
+    }
+
+    #[test]
+    fn test_candidate_search_skips_missing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.toml");
+        let present = temp.path().join("config.toml");
+        std::fs::write(&present, "[embedding]\nnpu_weight = 321\n").unwrap();
+
+        let cfg = AppConfig::load_from_candidates([missing, present]).unwrap();
+        assert_eq!(cfg.embedding.npu_weight, 321);
     }
 
     #[test]

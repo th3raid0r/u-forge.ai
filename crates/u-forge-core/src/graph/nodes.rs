@@ -7,6 +7,38 @@ use rusqlite::{OptionalExtension, params};
 use crate::types::{ObjectId, ObjectMetadata};
 
 impl KnowledgeGraphStorage {
+    /// Atomically insert or update a batch of nodes.
+    pub fn upsert_nodes(&self, metadata: &[ObjectMetadata]) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("Failed to begin node batch")?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO nodes
+                     (id, object_type, schema_name, name, properties, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     object_type = excluded.object_type,
+                     schema_name = excluded.schema_name,
+                     name = excluded.name,
+                     properties = excluded.properties,
+                     updated_at = excluded.updated_at",
+            )?;
+            for node in metadata {
+                statement.execute(params![
+                    node.id.hyphenated().to_string(),
+                    &node.object_type,
+                    &node.schema_name,
+                    &node.name,
+                    node.properties.to_string(),
+                    node.created_at.to_rfc3339(),
+                    node.updated_at.to_rfc3339(),
+                ])?;
+            }
+        }
+        tx.commit().context("Failed to commit node batch")?;
+        Ok(())
+    }
+
     /// Insert or update a node.
     ///
     /// Uses `ON CONFLICT(id) DO UPDATE SET …` (the SQLite upsert syntax) rather

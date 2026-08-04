@@ -5,6 +5,7 @@ pub mod chat_panel;
 pub mod graph_canvas;
 pub mod node_editor;
 pub mod node_panel;
+mod panel_contracts;
 pub mod path_picker;
 pub mod search_panel;
 pub mod selection_model;
@@ -22,5 +23,6 @@ actions!([
     ImportData,
     ImportSchema,
     ExportData,
-    TogglePerfOverlay
+    TogglePerfOverlay,
+    FitGraph
 ]);

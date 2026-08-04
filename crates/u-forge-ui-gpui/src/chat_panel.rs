@@ -10,7 +10,8 @@ use gpui::{
 };
 use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
-    ChatMessage, ChatRequest, StreamToken,
+    ChatMessage, ChatRequest, LemonadeRuntime, LemonadeRuntimeProfile, ModelLoadOptions,
+    StreamToken,
     lemonade::{LemonadeChatProvider, SelectedModel},
 };
 
@@ -63,6 +64,10 @@ pub(crate) struct ChatPanel {
     model_dropdown_open: bool,
     /// The active chat provider for direct streaming (None until Lemonade is discovered).
     chat_provider: Option<LemonadeChatProvider>,
+    /// Serializes model/reasoning profile reloads before inference.
+    runtime: Option<Arc<LemonadeRuntime>>,
+    /// Lemonade applies this mode only after a full profile reload.
+    reasoning_enabled: bool,
     /// True while a do_init_lemonade call is in flight (after ConnectRequested emitted).
     connecting: bool,
     /// Brief error string shown under the button when the last connect attempt failed.
@@ -109,14 +114,20 @@ pub(crate) struct AvailableModel {
     pub(crate) model_id: String,
     pub(crate) recipe: String,
     pub(crate) backend: Option<String>,
+    pub(crate) load_options: ModelLoadOptions,
 }
 
 impl From<&SelectedModel> for AvailableModel {
     fn from(sel: &SelectedModel) -> Self {
+        let mut load_options = sel.load_opts.clone();
+        if sel.recipe == "llamacpp" {
+            load_options.llamacpp_backend = sel.backend.clone();
+        }
         Self {
             model_id: sel.model_id.clone(),
             recipe: sel.recipe.clone(),
             backend: sel.backend.clone(),
+            load_options,
         }
     }
 }
@@ -184,6 +195,8 @@ impl ChatPanel {
             selected_model_idx: 0,
             model_dropdown_open: false,
             chat_provider: None,
+            runtime: None,
+            reasoning_enabled: true,
             connecting: false,
             connect_error: None,
             agent: None,
@@ -210,12 +223,23 @@ impl ChatPanel {
         provider: LemonadeChatProvider,
         models: Vec<AvailableModel>,
         preferred_idx: usize,
+        runtime: Arc<LemonadeRuntime>,
     ) {
         self.chat_provider = Some(provider);
         self.available_models = models;
         self.selected_model_idx = preferred_idx;
+        self.runtime = Some(runtime);
         self.connecting = false;
         self.connect_error = None;
+    }
+
+    fn selected_runtime_profile(&self) -> Option<LemonadeRuntimeProfile> {
+        let model = self.available_models.get(self.selected_model_idx)?;
+        Some(LemonadeRuntimeProfile::new(
+            model.model_id.clone(),
+            self.reasoning_enabled,
+            model.load_options.clone(),
+        ))
     }
 
     /// Called from AppView once the graph, inference queue, and Lemonade URL
@@ -372,12 +396,43 @@ impl ChatPanel {
     /// spawns the agent or direct stream. Used by both `do_send` and
     /// `retry_message`.
     fn send_with_text(&mut self, text: String, cx: &mut Context<Self>) {
-        // Record the user message immediately.
-        self.push_text_message(ChatMessageRole::User, text.clone(), cx);
+        let Some(runtime) = self.runtime.clone() else {
+            self.start_send_with_text(text, cx);
+            return;
+        };
+        let Some(profile) = self.selected_runtime_profile() else {
+            self.start_send_with_text(text, cx);
+            return;
+        };
+        let tokio_rt = self.tokio_rt.clone();
         self.streaming = true;
         cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let activation = cx
+                .background_executor()
+                .spawn(async move { tokio_rt.block_on(runtime.activate(&profile)) })
+                .await;
+            this.update(cx, |view: &mut ChatPanel, cx| match activation {
+                Ok(_) => view.start_send_with_text(text, cx),
+                Err(error) => {
+                    view.push_text_message(ChatMessageRole::User, text, cx);
+                    view.push_text_message(
+                        ChatMessageRole::Assistant,
+                        format!("Runtime profile reload failed: {error:#}"),
+                        cx,
+                    );
+                    view.finalize_stream(cx);
+                }
+            })
+            .ok();
+        });
+        self.stream_task = Some(task);
+    }
 
-        // Build token-windowed history from prior User/Assistant turns. Reads
+    fn start_send_with_text(&mut self, text: String, cx: &mut Context<Self>) {
+        // Build token-windowed history from prior User/Assistant turns before
+        // recording the current prompt. GraphAgent receives the current prompt
+        // separately, so including it here would send it twice.
         // each message entity once up-front so we don't need cx access later.
         let raw_history: Vec<HistoryMessage> = self
             .messages
@@ -405,6 +460,11 @@ impl ChatPanel {
             self.response_reserve,
         );
 
+        // Record the user message immediately after history has been captured.
+        self.push_text_message(ChatMessageRole::User, text.clone(), cx);
+        self.streaming = true;
+        cx.notify();
+
         // ── Agent path ────────────────────────────────────────────────────────
         // When a GraphAgent is wired up, route through the tool-calling loop
         // with streaming output. Tool calls appear as collapsible entries.
@@ -416,6 +476,7 @@ impl ChatPanel {
             } else {
                 String::new()
             };
+            let reasoning_enabled = self.reasoning_enabled;
             let tokio_rt = self.tokio_rt.clone();
 
             let task = cx.spawn(async move |this, cx| {
@@ -423,7 +484,12 @@ impl ChatPanel {
                 let mut rx = cx
                     .background_executor()
                     .spawn(async move {
-                        tokio_rt.block_on(agent.prompt_stream(&model_id, &text, &history))
+                        tokio_rt.block_on(agent.prompt_stream(
+                            &model_id,
+                            &text,
+                            &history,
+                            reasoning_enabled,
+                        ))
                     })
                     .await;
 
@@ -568,6 +634,7 @@ impl ChatPanel {
                 _ => api_messages.push(ChatMessage::assistant(&msg.content)),
             }
         }
+        api_messages.push(ChatMessage::user(&text));
 
         // Determine model override if user selected a different model.
         let model_override = if !self.available_models.is_empty() {
@@ -580,7 +647,7 @@ impl ChatPanel {
             None
         };
 
-        let mut req = ChatRequest::new(api_messages).with_thinking(true);
+        let mut req = ChatRequest::new(api_messages).with_thinking(self.reasoning_enabled);
         if let Some(model) = model_override {
             req = req.with_model(model);
         }
@@ -882,15 +949,15 @@ impl Render for ChatPanel {
         let connecting = self.connecting;
         let connect_error = self.connect_error.clone();
         let model_dropdown_open = self.model_dropdown_open;
+        let reasoning_enabled = self.reasoning_enabled;
         let has_provider = self.chat_provider.is_some() || self.agent.is_some();
         let model_label = self.selected_model_label();
-        let history_dropdown_open = self.history_dropdown_open;
-        let history_label = self.session_title();
+        let _history_label = self.session_title();
 
         // Virtualized history dropdown list — only renders visible rows so the
         // dropdown stays cheap even with hundreds of accumulated sessions.
         let history_list_entity = cx.entity().clone();
-        let history_list_el = list(
+        let _history_list_el = list(
             self.history_list_state.clone(),
             move |ix, _window, cx: &mut App| {
                 let panel = history_list_entity.read(cx);
@@ -1192,7 +1259,9 @@ impl Render for ChatPanel {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                this.selected_model_idx = idx;
+                                if !this.streaming {
+                                    this.selected_model_idx = idx;
+                                }
                                 this.model_dropdown_open = false;
                                 cx.notify();
                             }),
@@ -1239,102 +1308,48 @@ impl Render for ChatPanel {
             .bg(rgb(0x181825))
             .border_l_1()
             .border_color(rgb(0x313244))
-            // ── Header: chat history selector ────────────────────────────────
+            // Zed-aligned chat header. Session persistence remains internal;
+            // chat-history navigation is intentionally not exposed.
             .child(
                 div()
                     .id("chat-header")
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_none()
                     .w_full()
+                    .items_center()
                     .border_b_1()
                     .border_color(rgb(0x313244))
                     .px_2()
                     .py_1()
+                    .child(div().text_sm().text_color(rgba(0xcdd6f4ff)).child("Chat"))
+                    .child({
+                        let mut spacer = div();
+                        spacer.style().flex_grow = Some(1.0);
+                        spacer
+                    })
                     .child(
                         div()
-                            .id("history-selector-row")
+                            .id("new-chat-btn")
                             .flex()
-                            .flex_row()
+                            .flex_none()
                             .items_center()
-                            .gap(px(4.0))
-                            .child(
-                                div()
-                                    .id("history-selector-btn")
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .h(px(22.0))
-                                    .bg(rgb(0x313244))
-                                    .border_1()
-                                    .border_color(rgb(0x45475a))
-                                    .rounded(px(3.0))
-                                    .text_sm()
-                                    .text_color(rgba(0xcdd6f4ff))
-                                    .cursor_pointer()
-                                    .overflow_x_hidden()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.history_dropdown_open =
-                                                !this.history_dropdown_open;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(history_label),
-                            )
-                            .child({
-                                let mut spacer = div();
-                                spacer.style().flex_grow = Some(1.0);
-                                spacer
-                            })
-                            .child(
-                                div()
-                                    .id("new-chat-btn")
-                                    .flex()
-                                    .flex_none()
-                                    .items_center()
-                                    .justify_center()
-                                    .px_2()
-                                    .h(px(22.0))
-                                    .bg(rgb(0xa6e3a1))
-                                    .rounded(px(3.0))
-                                    .text_sm()
-                                    .text_color(rgba(0x1e1e2eff))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.new_session(cx);
-                                        }),
-                                    )
-                                    .child("New"),
-                            ),
-                    )
-                    .when(history_dropdown_open, |header| {
-                        header.child(
-                            div()
-                                .id("history-dropdown")
-                                .flex()
-                                .flex_col()
-                                .flex_none()
-                                .w_full()
-                                .bg(rgb(0x313244))
-                                .border_1()
-                                .border_color(rgb(0x45475a))
-                                .rounded(px(3.0))
-                                .mt_1()
-                                .h(px(200.0))
-                                .overflow_hidden()
-                                .child({
-                                    let mut el = history_list_el;
-                                    el.style().flex_grow = Some(1.0);
-                                    el.style().flex_shrink = Some(1.0);
-                                    el.style().flex_basis = Some(relative(0.).into());
-                                    el
+                            .justify_center()
+                            .px_2()
+                            .h(px(22.0))
+                            .rounded(px(3.0))
+                            .text_sm()
+                            .text_color(rgba(0xa6adc8ff))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x313244)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.new_session(cx);
                                 }),
-                        )
-                    }),
+                            )
+                            .child("New chat"),
+                    ),
             )
             // ── Message area (virtualized list) ──────────────────────────────
             .child({
@@ -1608,6 +1623,46 @@ impl Render for ChatPanel {
                                                 ),
                                             )
                                             .child(model_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("reasoning-toggle")
+                                            .flex()
+                                            .items_center()
+                                            .px_2()
+                                            .h(px(22.0))
+                                            .bg(if reasoning_enabled {
+                                                rgb(0x45475a)
+                                            } else {
+                                                rgb(0x313244)
+                                            })
+                                            .border_1()
+                                            .border_color(rgb(0x45475a))
+                                            .rounded(px(3.0))
+                                            .text_sm()
+                                            .text_color(if reasoning_enabled {
+                                                rgba(0xcdd6f4ff)
+                                            } else {
+                                                rgba(0x6c7086ff)
+                                            })
+                                            .cursor_pointer()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, _: &MouseDownEvent, _window, cx| {
+                                                        if !this.streaming {
+                                                            this.reasoning_enabled =
+                                                                !this.reasoning_enabled;
+                                                            cx.notify();
+                                                        }
+                                                    },
+                                                ),
+                                            )
+                                            .child(if reasoning_enabled {
+                                                "Thinking on"
+                                            } else {
+                                                "Thinking off"
+                                            }),
                                     ),
                             )
                             .when(model_dropdown_open, |container| {

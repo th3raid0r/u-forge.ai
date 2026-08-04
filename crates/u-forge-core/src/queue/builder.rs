@@ -123,6 +123,7 @@ impl InferenceQueueBuilder {
         let mut tts_workers: usize = 0;
         let mut llm_workers: usize = 0;
         let mut reranking_workers: usize = 0;
+        let mut embedding_models = Vec::new();
 
         // ── Phase 1: register workers with the dispatcher (no spawning yet) ──
         //
@@ -132,6 +133,11 @@ impl InferenceQueueBuilder {
         for built in self.providers {
             match (built.capability, built.provider) {
                 (Capability::Embedding, ProviderSlot::Embedding(provider)) => {
+                    if let Some(info) = provider.model_info() {
+                        embedding_models.push(format!("{}@{}", info.name, info.dimensions));
+                    } else {
+                        embedding_models.push(format!("{}@unknown", built.name));
+                    }
                     let (queue, idle, ewma_us) =
                         embed_dispatcher.add_worker(built.weight, &built.name);
                     debug!(name = %built.name, weight = built.weight, "Registered embedding worker");
@@ -193,6 +199,13 @@ impl InferenceQueueBuilder {
         // registered.
         let embed_dispatcher = Arc::new(embed_dispatcher);
         let embedding_workers = embed_specs.len();
+        embedding_models.sort();
+        embedding_models.dedup();
+        let embedding_space_fingerprint = if embedding_models.is_empty() {
+            None
+        } else {
+            Some(Arc::<str>::from(embedding_models.join("|")))
+        };
 
         for spec in embed_specs {
             let dispatcher = Arc::clone(&embed_dispatcher);
@@ -230,6 +243,7 @@ impl InferenceQueueBuilder {
             generate_queue,
             rerank_queue,
             chat_providers: Arc::new(chat_providers_for_stream),
+            embedding_space_fingerprint,
             embedding_workers,
             transcription_workers,
             tts_workers,

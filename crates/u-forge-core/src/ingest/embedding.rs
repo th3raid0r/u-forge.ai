@@ -239,6 +239,19 @@ pub async fn rechunk_and_embed(
 ) -> Result<usize> {
     use crate::types::ChunkType;
 
+    let standard_fingerprint = queue
+        .embedding_space_fingerprint()
+        .ok_or_else(|| anyhow::anyhow!("Embedding queue has no model fingerprint"))?;
+    graph.ensure_embedding_space(EmbeddingTarget::Standard, standard_fingerprint)?;
+    if let Some(hq) = hq_queue
+        && hq.has_embedding()
+    {
+        let hq_fingerprint = hq
+            .embedding_space_fingerprint()
+            .ok_or_else(|| anyhow::anyhow!("HQ embedding queue has no model fingerprint"))?;
+        graph.ensure_embedding_space(EmbeddingTarget::HighQuality, hq_fingerprint)?;
+    }
+
     let meta = graph
         .get_object(object_id)?
         .ok_or_else(|| anyhow::anyhow!("Node {object_id} not found"))?;
@@ -302,6 +315,18 @@ pub async fn embed_all_chunks(
     queue: &InferenceQueue,
     target: EmbeddingTarget,
 ) -> Result<EmbeddingResult> {
+    if !queue.has_embedding() {
+        return Ok(EmbeddingResult {
+            stored: 0,
+            skipped: 0,
+            total: 0,
+        });
+    }
+    let fingerprint = queue
+        .embedding_space_fingerprint()
+        .ok_or_else(|| anyhow::anyhow!("Embedding queue has no model fingerprint"))?;
+    graph.ensure_embedding_space(target, fingerprint)?;
+
     let stats = graph.get_stats()?;
 
     let needs_embedding = match target {
@@ -309,14 +334,12 @@ pub async fn embed_all_chunks(
         EmbeddingTarget::HighQuality => stats.chunk_count > stats.embedded_hq_count,
     };
 
-    if !queue.has_embedding() || !needs_embedding {
-        if queue.has_embedding() && !needs_embedding {
-            info!(
-                target = ?target,
-                chunks = stats.chunk_count,
-                "All chunks already embedded — skipping"
-            );
-        }
+    if !needs_embedding {
+        info!(
+            target = ?target,
+            chunks = stats.chunk_count,
+            "All chunks already embedded — skipping"
+        );
         return Ok(EmbeddingResult {
             stored: 0,
             skipped: 0,

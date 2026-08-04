@@ -1171,6 +1171,7 @@ impl GraphAgent {
     fn build_agent(
         &self,
         model_id: &str,
+        reasoning_enabled: bool,
     ) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
         let mut builder = self.client.agent(model_id).preamble(&self.system_prompt);
         if let Some(temp) = self.params.temperature {
@@ -1180,7 +1181,16 @@ impl GraphAgent {
         if let Some(max_tokens) = self.params.max_tokens {
             builder = builder.max_tokens(max_tokens);
         }
-        if let Some(additional) = self.additional_params() {
+        let mut additional = self
+            .additional_params()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let serde_json::Value::Object(params) = &mut additional {
+            params.insert(
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(reasoning_enabled),
+            );
+        }
+        if !additional.as_object().is_none_or(serde_json::Map::is_empty) {
             builder = builder.additional_params(additional);
         }
 
@@ -1217,10 +1227,11 @@ impl GraphAgent {
         model_id: &str,
         user_message: &str,
         history: &[HistoryMessage],
+        reasoning_enabled: bool,
     ) -> mpsc::Receiver<AgentStreamEvent> {
         let (tx, rx) = mpsc::channel(64);
 
-        let agent = self.build_agent(model_id);
+        let agent = self.build_agent(model_id, reasoning_enabled);
         let max_turns = self.params.max_tool_turns;
 
         let user_message = user_message.to_string();
@@ -1367,7 +1378,7 @@ impl GraphAgent {
         user_message: &str,
         history: &[HistoryMessage],
     ) -> Result<String, String> {
-        let agent = self.build_agent(model_id);
+        let agent = self.build_agent(model_id, true);
         let rig_history: Vec<rig::completion::message::Message> = history
             .iter()
             .map(|m| {

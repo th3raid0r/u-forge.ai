@@ -13,7 +13,9 @@
 //! in the facade layer.  `parking_lot::Mutex` has no poisoning semantics, so
 //! lock guards are obtained without `.unwrap()`.
 
-use crate::error::EmbeddingDimensionMismatch;
+use crate::error::{
+    EmbeddingDimensionMismatch, EmbeddingSpaceMismatch, UnidentifiedEmbeddingSpace,
+};
 use crate::schema::SchemaDefinition;
 use crate::types::{ChunkType, ObjectId, ObjectMetadata};
 use anyhow::{Context, Result};
@@ -317,6 +319,54 @@ fn check_or_init_embedding_dims(conn: &Connection, checks: &[(&str, usize)]) -> 
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 impl KnowledgeGraphStorage {
+    /// Verify or initialize the model fingerprint for a vector lane.
+    ///
+    /// A fingerprint may be initialized only while the lane is empty. This
+    /// prevents legacy vectors with unknown provenance from being silently
+    /// blessed as compatible with the currently selected model.
+    pub fn ensure_embedding_space(&self, lane: &str, fingerprint: &str) -> Result<()> {
+        let table = match lane {
+            "standard" => "chunks_vec",
+            "high_quality" => "chunks_vec_hq",
+            other => return Err(anyhow::anyhow!("Unknown embedding lane '{other}'")),
+        };
+        let key = format!("{table}_fingerprint");
+        let conn = self.conn.lock();
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(stored) if stored == fingerprint => Ok(()),
+            Some(stored) => Err(EmbeddingSpaceMismatch {
+                lane: lane.to_string(),
+                stored,
+                current: fingerprint.to_string(),
+            }
+            .into()),
+            None => {
+                let vector_count: i64 =
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+                if vector_count > 0 {
+                    return Err(UnidentifiedEmbeddingSpace {
+                        lane: lane.to_string(),
+                    }
+                    .into());
+                }
+                conn.execute(
+                    "INSERT INTO schema_metadata (key, value) VALUES (?1, ?2)",
+                    params![key, fingerprint],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
     // ── Construction ──────────────────────────────────────────────────────────
 
     /// Open (or create) the knowledge graph database at `<db_path>/knowledge.db`.

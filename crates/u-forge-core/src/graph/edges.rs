@@ -9,6 +9,33 @@ use crate::types::{Edge, EdgeType, ObjectId};
 use std::collections::HashMap;
 
 impl KnowledgeGraphStorage {
+    /// Atomically insert or update a batch of edges.
+    pub fn upsert_edges(&self, edges: &[Edge]) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("Failed to begin edge batch")?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT OR REPLACE INTO edges
+                     (source_id, target_id, edge_type, weight, metadata, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for edge in edges {
+                let metadata = serde_json::to_string(&edge.metadata)
+                    .context("Failed to serialise edge metadata")?;
+                statement.execute(params![
+                    edge.from.hyphenated().to_string(),
+                    edge.to.hyphenated().to_string(),
+                    edge.edge_type.as_str(),
+                    edge.weight as f64,
+                    metadata,
+                    edge.created_at.to_rfc3339(),
+                ])?;
+            }
+        }
+        tx.commit().context("Failed to commit edge batch")?;
+        Ok(())
+    }
+
     /// Insert or replace an edge.
     ///
     /// `INSERT OR REPLACE` is safe here because the `edges` table has no

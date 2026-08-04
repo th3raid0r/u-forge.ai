@@ -7,6 +7,28 @@
 use glam::Vec2;
 use u_forge_graph_view::{GraphSnapshot, LodLevel};
 
+/// Stable identity and default docking metadata for a Zed-style panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PanelMetadata {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub position: PanelPosition,
+    pub closable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PanelPosition {
+    Left,
+    Right,
+    Bottom,
+    Center,
+}
+
+/// Framework-neutral contract implemented by each application panel.
+pub trait Panel {
+    fn metadata(&self) -> PanelMetadata;
+}
+
 /// A node primitive (circle / squircle) in screen space.
 #[derive(Debug, Clone)]
 pub struct NodeCmd {
@@ -57,6 +79,33 @@ const LOD_DOT_THRESHOLD: f32 = 0.25;
 const LOD_LABEL_THRESHOLD: f32 = 0.6;
 
 impl Viewport {
+    /// Construct a camera that contains every point with screen-space padding.
+    pub fn fit_points(points: &[Vec2], size: Vec2, padding: f32) -> Self {
+        if points.is_empty() {
+            return Self {
+                center: Vec2::ZERO,
+                size,
+                zoom: 1.0,
+            };
+        }
+        let mut min = points[0];
+        let mut max = points[0];
+        for point in &points[1..] {
+            min = min.min(*point);
+            max = max.max(*point);
+        }
+        let extent = (max - min).max(Vec2::splat(1.0));
+        let available = (size - Vec2::splat(padding.max(0.0) * 2.0)).max(Vec2::splat(1.0));
+        let zoom = (available.x / extent.x)
+            .min(available.y / extent.y)
+            .clamp(0.05, 8.0);
+        Self {
+            center: (min + max) * 0.5,
+            size,
+            zoom,
+        }
+    }
+
     /// World-space bounding rectangle `(min, max)`.
     pub fn world_rect(&self) -> (Vec2, Vec2) {
         let half = self.size / (2.0 * self.zoom);
@@ -293,5 +342,17 @@ mod tests {
         assert_eq!(make(0.1).lod_level(), LodLevel::Dot);
         assert_eq!(make(0.4).lod_level(), LodLevel::Label);
         assert_eq!(make(1.0).lod_level(), LodLevel::Full);
+    }
+
+    #[test]
+    fn fit_points_centers_and_contains_graph() {
+        let points = [Vec2::new(-100.0, -50.0), Vec2::new(100.0, 50.0)];
+        let viewport = Viewport::fit_points(&points, Vec2::new(800.0, 600.0), 40.0);
+        assert_eq!(viewport.center, Vec2::ZERO);
+        let (min, max) = viewport.world_rect();
+        assert!(points.iter().all(|point| point.x >= min.x
+            && point.x <= max.x
+            && point.y >= min.y
+            && point.y <= max.y));
     }
 }

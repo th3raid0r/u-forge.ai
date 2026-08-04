@@ -32,6 +32,27 @@ pub struct EmbeddingDimensionMismatch {
     pub expected: usize,
 }
 
+/// Returned when vectors already stored in a lane were produced by a
+/// different embedding provider set than the current queue.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "embedding space mismatch for lane '{lane}': database fingerprint is '{stored}', current fingerprint is '{current}'. Re-index this lane before semantic search."
+)]
+pub struct EmbeddingSpaceMismatch {
+    pub lane: String,
+    pub stored: String,
+    pub current: String,
+}
+
+/// Returned for a legacy populated vector lane that has no recorded identity.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "embedding space for lane '{lane}' is unidentified but already contains vectors. Re-index this lane once to record its model fingerprint."
+)]
+pub struct UnidentifiedEmbeddingSpace {
+    pub lane: String,
+}
+
 /// Application-level error returned by axum HTTP handlers.
 ///
 /// Convert any `anyhow::Error` via the `From` impl (or `?` operator) and let
