@@ -83,13 +83,13 @@ created_at TEXT NOT NULL
 
 **`chunks_fts`** — FTS5 virtual table mirroring `chunks(content)`. Auto-populated and auto-updated via `AFTER INSERT/UPDATE/DELETE` triggers on `chunks`. Never manually insert.
 
-**`chunks_vec`** — sqlite-vec `vec0` table, 768-dim cosine distance.
+**`chunks_vec`** — sqlite-vec `vec0` table using the configured standard embedding dimensions (768 by default) and cosine distance.
 ```
 rowid INTEGER (maps to chunks.rowid), embedding float[768] distance_metric=cosine
 ```
 Populated via `upsert_chunk_embedding()`. Not every chunk has an entry immediately. Cleaned by `chunks_vec_ad` trigger on `AFTER DELETE ON chunks`.
 
-**`chunks_vec_hq`** — sqlite-vec `vec0` table, 4096-dim cosine distance.
+**`chunks_vec_hq`** — sqlite-vec `vec0` table using the configured high-quality embedding dimensions (4096 by default) and cosine distance.
 ```
 rowid INTEGER (maps to chunks.rowid), embedding float[4096] distance_metric=cosine
 ```
@@ -209,7 +209,7 @@ Graceful degradation at every stage: missing worker → skip that stage with `in
 
 `fts5_sanitize` strips characters illegal in FTS5 query syntax before `MATCH`; the original query is passed verbatim to `embed()` and `rerank()` where punctuation is meaningful. Returns `None` for all-punctuation input (FTS stage cleanly skipped).
 
-The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not mix model families. Changing the embedding model without re-indexing is caught at DB open time (`EmbeddingDimensionMismatch`, re-exported from `u_forge_core`) rather than silently corrupting the vector index.
+The standard and high-quality vector spaces are independently configurable and incompatible — do not mix model families within a lane. Their configured dimensions are recorded in `schema_metadata`; changing either dimension requires rebuilding the database and is rejected at open time (`EmbeddingDimensionMismatch`) rather than silently corrupting the vector index.
 
 ---
 
@@ -217,7 +217,7 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 
 `SchemaDefinition` holds named maps of `ObjectTypeSchema` and `EdgeTypeSchema`. `prompt_summary()` generates a compact markdown block (node types with property names/types/required flags + edge types) for system prompt injection.
 
-`SchemaManager` caches schemas in `parking_lot::RwLock<HashMap>`. Validation helpers (`is_valid_object_type`, `all_object_type_names`, etc.) read from the in-memory cache without touching SQLite. `validate_and_coerce_properties` coerces `String("42")` → `Number` and `String("true"/"false")` → `Bool` in-place; returns `Vec<PropertyIssue>` for type mismatches and invalid enum values. Unknown properties are silently accepted.
+`SchemaManager` caches schemas in `parking_lot::RwLock<HashMap>`. Validation helpers (`is_valid_object_type`, `all_object_type_names`, etc.) read from the in-memory cache without touching SQLite. `validate_and_coerce_properties` coerces compatible primitive strings in-place and returns `Vec<PropertyIssue>` for type mismatches and invalid enum values. The JSONL import boundary is stricter: it drops undeclared properties and skips records that reference unknown types, omit required properties, or use invalid edge endpoints.
 
 `KnowledgeGraph::schema_prompt_summary_all()` merges all persisted schemas and returns `prompt_summary()` output — used by `GraphAgent::new` to inject schema context into the system prompt.
 
@@ -227,17 +227,18 @@ The 768-dim and 4096-dim vector spaces are **fixed and incompatible** — do not
 
 Tool arguments emitted by the LLM are validated against each tool's JSON Schema (derived via `schemars::JsonSchema` and strict against unknown fields via `#[serde(deny_unknown_fields)]`) before deserialization. Each tool accepts `serde_json::Value` as its rig `Args` type, calls `tool_validation::validate_tool_args` first, and only then runs `serde_json::from_value` into the typed struct. Validators are compiled once per process via `std::sync::LazyLock` and reused across all calls. Validation failures return a `ToolError` whose message names the offending field path (JSON Pointer format), so the LLM can self-correct without burning extra turns. See `crates/u-forge-agent/src/lib.rs` — `tool_validation` module.
 
-`SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and adds 24 common TTRPG edge types automatically.
+`SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and derives edge schemas from declared relationship fields, including their allowed target types.
 
 ---
 
 ## Data Ingestion (`src/ingest/`)
 
-**Two-pass JSONL import** (`data.rs`): collect all nodes → create objects with name→ID map → resolve edge names → create edges. `create_objects` deduplicates by type+name (existing node ID reused). `resolve_node_id` calls `find_by_name_only` as a storage fallback, allowing edges to reference nodes from prior import sessions.
+**Strict two-pass JSONL import** (`data.rs`): validate and collect nodes → create accepted objects with a name→ID map → validate and resolve edges → create accepted edges. Existing objects are preloaded for cross-session references. Unknown types, missing required fields, undeclared properties, invalid endpoint pairs, and unresolved endpoints are counted and written to a `.u-forge-import-diagnostics` JSONL sidecar rather than silently widening the graph shape.
 
 **Two ingestion entry points:**
 - `setup_and_index(graph, schema_dir, data_file)` — loads schemas AND imports data. Used for a full fresh setup only.
-- `import_data_only(graph, data_file)` — data import + FTS5 indexing with **no schema side-effects**. The UI's "Import Data…" action uses this so importing data never overwrites or clears loaded schemas.
+- `import_data_only(graph, data_file)` — strict data import against schemas already loaded in the graph, with **no schema side-effects**.
+- `import_schemas_and_data(graph, schema_files, data_files)` — explicit schema import followed by strict data import; used by the UI's combined import workflow.
 
 **Separate clear operations on `KnowledgeGraph`:**
 - `clear_data()` — deletes nodes/edges/chunks/vectors; schemas intact. Used by "Clear Data".

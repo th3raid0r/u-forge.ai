@@ -18,7 +18,7 @@ directory on drop. Discarding to `_` can drop before the test body runs.
 ## Running Tests
 
 ```bash
-cargo test --workspace -- --test-threads=1                             # All tests — always single-threaded
+make test                                                              # All tests — always single-threaded
 cargo test --workspace storage -- --test-threads=1                     # Module-specific
 cargo test --workspace -- --test-threads=1 --nocapture                 # With stdout
 RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture  # With debug logging
@@ -130,9 +130,9 @@ RUST_LOG=u_forge_core::ingest=warn                   # Suppress noisy modules
 ## CI Commands
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
-cargo test --workspace -- --test-threads=1
+make fmt-check
+make clippy
+make test
 cargo doc --no-deps --workspace
 ```
 

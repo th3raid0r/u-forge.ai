@@ -4,7 +4,7 @@ Read `.rules` first for every task. It contains the anti-patterns and task-based
 routing. Rule files in `.rulesdir/` have more detail by topic. `ARCHITECTURE.md`
 has the workspace layout, SQLite schema, inference design, and design decisions.
 
-**Canonical test command:** `cargo test --workspace -- --test-threads=1`
+**Canonical test command:** `make test`
 
 ## Project summary
 
