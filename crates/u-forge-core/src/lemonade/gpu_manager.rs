@@ -353,16 +353,18 @@ mod tests {
         let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
             .await
             .unwrap();
-        let cfg = crate::config::AppConfig::default();
-        let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let llm = selector
-            .select_llm_models()
-            .into_iter()
-            .next()
-            .expect("No LLM model found in catalog");
+        let Some(llm) = catalog.models.iter().find(|model| {
+            model.downloaded && model.id == crate::test_helpers::GPU_CPU_TEST_LLM_MODEL
+        }) else {
+            eprintln!(
+                "SKIP: {} is not downloaded",
+                crate::test_helpers::GPU_CPU_TEST_LLM_MODEL
+            );
+            return;
+        };
         let gpu = GpuResourceManager::new();
         let chat =
-            crate::lemonade::LemonadeChatProvider::new(&url, &llm.model_id, Some(Arc::clone(&gpu)));
+            crate::lemonade::LemonadeChatProvider::new(&url, &llm.id, Some(Arc::clone(&gpu)));
 
         // Simulate an active STT session (no real audio upload needed).
         let stt_guard = gpu

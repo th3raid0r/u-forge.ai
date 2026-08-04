@@ -16,8 +16,7 @@ use std::sync::{Arc, LazyLock};
 
 use tiktoken_rs::CoreBPE;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::{Tool, ToolContext};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
@@ -66,7 +65,7 @@ pub fn count_tokens(text: &str) -> usize {
 /// (The trailing 3 accounts for the assistant reply-priming tokens in OpenAI format.)
 ///
 /// Messages are evaluated newest-first; the returned `Vec` is in chronological
-/// order (oldest first), ready to pass directly to `with_history()`.
+/// order (oldest first), ready to pass directly to `history()`.
 pub fn select_history_window(
     history: &[HistoryMessage],
     system_prompt: &str,
@@ -337,19 +336,23 @@ impl Tool for FtsSearchTool {
     type Args = serde_json::Value;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Full-text keyword search over the knowledge graph using SQLite FTS5. \
+    fn description(&self) -> String {
+        "Full-text keyword search over the knowledge graph using SQLite FTS5. \
                  Fast and exact — good for specific names, terms, or known phrases. \
                  Returns nodes that contain matching text, with the matching snippets."
-                .to_string(),
-            parameters: serde_json::to_value(schema_for!(FtsSearchArgs))
-                .expect("FtsSearchArgs schema is always valid JSON"),
-        }
+            .to_string()
     }
 
-    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(FtsSearchArgs))
+            .expect("FtsSearchArgs schema is always valid JSON")
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        raw: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
         let args: FtsSearchArgs = serde_json::from_value(raw).map_err(|e| {
             ToolError(format!(
@@ -455,19 +458,23 @@ impl Tool for SemanticSearchTool {
     type Args = serde_json::Value;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Semantic (embedding-based) search over the knowledge graph. \
+    fn description(&self) -> String {
+        "Semantic (embedding-based) search over the knowledge graph. \
                  Finds conceptually related nodes even when exact keywords don't match. \
                  Use for exploratory queries, related concepts, or when FTS returns nothing."
-                .to_string(),
-            parameters: serde_json::to_value(schema_for!(SemanticSearchArgs))
-                .expect("SemanticSearchArgs schema is always valid JSON"),
-        }
+            .to_string()
     }
 
-    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(SemanticSearchArgs))
+            .expect("SemanticSearchArgs schema is always valid JSON")
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        raw: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
         let args: SemanticSearchArgs = serde_json::from_value(raw).map_err(|e| {
             ToolError(format!(
@@ -586,21 +593,25 @@ impl Tool for HybridSearchTool {
     type Args = serde_json::Value;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Hybrid search over the knowledge graph: combines FTS5 keyword matching \
+    fn description(&self) -> String {
+        "Hybrid search over the knowledge graph: combines FTS5 keyword matching \
                  with semantic embedding search using Reciprocal Rank Fusion, then \
                  optionally reranks results with a cross-encoder. Returns fully hydrated \
                  node results with metadata, relationships, and content. \
                  Recommended as the default search tool."
-                .to_string(),
-            parameters: serde_json::to_value(schema_for!(HybridSearchArgs))
-                .expect("HybridSearchArgs schema is always valid JSON"),
-        }
+            .to_string()
     }
 
-    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(HybridSearchArgs))
+            .expect("HybridSearchArgs schema is always valid JSON")
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        raw: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
         let args: HybridSearchArgs = serde_json::from_value(raw).map_err(|e| {
             ToolError(format!(
@@ -692,20 +703,23 @@ impl Tool for UpsertNodeTool {
     type Args = serde_json::Value;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description:
-                "Create or update a knowledge graph node. Always search first to avoid duplicates. \
+    fn description(&self) -> String {
+        "Create or update a knowledge graph node. Always search first to avoid duplicates. \
                  Populate name, object_type, and all known properties in one call. \
                  On update (node_id set), only changed keys are needed — omitted keys are kept."
-                    .to_string(),
-            parameters: serde_json::to_value(schema_for!(UpsertNodeArgs))
-                .expect("UpsertNodeArgs schema is always valid JSON"),
-        }
+            .to_string()
     }
 
-    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(UpsertNodeArgs))
+            .expect("UpsertNodeArgs schema is always valid JSON")
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        raw: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
         let args: UpsertNodeArgs = serde_json::from_value(raw).map_err(|e| {
             ToolError(format!(
@@ -882,20 +896,23 @@ impl Tool for UpsertEdgeTool {
     type Args = serde_json::Value;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description:
-                "Create or update a relationship (edge) between two nodes in the knowledge graph. \
+    fn description(&self) -> String {
+        "Create or update a relationship (edge) between two nodes in the knowledge graph. \
                  Nodes can be specified by exact name or UUID. \
                  Both endpoint nodes are re-indexed after the edge is saved."
-                    .to_string(),
-            parameters: serde_json::to_value(schema_for!(UpsertEdgeArgs))
-                .expect("UpsertEdgeArgs schema is always valid JSON"),
-        }
+            .to_string()
     }
 
-    async fn call(&self, raw: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(UpsertEdgeArgs))
+            .expect("UpsertEdgeArgs schema is always valid JSON")
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        raw: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         tool_validation::validate_tool_args(Self::NAME, &raw)?;
         let args: UpsertEdgeArgs = serde_json::from_value(raw).map_err(|e| {
             ToolError(format!(
@@ -959,7 +976,7 @@ impl Tool for UpsertEdgeTool {
 
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
-use rig::client::CompletionClient;
+use rig::client::AgentClientExt;
 use rig::completion::{Prompt, PromptError, message::ToolResultContent};
 use rig::providers::openai::CompletionsClient;
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
@@ -1222,8 +1239,8 @@ impl GraphAgent {
         tokio::spawn(async move {
             let mut stream = agent
                 .stream_prompt(&user_message)
-                .with_history(rig_history)
-                .multi_turn(max_turns)
+                .history(rig_history)
+                .max_turns(max_turns)
                 .await;
 
             let mut final_text = String::new();
@@ -1320,7 +1337,7 @@ impl GraphAgent {
                         // FinalResponse carries the full aggregated text for the
                         // last turn. Use it if we didn't accumulate via TextDelta.
                         let text = if final_text.is_empty() {
-                            resp.response().to_string()
+                            resp.output().to_string()
                         } else {
                             final_text.clone()
                         };
@@ -1363,7 +1380,7 @@ impl GraphAgent {
             .collect();
         agent
             .prompt(user_message)
-            .with_history(rig_history)
+            .history(rig_history)
             .max_turns(self.params.max_tool_turns)
             .await
             .map_err(|e: PromptError| e.to_string())

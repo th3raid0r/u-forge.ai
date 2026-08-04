@@ -326,22 +326,23 @@ All font sizes are relative to a single rem base configured via `[ui] font_size`
 
 | Crate | Version | Role |
 |---|---|---|
-| `rusqlite` | 0.32 | SQLite storage (`bundled` + `vtab` features) |
-| `sqlite-vec` | 0.1.7 | ANN vector search via `vec0` virtual table |
-| `tokio` | 1.45 | Async runtime |
-| `serde` / `serde_json` | 1.0 | Serialization (all layers) |
-| `reqwest` | 0.12 | HTTP client — all Lemonade endpoints |
-| `parking_lot` | 0.12 | Non-async mutex (storage, queue, GPU manager) |
-| `dashmap` | 6.1 | Concurrent maps (SchemaManager) |
-| `uuid` | 1.x | ID generation |
-| `anyhow` / `thiserror` | 1.x | Error handling |
-| `async-trait` | 0.1 | Trait-object async methods |
-| `tracing` / `tracing-subscriber` | 0.1 | Structured logging |
-| `rig-core` | 0.35.0 | LLM agent framework (`u-forge-agent`) |
-| `gpui` | 0.2.2 | GPU-accelerated UI framework (`u-forge-ui-gpui`, crates.io release) |
-| `glam` | — | Vector math (`u-forge-graph-view`, `u-forge-ui-traits`) |
-| `rstar` | — | R-tree spatial index (`u-forge-graph-view`) |
-| `tempfile` | 3.x | Test isolation (dev/test) |
+| `rusqlite` | 0.40.1 | SQLite storage (`bundled` + `vtab` features) |
+| `sqlite-vec` | 0.1.9 | ANN vector search via `vec0` virtual table |
+| `tokio` | 1.53.1 | Async runtime |
+| `serde` / `serde_json` | 1.0.229 / 1.0.151 | Serialization (all layers) |
+| `reqwest` | 0.13.4 | HTTP client — all Lemonade endpoints |
+| `async-openai` | 0.41.3 | OpenAI-compatible embedding, TTS, and STT client |
+| `parking_lot` | 0.12.5 | Non-async mutex (storage, queue, GPU manager) |
+| `dashmap` | 6.2.1 | Concurrent maps (SchemaManager) |
+| `uuid` | 1.24.0 | ID generation |
+| `anyhow` / `thiserror` | 1.0.104 / 2.0.19 | Error handling |
+| `async-trait` | 0.1.91 | Trait-object async methods |
+| `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | Structured logging |
+| `rig` | 0.41.0 | LLM agent framework facade (`u-forge-agent`) |
+| `gpui-ce` | 0.3.3 | GPU-accelerated UI framework (imported as `gpui`) |
+| `glam` | 0.33.3 | Vector math (`u-forge-graph-view`, `u-forge-ui-traits`) |
+| `rstar` | 0.13.0 | R-tree spatial index (`u-forge-graph-view`) |
+| `tempfile` | 3.27.0 | Test isolation (dev/test) |
 
 ---
 
@@ -349,7 +350,12 @@ All font sizes are relative to a single rem base configured via `[ui] font_size`
 
 ### `crates/cosmic-text-patched` — ShapePlan cache backport
 
-**What:** A local copy of `cosmic-text 0.14.2` (the version pulled in by `gpui 0.2.2`) with a single targeted fix backported from `cosmic-text 0.17.1`. Activated via `[patch.crates-io]` in the root `Cargo.toml` — `gpui` picks it up transparently.
+**What:** A local copy of `cosmic-text 0.14.2` (the version required by
+`gpui-ce 0.3.3`) with a single targeted fix backported from `cosmic-text
+0.17.1`. It is excluded from workspace resolution but activated via
+`[patch.crates-io]` in the root `Cargo.toml`, so `gpui` picks it up
+transparently. The root Makefile formats and tests the vendored manifest
+separately.
 
 **Why it exists:** `cosmic-text 0.14.2` creates a new `rustybuzz::ShapePlan` on every word of every cold-cache text shape call. A `ShapePlan` compiles the font's OpenType layout tables (GSUB/GPOS feature lookup via `hb_ot_map_builder_t::compile` → `find_language_feature`) — an operation costing several milliseconds per call. With `gpui`'s frame-scoped `LineLayoutCache`, any message that scrolls off-screen has its line layouts evicted; on scroll-back every line re-shapes, paying this cost for every word on every line simultaneously. A 4 KB assistant message (~87 lines × ~8 words each) produced a measured ~550 ms freeze confirmed via `samply` flamegraph (89% of samples in `shape_text`, 77% in `find_language_feature`).
 
@@ -358,29 +364,33 @@ All font sizes are relative to a single rem base configured via `[ui] font_size`
 - `shape_fallback` checks the cache (keyed on font + direction + script) before calling `ShapePlan::new`. Plans are reused across all lines sharing the same font/direction/script combination. Cache is capped at 6 entries (FIFO eviction).
 - No public API changes — the patch is invisible to `gpui`.
 
-**Why `cosmic-text 0.17.1` fixes it:** Version 0.17.1 (used by Zed's internal `gpui` fork) introduced the same `VecDeque` plan cache. `gpui 0.2.2` on crates.io cannot be bumped to use 0.17.x directly because the crate has not been republished with updated deps.
+**Why `cosmic-text 0.17.1` fixes it:** Version 0.17.1 (used by Zed's internal
+GPUI) introduced the same `VecDeque` plan cache. GPUI CE 0.3.3 still depends on
+the 0.14 line, so the local backport remains active.
 
 **Maintenance — how to check for an upstream fix:**
 
-1. Check whether a new `gpui` version has been published to crates.io:
+1. Check whether a new `gpui-ce` version has been published to crates.io:
    ```sh
-   cargo search gpui
+   cargo search gpui-ce
    ```
-   If `gpui > 0.2.2` appears, inspect its `Cargo.toml` for `cosmic-text` version. If it depends on `cosmic-text >= 0.17`, remove the patch.
+   Inspect its `Cargo.toml` for the `cosmic-text` version. If it depends on
+   `cosmic-text >= 0.17`, the local cache backport is no longer needed.
 
 2. Alternatively, check the `cosmic-text` version pulled in by `gpui`:
    ```sh
-   cargo tree -p gpui --depth 1 | grep cosmic
+   cargo tree -p gpui-ce --depth 1 | rg cosmic
    ```
    If the resolved version is `>= 0.17`, the upstream fix is present and the patch can be dropped.
 
 **Maintenance — how to remove the patch once upstream is fixed:**
 
-1. Delete `crates/cosmic-text-patched/` from the workspace.
+1. Delete the vendored `crates/cosmic-text-patched/` crate.
 2. Remove the `[patch.crates-io]` block and its comment from `Cargo.toml`.
-3. Remove `cosmic-text-patched` from the `members` glob (it auto-excludes when the directory is gone since members uses `crates/*`).
-4. Run `cargo build -p u-forge-ui-gpui` to confirm the upstream version compiles and `cargo test --workspace -- --test-threads=1` to verify nothing regressed.
-5. Run under `samply` during a chat scroll to confirm the `find_language_feature` hotspot is gone from the flamegraph.
+3. Remove its workspace `exclude` entry and the standalone Makefile
+   formatting/test commands.
+4. Run the canonical build and test targets, then profile a chat scroll under
+   `samply` to confirm the `find_language_feature` hotspot is gone.
 
 ---
 

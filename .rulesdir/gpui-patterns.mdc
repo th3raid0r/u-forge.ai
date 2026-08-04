@@ -4,11 +4,13 @@ globs: crates/u-forge-ui-gpui/**/*.rs,crates/u-forge-graph-view/**/*.rs,crates/u
 
 # GPUI Patterns for u-forge.ai
 
-Hard-won lessons from building the Alpha desktop UI on GPUI 0.2.2 (crates.io, blade-graphics backend). Violating these causes subtle bugs, silent regressions, or hard-to-diagnose perf spikes.
+Hard-won lessons from building the Alpha desktop UI on GPUI CE 0.3.3
+(crates.io, blade-graphics backend). Violating these causes subtle bugs, silent
+regressions, or hard-to-diagnose perf spikes.
 
-**Stay on `gpui = "0.2.2"`.** Zed `main` has restructured into
-`gpui_platform`/`gpui_linux`/`gpui_wgpu` sub-crates with a different entry
-point; upgrading requires a targeted API compatibility pass.
+The manifest aliases `gpui-ce = 0.3.3` as `gpui`, so source imports remain
+`gpui::...`. Zed `main` uses a separately evolving
+`gpui_platform`/`gpui_linux`/`gpui_wgpu` structure with a different entry point.
 
 ---
 
@@ -30,7 +32,7 @@ Wrap heavy sub-views that re-lay-out on every root-view notify with:
 AnyView::from(entity).cached(StyleRefinement::default().size_full())
 ```
 
-How it works (`gpui-0.2.2` `AnyView::prepaint`): stores `bounds`, `content_mask`, and `text_style` as a cache key. On the next frame, if all three match AND `window.dirty_views` does NOT contain this entity's id AND `window.refreshing == false`, GPUI calls `reuse_prepaint()` / `reuse_paint()` — the subtree's `render()`, layout, and paint are **all skipped**.
+How it works (`gpui-ce 0.3.3` `AnyView::prepaint`): stores `bounds`, `content_mask`, and `text_style` as a cache key. On the next frame, if all three match AND `window.dirty_views` does NOT contain this entity's id AND `window.refreshing == false`, GPUI calls `reuse_prepaint()` / `reuse_paint()` — the subtree's `render()`, layout, and paint are **all skipped**.
 
 `cx.notify()` **only marks the calling entity** — children are not transitively dirtied. So dragging a sidebar handle notifies `AppView` only; `ChatPanel` is not in `dirty_views` and its `.cached()` hits. Streaming a token notifies one `ChatMessageView`; other panels stay clean.
 
@@ -114,7 +116,7 @@ Required for scroll areas to work correctly inside a flex layout:
 - **`overflow_hidden()` on the body container** — without this, flex children that render more content than their computed size grow the parent rather than clip.
 - **`min_h_0()` on flex children with scrollable content** — flex items default to `min-height: auto`, preventing them from shrinking below content height. `min_h_0()` overrides this so the item can shrink to its flex-allocated size and let the inner `overflow_y_scroll()` div take over.
 - **Separate shell div from scroll area div** — outer div (`flex_col`, `flex_none` width, `min_h_0()`) provides the fixed size; inner div (`overflow_y_scroll()`, `flex_grow`) holds scrollable content. Combining them on one div causes layout issues.
-- **`WeakEntity<T>` for drag callbacks** — `on_drag_move` and `on_click` closures receive `&mut App` (no `Context<V>`). Capture `cx.weak_entity()` before building the element tree, then call `handle.update(cx, |view, cx| { … })` inside the closure. This is the correct GPUI 0.2.2 pattern when `cx.listener()` isn't available.
+- **`WeakEntity<T>` for drag callbacks** — `on_drag_move` and `on_click` closures receive `&mut App` (no `Context<V>`). Capture `cx.weak_entity()` before building the element tree, then call `handle.update(cx, |view, cx| { … })` inside the closure. This is the GPUI CE 0.3.3 pattern when `cx.listener()` isn't available.
 
 ---
 
@@ -218,7 +220,7 @@ Dialog structure: fixed-width `div` (~520 px) with a dark title bar row, a body 
 
 ## Conditional menu item grey-out (no disabled widget)
 
-GPUI 0.2.2 has no built-in disabled state. Pattern: build the base element outside an `if/else`, then conditionally attach interactivity.
+GPUI CE 0.3.3 has no built-in disabled state. Pattern: build the base element outside an `if/else`, then conditionally attach interactivity.
 
 ```rust
 .child({
@@ -247,7 +249,7 @@ The disabled branch omits `.cursor_pointer()`, `.hover()`, and `.on_mouse_down()
 
 ## Context menu — deferred+anchored overlay with comprehensive dismissal
 
-GPUI 0.2.2 has no built-in context menu widget. Pattern used in `TextFieldView` and `ChatPanel`:
+GPUI CE 0.3.3 has no built-in context menu widget. Pattern used in `TextFieldView` and `ChatPanel`:
 
 1. Store `context_menu_pos: Option<Point<Pixels>>` in view state.
 2. On right-click (`on_mouse_down(MouseButton::Right, ...)`): set `context_menu_pos = Some(event.position)`, `cx.stop_propagation()`, `cx.notify()`.

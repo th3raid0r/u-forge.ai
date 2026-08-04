@@ -28,6 +28,12 @@
 //! }
 //! ```
 
+/// Small GGUF model used by live GPU/CPU LLM tests.
+///
+/// Keeping live tests pinned prevents the application preference order from
+/// selecting a much larger downloaded model and exhausting shared memory.
+pub(crate) const GPU_CPU_TEST_LLM_MODEL: &str = "Gemma-4-E4B-it-GGUF";
+
 /// Returns the resolved Lemonade URL if integration tests should run.
 ///
 /// See the [module docs](self) for the `UFORGE_INTEGRATION_TESTS` contract.
