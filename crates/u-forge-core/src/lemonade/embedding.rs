@@ -5,15 +5,13 @@
 //! [`crate::ai::embeddings`] and are dependency-free; this module handles
 //! all Lemonade-specific HTTP logic.
 
-use anyhow::{anyhow, Result};
-use async_openai::{Client, config::OpenAIConfig};
+use anyhow::{Result, anyhow};
 use async_openai::types::embeddings::{CreateEmbeddingRequest, EmbeddingInput};
+use async_openai::{Client, config::OpenAIConfig};
 use async_trait::async_trait;
 use tracing::info;
 
-use crate::ai::embeddings::{
-    EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
-};
+use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
 
 use super::client::make_lemonade_openai_client;
 
@@ -57,17 +55,13 @@ impl LemonadeProvider {
             user: None,
         };
 
-        let probe_resp = client
-            .embeddings()
-            .create(probe_req)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to connect to Lemonade Server at {}: {}",
-                    base_url,
-                    e
-                )
-            })?;
+        let probe_resp = client.embeddings().create(probe_req).await.map_err(|e| {
+            anyhow!(
+                "Failed to connect to Lemonade Server at {}: {}",
+                base_url,
+                e
+            )
+        })?;
 
         let dimensions = probe_resp
             .data
@@ -190,4 +184,3 @@ impl EmbeddingProvider for LemonadeProvider {
         })
     }
 }
-

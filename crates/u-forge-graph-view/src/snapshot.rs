@@ -380,13 +380,13 @@ pub fn build_snapshot_incremental(
         // and adjust counts for the delta in O(delta).
         let mut tc = prev.type_counts.clone();
         for id in &removed {
-            if let Some(old) = prev.nodes.iter().find(|n| n.id == *id) {
-                if let Some(c) = tc.get_mut(&old.object_type) {
-                    if *c <= 1 {
-                        tc.remove(&old.object_type);
-                    } else {
-                        *c -= 1;
-                    }
+            if let Some(old) = prev.nodes.iter().find(|n| n.id == *id)
+                && let Some(c) = tc.get_mut(&old.object_type)
+            {
+                if *c <= 1 {
+                    tc.remove(&old.object_type);
+                } else {
+                    *c -= 1;
                 }
             }
         }
@@ -497,8 +497,14 @@ mod tests {
         let p2_a = snap2.nodes.iter().find(|n| n.id == id_a).unwrap().position;
         let p2_b = snap2.nodes.iter().find(|n| n.id == id_b).unwrap().position;
 
-        assert_eq!(p2_a, pos_a, "saved position for Alice must be restored exactly");
-        assert_eq!(p2_b, pos_b, "saved position for Bob must be restored exactly");
+        assert_eq!(
+            p2_a, pos_a,
+            "saved position for Alice must be restored exactly"
+        );
+        assert_eq!(
+            p2_b, pos_b,
+            "saved position for Bob must be restored exactly"
+        );
     }
 
     #[test]
@@ -593,7 +599,11 @@ mod tests {
 
         // Spatial index must reflect the deletion.
         let all = snap2.nodes_in_viewport(Vec2::splat(-100_000.0), Vec2::splat(100_000.0));
-        assert_eq!(all.len(), 1, "only Alice should remain in the spatial index");
+        assert_eq!(
+            all.len(),
+            1,
+            "only Alice should remain in the spatial index"
+        );
     }
 
     #[test]
@@ -631,7 +641,10 @@ mod tests {
         let snap2 = build_snapshot_incremental(&graph, &snap1).unwrap();
 
         // Legend must still contain exactly the same type(s).
-        assert_eq!(snap1.legend_types, snap2.legend_types, "legend must be identical when no type change");
+        assert_eq!(
+            snap1.legend_types, snap2.legend_types,
+            "legend must be identical when no type change"
+        );
         // But count for that type should have increased.
         let char_type = snap1.legend_types[0].as_str();
         assert_eq!(snap2.type_counts[char_type], 3);

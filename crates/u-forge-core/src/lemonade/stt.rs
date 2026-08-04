@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use async_openai::{Client, config::OpenAIConfig};
-use async_openai::types::{InputSource};
+use async_openai::types::InputSource;
 use async_openai::types::audio::{AudioInput, CreateTranscriptionRequestArgs};
+use async_openai::{Client, config::OpenAIConfig};
 use serde::{Deserialize, Serialize};
 
 use async_trait::async_trait;

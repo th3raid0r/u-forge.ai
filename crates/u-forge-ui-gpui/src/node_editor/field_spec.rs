@@ -227,9 +227,9 @@ impl EditorTab {
             for key in required_keys.iter().chain(optional_keys.iter()) {
                 if let Some(prop) = schema.properties.get(*key) {
                     let (kind, multiline) = match &prop.property_type {
-                        PropertyType::Text
-                        | PropertyType::String
-                        | PropertyType::Reference(_) => (prop.property_type.clone(), true),
+                        PropertyType::Text | PropertyType::String | PropertyType::Reference(_) => {
+                            (prop.property_type.clone(), true)
+                        }
                         PropertyType::Number | PropertyType::Boolean => {
                             (prop.property_type.clone(), false)
                         }

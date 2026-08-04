@@ -2,7 +2,7 @@
 
 use super::storage::*;
 use anyhow::{Context, Result};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 use crate::types::{ObjectId, ObjectMetadata};
 
@@ -164,11 +164,7 @@ impl KnowledgeGraphStorage {
     ///
     /// Suitable for building full-graph snapshots incrementally without loading
     /// every node into memory at once.
-    pub fn get_nodes_paginated(
-        &self,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<ObjectMetadata>> {
+    pub fn get_nodes_paginated(&self, offset: usize, limit: usize) -> Result<Vec<ObjectMetadata>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, object_type, schema_name, name, properties, created_at, updated_at

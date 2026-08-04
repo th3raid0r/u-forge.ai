@@ -4,9 +4,11 @@ mod render;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{prelude::*, Context, Entity, Pixels, Subscription};
+use gpui::{Context, Entity, Pixels, Subscription, prelude::*};
 use parking_lot::RwLock;
-use u_forge_core::{EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyIssue, PropertyType, SchemaManager};
+use u_forge_core::{
+    EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyIssue, PropertyType, SchemaManager,
+};
 use u_forge_graph_view::GraphSnapshot;
 
 use crate::selection_model::SelectionModel;
@@ -398,10 +400,10 @@ impl NodeEditorPanel {
         // Fix active_tab after removals.
         if self.tabs.is_empty() {
             self.active_tab = None;
-        } else if let Some(active) = self.active_tab {
-            if active >= self.tabs.len() {
-                self.active_tab = Some(self.tabs.len() - 1);
-            }
+        } else if let Some(active) = self.active_tab
+            && active >= self.tabs.len()
+        {
+            self.active_tab = Some(self.tabs.len() - 1);
         }
 
         // Second pass: persist dirty tabs.
@@ -531,19 +533,18 @@ impl NodeEditorPanel {
     pub(crate) fn commit_array_add(&mut self, cx: &mut Context<Self>) {
         if let Some((key, entity, _sub)) = self.array_add_field.take() {
             let text = entity.read(cx).content.trim().to_string();
-            if !text.is_empty() {
-                if let Some(tab_idx) = self.active_tab {
-                    if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                        let arr = tab
-                            .edited_values
-                            .entry(key)
-                            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-                        if let Some(a) = arr.as_array_mut() {
-                            a.push(serde_json::Value::String(text));
-                        }
-                        tab.recompute_dirty();
-                    }
+            if !text.is_empty()
+                && let Some(tab_idx) = self.active_tab
+                && let Some(tab) = self.tabs.get_mut(tab_idx)
+            {
+                let arr = tab
+                    .edited_values
+                    .entry(key)
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let Some(a) = arr.as_array_mut() {
+                    a.push(serde_json::Value::String(text));
                 }
+                tab.recompute_dirty();
             }
             cx.notify();
         }
@@ -553,18 +554,18 @@ impl NodeEditorPanel {
 
     /// Add a new edge row to the active tab, pre-populated with the current node as source.
     pub(crate) fn add_edge_row(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab_idx) = self.active_tab {
-            if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                let node_id = tab.node_id;
-                let node_name = tab.name.clone();
-                let mut edge = EditableEdge::empty();
-                edge.from = Some(node_id);
-                edge.from_name = node_name;
-                tab.edited_edges.push(edge);
-                let entity = cx.new(|cx| TextFieldView::new(false, "edge type", cx));
-                tab.edge_type_entities.push(entity);
-                tab.recompute_dirty();
-            }
+        if let Some(tab_idx) = self.active_tab
+            && let Some(tab) = self.tabs.get_mut(tab_idx)
+        {
+            let node_id = tab.node_id;
+            let node_name = tab.name.clone();
+            let mut edge = EditableEdge::empty();
+            edge.from = Some(node_id);
+            edge.from_name = node_name;
+            tab.edited_edges.push(edge);
+            let entity = cx.new(|cx| TextFieldView::new(false, "edge type", cx));
+            tab.edge_type_entities.push(entity);
+            tab.recompute_dirty();
         }
         self.rebuild_edge_type_subscriptions(cx);
         cx.notify();
@@ -574,16 +575,16 @@ impl NodeEditorPanel {
     pub(crate) fn remove_edge_row(&mut self, edge_idx: usize, cx: &mut Context<Self>) {
         // Close any open dropdown that references this or later indices.
         self.edge_node_dropdown = None;
-        if let Some(tab_idx) = self.active_tab {
-            if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                if edge_idx < tab.edited_edges.len() {
-                    tab.edited_edges.remove(edge_idx);
-                }
-                if edge_idx < tab.edge_type_entities.len() {
-                    tab.edge_type_entities.remove(edge_idx);
-                }
-                tab.recompute_dirty();
+        if let Some(tab_idx) = self.active_tab
+            && let Some(tab) = self.tabs.get_mut(tab_idx)
+        {
+            if edge_idx < tab.edited_edges.len() {
+                tab.edited_edges.remove(edge_idx);
             }
+            if edge_idx < tab.edge_type_entities.len() {
+                tab.edge_type_entities.remove(edge_idx);
+            }
+            tab.recompute_dirty();
         }
         self.rebuild_edge_type_subscriptions(cx);
         cx.notify();
@@ -632,7 +633,7 @@ impl NodeEditorPanel {
                     .map(|n| (n.id, n.name.clone()))
                     .collect();
                 drop(snap);
-                candidates.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                candidates.sort_by_key(|a| a.1.to_lowercase());
                 let target = highlighted.min(candidates.len().saturating_sub(1));
                 if let Some((id, name)) = candidates.into_iter().nth(target) {
                     this.select_edge_node(id, name, cx);
@@ -691,21 +692,19 @@ impl NodeEditorPanel {
         node_name: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(dd) = self.edge_node_dropdown.take() {
-            if let Some(tab_idx) = self.active_tab {
-                if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                    if let Some(edge) = tab.edited_edges.get_mut(dd.edge_idx) {
-                        if dd.is_target {
-                            edge.to = Some(node_id);
-                            edge.to_name = node_name;
-                        } else {
-                            edge.from = Some(node_id);
-                            edge.from_name = node_name;
-                        }
-                        tab.recompute_dirty();
-                    }
-                }
+        if let Some(dd) = self.edge_node_dropdown.take()
+            && let Some(tab_idx) = self.active_tab
+            && let Some(tab) = self.tabs.get_mut(tab_idx)
+            && let Some(edge) = tab.edited_edges.get_mut(dd.edge_idx)
+        {
+            if dd.is_target {
+                edge.to = Some(node_id);
+                edge.to_name = node_name;
+            } else {
+                edge.from = Some(node_id);
+                edge.from_name = node_name;
             }
+            tab.recompute_dirty();
         }
         cx.notify();
     }
@@ -715,30 +714,28 @@ impl NodeEditorPanel {
     /// Rebuild property-field text change subscriptions for the active tab.
     fn rebuild_field_subscriptions(&mut self, cx: &mut Context<Self>) {
         self._field_subs.clear();
-        if let Some(tab_idx) = self.active_tab {
-            if let Some(tab) = self.tabs.get(tab_idx) {
-                for (key, entity) in &tab.field_entities {
-                    let key: String = key.clone();
-                    let sub = cx.subscribe(
-                        entity,
-                        move |this: &mut Self, _tf, event: &TextChanged, cx| {
-                            if let Some(tab_idx) = this.active_tab {
-                                if let Some(tab) = this.tabs.get_mut(tab_idx) {
-                                    tab.edited_values.insert(
-                                        key.clone(),
-                                        serde_json::Value::String(event.0.clone()),
-                                    );
-                                    if key == "name" {
-                                        tab.name = event.0.clone();
-                                    }
-                                    tab.recompute_dirty();
-                                    cx.notify();
-                                }
+        if let Some(tab_idx) = self.active_tab
+            && let Some(tab) = self.tabs.get(tab_idx)
+        {
+            for (key, entity) in &tab.field_entities {
+                let key: String = key.clone();
+                let sub = cx.subscribe(
+                    entity,
+                    move |this: &mut Self, _tf, event: &TextChanged, cx| {
+                        if let Some(tab_idx) = this.active_tab
+                            && let Some(tab) = this.tabs.get_mut(tab_idx)
+                        {
+                            tab.edited_values
+                                .insert(key.clone(), serde_json::Value::String(event.0.clone()));
+                            if key == "name" {
+                                tab.name = event.0.clone();
                             }
-                        },
-                    );
-                    self._field_subs.push(sub);
-                }
+                            tab.recompute_dirty();
+                            cx.notify();
+                        }
+                    },
+                );
+                self._field_subs.push(sub);
             }
         }
         self.rebuild_edge_type_subscriptions(cx);
@@ -747,25 +744,25 @@ impl NodeEditorPanel {
     /// Rebuild edge-type text field subscriptions for the active tab.
     fn rebuild_edge_type_subscriptions(&mut self, cx: &mut Context<Self>) {
         self._edge_type_subs.clear();
-        if let Some(tab_idx) = self.active_tab {
-            if let Some(tab) = self.tabs.get(tab_idx) {
-                for (i, entity) in tab.edge_type_entities.iter().enumerate() {
-                    let sub = cx.subscribe(
-                        entity,
-                        move |this: &mut Self, _tf, event: &TextChanged, cx| {
-                            if let Some(tab_idx) = this.active_tab {
-                                if let Some(tab) = this.tabs.get_mut(tab_idx) {
-                                    if let Some(edge) = tab.edited_edges.get_mut(i) {
-                                        edge.edge_type = event.0.clone();
-                                    }
-                                    tab.recompute_dirty();
-                                    cx.notify();
-                                }
+        if let Some(tab_idx) = self.active_tab
+            && let Some(tab) = self.tabs.get(tab_idx)
+        {
+            for (i, entity) in tab.edge_type_entities.iter().enumerate() {
+                let sub = cx.subscribe(
+                    entity,
+                    move |this: &mut Self, _tf, event: &TextChanged, cx| {
+                        if let Some(tab_idx) = this.active_tab
+                            && let Some(tab) = this.tabs.get_mut(tab_idx)
+                        {
+                            if let Some(edge) = tab.edited_edges.get_mut(i) {
+                                edge.edge_type = event.0.clone();
                             }
-                        },
-                    );
-                    self._edge_type_subs.push(sub);
-                }
+                            tab.recompute_dirty();
+                            cx.notify();
+                        }
+                    },
+                );
+                self._edge_type_subs.push(sub);
             }
         }
     }

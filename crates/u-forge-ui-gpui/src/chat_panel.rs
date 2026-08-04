@@ -4,14 +4,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    anchored, deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px, relative,
-    rems, rgb, rgba, App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Window,
+    App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, ListAlignment, ListState,
+    MouseButton, MouseDownEvent, Pixels, Point, Window, anchored, deferred, div, linear_color_stop,
+    linear_gradient, list, prelude::*, px, relative, rems, rgb, rgba,
 };
-use u_forge_agent::{select_history_window, GraphAgent, HistoryMessage};
+use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
-    lemonade::{LemonadeChatProvider, SelectedModel},
     ChatMessage, ChatRequest, StreamToken,
+    lemonade::{LemonadeChatProvider, SelectedModel},
 };
 
 use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessage};
@@ -1218,12 +1218,12 @@ impl Render for ChatPanel {
             cx.notify();
         });
         let ctx_paste_listener = cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-            if let Some(clip) = cx.read_from_clipboard() {
-                if let Some(text) = clip.text() {
-                    input_field_paste.update(cx, |tf, cx| {
-                        tf.insert_at_cursor(&text, cx);
-                    });
-                }
+            if let Some(clip) = cx.read_from_clipboard()
+                && let Some(text) = clip.text()
+            {
+                input_field_paste.update(cx, |tf, cx| {
+                    tf.insert_at_cursor(&text, cx);
+                });
             }
             this.context_menu = None;
             cx.notify();

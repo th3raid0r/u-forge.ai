@@ -35,7 +35,10 @@ impl ObservableGraph {
     /// Wrap an existing shared `KnowledgeGraph`.
     pub fn new(graph: Arc<KnowledgeGraph>) -> Self {
         let (sender, _) = broadcast::channel(64);
-        Self { inner: graph, sender }
+        Self {
+            inner: graph,
+            sender,
+        }
     }
 
     /// Subscribe to graph mutation events.
@@ -75,14 +78,12 @@ impl ObservableGraph {
 
     /// Create a typed relationship between two objects.
     /// Emits [`GraphEvent::EdgeAdded`] on success.
-    pub fn connect_objects(
-        &self,
-        from: ObjectId,
-        to: ObjectId,
-        edge_type: EdgeType,
-    ) -> Result<()> {
+    pub fn connect_objects(&self, from: ObjectId, to: ObjectId, edge_type: EdgeType) -> Result<()> {
         self.inner.connect_objects(from, to, edge_type)?;
-        let _ = self.sender.send(GraphEvent::EdgeAdded { source: from, target: to });
+        let _ = self.sender.send(GraphEvent::EdgeAdded {
+            source: from,
+            target: to,
+        });
         Ok(())
     }
 
@@ -90,7 +91,10 @@ impl ObservableGraph {
     /// Emits [`GraphEvent::EdgeAdded`] on success.
     pub fn connect_objects_str(&self, from: ObjectId, to: ObjectId, edge_type: &str) -> Result<()> {
         self.inner.connect_objects_str(from, to, edge_type)?;
-        let _ = self.sender.send(GraphEvent::EdgeAdded { source: from, target: to });
+        let _ = self.sender.send(GraphEvent::EdgeAdded {
+            source: from,
+            target: to,
+        });
         Ok(())
     }
 }

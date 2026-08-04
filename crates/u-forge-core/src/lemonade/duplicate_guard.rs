@@ -12,7 +12,7 @@
 //! When Lemonade fixes this upstream, delete this file and remove the one call
 //! site in the discovery flow.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use super::selector::SelectedModel;
 
@@ -45,16 +45,16 @@ impl DuplicateGuard {
                 continue;
             }
             let backend = sel.backend.as_deref().unwrap_or("cpu");
-            if let Some(existing_backend) = seen.insert(&sel.model_id, backend) {
-                if existing_backend != backend {
-                    bail!(
-                        "Duplicate llamacpp model '{}' selected for both '{}' and '{}' backends. \
-                         Call DuplicateGuard::deduplicate() to resolve.",
-                        sel.model_id,
-                        existing_backend,
-                        backend
-                    );
-                }
+            if let Some(existing_backend) = seen.insert(&sel.model_id, backend)
+                && existing_backend != backend
+            {
+                bail!(
+                    "Duplicate llamacpp model '{}' selected for both '{}' and '{}' backends. \
+                     Call DuplicateGuard::deduplicate() to resolve.",
+                    sel.model_id,
+                    existing_backend,
+                    backend
+                );
             }
         }
 
@@ -118,8 +118,8 @@ impl DuplicateGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lemonade::selector::{QualityTier, SelectedModel};
     use crate::lemonade::load::ModelLoadOptions;
+    use crate::lemonade::selector::{QualityTier, SelectedModel};
 
     fn sel(model_id: &str, recipe: &str, backend: Option<&str>) -> SelectedModel {
         SelectedModel {
@@ -222,8 +222,8 @@ mod tests {
         let mut selections = vec![
             sel("embed-gemma.gguf", "llamacpp", Some("rocm")),
             sel("embed-gemma.gguf", "llamacpp", Some("cpu")),
-            sel("embed-gemma-FLM", "flm", None),   // must survive
-            sel("kokoro-v1", "kokoro", None),       // must survive
+            sel("embed-gemma-FLM", "flm", None), // must survive
+            sel("kokoro-v1", "kokoro", None),    // must survive
         ];
         DuplicateGuard::deduplicate(&mut selections);
         assert_eq!(selections.len(), 3);
@@ -232,7 +232,10 @@ mod tests {
         assert!(ids.contains(&"embed-gemma-FLM"));
         assert!(ids.contains(&"kokoro-v1"));
 
-        let llamacpp: Vec<_> = selections.iter().filter(|m| m.recipe == "llamacpp").collect();
+        let llamacpp: Vec<_> = selections
+            .iter()
+            .filter(|m| m.recipe == "llamacpp")
+            .collect();
         assert_eq!(llamacpp.len(), 1);
         assert_eq!(llamacpp[0].backend.as_deref(), Some("rocm"));
     }

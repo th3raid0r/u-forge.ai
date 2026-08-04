@@ -1,8 +1,8 @@
 //! Text-to-speech via kokoro-v1 running on CPU.
 
 use anyhow::{Context, Result};
-use async_openai::{Client, config::OpenAIConfig};
 use async_openai::types::audio::{CreateSpeechRequestArgs, SpeechModel, Voice};
+use async_openai::{Client, config::OpenAIConfig};
 use serde::{Deserialize, Serialize};
 
 use super::client::make_lemonade_openai_client;
@@ -156,10 +156,14 @@ mod tests {
     #[tokio::test]
     async fn test_tts_returns_audio_bytes() {
         let url = require_integration_url!();
-        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
+            .await
+            .unwrap();
         let cfg = crate::config::AppConfig::default();
         let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let tts_sel = selector.select_tts().expect("No TTS model found in catalog");
+        let tts_sel = selector
+            .select_tts()
+            .expect("No TTS model found in catalog");
         let tts = LemonadeTtsProvider::new(&url, &tts_sel.model_id);
 
         let audio = tts.synthesize_default("Hello, adventurer!").await.unwrap();

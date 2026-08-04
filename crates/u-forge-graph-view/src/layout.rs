@@ -117,7 +117,11 @@ pub fn force_directed_layout(nodes: &mut [NodeView], edges: &[EdgeView]) {
             let d = displacements[i];
             let mag = d.length();
             if mag > 0.01 {
-                let clamped = if mag > max_disp { d * (max_disp / mag) } else { d };
+                let clamped = if mag > max_disp {
+                    d * (max_disp / mag)
+                } else {
+                    d
+                };
                 node.position += clamped;
             }
         }

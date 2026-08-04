@@ -1,8 +1,9 @@
 use std::time::Instant;
 
 use gpui::{
-    anchored, canvas, deferred, div, point, prelude::*, px, relative, rgb, rgba, AnyView, App,
-    ClickEvent, Context, Corner, MouseButton, MouseDownEvent, Render, StyleRefinement, Window,
+    AnyView, App, ClickEvent, Context, Corner, MouseButton, MouseDownEvent, Render,
+    StyleRefinement, Window, anchored, canvas, deferred, div, point, prelude::*, px, relative, rgb,
+    rgba,
 };
 
 use crate::{
@@ -11,9 +12,9 @@ use crate::{
 };
 
 use super::{
-    AppView, SidebarTab, DEFAULT_EDITOR_RATIO, DEFAULT_RIGHT_PANEL_W, DEFAULT_SIDEBAR_W,
-    MAX_PANE_RATIO, MENU_BAR_H, MIN_PANEL_W, MIN_PANE_RATIO, MIN_WORKSPACE_W,
-    RESIZE_HANDLE_SIZE, ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H,
+    AppView, DEFAULT_EDITOR_RATIO, DEFAULT_RIGHT_PANEL_W, DEFAULT_SIDEBAR_W, MAX_PANE_RATIO,
+    MENU_BAR_H, MIN_PANE_RATIO, MIN_PANEL_W, MIN_WORKSPACE_W, RESIZE_HANDLE_SIZE,
+    ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H, SidebarTab,
 };
 
 impl Render for AppView {
@@ -86,7 +87,8 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _window, cx| {
                 if this.right_panel_open {
-                    this.chat_panel.update(cx, |panel, _cx| panel.last_render_us = 0);
+                    this.chat_panel
+                        .update(cx, |panel, _cx| panel.last_render_us = 0);
                 }
                 this.right_panel_open = !this.right_panel_open;
                 cx.notify();
@@ -213,8 +215,8 @@ impl Render for AppView {
                     // Handle right panel resize drags
                     .on_drag_move::<ResizeRightPanel>(move |event, _window, cx: &mut App| {
                         let mouse_x = f32::from(event.event.position.x);
-                        let body_right = f32::from(event.bounds.origin.x)
-                            + f32::from(event.bounds.size.width);
+                        let body_right =
+                            f32::from(event.bounds.origin.x) + f32::from(event.bounds.size.width);
                         let body_w = f32::from(event.bounds.size.width);
                         let new_width = body_right - mouse_x;
                         handle_right
@@ -224,8 +226,7 @@ impl Render for AppView {
                                 } else {
                                     0.0
                                 };
-                                let max_w =
-                                    (body_w - MIN_WORKSPACE_W - sidebar_w).max(MIN_PANEL_W);
+                                let max_w = (body_w - MIN_WORKSPACE_W - sidebar_w).max(MIN_PANEL_W);
                                 view.right_panel_width = new_width.clamp(MIN_PANEL_W, max_w);
                                 cx.notify();
                             })
@@ -250,9 +251,7 @@ impl Render for AppView {
                                 .min_h_0()
                                 .overflow_hidden()
                                 .child(match sidebar_tab {
-                                    SidebarTab::Nodes => {
-                                        self.node_panel.clone().into_any_element()
-                                    }
+                                    SidebarTab::Nodes => self.node_panel.clone().into_any_element(),
                                     SidebarTab::Search => {
                                         self.search_panel.clone().into_any_element()
                                     }
@@ -377,8 +376,16 @@ impl Render for AppView {
                 // The AnyView::cached wrapper lets GPUI skip the chat panel's
                 // layout + paint on frames where no ChatPanel / ChatMessageView
                 // entity was notified (e.g. sidebar drags, status bar ticks).
-                let right_open_w = if right_panel_open { right_panel_width } else { 0.0 };
-                let handle_w = if right_panel_open { RESIZE_HANDLE_SIZE } else { 0.0 };
+                let right_open_w = if right_panel_open {
+                    right_panel_width
+                } else {
+                    0.0
+                };
+                let handle_w = if right_panel_open {
+                    RESIZE_HANDLE_SIZE
+                } else {
+                    0.0
+                };
 
                 // Resize handle — present but zero-width when closed so its
                 // mouse hitbox disappears.
@@ -396,18 +403,16 @@ impl Render for AppView {
                         .on_drag(ResizeRightPanel, |_, _, _, cx: &mut App| {
                             cx.new(|_| ResizeRightPanel)
                         })
-                        .on_click(
-                            move |event: &ClickEvent, _window, cx: &mut App| {
-                                if event.click_count() == 2 {
-                                    handle_right_reset
-                                        .update(cx, |view, cx| {
-                                            view.right_panel_width = DEFAULT_RIGHT_PANEL_W;
-                                            cx.notify();
-                                        })
-                                        .ok();
-                                }
-                            },
-                        );
+                        .on_click(move |event: &ClickEvent, _window, cx: &mut App| {
+                            if event.click_count() == 2 {
+                                handle_right_reset
+                                    .update(cx, |view, cx| {
+                                        view.right_panel_width = DEFAULT_RIGHT_PANEL_W;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                        });
                 }
                 body = body.child(resize_handle);
 
@@ -477,14 +482,15 @@ impl Render for AppView {
                                             rgba(0x6c7086ff)
                                         },
                                     )
-                                    .when(
-                                        sidebar_open && sidebar_tab == SidebarTab::Nodes,
-                                        |el| el.bg(rgba(0x45475a88)),
-                                    )
+                                    .when(sidebar_open && sidebar_tab == SidebarTab::Nodes, |el| {
+                                        el.bg(rgba(0x45475a88))
+                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            if this.sidebar_open && this.sidebar_tab == SidebarTab::Nodes {
+                                            if this.sidebar_open
+                                                && this.sidebar_tab == SidebarTab::Nodes
+                                            {
                                                 this.sidebar_open = false;
                                             } else {
                                                 this.sidebar_open = true;
@@ -511,14 +517,15 @@ impl Render for AppView {
                                             rgba(0x6c7086ff)
                                         },
                                     )
-                                    .when(
-                                        sidebar_open && sidebar_tab == SidebarTab::Search,
-                                        |el| el.bg(rgba(0x45475a88)),
-                                    )
+                                    .when(sidebar_open && sidebar_tab == SidebarTab::Search, |el| {
+                                        el.bg(rgba(0x45475a88))
+                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            if this.sidebar_open && this.sidebar_tab == SidebarTab::Search {
+                                            if this.sidebar_open
+                                                && this.sidebar_tab == SidebarTab::Search
+                                            {
                                                 this.sidebar_open = false;
                                             } else {
                                                 this.sidebar_open = true;
@@ -542,10 +549,8 @@ impl Render for AppView {
                             .gap(px(12.0))
                             .text_color(rgba(0xa6adc8ff));
                         center.style().flex_grow = Some(1.0);
-                        center = center.child(format!(
-                            "{} nodes  ·  {} edges",
-                            node_count, edge_count
-                        ));
+                        center =
+                            center.child(format!("{} nodes  ·  {} edges", node_count, edge_count));
                         if let Some(msg) = data_status {
                             center = center.child(div().text_color(rgba(0xa6e3a1ff)).child(msg));
                         }
@@ -553,11 +558,7 @@ impl Render for AppView {
                             center = center.child(div().text_color(rgba(0xf9e2afff)).child(msg));
                         }
                         if let Some(perf) = perf_text {
-                            center = center.child(
-                                div()
-                                    .text_color(rgba(0xa6e3a1ff))
-                                    .child(perf),
-                            );
+                            center = center.child(div().text_color(rgba(0xa6e3a1ff)).child(perf));
                         }
                         center
                     })
@@ -589,8 +590,9 @@ impl Render for AppView {
                                         MouseButton::Left,
                                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                             if this.right_panel_open {
-                                                this.chat_panel
-                                                    .update(cx, |panel, _cx| panel.last_render_us = 0);
+                                                this.chat_panel.update(cx, |panel, _cx| {
+                                                    panel.last_render_us = 0
+                                                });
                                             }
                                             this.right_panel_open = !this.right_panel_open;
                                             cx.notify();
@@ -652,13 +654,11 @@ impl Render for AppView {
                                         .hover(|s| s.bg(rgba(0x45475a88)))
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
-                                                    this.do_save(cx);
-                                                    this.file_menu_open = false;
-                                                    cx.notify();
-                                                },
-                                            ),
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.do_save(cx);
+                                                this.file_menu_open = false;
+                                                cx.notify();
+                                            }),
                                         )
                                         .child("Save                Ctrl+S"),
                                 )
@@ -678,12 +678,10 @@ impl Render for AppView {
                                         .hover(|s| s.bg(rgba(0x45475a88)))
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, window, cx| {
-                                                    this.file_menu_open = false;
-                                                    this.do_import_schema_picker(window, cx);
-                                                },
-                                            ),
+                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                                this.file_menu_open = false;
+                                                this.do_import_schema_picker(window, cx);
+                                            }),
                                         )
                                         .child("Import Schema…"),
                                 )
@@ -828,13 +826,11 @@ impl Render for AppView {
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
-                                                    this.sidebar_open = !this.sidebar_open;
-                                                    this.view_menu_open = false;
-                                                    cx.notify();
-                                                },
-                                            ),
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.sidebar_open = !this.sidebar_open;
+                                                this.view_menu_open = false;
+                                                cx.notify();
+                                            }),
                                         )
                                         .child(if sidebar_open {
                                             "  Left Panel       Ctrl+B"
@@ -856,19 +852,16 @@ impl Render for AppView {
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(
-                                                |this, _: &MouseDownEvent, _window, cx| {
-                                                    if this.right_panel_open {
-                                                        this.chat_panel.update(cx, |panel, _cx| {
-                                                            panel.last_render_us = 0;
-                                                        });
-                                                    }
-                                                    this.right_panel_open =
-                                                        !this.right_panel_open;
-                                                    this.view_menu_open = false;
-                                                    cx.notify();
-                                                },
-                                            ),
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                if this.right_panel_open {
+                                                    this.chat_panel.update(cx, |panel, _cx| {
+                                                        panel.last_render_us = 0;
+                                                    });
+                                                }
+                                                this.right_panel_open = !this.right_panel_open;
+                                                this.view_menu_open = false;
+                                                cx.notify();
+                                            }),
                                         )
                                         .child(if right_panel_open {
                                             "  Right Panel      Ctrl+J"

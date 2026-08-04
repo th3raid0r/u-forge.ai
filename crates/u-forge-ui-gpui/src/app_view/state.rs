@@ -1,10 +1,10 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use parking_lot::RwLock;
-use u_forge_core::{queue::InferenceQueue, AppConfig, KnowledgeGraph};
+use u_forge_core::{AppConfig, KnowledgeGraph, queue::InferenceQueue};
 use u_forge_graph_view::GraphSnapshot;
 
 /// Non-render application state owned by [`super::AppView`].

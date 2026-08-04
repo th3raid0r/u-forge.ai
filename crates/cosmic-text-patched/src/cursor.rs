@@ -44,19 +44,11 @@ impl Affinity {
     }
 
     pub fn from_before(before: bool) -> Self {
-        if before {
-            Self::Before
-        } else {
-            Self::After
-        }
+        if before { Self::Before } else { Self::After }
     }
 
     pub fn from_after(after: bool) -> Self {
-        if after {
-            Self::After
-        } else {
-            Self::Before
-        }
+        if after { Self::After } else { Self::Before }
     }
 }
 

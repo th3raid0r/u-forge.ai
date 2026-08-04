@@ -58,8 +58,7 @@ impl SchemaDefinition {
 
         // --- Node types -------------------------------------------------
         out.push_str("### Node Types\n");
-        let mut node_types: Vec<(&String, &ObjectTypeSchema)> =
-            self.object_types.iter().collect();
+        let mut node_types: Vec<(&String, &ObjectTypeSchema)> = self.object_types.iter().collect();
         node_types.sort_by_key(|(k, _)| k.as_str());
         for (type_name, ots) in &node_types {
             out.push_str(&format!("- **{}**: {}\n", type_name, ots.description));
@@ -719,12 +718,16 @@ mod tests {
         let character_schema = ObjectTypeSchema::default_character();
         assert_eq!(character_schema.name, "character");
         assert!(character_schema.properties.contains_key("age"));
-        assert!(character_schema
-            .required_properties
-            .contains(&"name".to_string()));
-        assert!(character_schema
-            .allowed_edges
-            .contains(&"knows".to_string()));
+        assert!(
+            character_schema
+                .required_properties
+                .contains(&"name".to_string())
+        );
+        assert!(
+            character_schema
+                .allowed_edges
+                .contains(&"knows".to_string())
+        );
     }
 
     #[test]
@@ -742,9 +745,11 @@ mod tests {
         let edge_schema = EdgeTypeSchema::default_knows();
         assert_eq!(edge_schema.name, "knows");
         assert!(edge_schema.bidirectional);
-        assert!(edge_schema
-            .allowed_source_types
-            .contains(&"character".to_string()));
+        assert!(
+            edge_schema
+                .allowed_source_types
+                .contains(&"character".to_string())
+        );
     }
 
     #[test]

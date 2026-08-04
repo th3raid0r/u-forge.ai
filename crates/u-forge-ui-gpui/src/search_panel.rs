@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, relative, rgb, rgba, Context, Entity, MouseButton, MouseDownEvent, Window,
+    Context, Entity, MouseButton, MouseDownEvent, Window, div, prelude::*, px, relative, rgb, rgba,
 };
 use tracing::Instrument;
 use u_forge_core::{
-    queue::InferenceQueue, search_hybrid, AppConfig, HybridSearchConfig, KnowledgeGraph, ObjectId,
+    AppConfig, HybridSearchConfig, KnowledgeGraph, ObjectId, queue::InferenceQueue, search_hybrid,
 };
 use u_forge_ui_traits::node_color_for_type;
 

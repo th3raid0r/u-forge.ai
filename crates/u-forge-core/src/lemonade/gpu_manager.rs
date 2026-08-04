@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tracing::{debug, info};
@@ -266,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_queues_behind_active_stt_and_proceeds_on_release() {
-        use tokio::time::{sleep, timeout, Duration};
+        use tokio::time::{Duration, sleep, timeout};
 
         let gpu = GpuResourceManager::new();
         let gpu_llm = Arc::clone(&gpu);
@@ -301,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_llm_requests_serialise() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::time::{sleep, Duration};
+        use tokio::time::{Duration, sleep};
 
         let gpu = GpuResourceManager::new();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -348,15 +348,21 @@ mod tests {
     #[tokio::test]
     async fn test_llm_queues_behind_simulated_stt_integration() {
         let url = crate::test_helpers::require_integration_url!();
-        use tokio::time::{sleep, timeout, Duration};
+        use tokio::time::{Duration, sleep, timeout};
 
-        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url).await.unwrap();
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
+            .await
+            .unwrap();
         let cfg = crate::config::AppConfig::default();
         let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let llm = selector.select_llm_models().into_iter().next()
+        let llm = selector
+            .select_llm_models()
+            .into_iter()
+            .next()
             .expect("No LLM model found in catalog");
         let gpu = GpuResourceManager::new();
-        let chat = crate::lemonade::LemonadeChatProvider::new(&url, &llm.model_id, Some(Arc::clone(&gpu)));
+        let chat =
+            crate::lemonade::LemonadeChatProvider::new(&url, &llm.model_id, Some(Arc::clone(&gpu)));
 
         // Simulate an active STT session (no real audio upload needed).
         let stt_guard = gpu
