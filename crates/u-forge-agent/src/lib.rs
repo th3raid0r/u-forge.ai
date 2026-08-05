@@ -23,7 +23,7 @@ use serde::Deserialize;
 use u_forge_core::ingest::rechunk_and_embed;
 use u_forge_core::search::{HybridSearchConfig, NodeSearchResult, search_hybrid};
 use u_forge_core::types::ObjectMetadata;
-use u_forge_core::{KnowledgeGraph, PropertyIssue, queue::InferenceQueue, types::ObjectId};
+use u_forge_core::{KnowledgeGraph, queue::InferenceQueue, types::ObjectId};
 
 // ── History and token counting ────────────────────────────────────────────────
 
@@ -782,6 +782,16 @@ impl Tool for UpsertNodeTool {
         } else {
             vec![]
         };
+        if !prop_issues.is_empty() {
+            let details = prop_issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ToolError(format!(
+                "Node properties do not satisfy the loaded schema: {details}"
+            )));
+        }
 
         // Persist the node.
         if is_update {
@@ -801,17 +811,11 @@ impl Tool for UpsertNodeTool {
             .map_err(|e| ToolError(format!("Embedding failed: {e:#}")))?;
 
         let action = if is_update { "Updated" } else { "Created" };
-        let mut output = format!(
+        let output = format!(
             "{action} node \"{name}\" ({object_type}). node_id: {object_id}. chunks_embedded: {chunks}.",
             name = meta.name,
             object_type = meta.object_type,
         );
-        for issue in &prop_issues {
-            match issue {
-                PropertyIssue::UnknownProperty { .. } => {}
-                _ => output.push_str(&format!("\n[warning] {issue}")),
-            }
-        }
         Ok(output)
     }
 }
@@ -876,14 +880,27 @@ fn resolve_node(graph: &KnowledgeGraph, input: &str) -> Result<ObjectId, ToolErr
         ))),
         1 => Ok(matches[0].id),
         n => {
-            let list: Vec<String> = matches
-                .iter()
-                .take(5)
-                .map(|m| format!("  • {} ({}) [{}]", m.name, m.object_type, m.id))
-                .collect();
+            let mut grouped = std::collections::BTreeMap::<&str, Vec<&ObjectMetadata>>::new();
+            for candidate in &matches {
+                grouped
+                    .entry(candidate.object_type.as_str())
+                    .or_default()
+                    .push(candidate);
+            }
+            let mut lines = Vec::new();
+            for (object_type, mut candidates) in grouped {
+                candidates
+                    .sort_by_key(|candidate| (candidate.name.as_str(), candidate.id.to_string()));
+                lines.push(format!("  {object_type} ({}):", candidates.len()));
+                lines.extend(
+                    candidates
+                        .into_iter()
+                        .map(|candidate| format!("    • {} [{}]", candidate.name, candidate.id)),
+                );
+            }
             Err(ToolError(format!(
-                "\"{input}\" matched {n} nodes — provide the UUID to disambiguate:\n{}",
-                list.join("\n")
+                "\"{input}\" matched {n} nodes, grouped by object type:\n{}\nProvide one complete UUID in the source or target field to disambiguate.",
+                lines.join("\n")
             )))
         }
     }
@@ -1406,8 +1423,10 @@ pub use rig;
 
 #[cfg(test)]
 mod tests {
-    use super::tool_validation::validate_tool_args;
+    use super::{resolve_node, tool_validation::validate_tool_args};
     use serde_json::json;
+    use tempfile::TempDir;
+    use u_forge_core::{KnowledgeGraph, ObjectMetadata};
 
     // FtsSearchTool validation
 
@@ -1506,5 +1525,35 @@ mod tests {
         let err = validate_tool_args("nonexistent_tool", &json!({}))
             .expect_err("unregistered tool name should return error");
         assert!(err.to_string().contains("nonexistent_tool"));
+    }
+
+    #[test]
+    fn ambiguous_node_diagnostic_groups_every_candidate_by_type() {
+        let temp = TempDir::new().unwrap();
+        let graph = KnowledgeGraph::new(temp.path()).unwrap();
+        let candidates = (0..7)
+            .map(|index| {
+                ObjectMetadata::new(
+                    if index % 2 == 0 { "npc" } else { "location" }.to_string(),
+                    "Echo".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for candidate in &candidates {
+            graph.add_object(candidate.clone()).unwrap();
+        }
+
+        let error = resolve_node(&graph, "Echo").expect_err("name should be ambiguous");
+        let message = error.to_string();
+        assert!(message.contains("location (3)"));
+        assert!(message.contains("npc (4)"));
+        assert!(message.contains("complete UUID"));
+        for candidate in candidates {
+            assert!(
+                message.contains(&candidate.id.to_string()),
+                "diagnostic omitted {}: {message}",
+                candidate.id
+            );
+        }
     }
 }

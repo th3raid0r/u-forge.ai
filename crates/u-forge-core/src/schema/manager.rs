@@ -113,12 +113,11 @@ impl SchemaManager {
                 continue;
             }
 
-            if !object
-                .properties
-                .as_object()
-                .unwrap_or(&serde_json::Map::new())
-                .contains_key(required_prop)
-            {
+            let properties = object.properties.as_object();
+            if properties.is_none_or(|properties| {
+                !properties.contains_key(required_prop)
+                    || properties.get(required_prop).is_some_and(Value::is_null)
+            }) {
                 result.add_error(ValidationError {
                     property: required_prop.clone(),
                     message: format!("Missing required property: {}", required_prop),
@@ -669,6 +668,7 @@ impl SchemaManager {
     /// - `String("true"/"false"/"yes"/"no"/"1"/"0")` → `Bool` when the schema declares `Boolean`
     ///
     /// Issues returned for caller action:
+    /// - [`PropertyIssue::MissingRequired`] — required key is absent or null
     /// - [`PropertyIssue::TypeMismatch`] — wrong type and no coercion available
     /// - [`PropertyIssue::UnknownProperty`] — key not declared in the schema
     /// - [`PropertyIssue::InvalidEnum`] — string not in the enum's allowed list
@@ -690,6 +690,21 @@ impl SchemaManager {
 
         let mut issues = Vec::new();
         let mut coercions: Vec<(String, Value)> = Vec::new();
+
+        for required in &type_schema.required_properties {
+            // `name` is stored as a top-level ObjectMetadata field and is not
+            // present in this properties map.
+            if required == "name" {
+                continue;
+            }
+            if !properties.contains_key(required)
+                || properties.get(required).is_some_and(Value::is_null)
+            {
+                issues.push(PropertyIssue::MissingRequired {
+                    key: required.clone(),
+                });
+            }
+        }
 
         for (key, value) in properties.iter() {
             let prop_schema = match type_schema.properties.get(key) {
@@ -775,6 +790,8 @@ impl SchemaManager {
 /// attention are reported.
 #[derive(Debug, Clone)]
 pub enum PropertyIssue {
+    /// A required property is absent or explicitly null.
+    MissingRequired { key: String },
     /// Value type does not match schema and could not be automatically coerced.
     TypeMismatch { key: String, expected: String },
     /// Property key is not declared in the schema for this object type.
@@ -790,6 +807,9 @@ pub enum PropertyIssue {
 impl fmt::Display for PropertyIssue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PropertyIssue::MissingRequired { key } => {
+                write!(f, "required property '{key}' is missing")
+            }
             PropertyIssue::TypeMismatch { key, expected } => {
                 write!(f, "property '{key}': expected {expected}")
             }
@@ -990,5 +1010,47 @@ mod tests {
         let invalid_value = serde_json::Value::String("purple".to_string());
         let result = manager.validate_property_value("color", &invalid_value, &enum_schema);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_and_coerce_reports_missing_and_null_required_properties() {
+        let (manager, _temp) = create_test_schema_manager();
+        let mut schema = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "test".to_string(),
+        );
+        schema.add_object_type(
+            "npc".to_string(),
+            ObjectTypeSchema::new("npc".to_string(), "NPC".to_string())
+                .with_property("name".to_string(), PropertySchema::string("name"))
+                .with_property("role".to_string(), PropertySchema::string("role"))
+                .with_required_property("name".to_string())
+                .with_required_property("role".to_string()),
+        );
+        manager.save_schema(&schema).await.unwrap();
+
+        let mut missing = serde_json::Map::new();
+        let issues = manager.validate_and_coerce_properties("npc", &mut missing);
+        assert!(matches!(
+            issues.as_slice(),
+            [PropertyIssue::MissingRequired { key }] if key == "role"
+        ));
+
+        let mut null = serde_json::Map::from_iter([("role".to_string(), Value::Null)]);
+        let issues = manager.validate_and_coerce_properties("npc", &mut null);
+        assert!(
+            issues.iter().any(
+                |issue| matches!(issue, PropertyIssue::MissingRequired { key } if key == "role")
+            )
+        );
+
+        let mut valid =
+            serde_json::Map::from_iter([("role".to_string(), Value::String("Mayor".to_string()))]);
+        assert!(
+            manager
+                .validate_and_coerce_properties("npc", &mut valid)
+                .is_empty()
+        );
     }
 }

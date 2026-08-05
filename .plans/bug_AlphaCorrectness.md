@@ -28,10 +28,10 @@ Lemonade runtime redesign or the Zed workspace refactor.
 - [x] **AC-03 — Explicit qualification compatibility.** Accept existing plain
   names when unique. Add UUID and `object_type:name` qualification without
   widening schemas or inferring object types from records.
-- [ ] **AC-04 — Required-property contract.** Add a missing-required issue to
+- [x] **AC-04 — Required-property contract.** Add a missing-required issue to
   `SchemaManager::validate_and_coerce_properties`; align its callers with the
   already-strict import boundary.
-- [ ] **AC-05 — Agent ambiguity diagnostics.** For large name matches, group
+- [x] **AC-05 — Agent ambiguity diagnostics.** For large name matches, group
   candidates by object type and explain how to use a UUID instead of listing an
   arbitrary first five.
 

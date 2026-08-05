@@ -9758,6 +9758,7 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "tiktoken-rs",
  "tokio",
