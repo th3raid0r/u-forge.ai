@@ -1,6 +1,11 @@
 # Phase 3 — Storage Evolution
 
-**Status (2026-08-03): Partially implemented.** SQLite's two vector lanes are now dimension-configurable and guarded by persisted metadata, but the general embedding-space registry proposed by F5—and F1/F4—remain open. Paths and symbols are authoritative; line references below describe the audit snapshot.
+**Status (2026-08-04): Partially implemented.** SQLite's two vector lanes are dimension-configurable and now persist the sorted embedding-provider fingerprint as well as dimensions. Populated unidentified lanes and provider mismatches are rejected before embedding or semantic search. This hardens the fixed two-lane design but is not the general F5 registry. F1 and F4 remain open. Paths and symbols are authoritative; line references below describe the audit snapshot.
+
+**Reconciliation note:** `GraphMutation` provides a single typed mutation
+boundary and atomic import batches, which are useful prerequisites for F4. It
+does not persist before/after state, expose undo/redo, or create a journal, so
+F4 must not be marked complete.
 
 **Source findings:** F1, F4, F5
 

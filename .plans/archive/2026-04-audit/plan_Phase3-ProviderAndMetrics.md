@@ -1,6 +1,10 @@
 # Phase 3 — Provider Abstraction & Metrics Export
 
-**Status (2026-08-03): Open.** Retained from the audit for follow-up. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+**Status (2026-08-04): Partially implemented.** L7 now has a shared core `GraphChange` stream emitted after commits, with object ids and complete edge endpoint/type data. The UI consumes and coalesces it, but object updates do not carry changed-property keys and the UI still rebuilds a snapshot. L8 is only adjacent: capacity changed from 64 to a fixed 256 and lag implies a rebuild, but capacity is not configurable and lag has no telemetry. F6, F8, and D4 remain open. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+
+**Reconciliation note:** `u-forge-graph-view::GraphEvent` is now an alias for
+the core `GraphChange`; future L7/L8 work should extend that core contract
+instead of recreating a second observable graph event type.
 
 **Source findings:** F6, F8, L7, L8, D4
 

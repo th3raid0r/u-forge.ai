@@ -1,6 +1,11 @@
 # Phase 1 — Lemonade Inference Stability
 
-**Status (2026-08-03): Open.** Retained from the audit for follow-up. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+**Status (2026-08-04): Open for C3 and H8; adjacent runtime work implemented.** PR #33 added a serialized `LemonadeRuntime` profile keyed by model, load options, and reasoning mode, and made capability initialization tolerate missing embedding providers. The worker still awaits `provider.complete` under the client's 30-second timeout, and catalog discovery still uses `tokio::try_join!`, so neither named finding is closed. Paths and symbols are authoritative; line references below describe the 2026-04-24 snapshot.
+
+**Reconciliation note:** Keep the custom chat HTTP path. Lemonade's
+`enable_thinking` wire field remains intentionally separate from the
+OpenAI-compatible library used for the compatible endpoints, and toggling it
+now forces a serialized full model reload before inference.
 
 **Source findings:** C3, H8
 

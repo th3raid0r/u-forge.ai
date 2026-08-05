@@ -13,8 +13,9 @@ Source code is authoritative. Active implementation work is recorded only in
 - The graph remains the one intentionally distinct center view.
 - The current u-forge palette remains, behind semantic UI tokens. Zed is a
   behavioral reference, not a source-code dependency.
-- Chat sessions remain persisted and the latest session resumes, but Zed's new
-  history/archive navigation is outside the parity target.
+- Chat sessions remain persisted, the latest session resumes, and the existing
+  header history navigation remains; Zed's newer history/archive interface is
+  outside the parity target.
 - Lemonade control-plane and direct-chat deviations remain custom HTTP;
   compatible endpoints continue to use OpenAI-compatible libraries.
 - A reasoning-mode change requires an effective model reload and serialized
