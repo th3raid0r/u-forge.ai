@@ -24,6 +24,7 @@ use u_forge_graph_view::GraphSnapshot;
 use state::AppState;
 
 use crate::chat_panel::{AvailableModel, ChatPanel, ConnectRequested};
+use crate::confirmation_modal::{ConfirmationAccepted, ConfirmationCancelled, ConfirmationModal};
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
@@ -176,6 +177,10 @@ pub struct AppView {
     pub(crate) path_picker: Option<(PathPickerKind, Entity<PathPickerModal>)>,
     /// Subscriptions for the active path picker's confirm/cancel events.
     _path_picker_subs: Vec<Subscription>,
+    // ── Destructive-action confirmation ──────────────────────────────────────
+    pub(crate) confirmation: Option<Entity<ConfirmationModal>>,
+    pending_destructive_action: Option<DestructiveAction>,
+    _confirmation_subs: Vec<Subscription>,
     // ── GPUI bookkeeping ──────────────────────────────────────────────────────
     /// Subscriptions kept alive so handlers fire (node events, chat connect).
     _node_subs: Vec<Subscription>,
@@ -192,6 +197,13 @@ pub struct AppView {
     /// per frame to compute `avg_ms`. Fixed array avoids any per-frame
     /// allocation from the prior `VecDeque`.
     pub(crate) frame_times_us: FrameTimeRing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestructiveAction {
+    DeleteNode(ObjectId),
+    ClearData,
+    ClearSchema,
 }
 
 impl AppView {
@@ -224,7 +236,7 @@ impl AppView {
         let node_sub_delete = cx.subscribe(
             &node_panel,
             |this: &mut Self, _panel, event: &DeleteNodeRequest, cx| {
-                this.delete_node_by_id(event.0, cx);
+                this.request_delete_node(event.0, cx);
             },
         );
         let search_panel = cx.new(|cx| {
@@ -293,6 +305,9 @@ impl AppView {
             right_panel_width: DEFAULT_RIGHT_PANEL_W,
             path_picker: None,
             _path_picker_subs: vec![],
+            confirmation: None,
+            pending_destructive_action: None,
+            _confirmation_subs: vec![],
             _node_subs: vec![node_sub_create, node_sub_delete, connect_sub],
             _graph_change_task: None,
             perf_enabled: false,
@@ -405,6 +420,95 @@ impl AppView {
                 self.state.data_status = Some(format!("Clear schema failed: {e}"));
                 cx.notify();
             }
+        }
+    }
+
+    pub(crate) fn request_clear_data(&mut self, cx: &mut Context<Self>) {
+        self.open_confirmation(
+            DestructiveAction::ClearData,
+            "Clear all data",
+            "Delete every node, edge, chunk, and saved layout position? This cannot be undone.",
+            "Clear Data",
+            cx,
+        );
+    }
+
+    pub(crate) fn request_clear_schema(&mut self, cx: &mut Context<Self>) {
+        self.open_confirmation(
+            DestructiveAction::ClearSchema,
+            "Clear schemas",
+            "Remove all imported schemas? Existing graph data is not changed, but schema validation will be unavailable.",
+            "Clear Schema",
+            cx,
+        );
+    }
+
+    fn request_delete_node(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
+        let node_name = self
+            .state
+            .snapshot
+            .read()
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| node_id.to_string());
+        self.open_confirmation(
+            DestructiveAction::DeleteNode(node_id),
+            "Delete node",
+            &format!(
+                "Delete “{node_name}” and its connected edges and text chunks? This cannot be undone."
+            ),
+            "Delete Node",
+            cx,
+        );
+    }
+
+    fn open_confirmation(
+        &mut self,
+        action: DestructiveAction,
+        title: &str,
+        message: &str,
+        confirm_label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|_cx| {
+            ConfirmationModal::new(
+                title.to_string(),
+                message.to_string(),
+                confirm_label.to_string(),
+            )
+        });
+        let accepted = cx.subscribe(&modal, |this, _modal, _event: &ConfirmationAccepted, cx| {
+            let action = this.pending_destructive_action.take();
+            this.confirmation = None;
+            this._confirmation_subs.clear();
+            if let Some(action) = action {
+                this.execute_destructive_action(action, cx);
+            } else {
+                cx.notify();
+            }
+        });
+        let cancelled = cx.subscribe(
+            &modal,
+            |this, _modal, _event: &ConfirmationCancelled, cx| {
+                this.pending_destructive_action = None;
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                cx.notify();
+            },
+        );
+        self.pending_destructive_action = Some(action);
+        self.confirmation = Some(modal);
+        self._confirmation_subs = vec![accepted, cancelled];
+        cx.notify();
+    }
+
+    fn execute_destructive_action(&mut self, action: DestructiveAction, cx: &mut Context<Self>) {
+        match action {
+            DestructiveAction::DeleteNode(node_id) => self.delete_node_by_id(node_id, cx),
+            DestructiveAction::ClearData => self.do_clear_data(cx),
+            DestructiveAction::ClearSchema => self.do_clear_schema(cx),
         }
     }
 
@@ -752,28 +856,21 @@ impl AppView {
     /// Delete a node by its `ObjectId`, close any open editor tab for it,
     /// and refresh the snapshot.
     fn delete_node_by_id(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
-        // Close the editor tab for this node if one is open.
-        self.node_editor.update(cx, |editor, cx| {
-            if let Some(idx) = editor.tabs.iter().position(|t| t.node_id == node_id) {
-                editor.close_tab(idx, cx);
-            }
-            cx.notify();
-        });
-
-        // Remove stale edge references in other open tabs before deleting.
-        self.node_editor.update(cx, |editor, _cx| {
-            editor.remove_stale_edge_refs(node_id);
-        });
-
-        // Clear the selection if it pointed to this node.
-        let selected = self.selection.read(cx).selected_node_id;
-        if selected == Some(node_id) {
-            self.selection.update(cx, |sel, cx| sel.clear(cx));
-        }
-
         // Delete from DB (cascades to edges, chunks, etc.).
         match self.state.graph.delete_object(node_id) {
             Ok(()) => {
+                // Mutate dependent UI state only after the database commit succeeds.
+                self.node_editor.update(cx, |editor, cx| {
+                    if let Some(idx) = editor.tabs.iter().position(|t| t.node_id == node_id) {
+                        editor.close_tab(idx, cx);
+                    }
+                    editor.remove_stale_edge_refs(node_id);
+                    cx.notify();
+                });
+                if self.selection.read(cx).selected_node_id == Some(node_id) {
+                    self.selection
+                        .update(cx, |selection, cx| selection.clear(cx));
+                }
                 self.refresh_snapshot(cx);
             }
             Err(e) => {

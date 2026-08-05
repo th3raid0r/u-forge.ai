@@ -66,7 +66,7 @@ Lemonade runtime redesign or the Zed workspace refactor.
 - [x] **AC-14 — Embedding UI lifecycle.** Replace the epoch plus atomic cancel
   split with one authority. Until queue cancellation lands, label superseded
   work accurately rather than claiming it was cancelled.
-- [ ] **AC-15 — Event propagation and confirmation.** Stop delete-button events
+- [x] **AC-15 — Event propagation and confirmation.** Stop delete-button events
   from selecting their parent row. Require confirmation for node deletion and
   clear-data/clear-schema actions; preserve errors and cancellation cleanly.
 
