@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use u_forge_core::{AppConfig, KnowledgeGraph, queue::InferenceQueue};
+use u_forge_core::{
+    AppConfig, KnowledgeGraph,
+    lemonade::{EmbeddedLemonade, LemonadeConnection, LemonadeServerCatalog},
+    queue::InferenceQueue,
+};
 use u_forge_graph_view::GraphSnapshot;
 
 /// Non-render application state owned by [`super::AppView`].
@@ -21,6 +25,12 @@ pub(crate) struct AppState {
     pub(crate) inference_queue: Option<InferenceQueue>,
     /// High-quality embedding queue (None when HQ embedding is disabled or unavailable).
     pub(crate) hq_queue: Option<InferenceQueue>,
+    /// Owned private Lemonade process; absent for explicit external servers.
+    pub(crate) embedded_lemonade: Option<Arc<EmbeddedLemonade>>,
+    /// Shared runtime connection used by inference and the reopenable setup flow.
+    pub(crate) lemonade_connection: Option<Arc<LemonadeConnection>>,
+    /// Last live catalog snapshot used to explain setup/readiness state.
+    pub(crate) lemonade_catalog: Option<LemonadeServerCatalog>,
     /// True when at least one non-default schema is present in the graph DB.
     pub(crate) schema_loaded: bool,
     /// Status message displayed in the status bar during/after data operations.
@@ -84,6 +94,9 @@ impl AppState {
             schema_loaded,
             inference_queue: None,
             hq_queue: None,
+            embedded_lemonade: None,
+            lemonade_connection: None,
+            lemonade_catalog: None,
             data_status: None,
             embedding_status: None,
             embedding_plan: EmbeddingPlanAuthority::default(),

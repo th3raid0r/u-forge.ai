@@ -12,7 +12,9 @@ use async_trait::async_trait;
 
 use crate::ai::transcription::TranscriptionProvider;
 
-use super::client::make_lemonade_openai_client;
+use super::client::{
+    LemonadeConnection, make_lemonade_openai_client, make_lemonade_openai_client_for,
+};
 use super::gpu_manager::GpuResourceManager;
 
 /// Transcription result returned by the Whisper endpoint.
@@ -41,6 +43,18 @@ impl LemonadeSttProvider {
     pub fn new(base_url: &str, model: &str, gpu: Arc<GpuResourceManager>) -> Self {
         Self {
             client: make_lemonade_openai_client(base_url),
+            model: model.to_string(),
+            gpu,
+        }
+    }
+
+    pub fn from_connection(
+        connection: Arc<LemonadeConnection>,
+        model: &str,
+        gpu: Arc<GpuResourceManager>,
+    ) -> Self {
+        Self {
+            client: make_lemonade_openai_client_for(&connection),
             model: model.to_string(),
             gpu,
         }

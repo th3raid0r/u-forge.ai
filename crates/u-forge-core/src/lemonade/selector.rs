@@ -49,6 +49,79 @@ pub struct SelectedModel {
     /// Embedding quality tier.  [`QualityTier::NotApplicable`] for all
     /// non-embedding capabilities.
     pub quality_tier: QualityTier,
+    pub checkpoint: String,
+    pub max_context_window: Option<usize>,
+    pub tool_capable: bool,
+    pub reasoning_capable: bool,
+    /// Visible selection changes such as preferred-device fallback.
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveChatLimits {
+    pub load_context: Option<usize>,
+    pub context: usize,
+    pub response_reserve: usize,
+    pub direct_generation: usize,
+    pub agent_generation: usize,
+    pub history_budget: usize,
+    pub diagnostics: Vec<String>,
+}
+
+impl SelectedModel {
+    /// Reconcile every chat budget against the catalog model window and the
+    /// explicitly loaded context. Direct and agent paths consume this one result.
+    pub fn reconcile_chat_limits(
+        &self,
+        configured_context: usize,
+        configured_reserve: usize,
+        direct_generation: usize,
+        agent_generation: usize,
+    ) -> anyhow::Result<EffectiveChatLimits> {
+        let mut diagnostics = self.diagnostics.clone();
+        let load_context = match (self.load_opts.ctx_size, self.max_context_window) {
+            (Some(configured), Some(maximum)) if configured > maximum => {
+                diagnostics.push(format!(
+                    "load context clamped from {configured} to catalog maximum {maximum}"
+                ));
+                Some(maximum)
+            }
+            (configured, _) => configured,
+        };
+        let authority = load_context.or(self.max_context_window);
+        let context = authority
+            .map(|maximum| configured_context.min(maximum))
+            .unwrap_or(configured_context);
+        if context != configured_context {
+            diagnostics.push(format!(
+                "chat context clamped from {configured_context} to {context}"
+            ));
+        } else if authority.is_none() {
+            diagnostics.push("catalog context limit unavailable; configured limit retained".into());
+        }
+        if context < 2 {
+            return Err(anyhow::anyhow!(
+                "effective context leaves no prompt/response allocation"
+            ));
+        }
+        let response_reserve = configured_reserve.min(context - 1);
+        if response_reserve != configured_reserve {
+            diagnostics.push(format!(
+                "response reserve clamped from {configured_reserve} to {response_reserve}"
+            ));
+        }
+        let direct_generation = direct_generation.min(response_reserve);
+        let agent_generation = agent_generation.min(response_reserve);
+        Ok(EffectiveChatLimits {
+            load_context,
+            context,
+            response_reserve,
+            direct_generation,
+            agent_generation,
+            history_budget: context - response_reserve,
+            diagnostics,
+        })
+    }
 }
 
 // ── Private helpers (module-level) ───────────────────────────────────────────
@@ -139,6 +212,14 @@ impl<'a> ModelSelector<'a> {
                     backend,
                     load_opts: self.config.load_options_for(&m.id),
                     quality_tier,
+                    checkpoint: m.checkpoint.clone(),
+                    max_context_window: m.max_context_window,
+                    tool_capable: m.supports_tool_calling(),
+                    reasoning_capable: m.supports_reasoning(),
+                    diagnostics: self.backend_diagnostics(
+                        &m.recipe,
+                        self.resolve_llamacpp_backend(&m.recipe).as_deref(),
+                    ),
                 })
             })
             .collect();
@@ -179,6 +260,14 @@ impl<'a> ModelSelector<'a> {
             backend,
             load_opts: self.config.load_options_for(&m.id),
             quality_tier,
+            checkpoint: m.checkpoint.clone(),
+            max_context_window: m.max_context_window,
+            tool_capable: m.supports_tool_calling(),
+            reasoning_capable: m.supports_reasoning(),
+            diagnostics: self.backend_diagnostics(
+                &m.recipe,
+                self.resolve_llamacpp_backend(&m.recipe).as_deref(),
+            ),
         })
     }
 
@@ -194,6 +283,14 @@ impl<'a> ModelSelector<'a> {
             backend: self.resolve_llamacpp_backend(&m.recipe),
             load_opts: self.config.load_options_for(&m.id),
             quality_tier: QualityTier::NotApplicable,
+            checkpoint: m.checkpoint.clone(),
+            max_context_window: m.max_context_window,
+            tool_capable: m.supports_tool_calling(),
+            reasoning_capable: m.supports_reasoning(),
+            diagnostics: self.backend_diagnostics(
+                &m.recipe,
+                self.resolve_llamacpp_backend(&m.recipe).as_deref(),
+            ),
         })
     }
 
@@ -226,6 +323,14 @@ impl<'a> ModelSelector<'a> {
                 backend: self.resolve_llamacpp_backend(&m.recipe),
                 load_opts: self.config.load_options_for(&m.id),
                 quality_tier: QualityTier::NotApplicable,
+                checkpoint: m.checkpoint.clone(),
+                max_context_window: m.max_context_window,
+                tool_capable: m.supports_tool_calling(),
+                reasoning_capable: m.supports_reasoning(),
+                diagnostics: self.backend_diagnostics(
+                    &m.recipe,
+                    self.resolve_llamacpp_backend(&m.recipe).as_deref(),
+                ),
             })
             .collect();
 
@@ -268,6 +373,14 @@ impl<'a> ModelSelector<'a> {
                 backend: self.resolve_llamacpp_backend(&m.recipe),
                 load_opts: self.config.load_options_for(&m.id),
                 quality_tier: QualityTier::NotApplicable,
+                checkpoint: m.checkpoint.clone(),
+                max_context_window: m.max_context_window,
+                tool_capable: m.supports_tool_calling(),
+                reasoning_capable: m.supports_reasoning(),
+                diagnostics: self.backend_diagnostics(
+                    &m.recipe,
+                    self.resolve_llamacpp_backend(&m.recipe).as_deref(),
+                ),
             })
             .collect();
 
@@ -306,6 +419,14 @@ impl<'a> ModelSelector<'a> {
                 backend: self.resolve_llamacpp_backend(&m.recipe),
                 load_opts: self.config.load_options_for(&m.id),
                 quality_tier: QualityTier::NotApplicable,
+                checkpoint: m.checkpoint.clone(),
+                max_context_window: m.max_context_window,
+                tool_capable: m.supports_tool_calling(),
+                reasoning_capable: m.supports_reasoning(),
+                diagnostics: self.backend_diagnostics(
+                    &m.recipe,
+                    self.resolve_llamacpp_backend(&m.recipe).as_deref(),
+                ),
             })
             .collect()
     }
@@ -333,6 +454,14 @@ impl<'a> ModelSelector<'a> {
             backend: None, // TTS is always CPU via kokoro; no backend param needed
             load_opts: self.config.load_options_for(&m.id),
             quality_tier: QualityTier::NotApplicable,
+            checkpoint: m.checkpoint.clone(),
+            max_context_window: m.max_context_window,
+            tool_capable: m.supports_tool_calling(),
+            reasoning_capable: m.supports_reasoning(),
+            diagnostics: self.backend_diagnostics(
+                &m.recipe,
+                self.resolve_llamacpp_backend(&m.recipe).as_deref(),
+            ),
         })
     }
 
@@ -356,6 +485,18 @@ impl<'a> ModelSelector<'a> {
             }
         }
         Some("cpu".to_string())
+    }
+
+    fn backend_diagnostics(&self, recipe: &str, backend: Option<&str>) -> Vec<String> {
+        if recipe != "llamacpp" {
+            return Vec::new();
+        }
+        match (self.config.llamacpp_backend_preference.first(), backend) {
+            (Some(preferred), Some(selected)) if preferred != selected => vec![format!(
+                "preferred backend {preferred} unavailable; selected {selected} and rebuilt the profile"
+            )],
+            _ => Vec::new(),
+        }
     }
 
     /// Returns `true` if the resolved device path is enabled in the embedding config.
@@ -415,6 +556,7 @@ mod tests {
             downloaded: true,
             size_gb: None,
             checkpoint: String::new(),
+            ..Default::default()
         }
     }
 
@@ -431,6 +573,7 @@ mod tests {
             backend: backend.to_string(),
             devices: devices.iter().map(|s| s.to_string()).collect(),
             state: "installed".to_string(),
+            ..Default::default()
         }
     }
 
@@ -445,6 +588,7 @@ mod tests {
             loaded: vec![],
             processor: String::new(),
             memory_gb: 0.0,
+            ..Default::default()
         }
     }
 
@@ -470,6 +614,35 @@ mod tests {
         let results = selector.select_embedding_models();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].model_id, "embed-flm");
+    }
+
+    #[test]
+    fn reconciles_all_chat_limits_against_catalog_window() {
+        let selected = SelectedModel {
+            model_id: "chat".into(),
+            recipe: "llamacpp".into(),
+            backend: Some("vulkan".into()),
+            load_opts: ModelLoadOptions {
+                ctx_size: Some(16_384),
+                ..Default::default()
+            },
+            quality_tier: QualityTier::NotApplicable,
+            checkpoint: String::new(),
+            max_context_window: Some(8192),
+            tool_capable: true,
+            reasoning_capable: true,
+            diagnostics: Vec::new(),
+        };
+        let limits = selected
+            .reconcile_chat_limits(12_000, 10_000, 9000, 7000)
+            .unwrap();
+        assert_eq!(limits.load_context, Some(8192));
+        assert_eq!(limits.context, 8192);
+        assert_eq!(limits.response_reserve, 8191);
+        assert_eq!(limits.direct_generation, 8191);
+        assert_eq!(limits.agent_generation, 7000);
+        assert_eq!(limits.history_budget, 1);
+        assert!(limits.diagnostics.len() >= 3);
     }
 
     #[test]

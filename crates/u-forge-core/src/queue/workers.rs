@@ -20,9 +20,13 @@ use tracing::debug;
 
 use crate::ai::embeddings::EmbeddingProvider;
 use crate::ai::transcription::TranscriptionProvider;
-use crate::lemonade::{LemonadeChatProvider, LemonadeTtsProvider, RerankProvider};
+use crate::lemonade::{
+    CoordinatedChatProvider, LemonadeTtsProvider, ReasoningPolicy, RerankProvider,
+};
 
-use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
+use super::jobs::{
+    EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
+};
 use super::weighted::WeightedEmbedDispatcher;
 
 /// Maximum number of attempts for a single embed job before the error is
@@ -64,7 +68,7 @@ where
 /// call goes directly to the FLM model with no locking.
 pub(super) async fn run_llm_worker(
     queue: Arc<WorkQueue<GenerateJob>>,
-    provider: LemonadeChatProvider,
+    provider: CoordinatedChatProvider,
     device_name: String,
 ) {
     run_worker_loop(queue, move |job| {
@@ -73,7 +77,7 @@ pub(super) async fn run_llm_worker(
         async move {
             let start = std::time::Instant::now();
             let n_messages = job.request.messages.len();
-            let result = provider.complete(job.request).await;
+            let result = complete_coordinated(&provider, job.request).await;
             debug!(
                 device = %device_name,
                 n_messages,
@@ -85,6 +89,84 @@ pub(super) async fn run_llm_worker(
         }
     })
     .await;
+}
+
+pub(super) async fn run_llm_stream_worker(
+    queue: Arc<WorkQueue<GenerateStreamJob>>,
+    provider: CoordinatedChatProvider,
+    device_name: String,
+) {
+    run_worker_loop(queue, move |job| {
+        let provider = provider.clone();
+        let device_name = device_name.clone();
+        async move {
+            let start = std::time::Instant::now();
+            let requested_model = job.request.model.as_deref();
+            if requested_model.is_some_and(|model| model != provider.profile.model_id) {
+                let _ = job
+                    .response
+                    .send(Err(anyhow::anyhow!(
+                        "queued provider {} cannot serve requested model {}",
+                        provider.profile.model_id,
+                        requested_model.unwrap_or_default()
+                    )))
+                    .await;
+                return;
+            }
+            let mut profile = provider.profile.clone();
+            profile.reasoning = reasoning_policy(job.request.enable_thinking);
+            let lease = match provider.runtime.acquire(&profile).await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    let _ = job.response.send(Err(error)).await;
+                    return;
+                }
+            };
+            let mut stream = provider
+                .provider
+                .complete_stream_with_lease(job.request, lease);
+            while let Some(item) = stream.recv().await {
+                if job.response.send(item).await.is_err() {
+                    break;
+                }
+            }
+            debug!(
+                device = %device_name,
+                duration_ms = start.elapsed().as_millis(),
+                "LLM streaming job complete"
+            );
+        }
+    })
+    .await;
+}
+
+async fn complete_coordinated(
+    provider: &CoordinatedChatProvider,
+    request: crate::lemonade::ChatRequest,
+) -> anyhow::Result<crate::lemonade::ChatCompletionResponse> {
+    if request
+        .model
+        .as_deref()
+        .is_some_and(|model| model != provider.profile.model_id)
+    {
+        anyhow::bail!(
+            "queued provider {} cannot serve requested model {}",
+            provider.profile.model_id,
+            request.model.as_deref().unwrap_or_default()
+        );
+    }
+    let mut profile = provider.profile.clone();
+    profile.reasoning = reasoning_policy(request.enable_thinking);
+    let lease = provider.runtime.acquire(&profile).await?;
+    provider.provider.complete_with_lease(request, lease).await
+}
+
+fn reasoning_policy(enable_thinking: Option<bool>) -> ReasoningPolicy {
+    match enable_thinking {
+        None => ReasoningPolicy::Default,
+        Some(true) => ReasoningPolicy::Enabled,
+        Some(false) => ReasoningPolicy::Disabled,
+    }
 }
 
 pub(super) async fn run_rerank_worker(

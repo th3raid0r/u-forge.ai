@@ -8,10 +8,12 @@
 //! For GPU-locked STT with resource contention management, see
 //! [`LemonadeSttProvider`](super::stt::LemonadeSttProvider).
 
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
-use super::client::LemonadeHttpClient;
+use super::client::{LemonadeConnection, LemonadeHttpClient};
 use crate::ai::transcription::{TranscriptionProvider, mime_for_filename};
 
 // ── LemonadeTranscriptionProvider ─────────────────────────────────────────────
@@ -47,6 +49,13 @@ impl LemonadeTranscriptionProvider {
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
             client: LemonadeHttpClient::new(base_url),
+            model: model.to_string(),
+        }
+    }
+
+    pub fn from_connection(connection: Arc<LemonadeConnection>, model: &str) -> Self {
+        Self {
+            client: LemonadeHttpClient::from_connection(connection),
             model: model.to_string(),
         }
     }

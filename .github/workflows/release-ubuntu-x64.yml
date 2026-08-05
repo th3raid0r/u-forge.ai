@@ -1,0 +1,75 @@
+name: Draft Ubuntu x64 release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: u-forge release tag to create
+        required: true
+        type: string
+      source_ref:
+        description: Git ref to build
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Install Linux UI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libasound2-dev libfontconfig1-dev libudev-dev libwayland-dev \
+            libx11-xcb-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build u-forge
+        env:
+          UFORGE_REQUIRE_EMBEDDED_LEMONADE: "1"
+        run: cargo build --locked --release -p u-forge-ui-gpui
+
+      - name: Assemble stable bundle layout
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          bundle="u-forge-${RELEASE_TAG}-ubuntu-x64"
+          mkdir -p "$bundle"
+          install -m 0755 target/release/u-forge-ui-gpui "$bundle/u-forge-ui-gpui"
+          cp -a target/release/lemonade "$bundle/lemonade"
+          test -x "$bundle/u-forge-ui-gpui"
+          test -x "$bundle/lemonade/lemond"
+          "$bundle/lemonade/lemond" --version
+          if ldd "$bundle/lemonade/lemond" | grep -q 'not found'; then
+            ldd "$bundle/lemonade/lemond"
+            exit 1
+          fi
+          tar -czf "$bundle.tar.gz" "$bundle"
+          sha256sum "$bundle.tar.gz" > "$bundle.tar.gz.sha256"
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          bundle="u-forge-${RELEASE_TAG}-ubuntu-x64.tar.gz"
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --target "$SOURCE_REF" \
+            --title "u-forge ${RELEASE_TAG}" \
+            --generate-notes \
+            "$bundle" "$bundle.sha256"

@@ -406,6 +406,16 @@ pub async fn build_hq_embed_queue(
     catalog: &LemonadeServerCatalog,
     app_cfg: &AppConfig,
 ) -> Option<InferenceQueue> {
+    let connection =
+        Arc::new(crate::lemonade::LemonadeConnection::external(&catalog.base_url).ok()?);
+    build_hq_embed_queue_with_connection(catalog, app_cfg, connection).await
+}
+
+pub async fn build_hq_embed_queue_with_connection(
+    catalog: &LemonadeServerCatalog,
+    app_cfg: &AppConfig,
+    connection: Arc<crate::lemonade::LemonadeConnection>,
+) -> Option<InferenceQueue> {
     if !app_cfg.embedding.high_quality_embedding {
         return None;
     }
@@ -425,10 +435,10 @@ pub async fn build_hq_embed_queue(
         .map(|m| m.model_name.clone())
         .collect();
 
-    let built: BuiltProvider = match ProviderFactory::build(
+    let built: BuiltProvider = match ProviderFactory::build_with_connection(
         &hq_model,
         Capability::Embedding,
-        &catalog.base_url,
+        connection,
         app_cfg.embedding.gpu_weight,
         None,
         &already_loaded,

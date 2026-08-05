@@ -1,7 +1,7 @@
 mod render;
 mod state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{Context, Empty, Entity, Subscription, prelude::*};
@@ -11,10 +11,12 @@ use u_forge_agent::{AgentParams, GraphAgent};
 use u_forge_core::{
     AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, KnowledgeGraph, ObjectMetadata,
     SchemaManager,
-    ingest::build_hq_embed_queue,
+    ingest::build_hq_embed_queue_with_connection,
     lemonade::{
-        Capability, GpuResourceManager, LemonadeRuntime, LemonadeServerCatalog, ModelSelector,
-        ProviderFactory, QualityTier, resolve_lemonade_url,
+        Capability, GpuResourceManager, LemonadeManagement, LemonadeOwnership, LemonadeRuntime,
+        LemonadeServerCatalog, ModelSelector, ProviderFactory, QualityTier, chat_component_state,
+        component_state, initial_setup_components, resolve_runtime_connection,
+        select_setup_backend,
     },
     queue::InferenceQueueBuilder,
     types::ObjectId,
@@ -33,6 +35,10 @@ use crate::path_picker::{
 };
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
+use crate::setup_panel::{
+    SetupClosed, SetupDownloadOperation, SetupDownloadRequested, SetupPanel, SetupRefreshRequested,
+    SetupRequested,
+};
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -158,11 +164,13 @@ pub struct AppView {
     pub(crate) search_panel: Entity<SearchPanel>,
     pub(crate) node_editor: Entity<NodeEditorPanel>,
     pub(crate) chat_panel: Entity<ChatPanel>,
+    pub(crate) setup_panel: Entity<SetupPanel>,
     #[allow(dead_code)]
     pub(crate) selection: Entity<SelectionModel>,
     // ── UI layout state ───────────────────────────────────────────────────────
     pub(crate) file_menu_open: bool,
     pub(crate) view_menu_open: bool,
+    pub(crate) setup_open: bool,
     pub(crate) sidebar_open: bool,
     pub(crate) sidebar_tab: SidebarTab,
     pub(crate) right_panel_open: bool,
@@ -278,6 +286,52 @@ impl AppView {
             },
         );
 
+        let setup_hq_default = if app_config
+            .source_path
+            .as_ref()
+            .is_some_and(|path| path.exists())
+        {
+            app_config.embedding.high_quality_embedding
+        } else {
+            true
+        };
+        let setup_panel = cx.new(|_cx| {
+            SetupPanel::new(
+                LemonadeOwnership::External,
+                &LemonadeServerCatalog::default(),
+                app_config.chat.active_device_config().model.as_deref(),
+                setup_hq_default,
+                app_config.embedding.npu_enabled,
+                app_config.chat.preferred_device.clone(),
+                app_config.chat.reasoning_control,
+            )
+        });
+        let setup_requested = cx.subscribe(
+            &setup_panel,
+            |this: &mut Self, _panel, request: &SetupRequested, cx| {
+                this.do_provision_lemonade(request.clone(), cx);
+            },
+        );
+        let setup_refresh = cx.subscribe(
+            &setup_panel,
+            |this: &mut Self, _panel, _event: &SetupRefreshRequested, cx| {
+                this.do_refresh_lemonade_setup(cx);
+            },
+        );
+        let setup_download = cx.subscribe(
+            &setup_panel,
+            |this: &mut Self, _panel, request: &SetupDownloadRequested, cx| {
+                this.do_control_lemonade_download(request.clone(), cx);
+            },
+        );
+        let setup_closed = cx.subscribe(
+            &setup_panel,
+            |this: &mut Self, _panel, _event: &SetupClosed, cx| {
+                this.setup_open = false;
+                cx.notify();
+            },
+        );
+
         let state = AppState::new(
             graph,
             snapshot_arc,
@@ -294,9 +348,11 @@ impl AppView {
             search_panel,
             node_editor,
             chat_panel,
+            setup_panel,
             selection,
             file_menu_open: false,
             view_menu_open: false,
+            setup_open: false,
             sidebar_open: false,
             sidebar_tab: SidebarTab::Nodes,
             right_panel_open: false,
@@ -308,7 +364,15 @@ impl AppView {
             confirmation: None,
             pending_destructive_action: None,
             _confirmation_subs: vec![],
-            _node_subs: vec![node_sub_create, node_sub_delete, connect_sub],
+            _node_subs: vec![
+                node_sub_create,
+                node_sub_delete,
+                connect_sub,
+                setup_requested,
+                setup_refresh,
+                setup_download,
+                setup_closed,
+            ],
             _graph_change_task: None,
             perf_enabled: false,
             last_frame_cost_us: 0,
@@ -1068,9 +1132,257 @@ impl AppView {
 
     /// Asynchronously discover Lemonade Server and build the InferenceQueue + ChatProvider.
     /// FTS5 search works immediately even if this fails.
+    pub(crate) fn do_refresh_lemonade_setup(&mut self, cx: &mut Context<Self>) {
+        let Some(connection) = self.state.lemonade_connection.clone() else {
+            self.setup_panel.update(cx, |panel, cx| {
+                panel.set_busy(
+                    false,
+                    "Lemonade is not connected; retry the connection first.",
+                );
+                cx.notify();
+            });
+            return;
+        };
+        let tokio_rt = self.state.tokio_rt.clone();
+        self.setup_panel.update(cx, |panel, cx| {
+            panel.set_busy(true, "Refreshing catalog and durable downloads…");
+            cx.notify();
+        });
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(async move {
+                        let catalog = LemonadeServerCatalog::discover_with_connection(
+                            connection.clone(),
+                        )
+                        .await?;
+                        let downloads = LemonadeManagement::new(connection).downloads().await;
+                        Ok::<_, anyhow::Error>((catalog, downloads))
+                    })
+                })
+                .await;
+            this.update(cx, |view, cx| match result {
+                Ok((catalog, downloads)) => {
+                    view.state.lemonade_catalog = Some(catalog.clone());
+                    let mut complete = false;
+                    view.setup_panel.update(cx, |panel, cx| {
+                        panel.refresh_catalog(&catalog);
+                        match downloads {
+                            Ok(value) => panel.set_downloads(&value),
+                            Err(error) => panel.set_busy(
+                                false,
+                                format!(
+                                    "Catalog refreshed, but durable downloads are unavailable: {error}"
+                                ),
+                            ),
+                        }
+                        complete = panel.is_complete();
+                        if complete {
+                            panel.set_busy(false, "Setup is complete. AI providers are ready.");
+                        } else {
+                            panel.set_busy(false, "Setup still has components to provision.");
+                        }
+                        cx.notify();
+                    });
+                    if complete {
+                        view.do_init_lemonade(cx);
+                    }
+                }
+                Err(error) => view.setup_panel.update(cx, |panel, cx| {
+                    panel.set_busy(false, format!("Setup refresh failed: {error}"));
+                    cx.notify();
+                }),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn do_control_lemonade_download(
+        &mut self,
+        request: SetupDownloadRequested,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = self.state.lemonade_connection.clone() else {
+            return;
+        };
+        let tokio_rt = self.state.tokio_rt.clone();
+        self.setup_panel.update(cx, |panel, cx| {
+            panel.set_busy(
+                true,
+                format!("Applying {:?} to download…", request.operation),
+            );
+            cx.notify();
+        });
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(async move {
+                        let manager = LemonadeManagement::new(connection);
+                        match request.operation {
+                            SetupDownloadOperation::Control(action) => {
+                                manager
+                                    .control_download(
+                                        &request.job_id,
+                                        action,
+                                        request.confirmed_external,
+                                    )
+                                    .await?;
+                            }
+                            SetupDownloadOperation::Retry => {
+                                // Current Lemonade exposes pause/cancel/remove
+                                // controls. Retry/resume is a stopped-job remove
+                                // followed by the same durable pull; partial files
+                                // are reused by the server downloader.
+                                manager
+                                    .control_download(
+                                        &request.job_id,
+                                        u_forge_core::lemonade::DownloadAction::Remove,
+                                        request.confirmed_external,
+                                    )
+                                    .await?;
+                                let component =
+                                    initial_setup_components().into_iter().find(|component| {
+                                        component.matches_model_id(&request.model_name)
+                                    });
+                                let (model_name, checkpoint, recipe, embedding) = component
+                                    .as_ref()
+                                    .map(|component| {
+                                        (
+                                            component.model_id,
+                                            component.checkpoint,
+                                            component.recipe,
+                                            component.is_embedding(),
+                                        )
+                                    })
+                                    .unwrap_or((request.model_name.as_str(), None, None, false));
+                                manager
+                                    .pull(
+                                        model_name,
+                                        checkpoint,
+                                        recipe,
+                                        embedding,
+                                        request.confirmed_external,
+                                    )
+                                    .await?;
+                            }
+                        }
+                        manager.downloads().await
+                    })
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.setup_panel.update(cx, |panel, cx| {
+                    match result {
+                        Ok(downloads) => {
+                            panel.set_downloads(&downloads);
+                            panel.set_busy(false, "Download action accepted by Lemonade.");
+                        }
+                        Err(error) => {
+                            panel.set_busy(false, format!("Download action failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn do_provision_lemonade(
+        &mut self,
+        request: SetupRequested,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(connection), Some(catalog)) = (
+            self.state.lemonade_connection.clone(),
+            self.state.lemonade_catalog.clone(),
+        ) else {
+            self.setup_panel.update(cx, |panel, cx| {
+                panel.set_busy(
+                    false,
+                    "A live Lemonade catalog is required before provisioning.",
+                );
+                cx.notify();
+            });
+            return;
+        };
+
+        let mut next_config = (*self.state.app_config).clone();
+        if let Err(error) = next_config.persist_lemonade_setup(
+            request.high_quality_embedding,
+            request.preferred_device.clone(),
+            &request.chat_model,
+            request.reasoning_control,
+        ) {
+            self.setup_panel.update(cx, |panel, cx| {
+                panel.set_busy(false, format!("Could not save setup choices: {error}"));
+                cx.notify();
+            });
+            return;
+        }
+        next_config.embedding.high_quality_embedding = request.high_quality_embedding;
+        next_config.chat.preferred_device = request.preferred_device.clone();
+        next_config.chat.reasoning_control = request.reasoning_control;
+        match request.preferred_device {
+            u_forge_core::ChatDevice::Auto | u_forge_core::ChatDevice::Gpu => {
+                next_config.chat.gpu.model = Some(request.chat_model.clone())
+            }
+            u_forge_core::ChatDevice::Npu => {
+                next_config.chat.npu.model = Some(request.chat_model.clone())
+            }
+            u_forge_core::ChatDevice::Cpu => {
+                next_config.chat.cpu.model = Some(request.chat_model.clone())
+            }
+        }
+        self.state.app_config = Arc::new(next_config.clone());
+
+        let tokio_rt = self.state.tokio_rt.clone();
+        self.setup_panel.update(cx, |panel, cx| {
+            panel.set_busy(true, "Starting server-owned provisioning jobs…");
+            cx.notify();
+        });
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(provision_lemonade(
+                        connection,
+                        catalog,
+                        next_config,
+                        request,
+                    ))
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.setup_panel.update(cx, |panel, cx| {
+                    match result {
+                        Ok((catalog, downloads, message)) => {
+                            view.state.lemonade_catalog = Some(catalog.clone());
+                            panel.refresh_catalog(&catalog);
+                            panel.set_downloads(&downloads);
+                            panel.set_busy(false, message);
+                        }
+                        Err(error) => {
+                            panel.set_busy(false, format!("Provisioning failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(crate) fn do_init_lemonade(&mut self, cx: &mut Context<Self>) {
         let app_config = self.state.app_config.clone();
         let tokio_rt = self.state.tokio_rt.clone();
+        let existing_connection = self.state.lemonade_connection.clone();
+        let existing_embedded = self.state.embedded_lemonade.clone();
 
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1078,17 +1390,18 @@ impl AppView {
                 .spawn(
                     async move {
                         tokio_rt.block_on(async move {
-                            // Discover Lemonade Server URL.
-                            let url = match resolve_lemonade_url().await {
-                                Some(u) => u,
-                                None => {
-                                    return Err(anyhow::anyhow!("Lemonade Server not reachable"));
-                                }
+                            let (connection, embedded_lemonade) = match existing_connection {
+                                Some(connection) => (connection, existing_embedded),
+                                None => resolve_runtime_connection().await?,
                             };
+                            let url = connection.api_base().to_string();
                             tracing::debug!("milestone: discover — server reachable at {url}");
 
                             // Discover available models.
-                            let catalog = LemonadeServerCatalog::discover(&url).await?;
+                            let catalog = LemonadeServerCatalog::discover_with_connection(
+                                connection.clone(),
+                            )
+                            .await?;
                             tracing::debug!(
                                 loaded = catalog.loaded.len(),
                                 models = catalog.models.len(),
@@ -1113,6 +1426,10 @@ impl AppView {
                             for sel in embed_models
                                 .iter()
                                 .filter(|s| s.quality_tier == QualityTier::Standard)
+                                .filter(|_| {
+                                    catalog.capacity_for("embedding") > 1
+                                        || !app_config.embedding.high_quality_embedding
+                                })
                             {
                                 let weight = match sel.recipe.as_str() {
                                     "flm" => app_config.embedding.npu_weight,
@@ -1131,7 +1448,6 @@ impl AppView {
                             }
 
                             let gpu_mgr = GpuResourceManager::new();
-                            let url_owned = url.clone();
                             let loaded = already_loaded.clone();
 
                             let provider_futs: Vec<_> = build_futs
@@ -1140,11 +1456,19 @@ impl AppView {
                                     let s = sel.clone();
                                     let c = *cap;
                                     let w = *weight;
-                                    let base = url_owned.clone();
+                                    let connection = connection.clone();
                                     let ld = loaded.clone();
                                     let gm = Arc::clone(&gpu_mgr);
                                     async move {
-                                        ProviderFactory::build(&s, c, &base, w, Some(gm), &ld).await
+                                        ProviderFactory::build_with_connection(
+                                            &s,
+                                            c,
+                                            connection,
+                                            w,
+                                            Some(gm),
+                                            &ld,
+                                        )
+                                        .await
                                     }
                                 })
                                 .collect();
@@ -1171,12 +1495,15 @@ impl AppView {
                             );
 
                             // Build optional HQ embedding queue.
-                            let hq_queue = build_hq_embed_queue(&catalog, &app_config).await;
+                            let hq_queue = build_hq_embed_queue_with_connection(
+                                &catalog,
+                                &app_config,
+                                connection.clone(),
+                            )
+                            .await;
 
                             // Select ALL LLM models for the UI picker (no device-slot dedup).
                             let all_llm = selector.select_all_llm_models();
-                            let llm_available: Vec<AvailableModel> =
-                                all_llm.iter().map(AvailableModel::from).collect();
 
                             // Determine the preferred model for initial connection.
                             // Use the active device config's explicit model override,
@@ -1184,31 +1511,66 @@ impl AppView {
                             let preferred_model_id =
                                 app_config.chat.active_device_config().model.clone();
 
-                            let preferred_idx = preferred_model_id
-                                .as_ref()
-                                .and_then(|pref| all_llm.iter().position(|m| m.model_id == *pref))
-                                .or_else(|| {
-                                    // Fallback: first GPU-backed model in the list.
-                                    all_llm.iter().position(|m| {
-                                        matches!(
-                                            m.backend.as_deref(),
-                                            Some("rocm") | Some("vulkan") | Some("metal")
-                                        )
-                                    })
+                            let (preferred_idx, selection_diagnostic) =
+                                select_preferred_llm_index(
+                                    &all_llm,
+                                    app_config.chat.preferred_device.clone(),
+                                    preferred_model_id.as_deref(),
+                                );
+
+                            let llm_available: Vec<AvailableModel> = all_llm
+                                .iter()
+                                .enumerate()
+                                .map(|(index, selected)| {
+                                    let device_config = chat_device_config_for_model(
+                                        &app_config.chat,
+                                        selected,
+                                    )
+                                    .clone();
+                                    let configured_generation = device_config
+                                        .max_tokens
+                                        .map(|value| value as usize)
+                                        .unwrap_or(app_config.chat.response_reserve);
+                                    let mut effective_limits = selected
+                                    .reconcile_chat_limits(
+                                        app_config.chat.max_context_tokens,
+                                        app_config.chat.response_reserve,
+                                        configured_generation,
+                                        configured_generation,
+                                    )
+                                    .map_err(|error| tracing::warn!(%error, "chat context is unusable"))
+                                    .ok();
+                                    if index == preferred_idx
+                                        && let (Some(limits), Some(diagnostic)) =
+                                            (&mut effective_limits, &selection_diagnostic)
+                                    {
+                                        limits.diagnostics.push(diagnostic.clone());
+                                    }
+                                    AvailableModel::from(selected).with_chat_profile(
+                                        device_config,
+                                        effective_limits,
+                                        app_config.chat.max_tool_turns,
+                                    )
                                 })
-                                .unwrap_or(0);
+                                .collect();
+                            let effective_limits = llm_available
+                                .get(preferred_idx)
+                                .and_then(|model| model.effective_limits.clone());
 
                             let chat_provider = all_llm.get(preferred_idx).map(|sel| {
-                                let gpu = match sel.recipe.as_str() {
-                                    "llamacpp" => match sel.backend.as_deref() {
-                                        Some("rocm") | Some("vulkan") | Some("metal") => {
-                                            Some(Arc::clone(&gpu_mgr))
-                                        }
-                                        _ => None,
-                                    },
-                                    _ => None,
-                                };
-                                u_forge_core::LemonadeChatProvider::new(&url, &sel.model_id, gpu)
+                                // The picker can switch models after setup. Use
+                                // the shared GPU guard whenever any selectable
+                                // profile targets the GPU so a later switch can
+                                // never bypass device coordination.
+                                let gpu = all_llm
+                                    .iter()
+                                    .any(|model| selected_model_device(model) == "gpu")
+                                    .then(|| Arc::clone(&gpu_mgr));
+                                u_forge_core::LemonadeChatProvider::from_connection(
+                                    connection.clone(),
+                                    &sel.model_id,
+                                    gpu,
+                                )
                             });
 
                             tracing::debug!(
@@ -1216,8 +1578,12 @@ impl AppView {
                                 preferred_idx,
                                 "milestone: ready — init complete"
                             );
-                            let runtime = Arc::new(LemonadeRuntime::new(url.clone()));
-                            Ok((
+                            let downloads = LemonadeManagement::new(connection.clone())
+                                .downloads()
+                                .await;
+                            let setup_connection = connection.clone();
+                            let runtime = Arc::new(LemonadeRuntime::from_connection(connection));
+                            Ok::<_, anyhow::Error>((
                                 url,
                                 queue,
                                 hq_queue,
@@ -1225,6 +1591,11 @@ impl AppView {
                                 llm_available,
                                 preferred_idx,
                                 runtime,
+                                embedded_lemonade,
+                                effective_limits,
+                                catalog,
+                                setup_connection,
+                                downloads,
                             ))
                         })
                     }
@@ -1235,14 +1606,80 @@ impl AppView {
             this.update(cx, |view: &mut AppView, cx| {
                 match result {
                     Ok((
-                        lemonade_url,
+                        _lemonade_url,
                         queue,
                         hq_queue,
                         chat_provider,
                         llm_models,
                         preferred_idx,
                         runtime,
+                        embedded_lemonade,
+                        effective_limits,
+                        catalog,
+                        connection,
+                        downloads,
                     )) => {
+                        view.state.embedded_lemonade = embedded_lemonade;
+                        view.state.lemonade_connection = Some(connection.clone());
+                        view.state.lemonade_catalog = Some(catalog.clone());
+                        let setup_hq_default = if view
+                            .state
+                            .app_config
+                            .source_path
+                            .as_ref()
+                            .is_some_and(|path| path.exists())
+                        {
+                            view.state.app_config.embedding.high_quality_embedding
+                        } else {
+                            true
+                        };
+                        let mut setup = SetupPanel::new(
+                            connection.ownership(),
+                            &catalog,
+                            view.state
+                                .app_config
+                                .chat
+                                .active_device_config()
+                                .model
+                                .as_deref(),
+                            setup_hq_default,
+                            view.state.app_config.embedding.npu_enabled,
+                            view.state.app_config.chat.preferred_device.clone(),
+                            view.state.app_config.chat.reasoning_control,
+                        );
+                        match downloads {
+                            Ok(downloads) => {
+                                setup.set_downloads(&downloads);
+                                let degraded = [
+                                    catalog.diagnostics.health.as_deref(),
+                                    catalog.diagnostics.system_info.as_deref(),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>();
+                                if !degraded.is_empty() {
+                                    setup.set_busy(
+                                        false,
+                                        format!(
+                                            "Discovery is degraded: {}",
+                                            degraded.join("; ")
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(error) => setup.set_busy(
+                                false,
+                                format!(
+                                    "Inference is available, but managed downloads are unavailable: {error}"
+                                ),
+                            ),
+                        }
+                        let setup_incomplete = !setup.is_complete();
+                        view.setup_panel.update(cx, |panel, cx| {
+                            *panel = setup;
+                            cx.notify();
+                        });
+                        view.setup_open |= setup_incomplete;
                         eprintln!("Lemonade connected — capabilities discovered");
                         let has_embedding = queue.has_embedding()
                             || hq_queue.as_ref().is_some_and(|q| q.has_embedding());
@@ -1260,11 +1697,22 @@ impl AppView {
 
                         // Build the graph agent and wire it to the chat panel.
                         let graph = view.state.graph.clone();
+                        let agent_gpu = chat_provider
+                            .as_ref()
+                            .and_then(|provider| provider.gpu.clone());
                         let system_prompt = view.state.app_config.chat.system_prompt.clone();
-                        let dev = view.state.app_config.chat.active_device_config();
+                        let dev = llm_models
+                            .get(preferred_idx)
+                            .map(|model| &model.sampling)
+                            .unwrap_or_else(|| {
+                                view.state.app_config.chat.active_device_config()
+                            });
                         let agent_params = AgentParams {
                             temperature: dev.temperature.map(|v| v as f64),
-                            max_tokens: dev.max_tokens.map(|v| v as u64),
+                            max_tokens: effective_limits
+                                .as_ref()
+                                .map(|limits| limits.agent_generation as u64)
+                                .or_else(|| dev.max_tokens.map(|v| v as u64)),
                             top_p: dev.top_p.map(|v| v as f64),
                             top_k: dev.top_k,
                             min_p: dev.min_p.map(|v| v as f64),
@@ -1276,13 +1724,14 @@ impl AppView {
                             max_tool_turns: view.state.app_config.chat.max_tool_turns,
                         };
                         if has_chat {
-                            match GraphAgent::new(
-                                &lemonade_url,
+                            match GraphAgent::new_with_connection_and_gpu(
+                                runtime.connection().clone(),
                                 graph,
                                 Arc::new(queue),
                                 hq_arc,
                                 system_prompt,
                                 agent_params,
+                                agent_gpu,
                             ) {
                                 Ok(agent) => {
                                     view.chat_panel.update(cx, |panel, _cx| {
@@ -1298,7 +1747,13 @@ impl AppView {
                         // Push chat provider to chat panel (model list + direct streaming fallback).
                         if let Some(provider) = chat_provider {
                             view.chat_panel.update(cx, |panel, _cx| {
-                                panel.set_provider(provider, llm_models, preferred_idx, runtime);
+                                panel.set_provider(
+                                    provider,
+                                    llm_models,
+                                    preferred_idx,
+                                    runtime,
+                                    view.state.app_config.chat.reasoning_control,
+                                );
                             });
                         } else {
                             view.chat_panel.update(cx, |panel, _cx| {
@@ -1431,5 +1886,247 @@ impl AppView {
             .ok();
         })
         .detach();
+    }
+}
+
+fn select_preferred_llm_index(
+    models: &[u_forge_core::lemonade::SelectedModel],
+    preferred_device: u_forge_core::ChatDevice,
+    explicit_model: Option<&str>,
+) -> (usize, Option<String>) {
+    if let Some(explicit_model) = explicit_model
+        && let Some(index) = models
+            .iter()
+            .position(|model| model.model_id == explicit_model)
+    {
+        return (index, None);
+    }
+
+    let requested = match preferred_device {
+        u_forge_core::ChatDevice::Auto => None,
+        u_forge_core::ChatDevice::Gpu => Some("gpu"),
+        u_forge_core::ChatDevice::Npu => Some("npu"),
+        u_forge_core::ChatDevice::Cpu => Some("cpu"),
+    };
+    let index = requested
+        .and_then(|device| {
+            models
+                .iter()
+                .position(|model| selected_model_device(model) == device)
+        })
+        .or_else(|| {
+            ["gpu", "npu", "cpu"].into_iter().find_map(|device| {
+                models
+                    .iter()
+                    .position(|model| selected_model_device(model) == device)
+            })
+        })
+        .unwrap_or(0);
+    let selected_device = models.get(index).map(selected_model_device);
+    let diagnostic = if let Some(explicit) = explicit_model {
+        Some(format!(
+            "configured model {explicit} is unavailable; rebuilt the complete profile for {}",
+            selected_device.unwrap_or("the available device")
+        ))
+    } else if let (Some(requested), Some(selected)) = (requested, selected_device) {
+        (requested != selected).then(|| {
+            format!(
+                "preferred device {requested} is unavailable; rebuilt the complete profile for {selected}"
+            )
+        })
+    } else {
+        None
+    };
+    (index, diagnostic)
+}
+
+fn selected_model_device(model: &u_forge_core::lemonade::SelectedModel) -> &'static str {
+    match model.recipe.as_str() {
+        "flm" => "npu",
+        "llamacpp" if matches!(model.backend.as_deref(), Some("rocm" | "vulkan" | "metal")) => {
+            "gpu"
+        }
+        _ => "cpu",
+    }
+}
+
+fn chat_device_config_for_model<'a>(
+    chat: &'a u_forge_core::ChatConfig,
+    model: &u_forge_core::lemonade::SelectedModel,
+) -> &'a u_forge_core::ChatDeviceConfig {
+    match selected_model_device(model) {
+        "gpu" => &chat.gpu,
+        "npu" => &chat.npu,
+        _ => &chat.cpu,
+    }
+}
+
+async fn provision_lemonade(
+    connection: Arc<u_forge_core::lemonade::LemonadeConnection>,
+    catalog: LemonadeServerCatalog,
+    config: AppConfig,
+    request: SetupRequested,
+) -> anyhow::Result<(LemonadeServerCatalog, serde_json::Value, String)> {
+    let manager = LemonadeManagement::new(connection.clone());
+    // Managed setup requires the durable download plane before it mutates an
+    // external or embedded runtime. This avoids invisible client-owned jobs.
+    manager.downloads().await?;
+    if let Some(error) = &catalog.diagnostics.system_info {
+        anyhow::bail!(
+            "backend discovery is unavailable, so managed setup cannot safely install a compatible backend: {error}"
+        );
+    }
+
+    let mut installed = HashSet::new();
+    let mut jobs_started = 0usize;
+    let components = initial_setup_components();
+    for component in components.iter().filter(|component| {
+        component.required
+            || (component.role == u_forge_core::lemonade::SetupRole::NpuEmbedding
+                && config.embedding.npu_enabled)
+            || (component.role == u_forge_core::lemonade::SetupRole::HighQualityEmbedding
+                && request.high_quality_embedding)
+    }) {
+        let state = component_state(&catalog, component);
+        if let u_forge_core::lemonade::SetupComponentState::Conflict(message) = &state {
+            anyhow::bail!(message.clone());
+        }
+        let recipe = component.recipe.or_else(|| {
+            catalog
+                .models
+                .iter()
+                .find(|model| component.matches_model_id(&model.id))
+                .map(|model| model.recipe.as_str())
+        });
+        if let Some(recipe) = recipe
+            && !recipe.is_empty()
+            && let Some(choice) =
+                select_setup_backend(&catalog, recipe, &config.models.llamacpp_backend_preference)
+            && choice.needs_install()
+            && installed.insert((choice.recipe.clone(), choice.backend.clone()))
+        {
+            manager
+                .install_backend(&choice.recipe, &choice.backend, request.confirmed_external)
+                .await?;
+        }
+        if state.needs_pull() {
+            manager
+                .pull(
+                    component.model_id,
+                    component.checkpoint,
+                    component.recipe,
+                    component.is_embedding(),
+                    request.confirmed_external,
+                )
+                .await?;
+            jobs_started += 1;
+        }
+    }
+
+    let chat_state = chat_component_state(&catalog, &request.chat_model);
+    if let u_forge_core::lemonade::SetupComponentState::Conflict(message) = &chat_state {
+        anyhow::bail!(message.clone());
+    }
+    let chat_model = catalog
+        .models
+        .iter()
+        .find(|model| model.id == request.chat_model)
+        .ok_or_else(|| anyhow::anyhow!("selected chat model is no longer in the live catalog"))?;
+    if let Some(choice) = select_setup_backend(
+        &catalog,
+        &chat_model.recipe,
+        &config.models.llamacpp_backend_preference,
+    ) && choice.needs_install()
+        && installed.insert((choice.recipe.clone(), choice.backend.clone()))
+    {
+        manager
+            .install_backend(&choice.recipe, &choice.backend, request.confirmed_external)
+            .await?;
+    }
+    if chat_state.needs_pull() {
+        manager
+            .pull(
+                &request.chat_model,
+                None,
+                None,
+                false,
+                request.confirmed_external,
+            )
+            .await?;
+        jobs_started += 1;
+    }
+
+    let downloads = manager.downloads().await?;
+    let refreshed = LemonadeServerCatalog::discover_with_connection(connection).await?;
+    let message = if jobs_started == 0 {
+        "Selections saved; all selected models are already downloaded.".to_string()
+    } else {
+        format!(
+            "Started {jobs_started} server-owned download job(s). Setup can be closed safely; use Refresh to restore progress."
+        )
+    };
+    Ok((refreshed, downloads, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selected(
+        id: &str,
+        recipe: &str,
+        backend: Option<&str>,
+    ) -> u_forge_core::lemonade::SelectedModel {
+        u_forge_core::lemonade::SelectedModel {
+            model_id: id.to_string(),
+            recipe: recipe.to_string(),
+            backend: backend.map(ToString::to_string),
+            load_opts: u_forge_core::ModelLoadOptions::default(),
+            quality_tier: u_forge_core::lemonade::QualityTier::NotApplicable,
+            checkpoint: id.to_string(),
+            max_context_window: None,
+            tool_capable: true,
+            reasoning_capable: false,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preferred_device_selects_a_coherent_profile_and_reports_fallback() {
+        let models = vec![
+            selected("gpu", "llamacpp", Some("vulkan")),
+            selected("npu", "flm", None),
+            selected("cpu", "llamacpp", Some("cpu")),
+        ];
+        assert_eq!(
+            select_preferred_llm_index(&models, u_forge_core::ChatDevice::Npu, None).0,
+            1
+        );
+        let (index, diagnostic) =
+            select_preferred_llm_index(&models[..1], u_forge_core::ChatDevice::Npu, None);
+        assert_eq!(index, 0);
+        assert!(diagnostic.unwrap().contains("rebuilt the complete profile"));
+    }
+
+    #[test]
+    fn model_picker_profiles_use_their_own_device_sampling() {
+        let mut chat = u_forge_core::ChatConfig::default();
+        chat.gpu.temperature = Some(0.1);
+        chat.npu.temperature = Some(0.2);
+        chat.cpu.temperature = Some(0.3);
+        assert_eq!(
+            chat_device_config_for_model(&chat, &selected("gpu", "llamacpp", Some("vulkan")))
+                .temperature,
+            Some(0.1)
+        );
+        assert_eq!(
+            chat_device_config_for_model(&chat, &selected("npu", "flm", None)).temperature,
+            Some(0.2)
+        );
+        assert_eq!(
+            chat_device_config_for_model(&chat, &selected("cpu", "llamacpp", Some("cpu")))
+                .temperature,
+            Some(0.3)
+        );
     }
 }

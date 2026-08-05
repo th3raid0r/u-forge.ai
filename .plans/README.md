@@ -2,9 +2,11 @@
 
 Last reconciled: 2026-08-04 against `main` after PR #33.
 
-Source code is authoritative. Active implementation work is recorded only in
-`bug_*.md` and `feature_*.md`; the older phase plans are retained under
-`archive/2026-04-audit/` as an audit snapshot, not as executable instructions.
+Source code is authoritative. Active implementation checklists are recorded in
+`bug_*.md` and `feature_*.md`. A decision-complete `plan_*.md` may accompany a
+large checklist when later sessions need more implementation detail than the
+tracker should duplicate. Older phase plans remain under
+`archive/2026-04-audit/` as an audit snapshot, not executable instructions.
 
 ## Approved direction
 
@@ -18,15 +20,19 @@ Source code is authoritative. Active implementation work is recorded only in
   outside the parity target.
 - Lemonade control-plane and direct-chat deviations remain custom HTTP;
   compatible endpoints continue to use OpenAI-compatible libraries.
-- A reasoning-mode change requires an effective model reload and serialized
-  execution, not only an `enable_thinking` request field.
+- Lemonade v11.5.1 request-scoped thinking control is the default. The
+  llama.cpp reload workaround remains available through a global TOML strategy
+  until supported models have been validated; either path stays serialized
+  through complete inference.
+- Packaged Ubuntu x64 builds own a private pinned embeddable `lemond` by
+  default. `LEMONADE_URL` explicitly selects an external instance.
 
 ## Active plans
 
 | Plan | Priority | Purpose |
 |------|----------|---------|
 | [Alpha correctness](bug_AlphaCorrectness.md) | P0 | Import integrity, graph invariants, search outcomes, GPUI lifecycle fixes, and maintenance debt. |
-| [Lemonade runtime](feature_LemonadeRuntime.md) | P0 | Shared connection/auth, partial catalog discovery, effective reasoning profiles, capacity-aware selection, and coordinated chat transports. |
+| [Lemonade runtime](feature_LemonadeRuntime.md) ([detailed plan](plan_LemonadeRuntime.md)) | P0 | Private embeddable runtime/release, managed setup, shared connection/auth, live effective profiles, and coordinated chat transports. |
 | [Zed UI parity](feature_ZedUiParity.md) | P0/P1 | Semantic components, behavioral docks, focus/actions, tabs, menus, status UI, and parity verification. |
 | [Inference lifecycle](feature_InferenceLifecycle.md) | P1 | Real cancellation and evidence-led queue observability/tuning. |
 | [Agent budgets](feature_AgentBudgets.md) | P1 | Schema prompt limits, cumulative budgets, and repeated-tool circuit breaking. |

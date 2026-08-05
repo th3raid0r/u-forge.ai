@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use super::client::LemonadeHttpClient;
-use super::load::{ModelLoadOptions, load_model};
+use std::sync::Arc;
+
+use super::client::{LemonadeConnection, LemonadeHttpClient};
+use super::load::{ModelLoadOptions, load_model_with_connection};
 
 /// A single ranked document returned by [`LemonadeRerankProvider::rerank`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,13 @@ impl LemonadeRerankProvider {
         }
     }
 
+    pub fn from_connection(connection: Arc<LemonadeConnection>, model: &str) -> Self {
+        Self {
+            client: LemonadeHttpClient::from_connection(connection),
+            model: model.to_string(),
+        }
+    }
+
     /// Explicitly load this model via `POST /api/v1/load` with the given options.
     ///
     /// Call this before the first [`rerank`](Self::rerank) to override server
@@ -71,7 +80,13 @@ impl LemonadeRerankProvider {
     ///
     /// Returns an error if the server is unreachable or rejects the load request.
     pub async fn load(&self, opts: &ModelLoadOptions, already_loaded: &[String]) -> Result<()> {
-        load_model(&self.client.base_url, &self.model, opts, already_loaded).await
+        load_model_with_connection(
+            self.client.connection().clone(),
+            &self.model,
+            opts,
+            already_loaded,
+        )
+        .await
     }
 
     /// Rerank `documents` by relevance to `query`.

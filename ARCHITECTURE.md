@@ -130,10 +130,10 @@ Holds `chunks_vec_dims` and `chunks_vec_hq_dims`. `check_or_init_embedding_dims`
 ### Catalog-Driven Selection Flow
 
 ```
-LemonadeServerCatalog::discover(url)
-  ├─ GET /api/v1/models   (all catalog entries + download status)
-  ├─ GET /system-info     (installed recipe backends)
-  └─ GET /api/v1/health   (currently loaded models)
+LemonadeServerCatalog::discover(connection)
+  ├─ GET /v1/models       (required catalog + download status)
+  ├─ GET /v1/system-info  (optional installed recipe backends)
+  └─ GET /v1/health       (optional live profile and capacity)
 
 ModelSelector::new(catalog, config)
   ├─ select_embedding_models()  → ≤1 per (device_slot, QualityTier)
@@ -143,7 +143,7 @@ ModelSelector::new(catalog, config)
   ├─ select_reranker()          → best downloaded reranker
   └─ model_by_id(id, tier)     → exact lookup (bypasses preference lists)
 
-ProviderFactory::build(sel, capability, url, queue_depth, gpu_mgr, already_loaded)
+ProviderFactory::build_with_connection(sel, capability, connection, weight, gpu_mgr, already_loaded)
   → BuiltProvider { slot, capability, weight }
 
 InferenceQueueBuilder::new()
@@ -151,7 +151,7 @@ InferenceQueueBuilder::new()
   .build()  → InferenceQueue
 ```
 
-**`already_loaded`:** pass `catalog.loaded` IDs to skip the `/api/v1/load` round-trip for models already in RAM. `do_init_lemonade()` fires all provider builds concurrently via `futures::future::join_all` after extracting this list — eliminating sequential load waits on warm servers.
+**`already_loaded`:** catalog IDs are only a warm-start optimization. LLM requests acquire a runtime lease, compare their effective loaded profile against live health, and reload when live state differs. The lease remains held through direct stream completion or the complete Rig tool loop.
 
 **Device slots** — deduplication key in `ModelSelector`:
 - `flm` recipe → `"npu"`
@@ -169,7 +169,7 @@ InferenceQueueBuilder::new()
 
 ### InferenceQueue Design
 
-MPMC work queue built from `parking_lot::Mutex<VecDeque<T>> + tokio::sync::Notify` per capability channel — no extra crate dependencies. Five channels: `WeightedEmbedDispatcher`, `transcribe_queue`, `generate_queue`, `synthesize_queue`, `rerank_queue`.
+MPMC work queue built from `parking_lot::Mutex<VecDeque<T>> + tokio::sync::Notify` per capability channel — no extra crate dependencies. Generation and generation streaming both use workers; streaming workers remain occupied until completion or receiver cancellation.
 
 **Weighted embedding dispatch** (`src/queue/weighted.rs`):
 - Each worker tracks an EWMA (α=0.5) of job duration in microseconds.
@@ -424,4 +424,4 @@ the 0.14 line, so the local backport remains active.
 
 Standard Rust stable toolchain + a C compiler (`gcc`, `clang`, or MSVC) for bundled SQLite compilation. No system SQLite, no ONNX Runtime, no RocksDB. `source env.sh` is not required.
 
-`cargo run -p u-forge-ui-gpui` works with zero environment variables set — Lemonade Server on `localhost:13305` is auto-discovered; all AI features degrade gracefully when absent.
+`cargo run -p u-forge-ui-gpui` works with zero environment variables set. On Ubuntu x64, the UI crate's build step downloads the checksum-pinned Embeddable Lemonade artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, and places `lemonade/lemond` beside the application executable. With no `LEMONADE_URL`, the application launches that private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.

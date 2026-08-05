@@ -4,9 +4,11 @@ use std::collections::VecDeque;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::lemonade::{ChatCompletionResponse, ChatRequest, KokoroVoice, RerankDocument};
+use crate::lemonade::{
+    ChatCompletionResponse, ChatRequest, KokoroVoice, RerankDocument, StreamToken,
+};
 
 // ── Internal job types ────────────────────────────────────────────────────────
 
@@ -35,6 +37,13 @@ pub(super) struct SynthesizeJob {
 pub(super) struct GenerateJob {
     pub(super) request: ChatRequest,
     pub(super) response: oneshot::Sender<Result<ChatCompletionResponse>>,
+}
+
+/// A streaming LLM job. The worker owns the job until the complete stream has
+/// been forwarded or the receiver is cancelled.
+pub(super) struct GenerateStreamJob {
+    pub(super) request: ChatRequest,
+    pub(super) response: mpsc::Sender<Result<StreamToken>>,
 }
 
 /// A single document reranking job.

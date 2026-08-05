@@ -22,6 +22,7 @@ export RUST_LOG=info                                 # Log verbosity
 # Integration test control (default: auto-skip when no server found)
 export UFORGE_INTEGRATION_TESTS=require  # Panic instead of skip when server unreachable
 export UFORGE_INTEGRATION_TESTS=skip     # Force-skip even when a server is present
+export UFORGE_SKIP_EMBEDDED_LEMONADE=1   # Skip automatic runtime provisioning
 ```
 
 ### Why env vars are overrides, not requirements
@@ -35,7 +36,17 @@ at the top level.
 
 ```bash
 export RUST_LOG=u_forge_core::graph::storage=debug,u_forge_core::ai::embeddings=info
+
+# Lemonade discovery plus redacted stdout/stderr from the owned lemond child.
+export RUST_LOG=info,u_forge_core::lemonade::management=debug,u_forge_core::lemonade::embedded::lemond=debug
 ```
+
+`RUST_LOG` controls u-forge's tracing filter. Embeddable Lemonade has its own
+`log_level` setting in `$XDG_DATA_HOME/u-forge/lemonade/config.json`, or
+`~/.local/share/u-forge/lemonade/config.json` when `XDG_DATA_HOME` is unset.
+Set that JSON field to `"debug"` when Lemonade's default informational child
+events are insufficient; u-forge forwards those lines only when the dedicated
+`lemond` tracing target above is enabled and redacts both runtime credentials.
 
 ## Path Resolution
 
@@ -67,9 +78,12 @@ The desktop app uses a persistent database. Set `UFORGE_DATA_FILE` /
 ## Lemonade Server
 
 Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
-TTS) via an OpenAI-compatible HTTP API. u-forge.ai does **not** fall back to a
-local model if Lemonade is unavailable — features degrade gracefully and a
-clear error is returned to the user.
+TTS) via an OpenAI-compatible HTTP API. On Ubuntu x64, building the desktop UI
+downloads the checksum-pinned Embeddable Lemonade release into `target/` and
+places its runtime beside the application executable. The build adds the
+`reasoning` catalog label to built-in Gemma 4 GGUF models before installation.
+If provisioning is skipped or unavailable, AI features degrade gracefully and
+the knowledge graph remains usable.
 
 ### Setup
 

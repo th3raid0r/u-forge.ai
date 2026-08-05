@@ -984,33 +984,9 @@ use tokio::sync::mpsc;
 
 // ── Stream event type ─────────────────────────────────────────────────────────
 
-/// An event emitted by [`GraphAgent::prompt_stream`] as the agent loop runs.
-#[derive(Debug, Clone)]
-pub enum AgentStreamEvent {
-    /// Partial reasoning/thinking token (streamed before the final response).
-    ReasoningDelta(String),
-    /// Partial text token streaming from the LLM.
-    TextDelta(String),
-    /// The LLM has decided to call a tool. Args are pretty-printed JSON.
-    ToolCallStart {
-        /// Stable identifier correlating this call with its [`ToolResult`].
-        internal_id: String,
-        /// Tool name, e.g. `"search_hybrid"`.
-        name: String,
-        /// Human-readable JSON arguments.
-        args_display: String,
-    },
-    /// A tool has returned its result.
-    ToolResult {
-        /// Matches the `internal_id` from the preceding [`ToolCallStart`].
-        internal_id: String,
-        content: String,
-    },
-    /// The agent loop is done; this is the complete final response text.
-    Done(String),
-    /// A fatal error terminated the loop.
-    Error(String),
-}
+/// Compatibility name for the shared event contract consumed above direct
+/// HTTP and Rig adapters.
+pub type AgentStreamEvent = u_forge_core::lemonade::ChatEvent;
 
 /// Sampling and generation parameters for the agent, built from
 /// [`ChatDeviceConfig`] + [`ChatConfig`].
@@ -1073,7 +1049,7 @@ pub struct GraphAgent {
     hq_queue: Option<Arc<InferenceQueue>>,
     system_prompt: String,
     params: AgentParams,
-    cached_additional_params: Option<serde_json::Value>,
+    gpu: Option<Arc<u_forge_core::GpuResourceManager>>,
 }
 
 impl GraphAgent {
@@ -1087,9 +1063,44 @@ impl GraphAgent {
         system_prompt: impl Into<String>,
         params: AgentParams,
     ) -> anyhow::Result<Self> {
+        let connection = Arc::new(u_forge_core::lemonade::LemonadeConnection::external(
+            lemonade_url,
+        )?);
+        Self::new_with_connection(connection, graph, queue, hq_queue, system_prompt, params)
+    }
+
+    pub fn new_with_connection(
+        connection: Arc<u_forge_core::lemonade::LemonadeConnection>,
+        graph: Arc<KnowledgeGraph>,
+        queue: Arc<InferenceQueue>,
+        hq_queue: Option<Arc<InferenceQueue>>,
+        system_prompt: impl Into<String>,
+        params: AgentParams,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_connection_and_gpu(
+            connection,
+            graph,
+            queue,
+            hq_queue,
+            system_prompt,
+            params,
+            None,
+        )
+    }
+
+    pub fn new_with_connection_and_gpu(
+        connection: Arc<u_forge_core::lemonade::LemonadeConnection>,
+        graph: Arc<KnowledgeGraph>,
+        queue: Arc<InferenceQueue>,
+        hq_queue: Option<Arc<InferenceQueue>>,
+        system_prompt: impl Into<String>,
+        params: AgentParams,
+        gpu: Option<Arc<u_forge_core::GpuResourceManager>>,
+    ) -> anyhow::Result<Self> {
         let client = CompletionsClient::builder()
-            .api_key("lemonade")
-            .base_url(lemonade_url)
+            .api_key(connection.api_credential().unwrap_or("lemonade"))
+            .base_url(connection.api_base())
+            .http_client(connection.completion_http_client())
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build rig client: {e}"))?;
         let base_prompt: String = system_prompt.into();
@@ -1112,8 +1123,6 @@ impl GraphAgent {
             format!("{base_prompt}\n\n{tool_guidance}\n\n{schema_summary}")
         };
 
-        let cached_additional_params = Self::build_additional_params(&params);
-
         Ok(Self {
             client,
             graph,
@@ -1121,11 +1130,11 @@ impl GraphAgent {
             hq_queue,
             system_prompt: full_prompt,
             params,
-            cached_additional_params,
+            gpu,
         })
     }
 
-    /// Compute `additional_params` JSON from sampling knobs once at construction.
+    /// Compute Rig's flattened `additional_params` JSON from sampling knobs.
     ///
     /// Rig's OpenAI provider flattens this into the request body, so keys like
     /// `frequency_penalty`, `top_p`, `seed`, etc. end up as top-level fields
@@ -1148,7 +1157,7 @@ impl GraphAgent {
             map.insert("presence_penalty".into(), serde_json::json!(v));
         }
         if let Some(v) = params.repetition_penalty {
-            map.insert("repetition_penalty".into(), serde_json::json!(v));
+            map.insert("repeat_penalty".into(), serde_json::json!(v));
         }
         if let Some(v) = params.seed {
             map.insert("seed".into(), serde_json::json!(v));
@@ -1163,8 +1172,18 @@ impl GraphAgent {
         }
     }
 
-    fn additional_params(&self) -> Option<serde_json::Value> {
-        self.cached_additional_params.clone()
+    fn build_request_additional_params(
+        params: &AgentParams,
+        reasoning: u_forge_core::ReasoningPolicy,
+    ) -> serde_json::Value {
+        let mut value = Self::build_additional_params(params)
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let (serde_json::Value::Object(values), Some(enabled)) =
+            (&mut value, reasoning.request_hint())
+        {
+            values.insert("enable_thinking".into(), serde_json::json!(enabled));
+        }
+        value
     }
 
     /// Build a rig agent configured with all sampling params and tools.
@@ -1173,23 +1192,32 @@ impl GraphAgent {
         model_id: &str,
         reasoning_enabled: bool,
     ) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
+        self.build_agent_with_params(
+            model_id,
+            if reasoning_enabled {
+                u_forge_core::ReasoningPolicy::Enabled
+            } else {
+                u_forge_core::ReasoningPolicy::Disabled
+            },
+            &self.params,
+        )
+    }
+
+    fn build_agent_with_params(
+        &self,
+        model_id: &str,
+        reasoning: u_forge_core::ReasoningPolicy,
+        params: &AgentParams,
+    ) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
         let mut builder = self.client.agent(model_id).preamble(&self.system_prompt);
-        if let Some(temp) = self.params.temperature {
+        if let Some(temp) = params.temperature {
             builder = builder.temperature(temp);
         }
 
-        if let Some(max_tokens) = self.params.max_tokens {
+        if let Some(max_tokens) = params.max_tokens {
             builder = builder.max_tokens(max_tokens);
         }
-        let mut additional = self
-            .additional_params()
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        if let serde_json::Value::Object(params) = &mut additional {
-            params.insert(
-                "enable_thinking".to_string(),
-                serde_json::Value::Bool(reasoning_enabled),
-            );
-        }
+        let additional = Self::build_request_additional_params(params, reasoning);
         if !additional.as_object().is_none_or(serde_json::Map::is_empty) {
             builder = builder.additional_params(additional);
         }
@@ -1221,7 +1249,7 @@ impl GraphAgent {
     ///
     /// Returns a [`mpsc::Receiver`] that yields [`AgentStreamEvent`]s as the
     /// agent streams text, calls tools, and receives tool results. The channel
-    /// closes after a [`AgentStreamEvent::Done`] or [`AgentStreamEvent::Error`].
+    /// closes after a terminal `Finished` or `FatalError` event.
     pub async fn prompt_stream(
         &self,
         model_id: &str,
@@ -1229,10 +1257,61 @@ impl GraphAgent {
         history: &[HistoryMessage],
         reasoning_enabled: bool,
     ) -> mpsc::Receiver<AgentStreamEvent> {
+        self.prompt_stream_with_params(
+            model_id,
+            user_message,
+            history,
+            reasoning_enabled,
+            self.params.clone(),
+        )
+        .await
+    }
+
+    /// Stream using the complete effective profile for the selected model.
+    ///
+    /// This keeps picker changes coherent: model, context/generation limits,
+    /// sampling controls, reasoning, and tool-loop ceiling change together.
+    pub async fn prompt_stream_with_params(
+        &self,
+        model_id: &str,
+        user_message: &str,
+        history: &[HistoryMessage],
+        reasoning_enabled: bool,
+        params: AgentParams,
+    ) -> mpsc::Receiver<AgentStreamEvent> {
+        self.prompt_stream_with_profile(
+            model_id,
+            user_message,
+            history,
+            if reasoning_enabled {
+                u_forge_core::ReasoningPolicy::Enabled
+            } else {
+                u_forge_core::ReasoningPolicy::Disabled
+            },
+            params,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Stream while retaining runtime and device coordination in the producer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prompt_stream_with_profile(
+        &self,
+        model_id: &str,
+        user_message: &str,
+        history: &[HistoryMessage],
+        reasoning: u_forge_core::ReasoningPolicy,
+        params: AgentParams,
+        runtime_lease: Option<u_forge_core::LemonadeRuntimeLease>,
+        uses_gpu: bool,
+    ) -> mpsc::Receiver<AgentStreamEvent> {
         let (tx, rx) = mpsc::channel(64);
 
-        let agent = self.build_agent(model_id, reasoning_enabled);
-        let max_turns = self.params.max_tool_turns;
+        let agent = self.build_agent_with_params(model_id, reasoning, &params);
+        let max_turns = params.max_tool_turns;
+        let gpu = uses_gpu.then(|| self.gpu.clone()).flatten();
 
         let user_message = user_message.to_string();
         // Convert HistoryMessage → rig::completion::message::Message.
@@ -1248,6 +1327,11 @@ impl GraphAgent {
             .collect();
 
         tokio::spawn(async move {
+            let _runtime_lease = runtime_lease;
+            let mut gpu_guard = match &gpu {
+                Some(gpu) => Some(gpu.begin_llm().await),
+                None => None,
+            };
             let mut stream = agent
                 .stream_prompt(&user_message)
                 .history(rig_history)
@@ -1273,6 +1357,10 @@ impl GraphAgent {
                             tool_call,
                             internal_call_id,
                         } => {
+                            // Rig executes the tool on the next poll. Release
+                            // the device now so embedding tools cannot deadlock
+                            // behind this LLM turn's GPU guard.
+                            gpu_guard.take();
                             let args_display =
                                 serde_json::to_string_pretty(&tool_call.function.arguments)
                                     .unwrap_or_else(|_| tool_call.function.arguments.to_string());
@@ -1342,6 +1430,10 @@ impl GraphAgent {
                             {
                                 break 'stream;
                             }
+                            // The next poll begins the following LLM turn.
+                            if let Some(gpu) = &gpu {
+                                gpu_guard = Some(gpu.begin_llm().await);
+                            }
                         }
                     },
                     Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
@@ -1352,14 +1444,33 @@ impl GraphAgent {
                         } else {
                             final_text.clone()
                         };
-                        let _ = tx.send(AgentStreamEvent::Done(text)).await;
+                        let usage = resp.usage();
+                        if usage.total_tokens > 0
+                            && tx
+                                .send(AgentStreamEvent::Usage(u_forge_core::lemonade::ChatUsage {
+                                    prompt_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
+                                    completion_tokens: usage.output_tokens.min(u32::MAX as u64)
+                                        as u32,
+                                    total_tokens: usage.total_tokens.min(u32::MAX as u64) as u32,
+                                }))
+                                .await
+                                .is_err()
+                        {
+                            break 'stream;
+                        }
+                        let _ = tx
+                            .send(AgentStreamEvent::Finished {
+                                reason: u_forge_core::lemonade::ChatTerminalReason::AgentComplete,
+                                full_text: Some(text),
+                            })
+                            .await;
                         break 'stream;
                     }
                     Ok(_) => {
                         // Non-exhaustive: ignore any new MultiTurnStreamItem variants.
                     }
                     Err(e) => {
-                        let _ = tx.send(AgentStreamEvent::Error(e.to_string())).await;
+                        let _ = tx.send(AgentStreamEvent::FatalError(e.to_string())).await;
                         break 'stream;
                     }
                 }
@@ -1406,10 +1517,52 @@ pub use rig;
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_node, tool_validation::validate_tool_args};
+    use super::tool_validation::validate_tool_args;
+    use super::{AgentParams, GraphAgent, resolve_node};
     use serde_json::json;
     use tempfile::TempDir;
     use u_forge_core::{KnowledgeGraph, ObjectMetadata};
+
+    #[test]
+    fn agent_sampling_uses_current_lemonade_wire_names() {
+        let params = AgentParams {
+            top_p: Some(0.8),
+            top_k: Some(40),
+            min_p: Some(0.05),
+            frequency_penalty: Some(0.1),
+            presence_penalty: Some(0.2),
+            repetition_penalty: Some(1.1),
+            seed: Some(7),
+            stop: Some(vec!["END".into()]),
+            ..AgentParams::default()
+        };
+        let value = GraphAgent::build_additional_params(&params).unwrap();
+        assert_eq!(value["repeat_penalty"], 1.1);
+        assert!(value.get("repetition_penalty").is_none());
+        assert_eq!(value["top_p"], 0.8);
+        assert_eq!(value["top_k"], 40);
+        assert_eq!(value["stop"], json!(["END"]));
+    }
+
+    #[test]
+    fn agent_reasoning_policy_omits_default_and_sends_explicit_states() {
+        let params = AgentParams::default();
+        let default = GraphAgent::build_request_additional_params(
+            &params,
+            u_forge_core::ReasoningPolicy::Default,
+        );
+        assert!(default.get("enable_thinking").is_none());
+        let enabled = GraphAgent::build_request_additional_params(
+            &params,
+            u_forge_core::ReasoningPolicy::Enabled,
+        );
+        assert_eq!(enabled["enable_thinking"], true);
+        let disabled = GraphAgent::build_request_additional_params(
+            &params,
+            u_forge_core::ReasoningPolicy::Disabled,
+        );
+        assert_eq!(disabled["enable_thinking"], false);
+    }
 
     // FtsSearchTool validation
 
