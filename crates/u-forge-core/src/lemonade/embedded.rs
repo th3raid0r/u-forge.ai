@@ -92,20 +92,13 @@ impl EmbeddedLemonade {
                 Some(admin_key.clone()),
                 timeouts,
             )?);
-            let mut command = Command::new(&binary);
-            command
-                .arg(&data_root)
-                .arg("--port")
-                .arg(port.to_string())
-                .arg("--host")
-                .arg("127.0.0.1")
-                .arg("--no-broadcast")
-                .env("LEMONADE_API_KEY", &api_key)
-                .env("LEMONADE_ADMIN_API_KEY", &admin_key)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
+            let mut command = embedded_command(
+                &binary,
+                &data_root,
+                port,
+                api_key.as_str(),
+                admin_key.as_str(),
+            );
             let mut child = command
                 .spawn()
                 .with_context(|| format!("failed to launch {}", binary.display()))?;
@@ -175,6 +168,29 @@ impl EmbeddedLemonade {
         self.shutting_down.store(true, Ordering::Release);
         shutdown_parts(self.connection.clone(), self.child.clone()).await;
     }
+}
+
+fn embedded_command(
+    binary: &Path,
+    data_root: &Path,
+    port: u16,
+    api_key: &str,
+    admin_key: &str,
+) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .arg(data_root)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--host")
+        .arg("127.0.0.1")
+        .env("LEMONADE_API_KEY", api_key)
+        .env("LEMONADE_ADMIN_API_KEY", admin_key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
 }
 
 impl Drop for EmbeddedLemonade {
@@ -532,6 +548,34 @@ mod tests {
         assert_eq!(
             std::fs::read(data.path().join("user_models.json")).unwrap(),
             b"{\"user\":true}"
+        );
+    }
+
+    #[test]
+    fn owned_command_uses_only_supported_lemond_arguments() {
+        let package = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let binary = package.path().join("lemond");
+        let command = embedded_command(&binary, data.path(), 13306, "api", "admin");
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                data.path().to_string_lossy().into_owned(),
+                "--port".to_owned(),
+                "13306".to_owned(),
+                "--host".to_owned(),
+                "127.0.0.1".to_owned(),
+            ]
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "--no-broadcast")
         );
     }
 
