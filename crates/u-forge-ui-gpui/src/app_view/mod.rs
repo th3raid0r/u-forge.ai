@@ -340,9 +340,9 @@ impl AppView {
 
     /// Rebuild the in-memory snapshot from the graph and push it to all child views.
     ///
-    /// Uses `build_snapshot_incremental` when a previous snapshot exists so that
-    /// single-mutation events (e.g. agent `UpsertNodeTool`) apply R-tree and
-    /// legend deltas in O(delta × log N) instead of rebuilding from scratch.
+    /// Uses `build_snapshot_incremental` when a previous snapshot exists so
+    /// legend bookkeeping can reuse the prior type set. Spatial state is always
+    /// bulk-rebuilt from the newly committed node positions.
     pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
         let snapshot_start = std::time::Instant::now();
         let result = {
@@ -368,6 +368,8 @@ impl AppView {
                     .selected_node_id
                     .is_none_or(|selected| snap.nodes.iter().any(|node| node.id == selected));
                 *self.state.snapshot.write() = snap;
+                self.graph_canvas
+                    .update(cx, |canvas, _cx| canvas.reconcile_snapshot_refresh());
                 if !selected_still_exists {
                     self.selection
                         .update(cx, |selection, cx| selection.clear(cx));

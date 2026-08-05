@@ -6,7 +6,7 @@ use rstar::RTree;
 use serde_json::Value as JsonValue;
 use u_forge_core::{KnowledgeGraph, ObjectId};
 
-use crate::layout::force_directed_layout;
+use crate::layout::force_directed_layout_with_fixed;
 use crate::spatial::NodeEntry;
 
 /// Level-of-detail for rendering, keyed on zoom level.
@@ -151,8 +151,8 @@ impl GraphSnapshot {
 /// 1. Fetches all objects, edges, and any previously saved canvas positions
 /// 2. Builds an ObjectId → index map
 /// 3. Converts edges to index-based EdgeViews
-/// 4. Runs force-directed layout to assign positions for all nodes
-/// 5. Overwrites positions with saved values where available
+/// 4. Restores saved positions and seeds new nodes near stable graph anchors
+/// 5. Relaxes only nodes without a saved position
 /// 6. Builds the R-tree spatial index
 pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
     let objects = graph.get_all_objects()?;
@@ -195,22 +195,7 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         })
         .collect();
 
-    // If every node already has a saved position (the common case for an
-    // established graph), skip force-directed layout entirely — it would just
-    // be overwritten immediately and wastes O(iterations * N) work.
-    // Only run layout when at least one node is missing a saved position
-    // (new node added, first run, or layout was reset).
-    let all_saved = nodes.iter().all(|n| saved_positions.contains_key(&n.id));
-    if !all_saved {
-        force_directed_layout(&mut nodes, &edges);
-    }
-
-    // Apply saved positions for all known nodes.
-    for node in &mut nodes {
-        if let Some(&(x, y)) = saved_positions.get(&node.id) {
-            node.position = Vec2::new(x, y);
-        }
-    }
+    apply_saved_and_layout_new_nodes(&mut nodes, &edges, &saved_positions);
 
     // Build R-tree spatial index from final positions
     let spatial_index = RTree::bulk_load(
@@ -242,15 +227,13 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
 /// `UpsertNodeTool`). It still fetches all objects/edges from the DB (same
 /// I/O as a full rebuild), but:
 ///
-/// - When all positions are saved (layout is skipped), the R-tree is updated
-///   with O(delta × log N) insert/remove operations instead of an O(N log N)
-///   `bulk_load`.
 /// - `legend_types` and `type_counts` are updated in O(delta) when no new
 ///   object types are introduced or removed entirely; otherwise they are
 ///   recomputed in O(N).
 ///
-/// Falls back to a full `bulk_load` whenever layout runs (i.e. a new node
-/// without a saved position was added), because layout changes all positions.
+/// The R-tree is always bulk-loaded from committed snapshot positions. The
+/// graph fetch is already O(N), and rebuilding avoids stale-entry corner cases
+/// after delete/refresh sequences.
 pub fn build_snapshot_incremental(
     graph: &KnowledgeGraph,
     prev: &GraphSnapshot,
@@ -296,14 +279,7 @@ pub fn build_snapshot_incremental(
         .collect();
 
     let all_saved = nodes.iter().all(|n| saved_positions.contains_key(&n.id));
-    if !all_saved {
-        force_directed_layout(&mut nodes, &edges);
-    }
-    for node in &mut nodes {
-        if let Some(&(x, y)) = saved_positions.get(&node.id) {
-            node.position = Vec2::new(x, y);
-        }
-    }
+    apply_saved_and_layout_new_nodes(&mut nodes, &edges, &saved_positions);
 
     // Compute the delta: which nodes were added and which were removed.
     let new_ids: HashSet<ObjectId> = nodes.iter().map(|n| n.id).collect();
@@ -311,45 +287,15 @@ pub fn build_snapshot_incremental(
     let removed: Vec<ObjectId> = prev_ids.difference(&new_ids).copied().collect();
     let added: Vec<ObjectId> = new_ids.difference(&prev_ids).copied().collect();
 
-    // Spatial index: incremental when all positions are saved (no layout ran),
-    // full bulk_load otherwise (layout changes every position).
-    let spatial_index = if all_saved {
-        let mut index = prev.spatial_index.clone();
-
-        // Remove deleted nodes — we know their old positions from prev.
-        for id in &removed {
-            if let Some(old) = prev.nodes.iter().find(|n| n.id == *id) {
-                let entry = NodeEntry {
-                    id: *id,
-                    position: [old.position.x, old.position.y],
-                };
-                index.remove(&entry);
-            }
-        }
-
-        // Insert new nodes using their freshly-assigned positions.
-        for id in &added {
-            if let Some(new_node) = nodes.iter().find(|n| n.id == *id) {
-                index.insert(NodeEntry {
-                    id: *id,
-                    position: [new_node.position.x, new_node.position.y],
-                });
-            }
-        }
-
-        index
-    } else {
-        // Layout ran — all positions changed, so a full rebuild is required.
-        RTree::bulk_load(
-            nodes
-                .iter()
-                .map(|n| NodeEntry {
-                    id: n.id,
-                    position: [n.position.x, n.position.y],
-                })
-                .collect(),
-        )
-    };
+    let spatial_index = RTree::bulk_load(
+        nodes
+            .iter()
+            .map(|n| NodeEntry {
+                id: n.id,
+                position: [n.position.x, n.position.y],
+            })
+            .collect(),
+    );
 
     // Legend: check whether any type was added or fully removed.
     //
@@ -406,6 +352,92 @@ pub fn build_snapshot_incremental(
         id_to_idx,
         type_counts,
     })
+}
+
+/// Restore fixed saved positions, deterministically seed new nodes, then relax
+/// only the new portion of the graph.
+fn apply_saved_and_layout_new_nodes(
+    nodes: &mut [NodeView],
+    edges: &[EdgeView],
+    saved_positions: &HashMap<ObjectId, (f32, f32)>,
+) {
+    const RING_GAP: f32 = 120.0;
+    const NEIGHBOUR_OFFSET: f32 = 60.0;
+
+    let fixed = nodes
+        .iter()
+        .map(|node| saved_positions.contains_key(&node.id))
+        .collect::<Vec<_>>();
+    for node in nodes.iter_mut() {
+        if let Some(&(x, y)) = saved_positions.get(&node.id) {
+            node.position = Vec2::new(x, y);
+        }
+    }
+    if fixed.iter().all(|is_fixed| *is_fixed) {
+        return;
+    }
+
+    let saved_points = nodes
+        .iter()
+        .zip(&fixed)
+        .filter_map(|(node, fixed)| fixed.then_some(node.position))
+        .collect::<Vec<_>>();
+    let center = if saved_points.is_empty() {
+        Vec2::ZERO
+    } else {
+        let min = saved_points
+            .iter()
+            .copied()
+            .reduce(Vec2::min)
+            .unwrap_or(Vec2::ZERO);
+        let max = saved_points
+            .iter()
+            .copied()
+            .reduce(Vec2::max)
+            .unwrap_or(Vec2::ZERO);
+        (min + max) * 0.5
+    };
+    let base_radius = saved_points
+        .iter()
+        .map(|point| (*point - center).length())
+        .fold(0.0_f32, f32::max)
+        + RING_GAP;
+
+    let mut unsaved = fixed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fixed)| (!fixed).then_some(index))
+        .collect::<Vec<_>>();
+    unsaved.sort_by_key(|index| nodes[*index].id.to_string());
+    let count = unsaved.len();
+    let ring_radius = base_radius.max(RING_GAP + count as f32 * 8.0);
+
+    for (rank, index) in unsaved.into_iter().enumerate() {
+        let angle = std::f32::consts::TAU * rank as f32 / count.max(1) as f32;
+        let direction = Vec2::new(angle.cos(), angle.sin());
+        let saved_neighbours = edges
+            .iter()
+            .filter_map(|edge| {
+                let other = if edge.source_idx == index {
+                    edge.target_idx
+                } else if edge.target_idx == index {
+                    edge.source_idx
+                } else {
+                    return None;
+                };
+                fixed[other].then_some(nodes[other].position)
+            })
+            .collect::<Vec<_>>();
+        nodes[index].position = if saved_neighbours.is_empty() {
+            center + direction * ring_radius
+        } else {
+            let neighbour_center =
+                saved_neighbours.iter().copied().sum::<Vec2>() / saved_neighbours.len() as f32;
+            neighbour_center + direction * NEIGHBOUR_OFFSET
+        };
+    }
+
+    force_directed_layout_with_fixed(nodes, edges, &fixed);
 }
 
 /// Build `(legend_types, type_counts)` from a node slice in O(N).
@@ -648,5 +680,58 @@ mod tests {
         // But count for that type should have increased.
         let char_type = snap1.legend_types[0].as_str();
         assert_eq!(snap2.type_counts[char_type], 3);
+    }
+
+    #[test]
+    fn new_connected_node_relaxes_near_saved_neighbour_without_moving_it() {
+        let (_dir, graph) = test_graph();
+        let anchor = ObjectBuilder::character("Anchor".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        let distant = ObjectBuilder::character("Distant".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph
+            .save_layout(&[(anchor, 500.0, 0.0), (distant, -500.0, 0.0)])
+            .unwrap();
+        let before = build_snapshot(&graph).unwrap();
+
+        let newcomer = ObjectBuilder::character("Newcomer".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph
+            .connect_objects(newcomer, anchor, EdgeType::new("knows"))
+            .unwrap();
+        let after = build_snapshot_incremental(&graph, &before).unwrap();
+
+        let anchor_position = after.nodes[after.id_to_idx[&anchor]].position;
+        let distant_position = after.nodes[after.id_to_idx[&distant]].position;
+        let newcomer_position = after.nodes[after.id_to_idx[&newcomer]].position;
+        assert_eq!(anchor_position, Vec2::new(500.0, 0.0));
+        assert_eq!(distant_position, Vec2::new(-500.0, 0.0));
+        assert!(
+            (newcomer_position - anchor_position).length()
+                < (newcomer_position - distant_position).length()
+        );
+    }
+
+    #[test]
+    fn isolated_new_node_is_seeded_outside_saved_extent() {
+        let (_dir, graph) = test_graph();
+        let anchor = ObjectBuilder::character("Anchor".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph.save_layout(&[(anchor, 0.0, 0.0)]).unwrap();
+        let before = build_snapshot(&graph).unwrap();
+
+        let isolated = ObjectBuilder::character("Isolated".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        let after = build_snapshot_incremental(&graph, &before).unwrap();
+        let anchor_position = after.nodes[after.id_to_idx[&anchor]].position;
+        let isolated_position = after.nodes[after.id_to_idx[&isolated]].position;
+
+        assert_eq!(anchor_position, Vec2::ZERO);
+        assert!((isolated_position - anchor_position).length() >= 100.0);
     }
 }

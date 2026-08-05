@@ -53,6 +53,24 @@ pub fn force_directed_layout(nodes: &mut [NodeView], edges: &[EdgeView]) {
         );
     }
 
+    force_directed_layout_with_fixed(nodes, edges, &vec![false; n]);
+}
+
+/// Relax pre-seeded node positions while preserving every node marked fixed.
+///
+/// `fixed` must have one entry per node. Fixed nodes still contribute forces,
+/// but their positions are never changed or included in final centering.
+pub fn force_directed_layout_with_fixed(
+    nodes: &mut [NodeView],
+    edges: &[EdgeView],
+    fixed: &[bool],
+) {
+    let n = nodes.len();
+    assert_eq!(fixed.len(), n, "fixed mask must match node count");
+    if n == 0 || fixed.iter().all(|is_fixed| *is_fixed) {
+        return;
+    }
+
     let mut temperature = 1.0f32;
 
     for _ in 0..ITERATIONS {
@@ -114,6 +132,9 @@ pub fn force_directed_layout(nodes: &mut [NodeView], edges: &[EdgeView]) {
         // ── Apply displacements with temperature clamping ────────────────
         let max_disp = MAX_DISPLACEMENT * temperature;
         for (i, node) in nodes.iter_mut().enumerate() {
+            if fixed[i] {
+                continue;
+            }
             let d = displacements[i];
             let mag = d.length();
             if mag > 0.01 {
@@ -130,7 +151,7 @@ pub fn force_directed_layout(nodes: &mut [NodeView], edges: &[EdgeView]) {
     }
 
     // Center the layout around the origin
-    if n > 0 {
+    if !fixed.iter().any(|is_fixed| *is_fixed) {
         let center: Vec2 = nodes.iter().map(|n| n.position).sum::<Vec2>() / n as f32;
         for node in nodes.iter_mut() {
             node.position -= center;

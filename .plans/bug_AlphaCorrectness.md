@@ -37,11 +37,11 @@ Lemonade runtime redesign or the Zed workspace refactor.
 
 ## Graph and viewport correctness
 
-- [ ] **AC-06 — Spatial rebuild policy.** Bulk-load the R-tree after committed
+- [x] **AC-06 — Spatial rebuild policy.** Bulk-load the R-tree after committed
   graph snapshot refreshes. Keep drag-time local rebuilding, but remove the
   fragile deleted-entry micro-optimization whose benefit is dominated by the
   existing full node/edge fetch.
-- [ ] **AC-07 — Saved/unsaved placement.** Preserve saved nodes as fixed. Seed
+- [x] **AC-07 — Saved/unsaved placement.** Preserve saved nodes as fixed. Seed
   new nodes near connected saved neighbors, otherwise on a deterministic ring
   around the current graph extent; relax only unsaved nodes.
 - [ ] **AC-08 — Viewport invariants.** Make viewport fields private and require

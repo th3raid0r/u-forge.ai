@@ -123,6 +123,20 @@ impl GraphCanvas {
         self.zoom = viewport.zoom;
         cx.notify();
     }
+
+    /// Cancel a drag whose node disappeared during a committed snapshot refresh.
+    pub(crate) fn reconcile_snapshot_refresh(&mut self) {
+        self.dragging_node = reconcile_dragged_node(self.dragging_node, |id| {
+            self.snapshot.read().id_to_idx.contains_key(&id)
+        });
+    }
+}
+
+fn reconcile_dragged_node(
+    dragging: Option<ObjectId>,
+    contains_node: impl FnOnce(ObjectId) -> bool,
+) -> Option<ObjectId> {
+    dragging.filter(|id| contains_node(*id))
 }
 
 /// Convert draw-command color `[u8;4]` → gpui `rgb` u32 (ignores alpha).
@@ -430,5 +444,22 @@ impl Render for GraphCanvas {
                 )
                 .size_full(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconcile_dragged_node;
+    use u_forge_core::ObjectId;
+
+    #[test]
+    fn snapshot_refresh_cancels_only_a_deleted_node_drag() {
+        let dragged = ObjectId::new_v4();
+        assert_eq!(
+            reconcile_dragged_node(Some(dragged), |id| id == dragged),
+            Some(dragged)
+        );
+        assert_eq!(reconcile_dragged_node(Some(dragged), |_| false), None);
+        assert_eq!(reconcile_dragged_node(None, |_| false), None);
     }
 }
