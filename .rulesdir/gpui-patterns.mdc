@@ -197,11 +197,15 @@ deferred(
         .id("modal-backdrop")
         .absolute().top_0().left_0()
         .w_full().h_full()
+        .occlude()
         .flex().items_center().justify_center()
         .bg(rgba(0x0000008c))
         .child(dialog_div),
 )
 ```
+
+The backdrop must call `.occlude()` so its hitbox blocks hover, clicks, and
+scroll handling from reaching controls behind the modal.
 
 Dialog structure: fixed-width `div` (~520 px) with a dark title bar row, a body row (inputs), and a footer row (Cancel + Confirm). Keep the entity stored as `Option<(Kind, Entity<Modal>)>` in `AppView`; drop (set to `None`) on cancel or confirm.
 

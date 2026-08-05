@@ -21,11 +21,17 @@ impl Render for NodeEditorPanel {
         // Measure panel size each frame so column layout adapts to window resizes.
         let entity_for_measure = cx.entity().clone();
         let measure_canvas = canvas(
-            |_, _, _| {},
-            move |bounds, (), _window, cx| {
-                entity_for_measure.update(cx, |this, _cx| {
+            move |bounds, _window, cx| {
+                entity_for_measure.update(cx, |this, cx| {
+                    let changed = this.panel_size != bounds.size;
                     this.panel_size = bounds.size;
+                    if changed {
+                        cx.notify();
+                    }
                 });
+            },
+            |_bounds, (), _window, _cx| {
+                // Measurement is prepared above; paint is intentionally empty.
             },
         )
         .w_full()

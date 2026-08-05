@@ -10,7 +10,7 @@ COSMIC_TEXT_MANIFEST := crates/cosmic-text-patched/Cargo.toml
 help:
 	@printf '%s\n' 'u-forge.ai development targets'
 	@printf '%s\n' '  make build      Build the workspace'
-	@printf '%s\n' '  make check      Check core and run workspace clippy'
+	@printf '%s\n' '  make check      Check required targets and run workspace clippy'
 	@printf '%s\n' '  make test       Test the workspace serially by default'
 	@printf '%s\n' '  make fmt        Format the workspace'
 	@printf '%s\n' '  make fmt-check  Verify workspace formatting'
@@ -21,6 +21,8 @@ build:
 
 check:
 	$(CARGO) check -p u-forge-core
+	$(CARGO) check -p u-forge-core --example convert_memorymesh
+	$(CARGO) check -p u-forge-graph-view --benches
 	$(CARGO) clippy $(CARGO_CLIPPY_FLAGS)
 
 test:

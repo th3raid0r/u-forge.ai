@@ -289,10 +289,10 @@ impl Render for NodePanel {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
-                                            move |_this, event: &MouseDownEvent, _window, cx| {
+                                            move |_this, _event: &MouseDownEvent, _window, cx| {
                                                 // Stop propagation: prevent the parent row's
                                                 // on_mouse_down from selecting the node.
-                                                let _ = event;
+                                                cx.stop_propagation();
                                                 cx.emit(DeleteNodeRequest(node_id_for_delete));
                                             },
                                         ),

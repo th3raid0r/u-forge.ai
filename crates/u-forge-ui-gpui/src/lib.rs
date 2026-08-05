@@ -2,6 +2,7 @@ pub mod app_view;
 pub mod chat_history;
 pub mod chat_message;
 pub mod chat_panel;
+mod confirmation_modal;
 pub mod graph_canvas;
 pub mod node_editor;
 pub mod node_panel;

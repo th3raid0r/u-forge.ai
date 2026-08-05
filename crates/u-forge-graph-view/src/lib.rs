@@ -8,7 +8,9 @@ mod observable;
 mod snapshot;
 mod spatial;
 
-pub use layout::force_directed_layout;
+pub use layout::{
+    LayoutIterationMetrics, LayoutMetrics, force_directed_layout, force_directed_layout_with_fixed,
+};
 pub use observable::{GraphEvent, ObservableGraph};
 pub use snapshot::{
     EdgeView, GraphSnapshot, LodLevel, NodeView, build_snapshot, build_snapshot_incremental,

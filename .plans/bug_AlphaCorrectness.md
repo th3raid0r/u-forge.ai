@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved, not implemented. This plan consolidates verified correctness work
+Implemented and verified on 2026-08-04. This plan consolidates correctness work
 from the 2026-04 audit and the 2026-08 source review. It does not include the
 Lemonade runtime redesign or the Zed workspace refactor.
 
@@ -18,82 +18,82 @@ Lemonade runtime redesign or the Zed workspace refactor.
 
 ## Import and schema integrity
 
-- [ ] **AC-01 — Candidate-aware in-session resolution.** Replace the import
+- [x] **AC-01 — Candidate-aware in-session resolution.** Replace the import
   `name -> ObjectId` map with `name -> candidates`. Preserve every same-name
   object across types rather than overwriting earlier entries.
-- [ ] **AC-02 — No persisted first-match fallback.** Resolve an edge endpoint
+- [x] **AC-02 — No persisted first-match fallback.** Resolve an edge endpoint
   only when the combined in-session/persisted candidate set is unique. On zero
   or multiple candidates, skip the edge and write a diagnostic containing the
   reference, object types, names, and IDs. Never use `results[0]`.
-- [ ] **AC-03 — Explicit qualification compatibility.** Accept existing plain
+- [x] **AC-03 — Explicit qualification compatibility.** Accept existing plain
   names when unique. Add UUID and `object_type:name` qualification without
   widening schemas or inferring object types from records.
-- [ ] **AC-04 — Required-property contract.** Add a missing-required issue to
+- [x] **AC-04 — Required-property contract.** Add a missing-required issue to
   `SchemaManager::validate_and_coerce_properties`; align its callers with the
   already-strict import boundary.
-- [ ] **AC-05 — Agent ambiguity diagnostics.** For large name matches, group
+- [x] **AC-05 — Agent ambiguity diagnostics.** For large name matches, group
   candidates by object type and explain how to use a UUID instead of listing an
   arbitrary first five.
 
 ## Graph and viewport correctness
 
-- [ ] **AC-06 — Spatial rebuild policy.** Bulk-load the R-tree after committed
+- [x] **AC-06 — Spatial rebuild policy.** Bulk-load the R-tree after committed
   graph snapshot refreshes. Keep drag-time local rebuilding, but remove the
   fragile deleted-entry micro-optimization whose benefit is dominated by the
   existing full node/edge fetch.
-- [ ] **AC-07 — Saved/unsaved placement.** Preserve saved nodes as fixed. Seed
+- [x] **AC-07 — Saved/unsaved placement.** Preserve saved nodes as fixed. Seed
   new nodes near connected saved neighbors, otherwise on a deterministic ring
   around the current graph extent; relax only unsaved nodes.
-- [ ] **AC-08 — Viewport invariants.** Make viewport fields private and require
+- [x] **AC-08 — Viewport invariants.** Make viewport fields private and require
   finite center/size plus finite positive zoom through constructors/setters.
   Apply the invariant to every transform, world rectangle, fit, and LOD path.
-- [ ] **AC-09 — Finite layout guard.** Reject or repair non-finite persisted
+- [x] **AC-09 — Finite layout guard.** Reject or repair non-finite persisted
   positions at the storage/snapshot boundary and assert finite layout output.
-- [ ] **AC-10 — Measured convergence.** Add displacement/convergence metrics
+- [x] **AC-10 — Measured convergence.** Add displacement/convergence metrics
   and small/large graph benchmarks before replacing the fixed iteration cap.
   Do not adopt guessed thresholds without measurements.
 
 ## GPUI state and destructive actions
 
-- [ ] **AC-11 — Text layout outside paint.** Move `TextFieldView` shaping,
+- [x] **AC-11 — Text layout outside paint.** Move `TextFieldView` shaping,
   hit-test layout, origin, visible-size, and content-height updates into
   layout/prepaint preparation. Paint consumes prepared state only.
-- [ ] **AC-12 — Editor measurement outside paint.** Move `NodeEditorPanel`
+- [x] **AC-12 — Editor measurement outside paint.** Move `NodeEditorPanel`
   size measurement out of its paint closure. The perf timing canvas and
   GraphCanvas's local bounds cell remain documented exceptions.
-- [ ] **AC-13 — Path picker task ownership.** Store and replace the browse task
+- [x] **AC-13 — Path picker task ownership.** Store and replace the browse task
   so stale portal results cannot update a newer modal state.
-- [ ] **AC-14 — Embedding UI lifecycle.** Replace the epoch plus atomic cancel
+- [x] **AC-14 — Embedding UI lifecycle.** Replace the epoch plus atomic cancel
   split with one authority. Until queue cancellation lands, label superseded
   work accurately rather than claiming it was cancelled.
-- [ ] **AC-15 — Event propagation and confirmation.** Stop delete-button events
+- [x] **AC-15 — Event propagation and confirmation.** Stop delete-button events
   from selecting their parent row. Require confirmation for node deletion and
   clear-data/clear-schema actions; preserve errors and cancellation cleanly.
 
 ## Search outcome contract
 
-- [ ] **AC-16 — Structured stage outcomes.** Record an outcome for FTS,
+- [x] **AC-16 — Structured stage outcomes.** Record an outcome for FTS,
   standard semantic, HQ semantic, and reranking: applied, intentionally
   skipped, unavailable, or failed with a safe diagnostic.
-- [ ] **AC-17 — Runtime failure propagation.** Refactor hybrid search so embed,
+- [x] **AC-17 — Runtime failure propagation.** Refactor hybrid search so embed,
   ANN, and rerank failures contribute outcomes while successful fallback
   results are retained.
-- [ ] **AC-18 — UI presentation.** Preserve the structured response through
+- [x] **AC-18 — UI presentation.** Preserve the structured response through
   `SearchPanel`; show a concise Zed-style status hint for degraded results and
   keep detailed diagnostics available for logs/tooltips.
-- [ ] **AC-19 — Mode enablement.** Derive semantic availability from an actual
+- [x] **AC-19 — Mode enablement.** Derive semantic availability from an actual
   compatible embedding lane, not merely `Option<InferenceQueue>` presence.
 
 ## Maintenance closure
 
-- [ ] **AC-20** Reject unknown keys on `AppConfig` and nested configuration
+- [x] **AC-20** Reject unknown keys on `AppConfig` and nested configuration
   sections, with path-specific parse tests.
-- [ ] **AC-21** Make schema saving synchronous and update all callers.
-- [ ] **AC-22** Keep one FTS sanitizer implementation and reuse it from agent
+- [x] **AC-21** Make schema saving synchronous and update all callers.
+- [x] **AC-22** Keep one FTS sanitizer implementation and reuse it from agent
   tools.
-- [ ] **AC-23** Do not install cursor-blink tasks for read-only text fields.
-- [ ] **AC-24** Compile-check `convert_memorymesh` from the root Makefile/CI.
-- [ ] **AC-25** Remove stale deprecated `EdgeType` guidance without changing
+- [x] **AC-23** Do not install cursor-blink tasks for read-only text fields.
+- [x] **AC-24** Compile-check `convert_memorymesh` from the root Makefile/CI.
+- [x] **AC-25** Remove stale deprecated `EdgeType` guidance without changing
   backward-compatible code unless separately justified.
 
 ## Tests and acceptance
@@ -106,5 +106,5 @@ Lemonade runtime redesign or the Zed workspace refactor.
   reach the UI-facing boundary.
 - GPUI logic is separated into testable state reducers; manual verification
   uses the frame overlay to confirm paint changes do not create redraw loops.
-- Final verification: `make fmt-check`, `make check`, `make clippy`, and the
-  unfiltered `make test`, with no environment variables or live server.
+- Final verification passed: `make fmt-check`, `make check`, `make clippy`, and
+  the unfiltered `make test`, with no environment variables or live server.

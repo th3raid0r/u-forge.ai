@@ -32,6 +32,27 @@ pub(crate) struct TextArrowKey(pub(crate) bool);
 /// that line starts in the content string. All fields use wrapped text for dynamic sizing.
 struct TextFieldLayout(Vec<(usize, WrappedLine)>);
 
+struct PreparedTextLine {
+    byte_start: usize,
+    byte_len: usize,
+    y_offset: Pixels,
+    layout: WrappedLine,
+}
+
+struct PreparedTextFieldPaint {
+    lines: Vec<PreparedTextLine>,
+    text_origin: Point<Pixels>,
+    inner_width: Pixels,
+    line_height: Pixels,
+    selection: Option<Range<usize>>,
+    cursor_position: Point<Pixels>,
+    paint_cursor: bool,
+}
+
+fn should_install_blink(read_only: bool, focused: bool) -> bool {
+    !read_only && focused
+}
+
 /// A minimal editable text field built on GPUI's `EntityInputHandler`.
 ///
 /// Handles basic cursor movement, character insertion (via platform IME),
@@ -147,6 +168,10 @@ impl TextFieldView {
 
     /// Show cursor immediately and restart the blink cycle with a 500 ms period.
     fn reset_blink(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            self.stop_blinking();
+            return;
+        }
         self.cursor_visible = true;
         self.blink_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -590,15 +615,15 @@ impl EntityInputHandler for TextFieldView {
 impl Render for TextFieldView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
-        let entity = cx.entity().clone();
-        let paint_entity = cx.entity().clone();
+        let input_entity = cx.entity().clone();
+        let prepare_entity = cx.entity().clone();
 
         // Start or stop the blink cycle when focus changes. Losing focus also
         // dismisses any open context menu so it doesn't linger after the user
         // clicks a different field.
         if focused != self.was_focused {
             self.was_focused = focused;
-            if focused {
+            if should_install_blink(self.read_only, focused) {
                 self.reset_blink(cx);
             } else {
                 self.stop_blinking();
@@ -606,7 +631,7 @@ impl Render for TextFieldView {
             }
         }
 
-        // Prepare data for the paint canvas closure (captures by value).
+        // Prepare immutable inputs for the canvas prepaint closure.
         let content = self.content.clone();
         let placeholder = self.placeholder.clone();
         let cursor_byte = self.cursor;
@@ -619,12 +644,10 @@ impl Render for TextFieldView {
         let text_color_hsla = self.text_color;
         let selection = self.selection.clone();
 
-        // The main canvas renders text and cursor via shape_line/paint, exactly
-        // matching the glyph positions GPUI uses internally — like Zed does.
-        // This guarantees the cursor aligns perfectly with the rendered text.
+        // Shaping and hit-test state are prepared before paint. The paint closure
+        // receives immutable prepared geometry and only emits draw operations.
         let text_canvas = canvas(
-            |_, _, _| {},
-            move |bounds, (), window, cx| {
+            move |bounds, window, cx| {
                 let rem_size = window.rem_size();
                 let font_size = rem_size; // text_base = 1.0rem
                 let line_height = (font_size * 1.618_034).round();
@@ -665,6 +688,7 @@ impl Render for TextFieldView {
                 let mut y_acc = px(0.0);
 
                 let mut stored_lines: Vec<(usize, WrappedLine)> = Vec::new();
+                let mut prepared_lines = Vec::new();
 
                 // Normalised selection range (start <= end).
                 let sel_range = selection.as_ref().map(|s| {
@@ -692,54 +716,6 @@ impl Render for TextFieldView {
                             None,
                         ) {
                             for wl in wrapped {
-                                let line_end = byte_offset + raw_line.len();
-
-                                // Paint selection highlight behind text.
-                                if let Some(ref sr) = sel_range
-                                    && sr.start < line_end
-                                    && sr.end > byte_offset
-                                {
-                                    let in_start = sr.start.saturating_sub(byte_offset);
-                                    let in_end = (sr.end - byte_offset).min(raw_line.len());
-                                    let start_pos = wl.position_for_index(in_start, line_height);
-                                    let end_pos = wl.position_for_index(in_end, line_height);
-                                    if let (Some(sp), Some(ep)) = (start_pos, end_pos) {
-                                        let start_row = (f32::from(sp.y) / f32::from(line_height))
-                                            .floor()
-                                            as usize;
-                                        let end_row = (f32::from(ep.y) / f32::from(line_height))
-                                            .floor()
-                                            as usize;
-                                        for row in start_row..=end_row {
-                                            let row_y = line_height * row as f32;
-                                            let x0 = if row == start_row { sp.x } else { px(0.0) };
-                                            let x1 = if row == end_row { ep.x } else { inner_w };
-                                            if x1 > x0 {
-                                                window.paint_quad(fill(
-                                                    gpui::Bounds::new(
-                                                        point(
-                                                            text_origin.x + x0,
-                                                            text_origin.y + y_acc + row_y,
-                                                        ),
-                                                        size(x1 - x0, line_height),
-                                                    ),
-                                                    rgba(0x585b7088),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let paint_origin = text_origin + point(px(0.0), y_acc);
-                                let _ = wl.paint(
-                                    paint_origin,
-                                    line_height,
-                                    TextAlign::Left,
-                                    None,
-                                    window,
-                                    cx,
-                                );
-
                                 // Cursor position within this line.
                                 if cursor_pos.is_none()
                                     && cursor_byte >= byte_offset
@@ -752,7 +728,13 @@ impl Render for TextFieldView {
                                 }
 
                                 let visual_rows = (wl.wrap_boundaries().len() + 1) as f32;
-                                stored_lines.push((byte_offset, wl));
+                                stored_lines.push((byte_offset, wl.clone()));
+                                prepared_lines.push(PreparedTextLine {
+                                    byte_start: byte_offset,
+                                    byte_len: raw_line.len(),
+                                    y_offset: y_acc,
+                                    layout: wl,
+                                });
                                 y_acc += line_height * visual_rows;
                             }
                         }
@@ -778,7 +760,13 @@ impl Render for TextFieldView {
                             None,
                         ) {
                             for wl in wrapped {
-                                stored_lines.push((byte_offset, wl));
+                                stored_lines.push((byte_offset, wl.clone()));
+                                prepared_lines.push(PreparedTextLine {
+                                    byte_start: byte_offset,
+                                    byte_len: 0,
+                                    y_offset: y_acc,
+                                    layout: wl,
+                                });
                             }
                         }
                         y_acc += line_height;
@@ -790,22 +778,7 @@ impl Render for TextFieldView {
                     }
                 }
 
-                // Store layout for click handling.
-                paint_entity.update(cx, |this, _cx| {
-                    this.shaped_layout = Some(TextFieldLayout(stored_lines));
-                });
-
-                // Paint the blinking cursor (editable fields only).
-                if !is_read_only && is_focused && cursor_visible {
-                    let cp = cursor_pos.unwrap_or(point(px(0.0), px(0.0)));
-                    let cursor_origin = text_origin + cp;
-                    window.paint_quad(fill(
-                        gpui::Bounds::new(cursor_origin, size(px(1.5), line_height)),
-                        rgba(0xcdd6f4ff),
-                    ));
-                }
-
-                // Store measurements for click handling and dynamic sizing.
+                // Store hit-test state and measurements during prepaint.
                 // Round content_height to whole pixels to prevent sub-pixel oscillation.
                 let lh_f = f32::from(line_height);
                 let origin_x = f32::from(bounds.origin.x);
@@ -814,21 +787,98 @@ impl Render for TextFieldView {
                 let visible_h = (f32::from(bounds.size.height) - TEXT_FIELD_PAD_Y * 2.0).max(0.0);
                 let visible_w = f32::from(inner_w).max(0.0);
 
-                paint_entity.update(cx, |this, _cx| {
+                prepare_entity.update(cx, |this, cx| {
+                    let height_changed = (this.content_height - total_content_h).abs() >= 1.0;
+                    this.shaped_layout = Some(TextFieldLayout(stored_lines));
                     this.field_origin_x = origin_x;
                     this.field_origin_y = origin_y;
                     this.measured_line_h = lh_f.max(1.0);
                     this.content_height = total_content_h;
                     this.visible_height = visible_h;
                     this.visible_width = visible_w;
+                    if height_changed {
+                        cx.notify();
+                    }
                 });
 
-                // Install the IME input handler (editable fields only).
+                PreparedTextFieldPaint {
+                    lines: prepared_lines,
+                    text_origin,
+                    inner_width: inner_w,
+                    line_height,
+                    selection: sel_range,
+                    cursor_position: cursor_pos.unwrap_or(point(px(0.0), px(0.0))),
+                    paint_cursor: !is_read_only && is_focused && cursor_visible,
+                }
+            },
+            move |bounds, prepared, window, cx| {
+                for line in prepared.lines {
+                    let line_end = line.byte_start + line.byte_len;
+                    if let Some(ref selection) = prepared.selection
+                        && selection.start < line_end
+                        && selection.end > line.byte_start
+                    {
+                        let in_start = selection.start.saturating_sub(line.byte_start);
+                        let in_end = (selection.end - line.byte_start).min(line.byte_len);
+                        let start_pos = line
+                            .layout
+                            .position_for_index(in_start, prepared.line_height);
+                        let end_pos = line.layout.position_for_index(in_end, prepared.line_height);
+                        if let (Some(start), Some(end)) = (start_pos, end_pos) {
+                            let start_row = (f32::from(start.y) / f32::from(prepared.line_height))
+                                .floor() as usize;
+                            let end_row = (f32::from(end.y) / f32::from(prepared.line_height))
+                                .floor() as usize;
+                            for row in start_row..=end_row {
+                                let row_y = prepared.line_height * row as f32;
+                                let x0 = if row == start_row { start.x } else { px(0.0) };
+                                let x1 = if row == end_row {
+                                    end.x
+                                } else {
+                                    prepared.inner_width
+                                };
+                                if x1 > x0 {
+                                    window.paint_quad(fill(
+                                        Bounds::new(
+                                            point(
+                                                prepared.text_origin.x + x0,
+                                                prepared.text_origin.y + line.y_offset + row_y,
+                                            ),
+                                            size(x1 - x0, prepared.line_height),
+                                        ),
+                                        rgba(0x585b7088),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    let paint_origin = prepared.text_origin + point(px(0.0), line.y_offset);
+                    let _ = line.layout.paint(
+                        paint_origin,
+                        prepared.line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+
+                if prepared.paint_cursor {
+                    let cursor_origin = prepared.text_origin + prepared.cursor_position;
+                    window.paint_quad(fill(
+                        Bounds::new(cursor_origin, size(px(1.5), prepared.line_height)),
+                        rgba(0xcdd6f4ff),
+                    ));
+                }
+
+                // GPUI requires input-handler registration during paint. This
+                // is frame instrumentation, not a mutation of TextFieldView.
                 if !is_read_only {
-                    let focus2 = entity.read(cx).focus.clone();
+                    let focus = input_entity.read(cx).focus.clone();
                     window.handle_input(
-                        &focus2,
-                        ElementInputHandler::new(bounds, entity.clone()),
+                        &focus,
+                        ElementInputHandler::new(bounds, input_entity.clone()),
                         cx,
                     );
                 }
@@ -1200,5 +1250,30 @@ impl Render for TextFieldView {
                     ),
                 ))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextFieldView, should_install_blink};
+    use gpui::TestAppContext;
+
+    #[test]
+    fn cursor_blink_tasks_are_only_installed_for_focused_editable_fields() {
+        assert!(should_install_blink(false, true));
+        assert!(!should_install_blink(false, false));
+        assert!(!should_install_blink(true, true));
+        assert!(!should_install_blink(true, false));
+    }
+
+    #[gpui::test]
+    fn editable_text_field_window_launches_paints_and_closes(cx: &mut TestAppContext) {
+        let (_field, cx) = cx.add_window_view(|window, cx| {
+            window.on_window_should_close(cx, |_window, _cx| true);
+            TextFieldView::new(false, "Search", cx)
+        });
+        cx.update(|window, _cx| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.simulate_close());
     }
 }

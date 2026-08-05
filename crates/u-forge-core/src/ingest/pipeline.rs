@@ -230,7 +230,7 @@ async fn load_schemas_into_graph(
             // Remove the hardcoded "default" placeholder (character, location...)
             // before saving the real imported schema set.
             let _ = mgr.delete_schema("default");
-            match mgr.save_schema(&schema_def).await {
+            match mgr.save_schema(&schema_def) {
                 Ok(()) => {
                     info!(count = schema_def.object_types.len(), "Schema types loaded");
                 }

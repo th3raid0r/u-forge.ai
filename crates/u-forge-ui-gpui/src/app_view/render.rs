@@ -98,10 +98,10 @@ impl Render for AppView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ClearData, _window, cx| {
-                this.do_clear_data(cx);
+                this.request_clear_data(cx);
             }))
             .on_action(cx.listener(|this, _: &ClearSchema, _window, cx| {
-                this.do_clear_schema(cx);
+                this.request_clear_schema(cx);
             }))
             .on_action(cx.listener(|this, _: &ImportData, window, cx| {
                 this.do_import_data_picker(window, cx);
@@ -763,7 +763,7 @@ impl Render for AppView {
                                                 cx.listener(
                                                     |this, _: &MouseDownEvent, _window, cx| {
                                                         this.file_menu_open = false;
-                                                        this.do_clear_schema(cx);
+                                                        this.request_clear_schema(cx);
                                                     },
                                                 ),
                                             )
@@ -790,7 +790,7 @@ impl Render for AppView {
                                                 cx.listener(
                                                     |this, _: &MouseDownEvent, _window, cx| {
                                                         this.file_menu_open = false;
-                                                        this.do_clear_data(cx);
+                                                        this.request_clear_data(cx);
                                                     },
                                                 ),
                                             )
@@ -879,6 +879,10 @@ impl Render for AppView {
             // ── Path picker modal ─────────────────────────────────────────────
             .when(self.path_picker.is_some(), |root| {
                 root.child(self.path_picker.as_ref().unwrap().1.clone())
+            })
+            // ── Destructive-action confirmation ──────────────────────────────
+            .when(self.confirmation.is_some(), |root| {
+                root.child(self.confirmation.as_ref().unwrap().clone())
             })
             // ── Frame-cost timing canvas ──────────────────────────────────────
             // Zero-size absolute element; its paint closure fires after GPUI

@@ -2,10 +2,7 @@ mod render;
 mod state;
 
 use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use gpui::{Context, Empty, Entity, Subscription, prelude::*};
 use parking_lot::RwLock;
@@ -27,6 +24,7 @@ use u_forge_graph_view::GraphSnapshot;
 use state::AppState;
 
 use crate::chat_panel::{AvailableModel, ChatPanel, ConnectRequested};
+use crate::confirmation_modal::{ConfirmationAccepted, ConfirmationCancelled, ConfirmationModal};
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::NodeEditorPanel;
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
@@ -179,6 +177,10 @@ pub struct AppView {
     pub(crate) path_picker: Option<(PathPickerKind, Entity<PathPickerModal>)>,
     /// Subscriptions for the active path picker's confirm/cancel events.
     _path_picker_subs: Vec<Subscription>,
+    // ── Destructive-action confirmation ──────────────────────────────────────
+    pub(crate) confirmation: Option<Entity<ConfirmationModal>>,
+    pending_destructive_action: Option<DestructiveAction>,
+    _confirmation_subs: Vec<Subscription>,
     // ── GPUI bookkeeping ──────────────────────────────────────────────────────
     /// Subscriptions kept alive so handlers fire (node events, chat connect).
     _node_subs: Vec<Subscription>,
@@ -195,6 +197,13 @@ pub struct AppView {
     /// per frame to compute `avg_ms`. Fixed array avoids any per-frame
     /// allocation from the prior `VecDeque`.
     pub(crate) frame_times_us: FrameTimeRing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestructiveAction {
+    DeleteNode(ObjectId),
+    ClearData,
+    ClearSchema,
 }
 
 impl AppView {
@@ -227,7 +236,7 @@ impl AppView {
         let node_sub_delete = cx.subscribe(
             &node_panel,
             |this: &mut Self, _panel, event: &DeleteNodeRequest, cx| {
-                this.delete_node_by_id(event.0, cx);
+                this.request_delete_node(event.0, cx);
             },
         );
         let search_panel = cx.new(|cx| {
@@ -296,6 +305,9 @@ impl AppView {
             right_panel_width: DEFAULT_RIGHT_PANEL_W,
             path_picker: None,
             _path_picker_subs: vec![],
+            confirmation: None,
+            pending_destructive_action: None,
+            _confirmation_subs: vec![],
             _node_subs: vec![node_sub_create, node_sub_delete, connect_sub],
             _graph_change_task: None,
             perf_enabled: false,
@@ -340,9 +352,9 @@ impl AppView {
 
     /// Rebuild the in-memory snapshot from the graph and push it to all child views.
     ///
-    /// Uses `build_snapshot_incremental` when a previous snapshot exists so that
-    /// single-mutation events (e.g. agent `UpsertNodeTool`) apply R-tree and
-    /// legend deltas in O(delta × log N) instead of rebuilding from scratch.
+    /// Uses `build_snapshot_incremental` when a previous snapshot exists so
+    /// legend bookkeeping can reuse the prior type set. Spatial state is always
+    /// bulk-rebuilt from the newly committed node positions.
     pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
         let snapshot_start = std::time::Instant::now();
         let result = {
@@ -354,7 +366,7 @@ impl AppView {
             }
         };
         match result {
-            Ok(snap) => {
+            Ok(mut snap) => {
                 let duration_ms = snapshot_start.elapsed().as_millis() as u64;
                 tracing::info!(
                     nodes = snap.nodes.len(),
@@ -367,6 +379,9 @@ impl AppView {
                     .read(cx)
                     .selected_node_id
                     .is_none_or(|selected| snap.nodes.iter().any(|node| node.id == selected));
+                self.graph_canvas.update(cx, |canvas, _cx| {
+                    canvas.reconcile_snapshot_refresh(&mut snap)
+                });
                 *self.state.snapshot.write() = snap;
                 if !selected_still_exists {
                     self.selection
@@ -406,6 +421,95 @@ impl AppView {
                 self.state.data_status = Some(format!("Clear schema failed: {e}"));
                 cx.notify();
             }
+        }
+    }
+
+    pub(crate) fn request_clear_data(&mut self, cx: &mut Context<Self>) {
+        self.open_confirmation(
+            DestructiveAction::ClearData,
+            "Clear all data",
+            "Delete every node, edge, chunk, and saved layout position? This cannot be undone.",
+            "Clear Data",
+            cx,
+        );
+    }
+
+    pub(crate) fn request_clear_schema(&mut self, cx: &mut Context<Self>) {
+        self.open_confirmation(
+            DestructiveAction::ClearSchema,
+            "Clear schemas",
+            "Remove all imported schemas? Existing graph data is not changed, but schema validation will be unavailable.",
+            "Clear Schema",
+            cx,
+        );
+    }
+
+    fn request_delete_node(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
+        let node_name = self
+            .state
+            .snapshot
+            .read()
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| node_id.to_string());
+        self.open_confirmation(
+            DestructiveAction::DeleteNode(node_id),
+            "Delete node",
+            &format!(
+                "Delete “{node_name}” and its connected edges and text chunks? This cannot be undone."
+            ),
+            "Delete Node",
+            cx,
+        );
+    }
+
+    fn open_confirmation(
+        &mut self,
+        action: DestructiveAction,
+        title: &str,
+        message: &str,
+        confirm_label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|_cx| {
+            ConfirmationModal::new(
+                title.to_string(),
+                message.to_string(),
+                confirm_label.to_string(),
+            )
+        });
+        let accepted = cx.subscribe(&modal, |this, _modal, _event: &ConfirmationAccepted, cx| {
+            let action = this.pending_destructive_action.take();
+            this.confirmation = None;
+            this._confirmation_subs.clear();
+            if let Some(action) = action {
+                this.execute_destructive_action(action, cx);
+            } else {
+                cx.notify();
+            }
+        });
+        let cancelled = cx.subscribe(
+            &modal,
+            |this, _modal, _event: &ConfirmationCancelled, cx| {
+                this.pending_destructive_action = None;
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                cx.notify();
+            },
+        );
+        self.pending_destructive_action = Some(action);
+        self.confirmation = Some(modal);
+        self._confirmation_subs = vec![accepted, cancelled];
+        cx.notify();
+    }
+
+    fn execute_destructive_action(&mut self, action: DestructiveAction, cx: &mut Context<Self>) {
+        match action {
+            DestructiveAction::DeleteNode(node_id) => self.delete_node_by_id(node_id, cx),
+            DestructiveAction::ClearData => self.do_clear_data(cx),
+            DestructiveAction::ClearSchema => self.do_clear_schema(cx),
         }
     }
 
@@ -623,7 +727,7 @@ impl AppView {
                     let save_start = std::time::Instant::now();
                     // Remove the built-in placeholder before saving the imported schema set.
                     let _ = mgr.delete_schema("default");
-                    let result = mgr.save_schema(&schema_def).await;
+                    let result = mgr.save_schema(&schema_def);
                     tracing::info!(
                         ui_action = "import_schema",
                         phase = "schema_saved",
@@ -753,28 +857,21 @@ impl AppView {
     /// Delete a node by its `ObjectId`, close any open editor tab for it,
     /// and refresh the snapshot.
     fn delete_node_by_id(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
-        // Close the editor tab for this node if one is open.
-        self.node_editor.update(cx, |editor, cx| {
-            if let Some(idx) = editor.tabs.iter().position(|t| t.node_id == node_id) {
-                editor.close_tab(idx, cx);
-            }
-            cx.notify();
-        });
-
-        // Remove stale edge references in other open tabs before deleting.
-        self.node_editor.update(cx, |editor, _cx| {
-            editor.remove_stale_edge_refs(node_id);
-        });
-
-        // Clear the selection if it pointed to this node.
-        let selected = self.selection.read(cx).selected_node_id;
-        if selected == Some(node_id) {
-            self.selection.update(cx, |sel, cx| sel.clear(cx));
-        }
-
         // Delete from DB (cascades to edges, chunks, etc.).
         match self.state.graph.delete_object(node_id) {
             Ok(()) => {
+                // Mutate dependent UI state only after the database commit succeeds.
+                self.node_editor.update(cx, |editor, cx| {
+                    if let Some(idx) = editor.tabs.iter().position(|t| t.node_id == node_id) {
+                        editor.close_tab(idx, cx);
+                    }
+                    editor.remove_stale_edge_refs(node_id);
+                    cx.notify();
+                });
+                if self.selection.read(cx).selected_node_id == Some(node_id) {
+                    self.selection
+                        .update(cx, |selection, cx| selection.clear(cx));
+                }
                 self.refresh_snapshot(cx);
             }
             Err(e) => {
@@ -810,7 +907,9 @@ impl AppView {
     ///
     /// Replaces the former `do_rechunk_and_embed` / `do_embed_all` /
     /// `spawn_embedding_sampler` / `stop_embedding_sampler` quartet.
-    /// Any previously running plan is implicitly cancelled via epoch bump.
+    /// A newer plan supersedes older UI progress. Queue work already dispatched
+    /// by an older plan continues in the background until queue cancellation is
+    /// supported.
     pub(crate) fn run_embedding_plan(&mut self, plan: EmbeddingPlan, cx: &mut Context<Self>) {
         let queue = match self.state.inference_queue.clone() {
             Some(q) => q,
@@ -870,41 +969,38 @@ impl AppView {
             hq_enabled = hq_queue.as_ref().is_some_and(|q| q.has_embedding()),
             "UI action scheduled"
         );
-        self.state.embedding_status = Some(plan.label());
+        let (generation, superseded) = self.state.embedding_plan.start();
+        self.state.embedding_status = Some(if superseded {
+            format!("{} (previous work still finishing)", plan.label())
+        } else {
+            plan.label()
+        });
+        if superseded {
+            tracing::info!(
+                ui_action = "embedding",
+                phase = "superseded",
+                plan_kind,
+                "Previous embedding work remains queued but may no longer update UI status"
+            );
+        }
         cx.notify();
-
-        // Cancel any previously running pipeline (sets the old flag → tasks exit on next tick).
-        self.state.embedding_cancel.store(true, Ordering::Relaxed);
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.state.embedding_cancel = Arc::clone(&cancel);
-
-        // Bump epoch to cancel any previously running poller.
-        self.state.embedding_plan_epoch = self.state.embedding_plan_epoch.wrapping_add(1);
-        let epoch = self.state.embedding_plan_epoch;
 
         // Shared progress state written by the tokio worker, read by the poller.
         let progress_state: Arc<parking_lot::Mutex<Option<EmbeddingProgress>>> =
             Arc::new(parking_lot::Mutex::new(None));
         let progress_write = Arc::clone(&progress_state);
 
-        let cancel_poller = Arc::clone(&cancel);
         // Poller: reads shared progress every 500 ms and refreshes the status bar.
         cx.spawn(async move |this, cx| {
             loop {
-                if cancel_poller.load(Ordering::Relaxed) {
-                    return;
-                }
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
                     .await;
-                if cancel_poller.load(Ordering::Relaxed) {
-                    return;
-                }
                 let Some(this) = this.upgrade() else { return };
                 let snap = progress_state.lock().clone();
                 let keep_running = this
                     .update(cx, |view: &mut AppView, cx| {
-                        if view.state.embedding_plan_epoch != epoch {
+                        if !view.state.embedding_plan.is_current(generation) {
                             return false;
                         }
                         if let Some(EmbeddingProgress::Rechunking { done, total }) = snap {
@@ -922,11 +1018,9 @@ impl AppView {
         })
         .detach();
 
-        // Worker: runs the plan on the tokio runtime and reports outcome.
-        // `_cancel_guard` sets the cancel flag on drop (including panic), which
-        // stops the poller immediately rather than waiting for an epoch bump.
+        // Worker: runs the plan on the tokio runtime and reports its outcome only
+        // while its generation remains authoritative for UI state.
         cx.spawn(async move |this, cx| {
-            let _cancel_guard = state::CancelOnDrop(Arc::clone(&cancel));
             let outcome = cx
                 .background_executor()
                 .spawn(
@@ -961,8 +1055,9 @@ impl AppView {
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
-                // Stop the poller by advancing the epoch.
-                view.state.embedding_plan_epoch = view.state.embedding_plan_epoch.wrapping_add(1);
+                if !view.state.embedding_plan.finish(generation) {
+                    return;
+                }
                 view.state.embedding_status = Self::format_embedding_outcome(&outcome);
                 cx.notify();
             })

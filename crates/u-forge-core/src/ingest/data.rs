@@ -10,11 +10,12 @@
 //!
 //! Field mapping:
 //! - `entitytype`   — discriminant tag ("node" | "edge")
-//! - `id`           — source UUID (stored as `_source_id` property; used for dedup)
+//! - `id`           — source UUID; may qualify edges in the same import
 //! - `nodetype`     — schema type name (e.g. "npc", "faction", "location")
 //! - `properties`   — typed JSON object; arrays stay arrays, strings stay strings
 //!
-//! Dedup: nodes are matched first by `_source_id`, then by `(nodetype, name)`.
+//! Dedup: nodes are matched by `(nodetype, name)`. Each source UUID is mapped to
+//! the created or reused graph ID for the relationship phase.
 
 use crate::KnowledgeGraph;
 use crate::schema::{EdgeTypeSchema, ObjectTypeSchema};
@@ -85,9 +86,58 @@ struct ImportSchemaCache {
 
 #[derive(Default)]
 struct NameResolutionCache {
-    results: HashMap<String, Option<ObjectId>>,
+    results: HashMap<String, Vec<ResolutionCandidate>>,
     storage_lookups: usize,
     cache_hits: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ResolutionCandidate {
+    id: ObjectId,
+    object_type: String,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+enum NodeResolution {
+    Unique(ObjectId),
+    Missing {
+        reference: String,
+    },
+    Ambiguous {
+        reference: String,
+        candidates: Vec<ResolutionCandidate>,
+    },
+}
+
+impl NodeResolution {
+    fn id(&self) -> Option<ObjectId> {
+        match self {
+            Self::Unique(id) => Some(*id),
+            Self::Missing { .. } | Self::Ambiguous { .. } => None,
+        }
+    }
+
+    fn diagnostic_json(&self, role: &str) -> Option<Value> {
+        match self {
+            Self::Unique(_) => None,
+            Self::Missing { reference } => Some(serde_json::json!({
+                "role": role,
+                "reference": reference,
+                "reason": "missing",
+                "candidates": [],
+            })),
+            Self::Ambiguous {
+                reference,
+                candidates,
+            } => Some(serde_json::json!({
+                "role": role,
+                "reference": reference,
+                "reason": "ambiguous",
+                "candidates": candidates,
+            })),
+        }
+    }
 }
 
 struct PendingImportObject {
@@ -110,6 +160,8 @@ struct ImportDiagnosticRecord {
     category: String,
     constraint: String,
     item: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
 }
 
 impl<'a> DataIngestion<'a> {
@@ -187,16 +239,28 @@ impl<'a> DataIngestion<'a> {
         self.stats.nodes_parsed = nodes.len();
         self.stats.edges_parsed = edges.len();
 
-        let mut name_to_id = HashMap::new();
+        let mut name_to_candidates = HashMap::new();
+        let mut source_id_to_candidates = HashMap::new();
         let mut id_to_type = HashMap::new();
         let mut name_resolution_cache = NameResolutionCache::default();
         let object_phase_start = Instant::now();
-        self.create_objects(nodes, &mut name_to_id, &mut id_to_type)
-            .await?;
+        self.create_objects(
+            nodes,
+            &mut name_to_candidates,
+            &mut source_id_to_candidates,
+            &mut id_to_type,
+        )
+        .await?;
         let object_phase_duration_ms = object_phase_start.elapsed().as_millis() as u64;
         let relationship_phase_start = Instant::now();
-        self.create_relationships(edges, &name_to_id, &id_to_type, &mut name_resolution_cache)
-            .await?;
+        self.create_relationships(
+            edges,
+            &name_to_candidates,
+            &source_id_to_candidates,
+            &id_to_type,
+            &mut name_resolution_cache,
+        )
+        .await?;
         let relationship_phase_duration_ms = relationship_phase_start.elapsed().as_millis() as u64;
         let diagnostics_start = Instant::now();
         self.write_import_diagnostics(data_file)?;
@@ -225,18 +289,20 @@ impl<'a> DataIngestion<'a> {
     async fn create_objects(
         &mut self,
         nodes: Vec<JsonEntry>,
-        name_to_id: &mut HashMap<String, ObjectId>,
+        name_to_candidates: &mut HashMap<String, Vec<ResolutionCandidate>>,
+        source_id_to_candidates: &mut HashMap<ObjectId, Vec<ResolutionCandidate>>,
         id_to_type: &mut HashMap<ObjectId, String>,
     ) -> Result<()> {
         let start = Instant::now();
         info!("Creating {} objects...", nodes.len());
         let existing_load_start = Instant::now();
-        let mut existing_by_type_name: HashMap<(String, String), ObjectId> = self
-            .graph
-            .get_all_objects()?
-            .into_iter()
-            .map(|object| ((object.object_type, object.name), object.id))
-            .collect();
+        let mut existing_by_type_name: HashMap<(String, String), Vec<ObjectId>> = HashMap::new();
+        for object in self.graph.get_all_objects()? {
+            existing_by_type_name
+                .entry((object.object_type, object.name))
+                .or_default()
+                .push(object.id);
+        }
         let existing_load_duration_ms = existing_load_start.elapsed().as_millis() as u64;
         let mut pending = Vec::new();
 
@@ -272,14 +338,25 @@ impl<'a> DataIngestion<'a> {
                 };
 
                 // Dedup: check by source_id first, then by (type, name).
-                let existing_id = self.find_existing(
-                    &source_id,
-                    &node_type,
-                    &name,
-                    name_to_id,
-                    &existing_by_type_name,
-                );
-                if let Some(existing) = existing_id {
+                let existing_id =
+                    self.find_existing(&source_id, &node_type, &name, &existing_by_type_name);
+                if existing_id.len() > 1 {
+                    self.record_object_validation_drop(
+                        format!("object:{node_type}:identity"),
+                        format!(
+                            "{name}: source_id={source_id}; ambiguous_existing_ids={existing_id:?}"
+                        ),
+                    );
+                    warn!(
+                        source_id,
+                        object_type = node_type,
+                        object_name = name,
+                        existing_ids = ?existing_id,
+                        "Skipping object whose persisted identity is ambiguous"
+                    );
+                    continue;
+                }
+                if let Some(existing) = existing_id.first().copied() {
                     self.record_reused_object(
                         format!("object:{node_type}"),
                         format!("{name}: source_id={source_id}; existing_id={existing}"),
@@ -288,7 +365,13 @@ impl<'a> DataIngestion<'a> {
                         "Skipping duplicate '{}' (type: '{}'), reusing existing id {}",
                         name, node_type, existing
                     );
-                    name_to_id.insert(name, existing);
+                    let candidate = ResolutionCandidate {
+                        id: existing,
+                        object_type: node_type.clone(),
+                        name,
+                    };
+                    push_candidate(name_to_candidates, candidate.clone());
+                    push_source_candidate(source_id_to_candidates, &source_id, candidate);
                     id_to_type.insert(existing, node_type);
                     continue;
                 }
@@ -317,7 +400,10 @@ impl<'a> DataIngestion<'a> {
                     }
                 };
 
-                existing_by_type_name.insert((node_type.clone(), name.clone()), object_metadata.id);
+                existing_by_type_name
+                    .entry((node_type.clone(), name.clone()))
+                    .or_default()
+                    .push(object_metadata.id);
                 pending.push(PendingImportObject {
                     source_id,
                     node_type,
@@ -331,7 +417,12 @@ impl<'a> DataIngestion<'a> {
 
         let pending_objects = pending.len();
         let persist_start = Instant::now();
-        self.persist_import_objects(pending, name_to_id, id_to_type)?;
+        self.persist_import_objects(
+            pending,
+            name_to_candidates,
+            source_id_to_candidates,
+            id_to_type,
+        )?;
         let persist_duration_ms = persist_start.elapsed().as_millis() as u64;
 
         info!("Created {} objects total", self.stats.objects_created);
@@ -349,7 +440,7 @@ impl<'a> DataIngestion<'a> {
         Ok(())
     }
 
-    /// Check for a pre-existing object by (type, name).
+    /// Check for pre-existing objects by `(type, name)`.
     ///
     /// The `source_id` parameter is accepted for forward-compatibility but is not yet
     /// queryable — a property-index lookup can be added once `find_by_property` exists
@@ -359,20 +450,19 @@ impl<'a> DataIngestion<'a> {
         _source_id: &str,
         node_type: &str,
         name: &str,
-        name_to_id: &HashMap<String, ObjectId>,
-        existing_by_type_name: &HashMap<(String, String), ObjectId>,
-    ) -> Option<ObjectId> {
-        name_to_id.get(name).copied().or_else(|| {
-            existing_by_type_name
-                .get(&(node_type.to_string(), name.to_string()))
-                .copied()
-        })
+        existing_by_type_name: &HashMap<(String, String), Vec<ObjectId>>,
+    ) -> Vec<ObjectId> {
+        existing_by_type_name
+            .get(&(node_type.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn persist_import_objects(
         &mut self,
         pending: Vec<PendingImportObject>,
-        name_to_id: &mut HashMap<String, ObjectId>,
+        name_to_candidates: &mut HashMap<String, Vec<ResolutionCandidate>>,
+        source_id_to_candidates: &mut HashMap<ObjectId, Vec<ResolutionCandidate>>,
         id_to_type: &mut HashMap<ObjectId, String>,
     ) -> Result<()> {
         if pending.is_empty() {
@@ -385,7 +475,13 @@ impl<'a> DataIngestion<'a> {
             .collect::<Vec<_>>();
         if self.graph.add_objects(metadata).is_ok() {
             for pending in pending {
-                name_to_id.insert(pending.name, pending.metadata.id);
+                let candidate = ResolutionCandidate {
+                    id: pending.metadata.id,
+                    object_type: pending.node_type.clone(),
+                    name: pending.name,
+                };
+                push_candidate(name_to_candidates, candidate.clone());
+                push_source_candidate(source_id_to_candidates, &pending.source_id, candidate);
                 id_to_type.insert(pending.metadata.id, pending.node_type);
                 self.stats.objects_created += 1;
             }
@@ -395,7 +491,13 @@ impl<'a> DataIngestion<'a> {
         for pending in pending {
             match self.graph.add_object(pending.metadata.clone()) {
                 Ok(id) => {
-                    name_to_id.insert(pending.name, id);
+                    let candidate = ResolutionCandidate {
+                        id,
+                        object_type: pending.node_type.clone(),
+                        name: pending.name,
+                    };
+                    push_candidate(name_to_candidates, candidate.clone());
+                    push_source_candidate(source_id_to_candidates, &pending.source_id, candidate);
                     id_to_type.insert(id, pending.node_type);
                     self.stats.objects_created += 1;
                 }
@@ -425,7 +527,8 @@ impl<'a> DataIngestion<'a> {
     async fn create_relationships(
         &mut self,
         edges: Vec<JsonEntry>,
-        name_to_id: &HashMap<String, ObjectId>,
+        name_to_candidates: &HashMap<String, Vec<ResolutionCandidate>>,
+        source_id_to_candidates: &HashMap<ObjectId, Vec<ResolutionCandidate>>,
         id_to_type: &HashMap<ObjectId, String>,
         name_resolution_cache: &mut NameResolutionCache,
     ) -> Result<()> {
@@ -441,8 +544,20 @@ impl<'a> DataIngestion<'a> {
                 edge_type,
             } = entry
             {
-                let from_id = self.resolve_node_id(&from, name_to_id, name_resolution_cache);
-                let to_id = self.resolve_node_id(&to, name_to_id, name_resolution_cache);
+                let from_resolution = self.resolve_node_id(
+                    &from,
+                    name_to_candidates,
+                    source_id_to_candidates,
+                    name_resolution_cache,
+                );
+                let to_resolution = self.resolve_node_id(
+                    &to,
+                    name_to_candidates,
+                    source_id_to_candidates,
+                    name_resolution_cache,
+                );
+                let from_id = from_resolution.id();
+                let to_id = to_resolution.id();
 
                 match (from_id, to_id) {
                     (Some(fid), Some(tid)) => {
@@ -484,13 +599,25 @@ impl<'a> DataIngestion<'a> {
                         });
                     }
                     _ => {
-                        self.record_edge_validation_drop(
-                            "edge_endpoint_exists".to_string(),
-                            format!(
-                                "{from} -[{edge_type}]-> {to}: from_resolved={}, to_resolved={}",
-                                from_id.is_some(),
-                                to_id.is_some()
-                            ),
+                        let unresolved = [
+                            from_resolution.diagnostic_json("from"),
+                            to_resolution.diagnostic_json("to"),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                        let item = format!(
+                            "{from} -[{edge_type}]-> {to}: from_resolved={}, to_resolved={}",
+                            from_id.is_some(),
+                            to_id.is_some()
+                        );
+                        self.record_edge_validation_drop_with_details(
+                            "edge_endpoint_resolves_uniquely".to_string(),
+                            item,
+                            serde_json::json!({
+                                "edge": { "from": from, "to": to, "edge_type": edge_type },
+                                "unresolved_endpoints": unresolved,
+                            }),
                         );
                         error!(
                             from,
@@ -498,8 +625,8 @@ impl<'a> DataIngestion<'a> {
                             edge_type,
                             from_resolved = from_id.is_some(),
                             to_resolved = to_id.is_some(),
-                            constraint = "edge_endpoint_exists",
-                            "Skipping edge with missing node reference"
+                            constraint = "edge_endpoint_resolves_uniquely",
+                            "Skipping edge with unresolved node reference"
                         );
                     }
                 }
@@ -591,6 +718,18 @@ impl<'a> DataIngestion<'a> {
         record_diagnostic_sample(&mut self.validation_diagnostics, key, sample);
     }
 
+    fn record_edge_validation_drop_with_details(
+        &mut self,
+        key: String,
+        sample: String,
+        details: Value,
+    ) {
+        self.stats.edge_records_skipped += 1;
+        self.stats.validation_errors += 1;
+        self.record_diagnostic_with_details("validation", &key, &sample, details);
+        record_diagnostic_sample(&mut self.validation_diagnostics, key, sample);
+    }
+
     fn record_property_drop(&mut self, key: String, sample: String) {
         self.stats.dropped_properties += 1;
         self.record_diagnostic("dropped_property", &key, &sample);
@@ -608,6 +747,22 @@ impl<'a> DataIngestion<'a> {
             category: category.to_string(),
             constraint: constraint.to_string(),
             item: item.to_string(),
+            details: None,
+        });
+    }
+
+    fn record_diagnostic_with_details(
+        &mut self,
+        category: &str,
+        constraint: &str,
+        item: &str,
+        details: Value,
+    ) {
+        self.diagnostic_records.push(ImportDiagnosticRecord {
+            category: category.to_string(),
+            constraint: constraint.to_string(),
+            item: item.to_string(),
+            details: Some(details),
         });
     }
 
@@ -709,47 +864,103 @@ impl<'a> DataIngestion<'a> {
         }
     }
 
-    /// Resolve a node name to an ObjectId.
+    /// Resolve a plain, UUID, or `object_type:name` reference to one candidate.
     ///
-    /// Checks the in-session `name_to_id` map first (fast path), then falls back to a
-    /// storage name-index scan for nodes created in previous import sessions (BUG-7 fix).
+    /// UUID references prefer source-ID aliases from this import, then graph IDs.
+    /// Other references combine in-session and persisted exact-name candidates
+    /// before attempting `object_type:name` qualification.
     fn resolve_node_id(
         &self,
-        name: &str,
-        name_to_id: &HashMap<String, ObjectId>,
+        reference: &str,
+        name_to_candidates: &HashMap<String, Vec<ResolutionCandidate>>,
+        source_id_to_candidates: &HashMap<ObjectId, Vec<ResolutionCandidate>>,
         name_resolution_cache: &mut NameResolutionCache,
-    ) -> Option<ObjectId> {
-        if let Some(&id) = name_to_id.get(name) {
-            return Some(id);
+    ) -> NodeResolution {
+        if let Ok(id) = ObjectId::parse_str(reference) {
+            let mut candidates = source_id_to_candidates
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            if let Ok(Some(object)) = self.graph.get_object(id) {
+                candidates.push(ResolutionCandidate {
+                    id: object.id,
+                    object_type: object.object_type,
+                    name: object.name,
+                });
+            }
+            return resolution_from_candidates(reference, candidates);
         }
+
+        // Preserve exact-name compatibility before interpreting `type:name`.
+        // This prevents a literal node named `npc:Echo` from silently binding
+        // to an unrelated `npc` named `Echo`.
+        let literal_candidates =
+            self.candidates_for_name(reference, name_to_candidates, name_resolution_cache);
+        if !literal_candidates.is_empty() {
+            return resolution_from_candidates(reference, literal_candidates);
+        }
+
+        if let Some((object_type, name)) = reference
+            .split_once(':')
+            .filter(|(object_type, name)| !object_type.is_empty() && !name.is_empty())
+        {
+            let mut qualified_candidates =
+                self.candidates_for_name(name, name_to_candidates, name_resolution_cache);
+            let qualifier_is_known = self
+                .graph
+                .get_schema_manager()
+                .all_object_type_names()
+                .iter()
+                .any(|known| known == object_type)
+                || qualified_candidates
+                    .iter()
+                    .any(|candidate| candidate.object_type == object_type);
+            if qualifier_is_known {
+                qualified_candidates.retain(|candidate| candidate.object_type == object_type);
+                return resolution_from_candidates(reference, qualified_candidates);
+            }
+        }
+
+        NodeResolution::Missing {
+            reference: reference.to_string(),
+        }
+    }
+
+    fn candidates_for_name(
+        &self,
+        name: &str,
+        name_to_candidates: &HashMap<String, Vec<ResolutionCandidate>>,
+        name_resolution_cache: &mut NameResolutionCache,
+    ) -> Vec<ResolutionCandidate> {
+        let mut candidates = name_to_candidates.get(name).cloned().unwrap_or_default();
 
         if let Some(cached) = name_resolution_cache.results.get(name) {
             name_resolution_cache.cache_hits += 1;
-            return *cached;
+            candidates.extend(cached.iter().cloned());
+        } else {
+            name_resolution_cache.storage_lookups += 1;
+            let persisted = match self.graph.find_by_name_only(name) {
+                Ok(results) => results
+                    .into_iter()
+                    .map(|object| ResolutionCandidate {
+                        id: object.id,
+                        object_type: object.object_type,
+                        name: object.name,
+                    })
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    warn!("Storage lookup failed for node '{}': {}", name, e);
+                    Vec::new()
+                }
+            };
+            candidates.extend(persisted.iter().cloned());
+            name_resolution_cache
+                .results
+                .insert(name.to_string(), persisted);
         }
 
-        name_resolution_cache.storage_lookups += 1;
-        let resolved = match self.graph.find_by_name_only(name) {
-            Ok(results) if !results.is_empty() => {
-                if results.len() > 1 {
-                    warn!(
-                        "Ambiguous node name '{}' matched {} objects; using first match",
-                        name,
-                        results.len()
-                    );
-                }
-                Some(results[0].id)
-            }
-            Ok(_) => None,
-            Err(e) => {
-                warn!("Storage lookup failed for node '{}': {}", name, e);
-                None
-            }
-        };
-        name_resolution_cache
-            .results
-            .insert(name.to_string(), resolved);
-        resolved
+        sort_and_dedup_candidates(&mut candidates);
+        candidates
     }
 
     async fn validate_import_edge(
@@ -1007,6 +1218,64 @@ fn compact_json_object(properties: &Map<String, Value>) -> String {
     compact_json_value(&Value::Object(properties.clone()))
 }
 
+fn push_candidate(
+    index: &mut HashMap<String, Vec<ResolutionCandidate>>,
+    candidate: ResolutionCandidate,
+) {
+    let candidates = index.entry(candidate.name.clone()).or_default();
+    if !candidates
+        .iter()
+        .any(|existing| existing.id == candidate.id)
+    {
+        candidates.push(candidate);
+    }
+}
+
+fn push_source_candidate(
+    index: &mut HashMap<ObjectId, Vec<ResolutionCandidate>>,
+    source_id: &str,
+    candidate: ResolutionCandidate,
+) {
+    let Ok(source_id) = ObjectId::parse_str(source_id) else {
+        return;
+    };
+    let candidates = index.entry(source_id).or_default();
+    if !candidates
+        .iter()
+        .any(|existing| existing.id == candidate.id)
+    {
+        candidates.push(candidate);
+    }
+}
+
+fn sort_and_dedup_candidates(candidates: &mut Vec<ResolutionCandidate>) {
+    candidates.sort_by(|a, b| {
+        (&a.object_type, &a.name, a.id.to_string()).cmp(&(
+            &b.object_type,
+            &b.name,
+            b.id.to_string(),
+        ))
+    });
+    candidates.dedup_by_key(|candidate| candidate.id);
+}
+
+fn resolution_from_candidates(
+    reference: &str,
+    mut candidates: Vec<ResolutionCandidate>,
+) -> NodeResolution {
+    sort_and_dedup_candidates(&mut candidates);
+    match candidates.as_slice() {
+        [] => NodeResolution::Missing {
+            reference: reference.to_string(),
+        },
+        [candidate] => NodeResolution::Unique(candidate.id),
+        _ => NodeResolution::Ambiguous {
+            reference: reference.to_string(),
+            candidates,
+        },
+    }
+}
+
 fn compact_json_value(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
 }
@@ -1154,11 +1423,7 @@ mod tests {
                 .with_property("role".to_string(), PropertySchema::string("role"))
                 .with_required_property("name".to_string()),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon","role":"Mathematician","secret":"psychohistory"}}"#;
@@ -1200,11 +1465,7 @@ mod tests {
                 .with_required_property("name".to_string())
                 .with_required_property("role".to_string()),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon"}}
@@ -1238,11 +1499,7 @@ mod tests {
                 .with_property("name".to_string(), PropertySchema::string("name"))
                 .with_required_property("name".to_string()),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon"}}
@@ -1282,11 +1539,7 @@ mod tests {
                 .with_source_types(vec!["npc".to_string()])
                 .with_target_types(vec!["npc".to_string()]),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon"}}
@@ -1333,11 +1586,7 @@ mod tests {
                 .with_source_types(vec!["npc".to_string()])
                 .with_target_types(vec!["location".to_string()]),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon"}}
@@ -1381,7 +1630,261 @@ mod tests {
         let diagnostics_path = stats.diagnostics_path.as_ref().unwrap();
         let diagnostics = std::fs::read_to_string(diagnostics_path).unwrap();
         assert!(diagnostics.contains("\"category\":\"validation\""));
-        assert!(diagnostics.contains("\"constraint\":\"edge_endpoint_exists\""));
+        assert!(diagnostics.contains("\"constraint\":\"edge_endpoint_resolves_uniquely\""));
         assert!(diagnostics.contains("Missing Planet"));
+    }
+
+    #[tokio::test]
+    async fn qualified_references_resolve_same_file_cross_type_collisions() {
+        let (_temp_dir, graph) = create_test_graph();
+        let mut schema = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "test".to_string(),
+        );
+        for object_type in ["npc", "location"] {
+            schema.add_object_type(
+                object_type.to_string(),
+                ObjectTypeSchema::new(object_type.to_string(), object_type.to_string())
+                    .with_property("name".to_string(), PropertySchema::string("name"))
+                    .with_required_property("name".to_string()),
+            );
+        }
+        schema.add_edge_type(
+            "located_in".to_string(),
+            EdgeTypeSchema::new("located_in".to_string(), "location".to_string())
+                .with_source_types(vec!["npc".to_string()])
+                .with_target_types(vec!["location".to_string()]),
+        );
+        graph.get_schema_manager().save_schema(&schema).unwrap();
+
+        let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Echo"}}
+{"entitytype":"node","id":"00000000-0000-0000-0000-000000000002","nodetype":"location","properties":{"name":"Echo"}}
+{"entitytype":"edge","from":"npc:Echo","to":"location:Echo","edgeType":"located_in"}
+{"entitytype":"edge","from":"Echo","to":"location:Echo","edgeType":"located_in"}"#;
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("cross-type.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        ingestion.import_json_data(&file).await.unwrap();
+
+        let stats = ingestion.get_stats();
+        assert_eq!(stats.objects_created, 2);
+        assert_eq!(stats.relationships_created, 1);
+        assert_eq!(stats.edge_records_skipped, 1);
+        let diagnostics =
+            std::fs::read_to_string(stats.diagnostics_path.as_ref().unwrap()).unwrap();
+        assert!(diagnostics.contains("\"reason\":\"ambiguous\""));
+        assert!(diagnostics.contains("\"object_type\":\"npc\""));
+        assert!(diagnostics.contains("\"object_type\":\"location\""));
+        assert!(diagnostics.contains("\"id\":"));
+    }
+
+    #[tokio::test]
+    async fn persisted_ambiguous_name_requires_uuid_qualification() {
+        let (_temp_dir, graph) = create_test_graph();
+        let source = ObjectMetadata::new("npc".to_string(), "Source".to_string());
+        let first = ObjectMetadata::new("npc".to_string(), "Echo".to_string());
+        let second = ObjectMetadata::new("location".to_string(), "Echo".to_string());
+        graph
+            .add_objects(vec![source.clone(), first.clone(), second])
+            .unwrap();
+
+        let jsonl = format!(
+            "{{\"entitytype\":\"edge\",\"from\":\"{}\",\"to\":\"{}\",\"edgeType\":\"knows\"}}\n\
+             {{\"entitytype\":\"edge\",\"from\":\"Source\",\"to\":\"Echo\",\"edgeType\":\"knows\"}}",
+            source.id, first.id
+        );
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("persisted.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        ingestion.import_json_data(&file).await.unwrap();
+
+        assert_eq!(ingestion.get_stats().relationships_created, 1);
+        assert_eq!(ingestion.get_stats().edge_records_skipped, 1);
+        let edges = graph.get_all_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, source.id);
+        assert_eq!(edges[0].to, first.id);
+    }
+
+    #[tokio::test]
+    async fn unique_literal_known_type_prefix_wins_over_qualification() {
+        let (_temp_dir, graph) = create_test_graph();
+        let mut schema = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "test".to_string(),
+        );
+        schema.add_object_type(
+            "npc".to_string(),
+            ObjectTypeSchema::new("npc".to_string(), "NPC".to_string())
+                .with_property("name".to_string(), PropertySchema::string("name"))
+                .with_required_property("name".to_string()),
+        );
+        schema.add_edge_type(
+            "knows".to_string(),
+            EdgeTypeSchema::new("knows".to_string(), "knows".to_string())
+                .with_source_types(vec!["npc".to_string()])
+                .with_target_types(vec!["npc".to_string()]),
+        );
+        graph.get_schema_manager().save_schema(&schema).unwrap();
+
+        let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000201","nodetype":"npc","properties":{"name":"npc:Echo"}}
+{"entitytype":"node","id":"00000000-0000-0000-0000-000000000202","nodetype":"npc","properties":{"name":"Echo"}}
+{"entitytype":"node","id":"00000000-0000-0000-0000-000000000203","nodetype":"npc","properties":{"name":"Reader"}}
+{"entitytype":"edge","from":"npc:Echo","to":"Reader","edgeType":"knows"}"#;
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("literal-known-prefix.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        ingestion.import_json_data(&file).await.unwrap();
+
+        assert_eq!(ingestion.get_stats().relationships_created, 1);
+        let literal = graph.find_by_name_only("npc:Echo").unwrap().pop().unwrap();
+        let decoy = graph.find_by_name_only("Echo").unwrap().pop().unwrap();
+        let edges = graph.get_all_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, literal.id);
+        assert_ne!(edges[0].from, decoy.id);
+    }
+
+    #[tokio::test]
+    async fn unknown_colon_prefix_remains_a_plain_name() {
+        let (_temp_dir, graph) = create_test_graph();
+        let from = ObjectMetadata::new("npc".to_string(), "Chapter: One".to_string());
+        let to = ObjectMetadata::new("npc".to_string(), "Reader".to_string());
+        graph.add_objects(vec![from.clone(), to.clone()]).unwrap();
+
+        let jsonl =
+            r#"{"entitytype":"edge","from":"Chapter: One","to":"Reader","edgeType":"knows"}"#;
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("colon-name.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        ingestion.import_json_data(&file).await.unwrap();
+        assert_eq!(ingestion.get_stats().relationships_created, 1);
+    }
+
+    #[tokio::test]
+    async fn known_type_prefix_in_a_unique_literal_name_wins() {
+        let (_temp_dir, graph) = create_test_graph();
+        let literal = ObjectMetadata::new("location".to_string(), "npc:Echo".to_string());
+        let qualified = ObjectMetadata::new("npc".to_string(), "Echo".to_string());
+        let target = ObjectMetadata::new("location".to_string(), "Target".to_string());
+        graph
+            .add_objects(vec![literal.clone(), qualified, target.clone()])
+            .unwrap();
+
+        let jsonl = r#"{"entitytype":"edge","from":"npc:Echo","to":"Target","edgeType":"knows"}"#;
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("known-prefix-literal.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        ingestion.import_json_data(&file).await.unwrap();
+
+        assert_eq!(ingestion.get_stats().relationships_created, 1);
+        let edges = graph.get_all_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, literal.id);
+        assert_eq!(edges[0].to, target.id);
+    }
+
+    #[tokio::test]
+    async fn same_import_source_uuids_resolve_created_and_reused_nodes() {
+        let (_temp_dir, graph) = create_test_graph();
+        let reused_target = ObjectMetadata::new("location".to_string(), "Target".to_string());
+        graph.add_object(reused_target.clone()).unwrap();
+
+        let source_uuid = "00000000-0000-0000-0000-000000000001";
+        let target_uuid = "00000000-0000-0000-0000-000000000002";
+        let jsonl = format!(
+            "{{\"entitytype\":\"node\",\"id\":\"{source_uuid}\",\"nodetype\":\"location\",\"properties\":{{\"name\":\"Source\"}}}}\n\
+             {{\"entitytype\":\"node\",\"id\":\"{target_uuid}\",\"nodetype\":\"location\",\"properties\":{{\"name\":\"Target\"}}}}\n\
+             {{\"entitytype\":\"edge\",\"from\":\"{source_uuid}\",\"to\":\"{target_uuid}\",\"edgeType\":\"knows\"}}"
+        );
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("source-uuid.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        ingestion.import_json_data(&file).await.unwrap();
+
+        assert_eq!(ingestion.get_stats().objects_created, 1);
+        assert_eq!(ingestion.get_stats().objects_reused, 1);
+        assert_eq!(ingestion.get_stats().relationships_created, 1);
+        let source = graph
+            .find_by_name("location", "Source")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let edges = graph.get_all_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, source.id);
+        assert_eq!(edges[0].to, reused_target.id);
+    }
+
+    #[tokio::test]
+    async fn source_uuid_collision_with_graph_id_is_ambiguous() {
+        let (_temp_dir, graph) = create_test_graph();
+        let shared_id = ObjectId::parse_str("00000000-0000-0000-0000-000000000301").unwrap();
+        let mut persisted = ObjectMetadata::new("location".to_string(), "Persisted".to_string());
+        persisted.id = shared_id;
+        let target = ObjectMetadata::new("location".to_string(), "Target".to_string());
+        graph
+            .add_objects(vec![persisted.clone(), target.clone()])
+            .unwrap();
+
+        let jsonl = format!(
+            "{{\"entitytype\":\"node\",\"id\":\"{shared_id}\",\"nodetype\":\"location\",\"properties\":{{\"name\":\"Imported\"}}}}\n\
+             {{\"entitytype\":\"edge\",\"from\":\"{shared_id}\",\"to\":\"Target\",\"edgeType\":\"knows\"}}"
+        );
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("source-graph-uuid-collision.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        ingestion.import_json_data(&file).await.unwrap();
+
+        assert_eq!(ingestion.get_stats().relationships_created, 0);
+        assert_eq!(ingestion.get_stats().edge_records_skipped, 1);
+        assert!(graph.get_all_edges().unwrap().is_empty());
+        let diagnostics =
+            std::fs::read_to_string(ingestion.get_stats().diagnostics_path.as_ref().unwrap())
+                .unwrap();
+        assert!(diagnostics.contains("\"reason\":\"ambiguous\""));
+        assert!(diagnostics.contains(&persisted.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn persisted_custom_type_can_qualify_a_reference() {
+        let (_temp_dir, graph) = create_test_graph();
+        let custom = ObjectMetadata::new("custom_kind".to_string(), "Echo".to_string());
+        let collision = ObjectMetadata::new("npc".to_string(), "Echo".to_string());
+        let target = ObjectMetadata::new("location".to_string(), "Target".to_string());
+        graph
+            .add_objects(vec![custom.clone(), collision, target.clone()])
+            .unwrap();
+
+        let jsonl =
+            r#"{"entitytype":"edge","from":"custom_kind:Echo","to":"Target","edgeType":"knows"}"#;
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("persisted-custom-type.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        ingestion.import_json_data(&file).await.unwrap();
+
+        assert_eq!(ingestion.get_stats().relationships_created, 1);
+        let edges = graph.get_all_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, custom.id);
+        assert_eq!(edges[0].to, target.id);
     }
 }

@@ -82,7 +82,7 @@ Files live in `defaults/schemas/` (or `$UFORGE_SCHEMA_DIR`). Named `{type}.schem
 // Load schemas from directory
 let schemas = SchemaIngestion::load_default_schemas()?;
 let schema_manager = graph.get_schema_manager();
-schema_manager.save_schema(schemas).await?;
+schema_manager.save_schema(&schemas)?;
 
 // Validate an object
 let result = schema_manager.validate_object(&object).await?;

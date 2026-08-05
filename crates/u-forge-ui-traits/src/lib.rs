@@ -69,9 +69,79 @@ pub struct DrawCommands {
 /// Camera/viewport state for culling and LOD decisions.
 #[derive(Debug, Clone)]
 pub struct Viewport {
-    pub center: Vec2,
-    pub size: Vec2,
-    pub zoom: f32,
+    center: Vec2,
+    size: Vec2,
+    zoom: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportError {
+    NonFiniteCenter,
+    NonFiniteSize,
+    InvalidZoom,
+}
+
+impl std::fmt::Display for ViewportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteCenter => f.write_str("viewport center must be finite"),
+            Self::NonFiniteSize => f.write_str("viewport size must be finite"),
+            Self::InvalidZoom => f.write_str("viewport zoom must be finite and positive"),
+        }
+    }
+}
+
+impl std::error::Error for ViewportError {}
+
+impl Viewport {
+    pub fn new(center: Vec2, size: Vec2, zoom: f32) -> Result<Self, ViewportError> {
+        if !center.is_finite() {
+            return Err(ViewportError::NonFiniteCenter);
+        }
+        if !size.is_finite() {
+            return Err(ViewportError::NonFiniteSize);
+        }
+        if !zoom.is_finite() || zoom <= 0.0 {
+            return Err(ViewportError::InvalidZoom);
+        }
+        Ok(Self { center, size, zoom })
+    }
+
+    pub fn center(&self) -> Vec2 {
+        self.center
+    }
+
+    pub fn size(&self) -> Vec2 {
+        self.size
+    }
+
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    pub fn set_center(&mut self, center: Vec2) -> Result<(), ViewportError> {
+        if !center.is_finite() {
+            return Err(ViewportError::NonFiniteCenter);
+        }
+        self.center = center;
+        Ok(())
+    }
+
+    pub fn set_size(&mut self, size: Vec2) -> Result<(), ViewportError> {
+        if !size.is_finite() {
+            return Err(ViewportError::NonFiniteSize);
+        }
+        self.size = size;
+        Ok(())
+    }
+
+    pub fn set_zoom(&mut self, zoom: f32) -> Result<(), ViewportError> {
+        if !zoom.is_finite() || zoom <= 0.0 {
+            return Err(ViewportError::InvalidZoom);
+        }
+        self.zoom = zoom;
+        Ok(())
+    }
 }
 
 /// Zoom thresholds for LOD transitions.
@@ -80,13 +150,9 @@ const LOD_LABEL_THRESHOLD: f32 = 0.6;
 
 impl Viewport {
     /// Construct a camera that contains every point with screen-space padding.
-    pub fn fit_points(points: &[Vec2], size: Vec2, padding: f32) -> Self {
+    pub fn fit_points(points: &[Vec2], size: Vec2, padding: f32) -> Result<Self, ViewportError> {
         if points.is_empty() {
-            return Self {
-                center: Vec2::ZERO,
-                size,
-                zoom: 1.0,
-            };
+            return Self::new(Vec2::ZERO, size, 1.0);
         }
         let mut min = points[0];
         let mut max = points[0];
@@ -99,11 +165,7 @@ impl Viewport {
         let zoom = (available.x / extent.x)
             .min(available.y / extent.y)
             .clamp(0.05, 8.0);
-        Self {
-            center: (min + max) * 0.5,
-            size,
-            zoom,
-        }
+        Self::new((min + max) * 0.5, size, zoom)
     }
 
     /// World-space bounding rectangle `(min, max)`.
@@ -252,7 +314,7 @@ pub fn generate_draw_commands(
         NODE_RADIUS
     };
     // Screen radius used to gate text visibility.
-    let screen_radius = NODE_RADIUS * viewport.zoom;
+    let screen_radius = NODE_RADIUS * viewport.zoom();
 
     out.nodes.reserve(visible_indices.len());
     for &idx in &visible_indices {
@@ -321,11 +383,7 @@ mod tests {
 
     #[test]
     fn viewport_transforms_roundtrip() {
-        let vp = Viewport {
-            center: Vec2::new(100.0, 200.0),
-            size: Vec2::new(800.0, 600.0),
-            zoom: 1.5,
-        };
+        let vp = Viewport::new(Vec2::new(100.0, 200.0), Vec2::new(800.0, 600.0), 1.5).unwrap();
         let world = Vec2::new(150.0, 250.0);
         let screen = vp.world_to_screen(world);
         let back = vp.screen_to_world(screen);
@@ -334,11 +392,7 @@ mod tests {
 
     #[test]
     fn lod_levels_match_zoom() {
-        let make = |zoom| Viewport {
-            center: Vec2::ZERO,
-            size: Vec2::new(800.0, 600.0),
-            zoom,
-        };
+        let make = |zoom| Viewport::new(Vec2::ZERO, Vec2::new(800.0, 600.0), zoom).unwrap();
         assert_eq!(make(0.1).lod_level(), LodLevel::Dot);
         assert_eq!(make(0.4).lod_level(), LodLevel::Label);
         assert_eq!(make(1.0).lod_level(), LodLevel::Full);
@@ -347,12 +401,33 @@ mod tests {
     #[test]
     fn fit_points_centers_and_contains_graph() {
         let points = [Vec2::new(-100.0, -50.0), Vec2::new(100.0, 50.0)];
-        let viewport = Viewport::fit_points(&points, Vec2::new(800.0, 600.0), 40.0);
-        assert_eq!(viewport.center, Vec2::ZERO);
+        let viewport = Viewport::fit_points(&points, Vec2::new(800.0, 600.0), 40.0).unwrap();
+        assert_eq!(viewport.center(), Vec2::ZERO);
         let (min, max) = viewport.world_rect();
         assert!(points.iter().all(|point| point.x >= min.x
             && point.x <= max.x
             && point.y >= min.y
             && point.y <= max.y));
+    }
+
+    #[test]
+    fn viewport_rejects_non_finite_or_non_positive_state() {
+        let size = Vec2::new(800.0, 600.0);
+        assert!(matches!(
+            Viewport::new(Vec2::new(f32::NAN, 0.0), size, 1.0),
+            Err(ViewportError::NonFiniteCenter)
+        ));
+        assert!(matches!(
+            Viewport::new(Vec2::ZERO, Vec2::new(f32::INFINITY, 1.0), 1.0),
+            Err(ViewportError::NonFiniteSize)
+        ));
+        assert!(matches!(
+            Viewport::new(Vec2::ZERO, size, 0.0),
+            Err(ViewportError::InvalidZoom)
+        ));
+        assert!(matches!(
+            Viewport::new(Vec2::ZERO, size, f32::NAN),
+            Err(ViewportError::InvalidZoom)
+        ));
     }
 }

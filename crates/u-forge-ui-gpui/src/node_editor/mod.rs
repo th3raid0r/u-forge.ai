@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gpui::{Context, Entity, Pixels, Subscription, prelude::*};
 use parking_lot::RwLock;
 use u_forge_core::{
-    EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyIssue, PropertyType, SchemaManager,
+    EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyType, SchemaManager,
 };
 use u_forge_graph_view::GraphSnapshot;
 
@@ -437,11 +437,11 @@ impl NodeEditorPanel {
             let issues = self
                 .graph
                 .validate_and_coerce_properties(&meta.object_type, &mut props);
-            for issue in &issues {
-                match issue {
-                    PropertyIssue::UnknownProperty { .. } => {}
-                    _ => tracing::warn!("node {}: {issue}", meta.id),
+            if !issues.is_empty() {
+                for issue in &issues {
+                    tracing::warn!(node_id = %meta.id, %issue, "Node save blocked by schema issue");
                 }
+                continue;
             }
             meta.properties = serde_json::Value::Object(props);
 

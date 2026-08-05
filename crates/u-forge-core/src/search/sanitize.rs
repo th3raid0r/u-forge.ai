@@ -14,7 +14,7 @@
 ///
 /// The original query is **not** modified — it is still used verbatim for
 /// embedding and reranking, where punctuation is meaningful.
-pub(super) fn fts5_sanitize(query: &str) -> Option<String> {
+pub fn fts5_sanitize(query: &str) -> Option<String> {
     let sanitized: String = query
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })

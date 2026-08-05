@@ -1,7 +1,4 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use u_forge_core::{AppConfig, KnowledgeGraph, queue::InferenceQueue};
@@ -30,22 +27,36 @@ pub(crate) struct AppState {
     pub(crate) data_status: Option<String>,
     /// Embedding progress/completion message shown in the status bar.
     pub(crate) embedding_status: Option<String>,
-    /// Epoch for the embedding-plan status poller. Bumping cancels any
-    /// in-flight poller timer so stale ticks don't overwrite a fresh status.
-    pub(crate) embedding_plan_epoch: usize,
-    /// Cancellation flag for the active embedding pipeline.
-    ///
-    /// Set to `true` when a new pipeline starts (cancelling the old one) or
-    /// when the pipeline completes. Tasks check this with `Relaxed` loads; the
-    /// epoch check remains as the authoritative guard for work-skipping.
-    pub(crate) embedding_cancel: Arc<AtomicBool>,
+    /// Single authority for which embedding plan may update UI progress.
+    pub(crate) embedding_plan: EmbeddingPlanAuthority,
 }
 
-/// RAII guard that sets the cancel flag on drop (including panic).
-pub(crate) struct CancelOnDrop(pub(crate) Arc<AtomicBool>);
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+#[derive(Debug, Default)]
+pub(crate) struct EmbeddingPlanAuthority {
+    generation: u64,
+    active: bool,
+}
+
+impl EmbeddingPlanAuthority {
+    /// Start a plan, returning its generation and whether older work remains
+    /// active in the queue.
+    pub(crate) fn start(&mut self) -> (u64, bool) {
+        let superseded = self.active;
+        self.generation = self.generation.wrapping_add(1);
+        self.active = true;
+        (self.generation, superseded)
+    }
+
+    pub(crate) fn is_current(&self, generation: u64) -> bool {
+        self.active && self.generation == generation
+    }
+
+    pub(crate) fn finish(&mut self, generation: u64) -> bool {
+        if !self.is_current(generation) {
+            return false;
+        }
+        self.active = false;
+        true
     }
 }
 
@@ -75,8 +86,28 @@ impl AppState {
             hq_queue: None,
             data_status: None,
             embedding_status: None,
-            embedding_plan_epoch: 0,
-            embedding_cancel: Arc::new(AtomicBool::new(false)),
+            embedding_plan: EmbeddingPlanAuthority::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmbeddingPlanAuthority;
+
+    #[test]
+    fn embedding_plan_authority_rejects_superseded_updates() {
+        let mut authority = EmbeddingPlanAuthority::default();
+        let (first, superseded) = authority.start();
+        assert!(!superseded);
+        assert!(authority.is_current(first));
+
+        let (second, superseded) = authority.start();
+        assert!(superseded);
+        assert!(!authority.is_current(first));
+        assert!(authority.is_current(second));
+        assert!(!authority.finish(first));
+        assert!(authority.finish(second));
+        assert!(!authority.is_current(second));
     }
 }

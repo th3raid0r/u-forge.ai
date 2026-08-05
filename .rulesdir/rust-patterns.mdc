@@ -92,9 +92,9 @@ Fluent API for node construction in `src/builder.rs`. Convenience constructors:
 Always descriptive string literals (`"located_in"`, `"controls"`, `"offers"`).
 `EdgeType` is a transparent newtype `struct EdgeType(pub String)` — not an enum.
 
-The deprecated enum variants (`Contains`, `OwnedBy`, `LocatedIn`, `MemberOf`)
-exist only for backward compatibility. **Never use them in new code.** TTRPG
-worldbuilding needs open-ended relationship labels; a fixed enum loses that.
+Backward compatibility is provided by the string newtype and its serde
+representation; no deprecated enum variants remain. Do not reintroduce a fixed
+relationship enum: TTRPG worldbuilding needs open-ended relationship labels.
 
 ---
 

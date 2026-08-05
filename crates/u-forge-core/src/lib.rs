@@ -65,8 +65,9 @@ pub use schema::{
     SchemaDefinition, SchemaIngestion, SchemaManager, SchemaStats, ValidationResult,
 };
 pub use search::{
-    ConnectedNode, HybridSearchConfig, MatchedChunk, NodeSearchResult, SearchCapabilities,
-    SearchResponse, SearchSources, search_hybrid, search_hybrid_response,
+    ConnectedNode, HybridSearchConfig, MatchedChunk, NodeSearchResult, SearchResponse,
+    SearchSources, SearchStageOutcome, SearchStageOutcomes, SearchStageStatus, search_hybrid,
+    search_hybrid_response,
 };
 pub use types::*;
 
