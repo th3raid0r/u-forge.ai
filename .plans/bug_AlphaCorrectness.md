@@ -18,14 +18,14 @@ Lemonade runtime redesign or the Zed workspace refactor.
 
 ## Import and schema integrity
 
-- [ ] **AC-01 — Candidate-aware in-session resolution.** Replace the import
+- [x] **AC-01 — Candidate-aware in-session resolution.** Replace the import
   `name -> ObjectId` map with `name -> candidates`. Preserve every same-name
   object across types rather than overwriting earlier entries.
-- [ ] **AC-02 — No persisted first-match fallback.** Resolve an edge endpoint
+- [x] **AC-02 — No persisted first-match fallback.** Resolve an edge endpoint
   only when the combined in-session/persisted candidate set is unique. On zero
   or multiple candidates, skip the edge and write a diagnostic containing the
   reference, object types, names, and IDs. Never use `results[0]`.
-- [ ] **AC-03 — Explicit qualification compatibility.** Accept existing plain
+- [x] **AC-03 — Explicit qualification compatibility.** Accept existing plain
   names when unique. Add UUID and `object_type:name` qualification without
   widening schemas or inferring object types from records.
 - [ ] **AC-04 — Required-property contract.** Add a missing-required issue to
