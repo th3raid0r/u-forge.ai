@@ -157,6 +157,11 @@ pub fn force_directed_layout_with_fixed(
             node.position -= center;
         }
     }
+
+    assert!(
+        nodes.iter().all(|node| node.position.is_finite()),
+        "force-directed layout produced a non-finite position"
+    );
 }
 
 #[cfg(test)]

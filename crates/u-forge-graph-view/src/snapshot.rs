@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use glam::Vec2;
 use rstar::RTree;
 use serde_json::Value as JsonValue;
@@ -196,6 +196,7 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         .collect();
 
     apply_saved_and_layout_new_nodes(&mut nodes, &edges, &saved_positions);
+    ensure_finite_positions(&nodes)?;
 
     // Build R-tree spatial index from final positions
     let spatial_index = RTree::bulk_load(
@@ -280,6 +281,7 @@ pub fn build_snapshot_incremental(
 
     let all_saved = nodes.iter().all(|n| saved_positions.contains_key(&n.id));
     apply_saved_and_layout_new_nodes(&mut nodes, &edges, &saved_positions);
+    ensure_finite_positions(&nodes)?;
 
     // Compute the delta: which nodes were added and which were removed.
     let new_ids: HashSet<ObjectId> = nodes.iter().map(|n| n.id).collect();
@@ -352,6 +354,14 @@ pub fn build_snapshot_incremental(
         id_to_idx,
         type_counts,
     })
+}
+
+fn ensure_finite_positions(nodes: &[NodeView]) -> Result<()> {
+    ensure!(
+        nodes.iter().all(|node| node.position.is_finite()),
+        "Graph snapshot contains a non-finite node position"
+    );
+    Ok(())
 }
 
 /// Restore fixed saved positions, deterministically seed new nodes, then relax

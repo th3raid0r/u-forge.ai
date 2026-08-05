@@ -44,10 +44,10 @@ Lemonade runtime redesign or the Zed workspace refactor.
 - [x] **AC-07 — Saved/unsaved placement.** Preserve saved nodes as fixed. Seed
   new nodes near connected saved neighbors, otherwise on a deterministic ring
   around the current graph extent; relax only unsaved nodes.
-- [ ] **AC-08 — Viewport invariants.** Make viewport fields private and require
+- [x] **AC-08 — Viewport invariants.** Make viewport fields private and require
   finite center/size plus finite positive zoom through constructors/setters.
   Apply the invariant to every transform, world rectangle, fit, and LOD path.
-- [ ] **AC-09 — Finite layout guard.** Reject or repair non-finite persisted
+- [x] **AC-09 — Finite layout guard.** Reject or repair non-finite persisted
   positions at the storage/snapshot boundary and assert finite layout output.
 - [ ] **AC-10 — Measured convergence.** Add displacement/convergence metrics
   and small/large graph benchmarks before replacing the fixed iteration cap.

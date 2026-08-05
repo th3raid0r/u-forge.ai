@@ -9,7 +9,9 @@ use gpui::{
 use parking_lot::RwLock;
 use u_forge_core::{KnowledgeGraph, ObjectId};
 use u_forge_graph_view::{GraphSnapshot, LodLevel};
-use u_forge_ui_traits::{NODE_RADIUS, Viewport, generate_draw_commands, node_color_for_type};
+use u_forge_ui_traits::{
+    NODE_RADIUS, Viewport, ViewportError, generate_draw_commands, node_color_for_type,
+};
 
 use crate::selection_model::SelectionModel;
 
@@ -74,12 +76,8 @@ impl GraphCanvas {
         }
     }
 
-    fn viewport(&self, canvas_size: Vec2) -> Viewport {
-        Viewport {
-            center: self.camera,
-            size: canvas_size,
-            zoom: self.zoom,
-        }
+    fn viewport(&self, canvas_size: Vec2) -> Result<Viewport, ViewportError> {
+        Viewport::new(self.camera, canvas_size, self.zoom)
     }
 
     /// Returns (canvas_size, canvas_origin) from the last paint frame.
@@ -118,10 +116,14 @@ impl GraphCanvas {
             .iter()
             .map(|node| node.position)
             .collect::<Vec<_>>();
-        let viewport = Viewport::fit_points(&positions, canvas_size, 48.0);
-        self.camera = viewport.center;
-        self.zoom = viewport.zoom;
-        cx.notify();
+        match Viewport::fit_points(&positions, canvas_size, 48.0) {
+            Ok(viewport) => {
+                self.camera = viewport.center();
+                self.zoom = viewport.zoom();
+                cx.notify();
+            }
+            Err(error) => tracing::warn!(%error, "Unable to fit invalid graph viewport"),
+        }
     }
 
     /// Cancel a drag whose node disappeared during a committed snapshot refresh.
@@ -175,7 +177,10 @@ impl Render for GraphCanvas {
                         f32::from(event.position.x) - origin.x,
                         f32::from(event.position.y) - origin.y,
                     );
-                    let world_pos = this.viewport(canvas_size).screen_to_world(screen_pos);
+                    let Ok(viewport) = this.viewport(canvas_size) else {
+                        return;
+                    };
+                    let world_pos = viewport.screen_to_world(screen_pos);
                     let half_size = NODE_RADIUS * 1.5;
 
                     if let Some(idx) = this
@@ -218,6 +223,9 @@ impl Render for GraphCanvas {
                         f32::from(delta.x) / this.zoom,
                         f32::from(delta.y) / this.zoom,
                     );
+                    if !world_delta.is_finite() {
+                        return;
+                    }
                     let mut snap = this.snapshot.write();
                     if let Some(node) = snap.nodes.iter_mut().find(|n| n.id == drag_id) {
                         node.position += world_delta;
@@ -228,8 +236,15 @@ impl Render for GraphCanvas {
                     }
                     cx.notify();
                 } else if this.panning {
-                    this.camera.x -= f32::from(delta.x) / this.zoom;
-                    this.camera.y -= f32::from(delta.y) / this.zoom;
+                    let next_camera = this.camera
+                        - Vec2::new(
+                            f32::from(delta.x) / this.zoom,
+                            f32::from(delta.y) / this.zoom,
+                        );
+                    if Viewport::new(next_camera, Vec2::ONE, this.zoom).is_err() {
+                        return;
+                    }
+                    this.camera = next_camera;
                     cx.notify();
                 }
             }))
@@ -244,16 +259,24 @@ impl Render for GraphCanvas {
                     f32::from(event.position.x) - origin.x,
                     f32::from(event.position.y) - origin.y,
                 );
-                let vp = this.viewport(canvas_size);
+                let Ok(vp) = this.viewport(canvas_size) else {
+                    return;
+                };
                 let world_under_mouse = vp.screen_to_world(mouse_screen);
 
-                this.zoom = (this.zoom * factor).clamp(0.05, 20.0);
+                let next_zoom = (this.zoom * factor).clamp(0.05, 20.0);
+                let Ok(new_vp) = Viewport::new(this.camera, canvas_size, next_zoom) else {
+                    return;
+                };
 
-                let new_vp = this.viewport(canvas_size);
                 let new_screen = new_vp.world_to_screen(world_under_mouse);
                 let screen_delta = mouse_screen - new_screen;
-                this.camera.x -= screen_delta.x / this.zoom;
-                this.camera.y -= screen_delta.y / this.zoom;
+                let next_camera = this.camera - screen_delta / next_zoom;
+                if Viewport::new(next_camera, canvas_size, next_zoom).is_err() {
+                    return;
+                }
+                this.camera = next_camera;
+                this.zoom = next_zoom;
 
                 cx.notify();
             }))
@@ -272,10 +295,9 @@ impl Render for GraphCanvas {
                         let ox = f32::from(bounds.origin.x);
                         let oy = f32::from(bounds.origin.y);
 
-                        let viewport = Viewport {
-                            center: camera,
-                            size: canvas_size,
-                            zoom,
+                        let Ok(viewport) = Viewport::new(camera, canvas_size, zoom) else {
+                            tracing::warn!("Skipping graph paint for invalid viewport state");
+                            return;
                         };
 
                         let font_scale = f32::from(window.rem_size()) / 16.0;
