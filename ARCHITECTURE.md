@@ -202,7 +202,7 @@ Implementation: `parking_lot::Mutex<GpuWorkload>` (never held across `.await`) +
 
 ### Hybrid Search (`src/search/`)
 
-`search_hybrid(graph, queue, query, config)` — five-stage pipeline:
+`search_hybrid(graph, queue, hq_queue, query, config)` — five-stage pipeline:
 
 1. **FTS5** — `graph.search_chunks_fts(fts5_sanitize(query), fts_limit)`. Skipped when `alpha == 1.0`.
 2. **Embed** — `queue.embed(query)`. Skipped when `alpha == 0.0` or no embedding worker.
@@ -322,14 +322,29 @@ All font sizes are relative to a single rem base configured via `[ui] font_size`
 
 ---
 
-## Design Decisions — Questionable / Still Open
+## Current Design Boundaries
 
-- **`chat.rs` uses hand-crafted HTTP, not `async-openai`** — Lemonade Server's `enable_thinking: bool` parameter is non-standard; `async-openai`'s typed struct has no way to inject it. The other Lemonade endpoints (embeddings, TTS, STT, reranking) remain genuinely OpenAI-compatible and continue using `async-openai`. If Lemonade ever standardises the thinking parameter, `LemonadeChatProvider` can be ported.
-- **LLM runtime profiles are server-global** — `LemonadeRuntime` serializes model, load options, and thinking mode as one identity. Changing any part forces a full `/load` before the next direct or agent request.
+- **Chat uses two intentional adapters** — direct chat uses hand-crafted HTTP
+  because Lemonade's flat `enable_thinking: bool` request field is not modeled
+  by `async-openai`; agent/tool chat uses Rig's OpenAI-compatible adapter and
+  flattened additional parameters. Embeddings, TTS, and STT use
+  `async-openai`; Lemonade management and reranking remain custom HTTP.
+- **LLM runtime profiles are server-global** — `LemonadeRuntime` compares model,
+  load options, and thinking mode as one local identity. Changing any part
+  triggers `/load` before the next direct or agent request. The current runtime
+  lock covers profile activation, not the full subsequent response stream, and
+  thinking mode is also sent as the request-level `enable_thinking` hint.
 - **`properties` as JSON text** — stored as an opaque string. Filtering inside the blob requires deserializing at the Rust layer, or using `json_set`/`json_extract` for targeted mutations. Acceptable for now; revisit if query patterns demand indexed property access.
 - **Schema naming `add_npc` vs `npc`** — `.schema.json` files are named after MCP tool actions. `SchemaIngestion` strips the `add_` prefix, but the file names leak an external convention.
 - **`save_schema` is `async` but has no `.await`** — called with `.await` by several callers; making it sync would require updating all of them. Minor but misleading.
 - **`embedding_manager` not in `KnowledgeGraph`** — embedding is now a caller concern. Simplifies the core struct but means callers must manage the embedding lifecycle separately from storage.
+- **Panel metadata is descriptive only** — `u-forge-ui-traits::Panel` currently
+  exposes static metadata, while `AppView` owns actual placement, resizing,
+  activation, and open state. The graph drawing contracts remain the reusable
+  part of `u-forge-ui-traits`.
+- **The TypeScript runtime is a stub** — `u-forge-ts-runtime` has no V8 or
+  `deno_core` implementation and participates in the workspace only as a
+  placeholder crate.
 
 ---
 

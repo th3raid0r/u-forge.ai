@@ -28,6 +28,27 @@ useful, but line numbers refer to the 2026-04-24 tree.
 
 All other findings remain open unless source code now demonstrates otherwise.
 
+## Status after the 2026-08-04 source and plan reconciliation
+
+This file remains the original audit record; its suggested fixes are not active
+implementation instructions. Current work is tracked in `.plans/README.md`.
+
+- The original C5 collision explanation and M12 selection consequence do not
+  match current control flow: layout reseeds nodes, tiny distances are skipped,
+  and non-finite distances fail hit-test filters. Graph hardening remains useful
+  under a revised saved/unsaved placement and viewport-invariant specification.
+- C6's float-equality explanation is incomplete because `NodeEntry` equality is
+  ID-based and drag mouse-up rebuilds the index. A narrow refresh-during-drag
+  race remains; active planning chooses a simpler bulk-rebuild policy.
+- SearchPanel now owns stale-search cancellation, list-state helpers exist, CI
+  and dimension mismatch coverage are present, and HQ backfill is automatic.
+- The proposed five-second C3 completion timeout is rejected for local models.
+  Active planning separates connection, load, first-token, idle, and completion
+  timeouts and retains guards until each operation terminates.
+- Generic provider abstraction, multi-tenant identity, typed property storage,
+  and a general embedding-space registry are parked decisions rather than Alpha
+  defects.
+
 ---
 
 ## How to read this
