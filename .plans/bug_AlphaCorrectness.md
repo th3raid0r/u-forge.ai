@@ -49,7 +49,7 @@ Lemonade runtime redesign or the Zed workspace refactor.
   Apply the invariant to every transform, world rectangle, fit, and LOD path.
 - [x] **AC-09 — Finite layout guard.** Reject or repair non-finite persisted
   positions at the storage/snapshot boundary and assert finite layout output.
-- [ ] **AC-10 — Measured convergence.** Add displacement/convergence metrics
+- [x] **AC-10 — Measured convergence.** Add displacement/convergence metrics
   and small/large graph benchmarks before replacing the fixed iteration cap.
   Do not adopt guessed thresholds without measurements.
 

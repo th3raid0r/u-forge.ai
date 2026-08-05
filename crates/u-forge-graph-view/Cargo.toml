@@ -12,4 +12,9 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["sync"] }
 
 [dev-dependencies]
+criterion = "0.5.1"
 tempfile = "3.27.0"
+
+[[bench]]
+name = "layout"
+harness = false

@@ -32,14 +32,28 @@ const MAX_REPULSION_DIST: f32 = CELL_SIZE * 0.5;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/// Displacement observed during one force-layout iteration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutIterationMetrics {
+    pub iteration: usize,
+    pub max_displacement: f32,
+    pub mean_displacement: f32,
+}
+
+/// Measurements from a completed force-layout run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LayoutMetrics {
+    pub iterations: Vec<LayoutIterationMetrics>,
+}
+
 /// Assign positions to nodes using a force-directed layout with grid-cell
 /// bucketed repulsion (O(N) per step, not O(N²)).
 ///
 /// Modifies `nodes[..].position` in-place.
-pub fn force_directed_layout(nodes: &mut [NodeView], edges: &[EdgeView]) {
+pub fn force_directed_layout(nodes: &mut [NodeView], edges: &[EdgeView]) -> LayoutMetrics {
     let n = nodes.len();
     if n == 0 {
-        return;
+        return LayoutMetrics::default();
     }
 
     // Seed initial positions in a rough grid to avoid overlapping starts
@@ -53,7 +67,7 @@ pub fn force_directed_layout(nodes: &mut [NodeView], edges: &[EdgeView]) {
         );
     }
 
-    force_directed_layout_with_fixed(nodes, edges, &vec![false; n]);
+    force_directed_layout_with_fixed(nodes, edges, &vec![false; n])
 }
 
 /// Relax pre-seeded node positions while preserving every node marked fixed.
@@ -64,16 +78,23 @@ pub fn force_directed_layout_with_fixed(
     nodes: &mut [NodeView],
     edges: &[EdgeView],
     fixed: &[bool],
-) {
+) -> LayoutMetrics {
     let n = nodes.len();
     assert_eq!(fixed.len(), n, "fixed mask must match node count");
+    assert!(
+        nodes.iter().all(|node| node.position.is_finite()),
+        "force-directed layout received a non-finite position"
+    );
     if n == 0 || fixed.iter().all(|is_fixed| *is_fixed) {
-        return;
+        return LayoutMetrics::default();
     }
 
     let mut temperature = 1.0f32;
+    let mut metrics = LayoutMetrics {
+        iterations: Vec::with_capacity(ITERATIONS),
+    };
 
-    for _ in 0..ITERATIONS {
+    for iteration in 0..ITERATIONS {
         let mut displacements = vec![Vec2::ZERO; n];
 
         // ── Repulsion via grid-cell bucketing ────────────────────────────
@@ -131,10 +152,14 @@ pub fn force_directed_layout_with_fixed(
 
         // ── Apply displacements with temperature clamping ────────────────
         let max_disp = MAX_DISPLACEMENT * temperature;
+        let mut applied_max = 0.0_f32;
+        let mut applied_total = 0.0_f32;
+        let mut movable_count = 0_usize;
         for (i, node) in nodes.iter_mut().enumerate() {
             if fixed[i] {
                 continue;
             }
+            movable_count += 1;
             let d = displacements[i];
             let mag = d.length();
             if mag > 0.01 {
@@ -144,8 +169,16 @@ pub fn force_directed_layout_with_fixed(
                     d
                 };
                 node.position += clamped;
+                let applied = clamped.length();
+                applied_max = applied_max.max(applied);
+                applied_total += applied;
             }
         }
+        metrics.iterations.push(LayoutIterationMetrics {
+            iteration,
+            max_displacement: applied_max,
+            mean_displacement: applied_total / movable_count.max(1) as f32,
+        });
 
         temperature *= COOLING;
     }
@@ -162,6 +195,7 @@ pub fn force_directed_layout_with_fixed(
         nodes.iter().all(|node| node.position.is_finite()),
         "force-directed layout produced a non-finite position"
     );
+    metrics
 }
 
 #[cfg(test)]
@@ -219,6 +253,30 @@ mod tests {
         assert!(
             ab_dist < IDEAL_LENGTH * 2.5,
             "connected nodes should be within ~2.5× ideal length, got {ab_dist}"
+        );
+    }
+
+    #[test]
+    fn layout_reports_finite_displacement_for_each_iteration() {
+        let mut nodes = vec![make_node("A"), make_node("B"), make_node("C")];
+        let edges = vec![EdgeView {
+            source_idx: 0,
+            target_idx: 1,
+            edge_type: "knows".to_string(),
+            weight: 1.0,
+        }];
+
+        let metrics = force_directed_layout(&mut nodes, &edges);
+
+        assert_eq!(metrics.iterations.len(), ITERATIONS);
+        assert!(metrics.iterations.iter().all(|sample| {
+            sample.max_displacement.is_finite()
+                && sample.mean_displacement.is_finite()
+                && sample.mean_displacement <= sample.max_displacement
+        }));
+        assert!(
+            metrics.iterations.last().unwrap().max_displacement
+                < metrics.iterations.first().unwrap().max_displacement
         );
     }
 }
