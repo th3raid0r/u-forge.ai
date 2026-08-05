@@ -72,10 +72,10 @@ Lemonade runtime redesign or the Zed workspace refactor.
 
 ## Search outcome contract
 
-- [ ] **AC-16 — Structured stage outcomes.** Record an outcome for FTS,
+- [x] **AC-16 — Structured stage outcomes.** Record an outcome for FTS,
   standard semantic, HQ semantic, and reranking: applied, intentionally
   skipped, unavailable, or failed with a safe diagnostic.
-- [ ] **AC-17 — Runtime failure propagation.** Refactor hybrid search so embed,
+- [x] **AC-17 — Runtime failure propagation.** Refactor hybrid search so embed,
   ANN, and rerank failures contribute outcomes while successful fallback
   results are retained.
 - [ ] **AC-18 — UI presentation.** Preserve the structured response through
