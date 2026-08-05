@@ -37,7 +37,10 @@ cargo build
 cargo run -p u-forge-ui-gpui
 ```
 
-The app opens with a sample dataset based on Isaac Asimov's **Foundation** universe so you can explore the interface right away.
+The app opens with an empty local database. Import one or more schemas through
+**File → Import Schema…**, then import matching JSONL data through
+**File → Import Data…**. The sample Foundation data under `defaults/` is
+available for an explicit import; startup never modifies the graph implicitly.
 
 ### Enabling AI features (optional)
 
@@ -73,17 +76,12 @@ u-forge.ai will detect the server automatically on startup. Semantic search and 
 
 ---
 
-## Roadmap
-
-1. **Polish the Alpha** — UI refinement, better onboarding, error handling.
-2. **AI agents** — Let AI assistants query and modify your knowledge graph autonomously via a sandboxed scripting environment.
-3. **Agentic workflows** — Higher-level automation: "fill in the history of this faction", "suggest connections between these characters".
-
----
-
 ## For Developers
 
 Technical details — crate layout, SQLite schema, inference pipeline, embedding architecture, design decisions — live in [ARCHITECTURE.md](ARCHITECTURE.md).
+Current implementation briefs and their status live in
+[the active plan ledger](.plans/README.md); archived phase plans are historical
+audit material.
 
 ```bash
 # Run the test suite (no server required)
