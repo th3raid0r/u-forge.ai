@@ -1,5 +1,7 @@
 //! Reopenable Lemonade provisioning dialog.
 
+use std::collections::BTreeMap;
+
 use gpui::{
     Context, EventEmitter, MouseButton, MouseDownEvent, Render, Window, deferred, div, prelude::*,
     px, rgb, rgba,
@@ -29,6 +31,13 @@ pub(crate) struct SetupDownloadRequested {
     pub(crate) confirmed_external: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SetupBackendInstallRequested {
+    pub(crate) recipe: String,
+    pub(crate) backend: String,
+    pub(crate) confirmed_external: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SetupDownloadOperation {
     Control(DownloadAction),
@@ -37,6 +46,94 @@ pub(crate) enum SetupDownloadOperation {
 
 pub(crate) struct SetupRefreshRequested;
 pub(crate) struct SetupClosed;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupPage {
+    Backends,
+    Configuration,
+}
+
+#[derive(Debug, Clone)]
+struct BackendRow {
+    recipe: String,
+    backend: String,
+    state: String,
+    message: String,
+    action: String,
+    version: Option<String>,
+    devices: Vec<String>,
+}
+
+impl BackendRow {
+    fn can_install(&self) -> bool {
+        matches!(self.state.as_str(), "installable" | "update_required")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackendGroup {
+    recipe: String,
+    rows: Vec<BackendRow>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BackendTagTone {
+    Success,
+    Info,
+    Warning,
+    Neutral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendCapability {
+    Chat,
+    Embeddings,
+    Reranking,
+    SpeechToText,
+    TextToSpeech,
+    ImageGeneration,
+    MusicGeneration,
+    SoundEffects,
+    Routing,
+    ThreeDGeneration,
+    ConcurrentServing,
+}
+
+impl BackendCapability {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Embeddings => "Embeddings",
+            Self::Reranking => "Reranking",
+            Self::SpeechToText => "Speech to text",
+            Self::TextToSpeech => "Text to speech",
+            Self::ImageGeneration => "Image generation",
+            Self::MusicGeneration => "Music generation",
+            Self::SoundEffects => "Sound effects",
+            Self::Routing => "Routing / classification",
+            Self::ThreeDGeneration => "3D generation",
+            Self::ConcurrentServing => "Multi-session throughput",
+        }
+    }
+
+    fn is_currently_relevant(self) -> bool {
+        matches!(self, Self::Chat | Self::Embeddings | Self::Reranking)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackendTag {
+    label: String,
+    tone: BackendTagTone,
+}
+
+#[derive(Debug, Clone)]
+struct ComponentRow {
+    label: String,
+    state: SetupComponentState,
+    status: String,
+    backend_ready: bool,
+}
 
 #[derive(Debug, Clone)]
 struct ChatChoice {
@@ -61,7 +158,10 @@ struct DownloadJob {
 pub(crate) struct SetupPanel {
     ownership: LemonadeOwnership,
     catalog: LemonadeServerCatalog,
-    component_rows: Vec<(String, SetupComponentState)>,
+    page: SetupPage,
+    backend_rows: Vec<BackendRow>,
+    show_all_backends: bool,
+    component_rows: Vec<ComponentRow>,
     chat_models: Vec<ChatChoice>,
     selected_chat: usize,
     high_quality_embedding: bool,
@@ -75,6 +175,7 @@ pub(crate) struct SetupPanel {
 }
 
 impl EventEmitter<SetupRequested> for SetupPanel {}
+impl EventEmitter<SetupBackendInstallRequested> for SetupPanel {}
 impl EventEmitter<SetupDownloadRequested> for SetupPanel {}
 impl EventEmitter<SetupRefreshRequested> for SetupPanel {}
 impl EventEmitter<SetupClosed> for SetupPanel {}
@@ -106,6 +207,9 @@ impl SetupPanel {
         Self {
             ownership,
             catalog: catalog.clone(),
+            page: SetupPage::Backends,
+            backend_rows: backend_rows(catalog),
+            show_all_backends: false,
             component_rows,
             chat_models,
             selected_chat,
@@ -114,7 +218,8 @@ impl SetupPanel {
             preferred_device,
             reasoning_control,
             downloads: Vec::new(),
-            status: "Review the selected components, then save and provision.".to_string(),
+            status: "Install the backends you want Lemonade to use, then continue to model configuration."
+                .to_string(),
             busy: false,
             external_confirmation_armed: false,
         }
@@ -125,12 +230,17 @@ impl SetupPanel {
             && self
                 .component_rows
                 .iter()
-                .all(|(_, state)| *state == SetupComponentState::Ready)
+                .all(|row| row.state == SetupComponentState::Ready && row.backend_ready)
             && self.chat_models[self.selected_chat].downloaded
+            && recipe_has_installed_backend(
+                &self.catalog,
+                &self.chat_models[self.selected_chat].recipe,
+            )
     }
 
     pub(crate) fn refresh_catalog(&mut self, catalog: &LemonadeServerCatalog) {
         self.catalog = catalog.clone();
+        self.backend_rows = backend_rows(catalog);
         let selected = self
             .chat_models
             .get(self.selected_chat)
@@ -225,6 +335,27 @@ impl SetupPanel {
         });
     }
 
+    fn request_backend_install(&mut self, row: BackendRow, cx: &mut Context<Self>) {
+        if self.busy || !row.can_install() {
+            return;
+        }
+        if self.ownership == LemonadeOwnership::External && !self.external_confirmation_armed {
+            self.external_confirmation_armed = true;
+            self.status = format!(
+                "Installing {}:{} changes an external Lemonade server. Click Install again to confirm.",
+                row.recipe, row.backend
+            );
+            cx.notify();
+            return;
+        }
+        cx.emit(SetupBackendInstallRequested {
+            recipe: row.recipe,
+            backend: row.backend,
+            confirmed_external: self.ownership == LemonadeOwnership::Embedded
+                || self.external_confirmation_armed,
+        });
+    }
+
     fn request_download_operation(
         &mut self,
         job_id: String,
@@ -250,11 +381,202 @@ impl SetupPanel {
     }
 }
 
+fn backend_rows(catalog: &LemonadeServerCatalog) -> Vec<BackendRow> {
+    let mut rows: Vec<_> = catalog
+        .backends
+        .iter()
+        .filter(|backend| backend.state != "unsupported")
+        .map(|backend| BackendRow {
+            recipe: backend.recipe.clone(),
+            backend: backend.backend.clone(),
+            state: backend.state.clone(),
+            message: backend.message.clone(),
+            action: backend.action.clone(),
+            version: backend.version.clone(),
+            devices: backend.devices.clone(),
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        left.recipe
+            .cmp(&right.recipe)
+            .then_with(|| left.backend.cmp(&right.backend))
+    });
+    rows
+}
+
+fn backend_groups(rows: &[BackendRow], show_all: bool) -> Vec<BackendGroup> {
+    let mut by_recipe = BTreeMap::<String, Vec<BackendRow>>::new();
+    for row in rows.iter().filter(|row| {
+        show_all
+            || recipe_capabilities(&row.recipe)
+                .iter()
+                .any(|capability| capability.is_currently_relevant())
+    }) {
+        by_recipe
+            .entry(row.recipe.clone())
+            .or_default()
+            .push(row.clone());
+    }
+    let mut groups: Vec<_> = by_recipe
+        .into_iter()
+        .map(|(recipe, rows)| BackendGroup { recipe, rows })
+        .collect();
+    groups.sort_by_key(|group| match group.recipe.as_str() {
+        "llamacpp" => 0,
+        "flm" => 1,
+        "vllm" => 2,
+        "whispercpp" | "moonshine" => 3,
+        "kokoro" | "openmoss" => 4,
+        "acestep" | "ace-step" | "ace_step" => 5,
+        "thinksound" => 6,
+        "sd-cpp" => 7,
+        "trellis" => 8,
+        "onnxruntime" => 9,
+        _ => 10,
+    });
+    groups
+}
+
+fn recipe_capabilities(recipe: &str) -> &'static [BackendCapability] {
+    match recipe {
+        "llamacpp" => &[
+            BackendCapability::Chat,
+            BackendCapability::Embeddings,
+            BackendCapability::Reranking,
+        ],
+        "flm" => &[
+            BackendCapability::Chat,
+            BackendCapability::Embeddings,
+            BackendCapability::SpeechToText,
+        ],
+        "vllm" => &[
+            BackendCapability::Chat,
+            BackendCapability::ConcurrentServing,
+        ],
+        "whispercpp" | "moonshine" => &[BackendCapability::SpeechToText],
+        "kokoro" | "openmoss" => &[BackendCapability::TextToSpeech],
+        "sd-cpp" => &[BackendCapability::ImageGeneration],
+        "acestep" | "ace-step" | "ace_step" => &[BackendCapability::MusicGeneration],
+        "thinksound" => &[BackendCapability::SoundEffects],
+        "onnxruntime" => &[BackendCapability::Routing],
+        "trellis" => &[BackendCapability::ThreeDGeneration],
+        _ => &[],
+    }
+}
+
+fn recipe_display_name(recipe: &str) -> String {
+    match recipe {
+        "llamacpp" => "llama.cpp".to_string(),
+        "flm" => "FLM".to_string(),
+        "vllm" => "vLLM".to_string(),
+        "whispercpp" => "Whisper.cpp".to_string(),
+        "moonshine" => "Moonshine".to_string(),
+        "kokoro" => "Kokoro".to_string(),
+        "openmoss" => "OpenMOSS".to_string(),
+        "sd-cpp" => "Stable Diffusion.cpp".to_string(),
+        "acestep" | "ace-step" | "ace_step" => "ACE-Step".to_string(),
+        "thinksound" => "ThinkSound".to_string(),
+        "onnxruntime" => "ONNX Runtime".to_string(),
+        "trellis" => "TRELLIS".to_string(),
+        recipe => recipe.to_string(),
+    }
+}
+
+fn recipe_description(recipe: &str) -> &'static str {
+    match recipe {
+        "llamacpp" => "Runs GGUF chat, embedding, and reranking models on CPU or GPU hardware.",
+        "flm" => "Runs optimized language, embedding, and audio models on AMD NPUs.",
+        "vllm" => "Runs chat models with high throughput for multiple concurrent sessions.",
+        "whispercpp" => "Runs Whisper speech recognition models on CPU or GPU hardware.",
+        "moonshine" => "Runs Moonshine as an alternative local speech-to-text engine.",
+        "kokoro" => "Runs local Kokoro text-to-speech models.",
+        "openmoss" => "Runs OpenMOSS as an alternative local text-to-speech engine.",
+        "sd-cpp" => "Runs local image-generation models through Stable Diffusion.cpp.",
+        "acestep" | "ace-step" | "ace_step" => "Generates music locally with ACE-Step.",
+        "thinksound" => "Generates sound effects and other non-speech audio.",
+        "onnxruntime" => {
+            "Runs routing and classification models; this is not currently used by u-forge."
+        }
+        "trellis" => "Generates 3D models from prompts or reference images.",
+        _ => "A model runtime reported by Lemonade Server.",
+    }
+}
+
+fn friendly_device(device: &str) -> String {
+    match device {
+        "amd_igpu" => "AMD iGPU".to_string(),
+        "amd_dgpu" => "AMD GPU".to_string(),
+        "amd_npu" => "AMD NPU".to_string(),
+        "nvidia_gpu" => "NVIDIA GPU".to_string(),
+        "apple_gpu" => "Apple GPU".to_string(),
+        "cpu" => "CPU".to_string(),
+        device => device.replace('_', " "),
+    }
+}
+
+fn backend_display_name(backend: &str) -> String {
+    match backend {
+        "rocm" => "ROCm".to_string(),
+        "vulkan" => "Vulkan".to_string(),
+        "cuda" => "CUDA".to_string(),
+        "metal" => "Metal".to_string(),
+        "npu" => "NPU".to_string(),
+        "cpu" => "CPU".to_string(),
+        backend => backend.to_string(),
+    }
+}
+
+fn backend_tags(backend: &BackendRow) -> Vec<BackendTag> {
+    let mut tags = vec![BackendTag {
+        label: match backend.state.as_str() {
+            "installed" => "Installed".to_string(),
+            "installable" => "Available".to_string(),
+            "update_required" => "Update required".to_string(),
+            "" => "State unavailable".to_string(),
+            state => state.replace('_', " "),
+        },
+        tone: match backend.state.as_str() {
+            "installed" => BackendTagTone::Success,
+            "update_required" => BackendTagTone::Warning,
+            "installable" => BackendTagTone::Info,
+            _ => BackendTagTone::Neutral,
+        },
+    }];
+    tags.push(BackendTag {
+        label: match backend.backend.as_str() {
+            "rocm" => "AMD GPU optimized".to_string(),
+            "vulkan" => "Portable GPU".to_string(),
+            "cuda" => "NVIDIA GPU optimized".to_string(),
+            "metal" => "Apple GPU optimized".to_string(),
+            "npu" => "Low-power accelerator".to_string(),
+            "cpu" => "Universal CPU fallback".to_string(),
+            backend => backend.to_uppercase(),
+        },
+        tone: BackendTagTone::Neutral,
+    });
+    for device in &backend.devices {
+        let label = friendly_device(device);
+        if !tags.iter().any(|tag| tag.label == label) {
+            tags.push(BackendTag {
+                label,
+                tone: BackendTagTone::Neutral,
+            });
+        }
+    }
+    if let Some(version) = &backend.version {
+        tags.push(BackendTag {
+            label: version.clone(),
+            tone: BackendTagTone::Neutral,
+        });
+    }
+    tags
+}
+
 fn component_rows(
     catalog: &LemonadeServerCatalog,
     include_hq: bool,
     include_npu: bool,
-) -> Vec<(String, SetupComponentState)> {
+) -> Vec<ComponentRow> {
     initial_setup_components()
         .into_iter()
         .filter(|component| {
@@ -265,12 +587,56 @@ fn component_rows(
                     && include_npu)
         })
         .map(|component| {
-            (
-                format!("{:?}: {}", component.role, component.model_id),
-                component_state(catalog, &component),
-            )
+            let state = component_state(catalog, &component);
+            let recipe = component.recipe.or_else(|| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| component.matches_model_id(&model.id))
+                    .map(|model| model.recipe.as_str())
+            });
+            let backend_ready = recipe.is_none_or(|recipe| {
+                recipe.is_empty() || recipe_has_installed_backend(catalog, recipe)
+            });
+            let status = if !backend_ready {
+                recipe
+                    .map(|recipe| backend_requirement_text(catalog, recipe))
+                    .unwrap_or_else(|| state_text(&state))
+            } else {
+                state_text(&state)
+            };
+            ComponentRow {
+                label: format!("{:?}: {}", component.role, component.model_id),
+                state,
+                status,
+                backend_ready,
+            }
         })
         .collect()
+}
+
+fn recipe_has_installed_backend(catalog: &LemonadeServerCatalog, recipe: &str) -> bool {
+    catalog
+        .backends
+        .iter()
+        .any(|backend| backend.recipe == recipe && backend.state == "installed")
+}
+
+fn backend_requirement_text(catalog: &LemonadeServerCatalog, recipe: &str) -> String {
+    if catalog.backends.iter().any(|backend| {
+        backend.recipe == recipe
+            && matches!(backend.state.as_str(), "installable" | "update_required")
+    }) {
+        format!("{recipe} backend install required")
+    } else if catalog
+        .backends
+        .iter()
+        .any(|backend| backend.recipe == recipe)
+    {
+        format!("{recipe} backend unavailable")
+    } else {
+        format!("{recipe} backend not reported")
+    }
 }
 
 fn parse_download_jobs(value: &serde_json::Value) -> Vec<DownloadJob> {
@@ -330,7 +696,7 @@ fn parse_download_jobs(value: &serde_json::Value) -> Vec<DownloadJob> {
 fn state_text(state: &SetupComponentState) -> String {
     match state {
         SetupComponentState::Ready => "ready".to_string(),
-        SetupComponentState::Missing => "registration required".to_string(),
+        SetupComponentState::Missing => "model registration required".to_string(),
         SetupComponentState::NeedsDownload => "download required".to_string(),
         SetupComponentState::Conflict(message) => format!("blocked: {message}"),
     }
@@ -348,8 +714,8 @@ fn device_text(device: &ChatDevice) -> &'static str {
 impl Render for SetupPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut components = div().flex().flex_col().gap(px(3.0));
-        for (index, (name, state)) in self.component_rows.iter().enumerate() {
-            let ready = *state == SetupComponentState::Ready;
+        for (index, row) in self.component_rows.iter().enumerate() {
+            let ready = row.state == SetupComponentState::Ready && row.backend_ready;
             components = components.child(
                 div()
                     .id(format!("setup-component-{index}"))
@@ -362,8 +728,153 @@ impl Render for SetupPanel {
                     } else {
                         rgba(0xf9e2afff)
                     })
-                    .child(name.clone())
-                    .child(state_text(state)),
+                    .child(row.label.clone())
+                    .child(row.status.clone()),
+            );
+        }
+
+        let visible_backend_groups = backend_groups(&self.backend_rows, self.show_all_backends);
+        let has_visible_backends = !visible_backend_groups.is_empty();
+        let mut backends = div().flex().flex_col().gap(px(16.0));
+        for (group_index, group) in visible_backend_groups.into_iter().enumerate() {
+            let recipe = group.recipe;
+            let mut capability_tags = div().flex().flex_row().flex_wrap().gap(px(4.0));
+            for capability in recipe_capabilities(&recipe) {
+                capability_tags = capability_tags.child(
+                    div()
+                        .h(px(20.0))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded(px(10.0))
+                        .bg(rgba(0x89b4fa20))
+                        .text_xs()
+                        .text_color(rgba(0x89b4faff))
+                        .child(capability.label()),
+                );
+            }
+            let mut group_rows = div().flex().flex_col().gap(px(6.0));
+            for (row_index, row) in group.rows.into_iter().enumerate() {
+                let can_install = row.can_install();
+                let action = if row.action.is_empty() {
+                    if row.state == "update_required" {
+                        "Update".to_string()
+                    } else {
+                        "Install".to_string()
+                    }
+                } else {
+                    row.action.clone()
+                };
+                let control_label = if can_install {
+                    action
+                } else if row.state == "installed" {
+                    "Installed".to_string()
+                } else {
+                    "Unavailable".to_string()
+                };
+                let mut tags = div().flex().flex_row().flex_wrap().gap(px(4.0));
+                for tag in backend_tags(&row) {
+                    let (background, foreground) = match tag.tone {
+                        BackendTagTone::Success => (rgba(0xa6e3a126), rgba(0xa6e3a1ff)),
+                        BackendTagTone::Info => (rgba(0x89b4fa26), rgba(0x89b4faff)),
+                        BackendTagTone::Warning => (rgba(0xf9e2af26), rgba(0xf9e2afff)),
+                        BackendTagTone::Neutral => (rgba(0x45475a80), rgba(0xbac2deff)),
+                    };
+                    tags = tags.child(
+                        div()
+                            .h(px(20.0))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(10.0))
+                            .bg(background)
+                            .text_xs()
+                            .text_color(foreground)
+                            .child(tag.label),
+                    );
+                }
+                let install_row = row.clone();
+                group_rows = group_rows.child(
+                    div()
+                        .id(format!("setup-backend-{group_index}-{row_index}"))
+                        .p_3()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0x1e1e2e80))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(5.0))
+                                .child(backend_display_name(&row.backend))
+                                .child(tags)
+                                .when(!row.message.is_empty(), |details| {
+                                    details.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgba(0xa6adc8ff))
+                                            .child(row.message.clone()),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id(format!("setup-backend-install-{group_index}-{row_index}"))
+                                .h(px(26.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .bg(if can_install {
+                                    rgb(0x89b4fa)
+                                } else {
+                                    rgb(0x45475a)
+                                })
+                                .text_color(if can_install {
+                                    rgba(0x1e1e2eff)
+                                } else {
+                                    rgba(0xa6adc8ff)
+                                })
+                                .when(can_install, |button| {
+                                    button.cursor_pointer().on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.request_backend_install(install_row.clone(), cx)
+                                        }),
+                                    )
+                                })
+                                .child(control_label),
+                        ),
+                );
+            }
+            backends = backends.child(
+                div()
+                    .id(format!("setup-backend-group-{group_index}"))
+                    .flex()
+                    .flex_col()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(recipe_display_name(&recipe))
+                            .when(!recipe_capabilities(&recipe).is_empty(), |header| {
+                                header.child(capability_tags)
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgba(0xa6adc8ff))
+                                    .child(recipe_description(&recipe)),
+                            ),
+                    )
+                    .child(group_rows),
             );
         }
 
@@ -490,12 +1001,235 @@ impl Render for SetupPanel {
 
         let provision_label = if self.busy {
             "Working…"
+        } else if self.page == SetupPage::Backends {
+            "Continue to configuration"
         } else if self.ownership == LemonadeOwnership::External && self.external_confirmation_armed
         {
             "Confirm external provisioning"
         } else {
             "Save and provision"
         };
+
+        let backend_content = div()
+            .id("setup-backend-page")
+            .p_4()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .min_h_0()
+            .gap(px(12.0))
+            .child("1 of 2 · Lemonade backends")
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgba(0xa6adc8ff))
+                    .child(
+                        "Backends are Lemonade's hardware runtimes. Install the ones you want before downloading or registering models.",
+                    ),
+            )
+            .child(
+                div()
+                    .id("setup-show-all-backends")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.show_all_backends = !this.show_all_backends;
+                            this.external_confirmation_armed = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .border_1()
+                            .border_color(rgb(0x89b4fa))
+                            .bg(if self.show_all_backends {
+                                rgb(0x89b4fa)
+                            } else {
+                                rgb(0x313244)
+                            })
+                            .text_color(rgba(0x1e1e2eff))
+                            .child(if self.show_all_backends { "✓" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child("Show all backends")
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgba(0xa6adc8ff))
+                                    .child(
+                                        "Includes speech, music, image, sound-effect, routing, and 3D runtimes.",
+                                    ),
+                            ),
+                    ),
+            )
+            .child(if !has_visible_backends {
+                div()
+                    .text_color(rgba(0xf9e2afff))
+                    .child(if self.backend_rows.is_empty() {
+                        "No backend information was reported by Lemonade."
+                    } else {
+                        "No chat, embedding, or reranking backends were reported. Enable Show all backends to inspect the remaining runtimes."
+                    })
+            } else {
+                backends
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgba(0xf9e2afff))
+                    .child(self.status.clone()),
+            );
+
+        let configuration_content = div()
+            .id("setup-configuration-page")
+            .p_4()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .min_h_0()
+            .gap(px(12.0))
+            .child("2 of 2 · Models and configuration")
+            .child(components)
+            .child(div().h(px(1.0)).bg(rgb(0x45475a)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child("Chat model")
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id("setup-chat-prev")
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.cycle_chat(-1, cx)),
+                                    )
+                                    .child("‹"),
+                            )
+                            .child(chat_label)
+                            .child(
+                                div()
+                                    .id("setup-chat-next")
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.cycle_chat(1, cx)),
+                                    )
+                                    .child("›"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child("High-quality embedding (optional)")
+                    .child(
+                        div()
+                            .id("setup-hq-toggle")
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.high_quality_embedding = !this.high_quality_embedding;
+                                    this.component_rows = component_rows(
+                                        &this.catalog,
+                                        this.high_quality_embedding,
+                                        this.npu_embedding_enabled,
+                                    );
+                                    this.external_confirmation_armed = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(if self.high_quality_embedding {
+                                "Enabled"
+                            } else {
+                                "Disabled"
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child("Preferred device")
+                    .child(
+                        div()
+                            .id("setup-device-cycle")
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.cycle_device(cx)),
+                            )
+                            .child(device_text(&self.preferred_device)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child("Reasoning control")
+                    .child(
+                        div()
+                            .id("setup-reasoning-toggle")
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.reasoning_control = match this.reasoning_control {
+                                        ReasoningControl::Request => ReasoningControl::Reload,
+                                        ReasoningControl::Reload => ReasoningControl::Request,
+                                    };
+                                    this.external_confirmation_armed = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(match self.reasoning_control {
+                                ReasoningControl::Request => "Request",
+                                ReasoningControl::Reload => "Reload fallback",
+                            }),
+                    ),
+            )
+            .child(div().h(px(1.0)).bg(rgb(0x45475a)))
+            .child("Server-owned downloads")
+            .child(if self.downloads.is_empty() {
+                div().text_color(rgba(0x6c7086ff)).child("No active jobs")
+            } else {
+                downloads
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgba(0xf9e2afff))
+                    .child(self.status.clone()),
+            );
 
         deferred(
             div()
@@ -504,6 +1238,7 @@ impl Render for SetupPanel {
                 .top_0()
                 .left_0()
                 .size_full()
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -545,152 +1280,11 @@ impl Render for SetupPanel {
                                         .child("Close"),
                                 ),
                         )
-                        .child(
-                            div()
-                                .p_4()
-                                .flex()
-                                .flex_col()
-                                .gap(px(12.0))
-                                .child("Required and optional components")
-                                .child(components)
-                                .child(div().h(px(1.0)).bg(rgb(0x45475a)))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .child("Chat model")
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .gap(px(6.0))
-                                                .child(
-                                                    div()
-                                                        .id("setup-chat-prev")
-                                                        .px_2()
-                                                        .cursor_pointer()
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _, _, cx| {
-                                                                this.cycle_chat(-1, cx)
-                                                            }),
-                                                        )
-                                                        .child("‹"),
-                                                )
-                                                .child(chat_label)
-                                                .child(
-                                                    div()
-                                                        .id("setup-chat-next")
-                                                        .px_2()
-                                                        .cursor_pointer()
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _, _, cx| {
-                                                                this.cycle_chat(1, cx)
-                                                            }),
-                                                        )
-                                                        .child("›"),
-                                                ),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .justify_between()
-                                        .child("High-quality embedding (optional)")
-                                        .child(
-                                            div()
-                                                .id("setup-hq-toggle")
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.high_quality_embedding =
-                                                            !this.high_quality_embedding;
-                                                        this.component_rows = component_rows(
-                                                            &this.catalog,
-                                                            this.high_quality_embedding,
-                                                            this.npu_embedding_enabled,
-                                                        );
-                                                        this.external_confirmation_armed = false;
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                                .child(if self.high_quality_embedding {
-                                                    "Enabled"
-                                                } else {
-                                                    "Disabled"
-                                                }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .justify_between()
-                                        .child("Preferred device")
-                                        .child(
-                                            div()
-                                                .id("setup-device-cycle")
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.cycle_device(cx)
-                                                    }),
-                                                )
-                                                .child(device_text(&self.preferred_device)),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .justify_between()
-                                        .child("Reasoning control")
-                                        .child(
-                                            div()
-                                                .id("setup-reasoning-toggle")
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.reasoning_control =
-                                                            match this.reasoning_control {
-                                                                ReasoningControl::Request => {
-                                                                    ReasoningControl::Reload
-                                                                }
-                                                                ReasoningControl::Reload => {
-                                                                    ReasoningControl::Request
-                                                                }
-                                                            };
-                                                        this.external_confirmation_armed = false;
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                                .child(match self.reasoning_control {
-                                                    ReasoningControl::Request => "Request",
-                                                    ReasoningControl::Reload => "Reload fallback",
-                                                }),
-                                        ),
-                                )
-                                .child(div().h(px(1.0)).bg(rgb(0x45475a)))
-                                .child("Server-owned downloads")
-                                .child(if self.downloads.is_empty() {
-                                    div().text_color(rgba(0x6c7086ff)).child("No active jobs")
-                                } else {
-                                    downloads
-                                })
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgba(0xf9e2afff))
-                                        .child(self.status.clone()),
-                                ),
-                        )
+                        .child(if self.page == SetupPage::Backends {
+                            backend_content
+                        } else {
+                            configuration_content
+                        })
                         .child(
                             div()
                                 .h(px(48.0))
@@ -701,6 +1295,29 @@ impl Render for SetupPanel {
                                 .gap(px(8.0))
                                 .border_t_1()
                                 .border_color(rgb(0x45475a))
+                                .when(self.page == SetupPage::Configuration, |footer| {
+                                    footer.child(
+                                        div()
+                                            .id("setup-back")
+                                            .h(px(28.0))
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .bg(rgb(0x45475a))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.page = SetupPage::Backends;
+                                                    this.external_confirmation_armed = false;
+                                                    this.status = "Review or install Lemonade backends."
+                                                        .to_string();
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child("Back"),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .id("setup-refresh")
@@ -730,7 +1347,20 @@ impl Render for SetupPanel {
                                         .text_color(rgba(0x1e1e2eff))
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| this.request_setup(cx)),
+                                            cx.listener(|this, _, _, cx| {
+                                                if this.busy {
+                                                    return;
+                                                }
+                                                if this.page == SetupPage::Backends {
+                                                    this.page = SetupPage::Configuration;
+                                                    this.external_confirmation_armed = false;
+                                                    this.status = "Choose models and runtime preferences, then save and provision."
+                                                        .to_string();
+                                                    cx.notify();
+                                                } else {
+                                                    this.request_setup(cx);
+                                                }
+                                            }),
                                         )
                                         .child(provision_label),
                                 ),
@@ -766,5 +1396,154 @@ mod tests {
         assert_eq!(component_rows(&catalog, true, false).len(), 3);
         assert_eq!(component_rows(&catalog, false, true).len(), 3);
         assert_eq!(component_rows(&catalog, false, false).len(), 2);
+    }
+
+    #[test]
+    fn missing_model_reports_backend_prerequisite_before_registration() {
+        let mut catalog = LemonadeServerCatalog {
+            backends: vec![u_forge_core::lemonade::InstalledBackend {
+                recipe: "flm".to_string(),
+                backend: "npu".to_string(),
+                state: "installable".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rows = component_rows(&catalog, false, true);
+        let flm = rows
+            .iter()
+            .find(|row| row.label.contains("embed-gemma-300m-FLM"))
+            .unwrap();
+        assert_eq!(flm.status, "flm backend install required");
+        assert!(!flm.backend_ready);
+
+        catalog.backends[0].state = "installed".to_string();
+        let rows = component_rows(&catalog, false, true);
+        let flm = rows
+            .iter()
+            .find(|row| row.label.contains("embed-gemma-300m-FLM"))
+            .unwrap();
+        assert_eq!(flm.status, "model registration required");
+        assert!(flm.backend_ready);
+    }
+
+    #[test]
+    fn backend_page_excludes_unsupported_options() {
+        let catalog = LemonadeServerCatalog {
+            backends: vec![
+                u_forge_core::lemonade::InstalledBackend {
+                    recipe: "llamacpp".to_string(),
+                    backend: "rocm".to_string(),
+                    state: "unsupported".to_string(),
+                    ..Default::default()
+                },
+                u_forge_core::lemonade::InstalledBackend {
+                    recipe: "flm".to_string(),
+                    backend: "npu".to_string(),
+                    state: "installable".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let rows = backend_rows(&catalog);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows.iter()
+                .any(|row| row.recipe == "flm" && row.can_install())
+        );
+        assert!(!rows.iter().any(|row| row.backend == "rocm"));
+    }
+
+    #[test]
+    fn backend_groups_keep_recipe_variants_together_and_describe_targets() {
+        let rows = vec![
+            BackendRow {
+                recipe: "flm".to_string(),
+                backend: "npu".to_string(),
+                state: "installed".to_string(),
+                message: String::new(),
+                action: String::new(),
+                version: Some("v1".to_string()),
+                devices: vec!["amd_npu".to_string()],
+            },
+            BackendRow {
+                recipe: "llamacpp".to_string(),
+                backend: "vulkan".to_string(),
+                state: "installable".to_string(),
+                message: String::new(),
+                action: String::new(),
+                version: None,
+                devices: vec!["amd_igpu".to_string()],
+            },
+            BackendRow {
+                recipe: "llamacpp".to_string(),
+                backend: "cpu".to_string(),
+                state: "installed".to_string(),
+                message: String::new(),
+                action: String::new(),
+                version: None,
+                devices: vec!["cpu".to_string()],
+            },
+        ];
+        let groups = backend_groups(&rows, false);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].recipe, "llamacpp");
+        assert_eq!(groups[0].rows.len(), 2);
+        assert_eq!(recipe_display_name(&groups[0].recipe), "llama.cpp");
+
+        let vulkan = groups[0]
+            .rows
+            .iter()
+            .find(|row| row.backend == "vulkan")
+            .unwrap();
+        let labels: Vec<_> = backend_tags(vulkan)
+            .into_iter()
+            .map(|tag| tag.label)
+            .collect();
+        assert!(labels.contains(&"Available".to_string()));
+        assert!(labels.contains(&"Portable GPU".to_string()));
+        assert!(labels.contains(&"AMD iGPU".to_string()));
+    }
+
+    #[test]
+    fn backend_filter_defaults_to_current_features_and_show_all_exposes_future_engines() {
+        let row = |recipe: &str| BackendRow {
+            recipe: recipe.to_string(),
+            backend: "cpu".to_string(),
+            state: "installable".to_string(),
+            message: String::new(),
+            action: String::new(),
+            version: None,
+            devices: vec!["cpu".to_string()],
+        };
+        let rows = [
+            "llamacpp",
+            "flm",
+            "vllm",
+            "acestep",
+            "moonshine",
+            "onnxruntime",
+            "openmoss",
+            "thinksound",
+            "trellis",
+        ]
+        .into_iter()
+        .map(row)
+        .collect::<Vec<_>>();
+
+        let relevant = backend_groups(&rows, false);
+        assert_eq!(
+            relevant
+                .iter()
+                .map(|group| group.recipe.as_str())
+                .collect::<Vec<_>>(),
+            vec!["llamacpp", "flm", "vllm"]
+        );
+        assert_eq!(backend_groups(&rows, true).len(), rows.len());
+        assert_eq!(recipe_display_name("acestep"), "ACE-Step");
+        assert_eq!(recipe_display_name("onnxruntime"), "ONNX Runtime");
+        assert_eq!(recipe_display_name("trellis"), "TRELLIS");
+        assert!(recipe_description("thinksound").contains("sound effects"));
     }
 }

@@ -36,8 +36,8 @@ use crate::path_picker::{
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
 use crate::setup_panel::{
-    SetupClosed, SetupDownloadOperation, SetupDownloadRequested, SetupPanel, SetupRefreshRequested,
-    SetupRequested,
+    SetupBackendInstallRequested, SetupClosed, SetupDownloadOperation, SetupDownloadRequested,
+    SetupPanel, SetupRefreshRequested, SetupRequested,
 };
 
 // ── Root app view ─────────────────────────────────────────────────────────────
@@ -318,6 +318,12 @@ impl AppView {
                 this.do_refresh_lemonade_setup(cx);
             },
         );
+        let setup_backend_install = cx.subscribe(
+            &setup_panel,
+            |this: &mut Self, _panel, request: &SetupBackendInstallRequested, cx| {
+                this.do_install_lemonade_backend(request.clone(), cx);
+            },
+        );
         let setup_download = cx.subscribe(
             &setup_panel,
             |this: &mut Self, _panel, request: &SetupDownloadRequested, cx| {
@@ -370,6 +376,7 @@ impl AppView {
                 connect_sub,
                 setup_requested,
                 setup_refresh,
+                setup_backend_install,
                 setup_download,
                 setup_closed,
             ],
@@ -1199,6 +1206,78 @@ impl AppView {
         .detach();
     }
 
+    pub(crate) fn do_install_lemonade_backend(
+        &mut self,
+        request: SetupBackendInstallRequested,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = self.state.lemonade_connection.clone() else {
+            self.setup_panel.update(cx, |panel, cx| {
+                panel.set_busy(
+                    false,
+                    "Lemonade is not connected; retry the connection first.",
+                );
+                cx.notify();
+            });
+            return;
+        };
+        let tokio_rt = self.state.tokio_rt.clone();
+        let label = format!("{}:{}", request.recipe, request.backend);
+        self.setup_panel.update(cx, |panel, cx| {
+            panel.set_busy(true, format!("Installing backend {label}…"));
+            cx.notify();
+        });
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(async move {
+                        let manager = LemonadeManagement::new(connection.clone());
+                        manager
+                            .install_backend(
+                                &request.recipe,
+                                &request.backend,
+                                request.confirmed_external,
+                            )
+                            .await?;
+                        let catalog = LemonadeServerCatalog::discover_with_connection(
+                            connection.clone(),
+                        )
+                        .await?;
+                        let downloads = manager.downloads().await;
+                        Ok::<_, anyhow::Error>((catalog, downloads))
+                    })
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.setup_panel.update(cx, |panel, cx| {
+                    match result {
+                        Ok((catalog, downloads)) => {
+                            view.state.lemonade_catalog = Some(catalog.clone());
+                            panel.refresh_catalog(&catalog);
+                            if let Ok(downloads) = downloads {
+                                panel.set_downloads(&downloads);
+                            }
+                            panel.set_busy(
+                                false,
+                                format!(
+                                    "Backend {label} installation completed. Review its refreshed state below."
+                                ),
+                            );
+                        }
+                        Err(error) => panel.set_busy(
+                            false,
+                            format!("Backend {label} installation failed: {error}"),
+                        ),
+                    }
+                    cx.notify();
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(crate) fn do_control_lemonade_download(
         &mut self,
         request: SetupDownloadRequested,
@@ -1250,14 +1329,15 @@ impl AppView {
                                 let (model_name, checkpoint, recipe, embedding) = component
                                     .as_ref()
                                     .map(|component| {
+                                        let pull = component.pull_spec();
                                         (
-                                            component.model_id,
-                                            component.checkpoint,
-                                            component.recipe,
-                                            component.is_embedding(),
+                                            pull.model_name,
+                                            pull.checkpoint,
+                                            pull.recipe,
+                                            pull.embedding,
                                         )
                                     })
-                                    .unwrap_or((request.model_name.as_str(), None, None, false));
+                                    .unwrap_or((request.model_name.as_str(), None, None, None));
                                 manager
                                     .pull(
                                         model_name,
@@ -1998,24 +2078,31 @@ async fn provision_lemonade(
                 .find(|model| component.matches_model_id(&model.id))
                 .map(|model| model.recipe.as_str())
         });
-        if let Some(recipe) = recipe
-            && !recipe.is_empty()
-            && let Some(choice) =
+        if let Some(recipe) = recipe.filter(|recipe| !recipe.is_empty()) {
+            let choice =
                 select_setup_backend(&catalog, recipe, &config.models.llamacpp_backend_preference)
-            && choice.needs_install()
-            && installed.insert((choice.recipe.clone(), choice.backend.clone()))
-        {
-            manager
-                .install_backend(&choice.recipe, &choice.backend, request.confirmed_external)
-                .await?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no installed or installable {recipe} backend was reported for {}",
+                            component.model_id
+                        )
+                    })?;
+            if choice.needs_install()
+                && installed.insert((choice.recipe.clone(), choice.backend.clone()))
+            {
+                manager
+                    .install_backend(&choice.recipe, &choice.backend, request.confirmed_external)
+                    .await?;
+            }
         }
         if state.needs_pull() {
+            let pull = component.pull_spec();
             manager
                 .pull(
-                    component.model_id,
-                    component.checkpoint,
-                    component.recipe,
-                    component.is_embedding(),
+                    pull.model_name,
+                    pull.checkpoint,
+                    pull.recipe,
+                    pull.embedding,
                     request.confirmed_external,
                 )
                 .await?;
@@ -2032,13 +2119,19 @@ async fn provision_lemonade(
         .iter()
         .find(|model| model.id == request.chat_model)
         .ok_or_else(|| anyhow::anyhow!("selected chat model is no longer in the live catalog"))?;
-    if let Some(choice) = select_setup_backend(
+    let choice = select_setup_backend(
         &catalog,
         &chat_model.recipe,
         &config.models.llamacpp_backend_preference,
-    ) && choice.needs_install()
-        && installed.insert((choice.recipe.clone(), choice.backend.clone()))
-    {
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no installed or installable {} backend was reported for {}",
+            chat_model.recipe,
+            request.chat_model
+        )
+    })?;
+    if choice.needs_install() && installed.insert((choice.recipe.clone(), choice.backend.clone())) {
         manager
             .install_backend(&choice.recipe, &choice.backend, request.confirmed_external)
             .await?;
@@ -2049,7 +2142,7 @@ async fn provision_lemonade(
                 &request.chat_model,
                 None,
                 None,
-                false,
+                None,
                 request.confirmed_external,
             )
             .await?;
