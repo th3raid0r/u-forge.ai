@@ -39,7 +39,7 @@ pub use ai::embeddings::{
 pub use builder::ObjectBuilder;
 pub use config::{
     AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig,
-    ModelConfig, ModelLoadParams, StorageConfig, UiConfig,
+    ModelConfig, ModelLoadParams, ReasoningControl, StorageConfig, UiConfig,
 };
 pub use error::{EmbeddingDimensionMismatch, EmbeddingSpaceMismatch, UnidentifiedEmbeddingSpace};
 pub use graph::{
@@ -48,15 +48,16 @@ pub use graph::{
 };
 pub use ingest::{
     DataIngestion, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, EmbeddingResult,
-    EmbeddingTarget, IngestionStats, SetupResult, build_hq_embed_queue, embed_all_chunks,
-    import_schemas_and_data, rechunk_and_embed, setup_and_index,
+    EmbeddingTarget, IngestionStats, SetupResult, build_hq_embed_queue,
+    build_hq_embed_queue_with_connection, embed_all_chunks, import_schemas_and_data,
+    rechunk_and_embed, setup_and_index,
 };
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,
     GpuWorkload, KokoroVoice, LemonadeChatProvider, LemonadeHealth, LemonadeRuntime,
-    LemonadeRuntimeProfile, LemonadeSttProvider, LemonadeTtsProvider, LlmGuard, LoadedModelEntry,
-    ModelLoadOptions, RerankDocument, RerankProvider, StreamToken, SttGuard, TranscriptionResult,
-    load_model, reload_model,
+    LemonadeRuntimeLease, LemonadeRuntimeProfile, LemonadeSttProvider, LemonadeTtsProvider,
+    LlmGuard, LoadedModelEntry, ModelLoadOptions, ReasoningPolicy, RerankDocument, RerankProvider,
+    StreamToken, SttGuard, TranscriptionResult, load_model, reload_model,
 };
 pub use mutation::{GraphChange, GraphMutation};
 pub use rag::{RagContext, build_rag_messages, format_search_context};

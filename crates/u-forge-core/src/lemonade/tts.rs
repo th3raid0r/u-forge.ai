@@ -1,11 +1,15 @@
 //! Text-to-speech via kokoro-v1 running on CPU.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use async_openai::types::audio::{CreateSpeechRequestArgs, SpeechModel, Voice};
 use async_openai::{Client, config::OpenAIConfig};
 use serde::{Deserialize, Serialize};
 
-use super::client::make_lemonade_openai_client;
+use super::client::{
+    LemonadeConnection, make_lemonade_openai_client, make_lemonade_openai_client_for,
+};
 
 /// Built-in voices supported by kokoro-v1.
 ///
@@ -73,6 +77,14 @@ impl LemonadeTtsProvider {
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
             client: make_lemonade_openai_client(base_url),
+            model: model.to_string(),
+            default_voice: KokoroVoice::default(),
+        }
+    }
+
+    pub fn from_connection(connection: Arc<LemonadeConnection>, model: &str) -> Self {
+        Self {
+            client: make_lemonade_openai_client_for(&connection),
             model: model.to_string(),
             default_voice: KokoroVoice::default(),
         }

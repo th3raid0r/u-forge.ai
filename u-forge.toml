@@ -27,7 +27,7 @@ cpu_weight = 10
 
 [models.load_params]
 "embed-gemma-300m-FLM"              = { ctx_size = 2048 }
-"user.ggml-org/embeddinggemma-300M-GGUF" = { ctx_size = 2048, batch_size = 2048, ubatch_size = 2048 }
+"ggml-org/embeddinggemma-300M-GGUF" = { ctx_size = 2048, batch_size = 2048, ubatch_size = 2048 }
 "nomic-embed-text-v1-GGUF"          = { ctx_size = 2048, batch_size = 2048, ubatch_size = 2048 }
 "Qwen3-Embedding-8B-GGUF"           = { ctx_size = 32768, batch_size = 2048, ubatch_size = 2048 }
 "bge-reranker-v2-m3-GGUF"          = { ctx_size = 8192, batch_size = 2048, ubatch_size = 2048 }

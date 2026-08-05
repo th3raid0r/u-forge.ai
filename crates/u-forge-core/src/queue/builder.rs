@@ -12,10 +12,13 @@ use crate::config::AppConfig;
 use crate::lemonade::provider_factory::{BuiltProvider, Capability, ProviderSlot};
 
 use super::dispatch::InferenceQueue;
-use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
+use super::jobs::{
+    EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
+};
 use super::weighted::WeightedEmbedDispatcher;
 use super::workers::{
-    run_embed_worker, run_llm_worker, run_rerank_worker, run_transcribe_worker, run_tts_worker,
+    run_embed_worker, run_llm_stream_worker, run_llm_worker, run_rerank_worker,
+    run_transcribe_worker, run_tts_worker,
 };
 
 /// Collected information for a single embedding worker, deferred until the
@@ -115,10 +118,10 @@ impl InferenceQueueBuilder {
         let transcribe_queue = Arc::new(WorkQueue::<TranscribeJob>::new());
         let synthesize_queue = Arc::new(WorkQueue::<SynthesizeJob>::new());
         let generate_queue = Arc::new(WorkQueue::<GenerateJob>::new());
+        let generate_stream_queue = Arc::new(WorkQueue::<GenerateStreamJob>::new());
         let rerank_queue = Arc::new(WorkQueue::<RerankJob>::new());
 
         let mut embed_specs: Vec<EmbedWorkerSpec> = Vec::new();
-        let mut chat_providers_for_stream: Vec<crate::lemonade::LemonadeChatProvider> = Vec::new();
         let mut transcription_workers: usize = 0;
         let mut tts_workers: usize = 0;
         let mut llm_workers: usize = 0;
@@ -159,13 +162,20 @@ impl InferenceQueueBuilder {
                     });
                 }
                 (Capability::TextGeneration, ProviderSlot::Chat(chat)) => {
+                    let mut chat = *chat;
                     let q = Arc::clone(&generate_queue);
+                    let stream_q = Arc::clone(&generate_stream_queue);
                     let name = built.name;
+                    chat.profile.reasoning_control = self.config.chat.reasoning_control;
                     llm_workers += 1;
-                    chat_providers_for_stream.push(chat.clone());
-                    debug!(name = %name, model = %chat.model, "Spawning LLM worker");
+                    debug!(name = %name, model = %chat.provider.model, "Spawning LLM worker");
+                    let stream_chat = chat.clone();
+                    let stream_name = name.clone();
                     tokio::spawn(async move {
                         run_llm_worker(q, chat, name).await;
+                    });
+                    tokio::spawn(async move {
+                        run_llm_stream_worker(stream_q, stream_chat, stream_name).await;
                     });
                 }
                 (Capability::TextToSpeech, ProviderSlot::Tts(tts)) => {
@@ -241,8 +251,8 @@ impl InferenceQueueBuilder {
             transcribe_queue,
             synthesize_queue,
             generate_queue,
+            generate_stream_queue,
             rerank_queue,
-            chat_providers: Arc::new(chat_providers_for_stream),
             embedding_space_fingerprint,
             embedding_workers,
             transcription_workers,

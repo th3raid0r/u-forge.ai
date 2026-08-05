@@ -253,6 +253,17 @@ pub enum ChatDevice {
     Cpu,
 }
 
+/// How reasoning policy affects the loaded Lemonade model.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningControl {
+    /// Use Lemonade's request-scoped `enable_thinking` control.
+    #[default]
+    Request,
+    /// Reload reasoning-capable llama.cpp models with managed template kwargs.
+    Reload,
+}
+
 /// Per-device LLM model and generation overrides.
 ///
 /// Corresponds to `[chat.gpu]`, `[chat.npu]`, and `[chat.cpu]` in
@@ -314,6 +325,10 @@ pub struct ChatConfig {
     /// Preferred inference device (`auto` | `gpu` | `npu` | `cpu`).
     #[serde(default)]
     pub preferred_device: ChatDevice,
+
+    /// Whether reasoning is request-scoped or part of loaded-model identity.
+    #[serde(default)]
+    pub reasoning_control: ReasoningControl,
 
     /// GPU device overrides — model, token limit, temperature.
     #[serde(default)]
@@ -430,6 +445,7 @@ impl Default for ChatConfig {
     fn default() -> Self {
         Self {
             preferred_device: ChatDevice::Auto,
+            reasoning_control: ReasoningControl::Request,
             gpu: ChatDeviceConfig::default(),
             npu: ChatDeviceConfig::default(),
             cpu: ChatDeviceConfig::default(),
@@ -591,6 +607,10 @@ impl Default for UiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    /// File this configuration was loaded from, or the per-user path selected
+    /// for first persistence. Never serialized into TOML.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
     /// Embedding-specific device settings.
     #[serde(default)]
     pub embedding: EmbeddingDeviceConfig,
@@ -623,11 +643,15 @@ impl AppConfig {
     /// callers never need to treat a missing config file as an error.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self {
+                source_path: Some(path.to_path_buf()),
+                ..Self::default()
+            });
         }
 
         let text = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&text)?;
+        let mut config: Self = toml::from_str(&text)?;
+        config.source_path = Some(path.to_path_buf());
 
         info!(path = %path.display(), "AppConfig loaded");
 
@@ -647,7 +671,10 @@ impl AppConfig {
         }
 
         info!("AppConfig: no config file found — using defaults");
-        Self::default()
+        Self {
+            source_path: Self::per_user_config_path(),
+            ..Self::default()
+        }
     }
 
     /// Load the first existing, valid config in an ordered list of candidates.
@@ -691,6 +718,70 @@ impl AppConfig {
 
         paths
     }
+
+    fn per_user_config_path() -> Option<PathBuf> {
+        let xdg_base = std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .ok()
+            .or_else(|| dirs_or_home().map(|home| home.join(".config")))?;
+        Some(xdg_base.join("u-forge/config.toml"))
+    }
+
+    /// Persist setup choices while preserving comments and unknown keys.
+    pub fn persist_lemonade_setup(
+        &self,
+        high_quality_embedding: bool,
+        preferred_device: ChatDevice,
+        selected_chat_model: &str,
+        reasoning_control: ReasoningControl,
+    ) -> Result<PathBuf> {
+        use toml_edit::{DocumentMut, Item, Table, value};
+
+        let path = self
+            .source_path
+            .clone()
+            .or_else(Self::per_user_config_path)
+            .ok_or_else(|| anyhow::anyhow!("cannot determine a configuration path"))?;
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut document = if text.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            text.parse::<DocumentMut>()?
+        };
+        for section in ["embedding", "chat"] {
+            if document.get(section).is_none_or(|item| !item.is_table()) {
+                document[section] = Item::Table(Table::new());
+            }
+        }
+        document["embedding"]["high_quality_embedding"] = value(high_quality_embedding);
+        let device = match preferred_device {
+            ChatDevice::Auto => "auto",
+            ChatDevice::Gpu => "gpu",
+            ChatDevice::Npu => "npu",
+            ChatDevice::Cpu => "cpu",
+        };
+        document["chat"]["preferred_device"] = value(device);
+        document["chat"]["reasoning_control"] = value(match reasoning_control {
+            ReasoningControl::Request => "request",
+            ReasoningControl::Reload => "reload",
+        });
+        let device_section = if device == "auto" { "gpu" } else { device };
+        if document["chat"]
+            .get(device_section)
+            .is_none_or(|item| !item.is_table())
+        {
+            document["chat"][device_section] = Item::Table(Table::new());
+        }
+        document["chat"][device_section]["model"] = value(selected_chat_model);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp, document.to_string())?;
+        std::fs::rename(temp, &path)?;
+        Ok(path)
+    }
 }
 
 /// Helper: `$HOME` path, if determinable.
@@ -727,6 +818,7 @@ fn default_llamacpp_backend_preference() -> Vec<String> {
 fn default_embedding_model_preferences() -> Vec<String> {
     vec![
         "embed-gemma-300m-FLM".to_string(),
+        "ggml-org/embeddinggemma-300M-GGUF".to_string(),
         "user.ggml-org/embeddinggemma-300M-GGUF".to_string(),
     ]
 }
@@ -764,6 +856,7 @@ fn default_model_load_params() -> HashMap<String, ModelLoadParams> {
     let mut m = HashMap::new();
     m.insert("embed-gemma-300m-FLM".to_string(), ctx(2048));
     m.insert("embed-gemma-300M-GGUF".to_string(), ctx(2048));
+    m.insert("ggml-org/embeddinggemma-300M-GGUF".to_string(), ctx(2048));
     m.insert(
         "user.ggml-org/embeddinggemma-300M-GGUF".to_string(),
         ctx(2048),
@@ -816,9 +909,45 @@ mod tests {
     }
 
     #[test]
+    fn setup_persistence_preserves_comments_and_unknown_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\nunknown = 42\n\n[chat]\npreferred_device = \"cpu\"\n",
+        )
+        .unwrap();
+        // Persistence is a lossless TOML edit, independent of strict runtime
+        // deserialization (which intentionally rejects unknown config keys).
+        let config = AppConfig {
+            source_path: Some(path.clone()),
+            ..AppConfig::default()
+        };
+        let written = config
+            .persist_lemonade_setup(
+                true,
+                ChatDevice::Npu,
+                "chat-model-FLM",
+                ReasoningControl::Reload,
+            )
+            .unwrap();
+        assert_eq!(written, path);
+        let text = std::fs::read_to_string(written).unwrap();
+        assert!(text.contains("# keep this comment"));
+        assert!(text.contains("unknown = 42"));
+        assert!(text.contains("preferred_device = \"npu\""));
+        assert!(text.contains("reasoning_control = \"reload\""));
+        assert!(text.contains("model = \"chat-model-FLM\""));
+    }
+
+    #[test]
     fn test_default_model_load_params() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.models.ctx_size_for("embed-gemma-300m-FLM"), 2048);
+        assert_eq!(
+            cfg.models.ctx_size_for("ggml-org/embeddinggemma-300M-GGUF"),
+            2048
+        );
         assert_eq!(
             cfg.models
                 .ctx_size_for("user.ggml-org/embeddinggemma-300M-GGUF"),

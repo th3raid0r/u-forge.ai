@@ -1,112 +1,182 @@
-# Feature Plan: Lemonade Connection and Runtime Coordination
+# Feature Checklist: Lemonade Runtime and Embedded Distribution
 
-## Status and constraints
+## Status and authority
 
-Approved, not implemented. Lemonade is OpenAI-compatible where practical but
-has a custom management plane and reasoning/load behavior. Preserve the mixed
-transport strategy. The application must still start and pass tests with no
-server, URL, or API key configured.
+Implemented and verified on 2026-08-04. `plan_LemonadeRuntime.md` is the
+decision-complete specification for this checklist. Source is authoritative for
+the existing connection probing, providers, model selection, activation-only
+runtime cache, reasoning request hint, and UI integration introduced before
+this revision.
 
-Reasoning mode is part of effective loaded-model identity. A mode change must
-perform the backend-appropriate reload and remain serialized through inference.
+Target Embeddable Lemonade v11.5.1 on Ubuntu x64 first. Preserve the intentional
+mixed transport strategy and the graph-only degraded path. The application and
+canonical tests must start with no bundled runtime, external server, URL, API
+key, or admin key.
+
+Reasoning is request-scoped by default. A global TOML strategy retains the
+llama.cpp reload workaround without version gating until it is validated across
+supported models; reasoning belongs to loaded-model identity only while that
+fallback is selected.
+
+## Embedded runtime and release
+
+- [x] **LR-01 — Draft release workflow.** Add a manual Ubuntu x64 GitHub
+  workflow that pins and verifies the v11.5.1 embeddable archive, builds
+  u-forge, packages the executable with sibling `lemonade/` runtime resources,
+  and creates a complete draft GitHub Release with archive and checksum.
+- [x] **LR-02 — Private runtime root.** Locate `lemonade/lemond` relative to the
+  installed executable, support `UFORGE_LEMOND_PATH` for owned development,
+  and initialize versioned resources plus persistent config/backends/models in
+  app-private user data.
+- [x] **LR-03 — Owned child lifecycle.** Start a loopback-only child on the
+  first available port from 13305 through 13315 without attaching to an
+  occupant; probe `/live`, retain bounded redacted diagnostics, detect exits,
+  and degrade without preventing application startup.
+- [x] **LR-04 — Safe shutdown.** Gracefully call authenticated
+  `/internal/shutdown`, then terminate/kill only the owned child after bounded
+  waits. Never shut down an external server.
 
 ## Connection and discovery
 
-- [ ] **LR-01 — Shared connection context.** Introduce a normalized connection
-  value containing base URL, optional credential, redacted debug output, and
-  phase-specific HTTP clients/timeouts. Thread it through probing, catalog,
-  load/reload, custom chat, `async-openai`, and Rig.
-- [ ] **LR-02 — Optional authentication.** Read `LEMONADE_API_KEY` as an
-  override, propagate it consistently, and never log it. No key remains valid
-  for the normal local server.
-- [ ] **LR-03 — Partial catalog.** Require `/models`; treat `/health` and
-  `/system-info` as optional enrichment. Retain endpoint-specific failures so
-  the UI can explain degraded discovery.
-- [ ] **LR-04 — Current wire data.** Preserve health recipe options, busy or
-  streaming state, server version, model context limits, and capacity data.
-  Accept additive unknown response fields.
-- [ ] **LR-05 — Live authority.** Compare requested effective profiles with
-  live health state. Treat the in-process runtime cache and `already_loaded`
-  list as optimizations, never sole authority.
+- [x] **LR-05 — Shared connection context.** Introduce a normalized origin/API
+  value with ownership, separate optional API/admin secrets, redacted debug,
+  and phase-specific HTTP clients. Thread it through probing, catalog,
+  load/reload, setup, custom chat, `async-openai`, and Rig.
+- [x] **LR-06 — Optional split authentication.** Read `LEMONADE_API_KEY` and
+  `LEMONADE_ADMIN_API_KEY` as overrides, generate separate secrets for the
+  owned child when absent, use each on the endpoint class Lemonade accepts, and
+  never log or persist either key. Keyless external inference remains valid.
+- [x] **LR-07 — Partial current catalog.** Require `/models?show_all=true`;
+  treat `/health`
+  and `/system-info` as independent enrichment. Preserve endpoint failures,
+  current GPU/backend states, server version, recipe options, busy/streaming,
+  context windows, capabilities, and capacity while accepting additive fields.
+- [x] **LR-08 — Live authority.** Compare requested loaded-profile keys with
+  health recipe options. Treat runtime cache and `already_loaded` as
+  optimizations; detect external changes and explicitly load when health cannot
+  establish authority.
+
+## Setup and TOML settings
+
+- [x] **LR-09 — Extensible setup model.** Build a reopenable, role-based setup
+  flow that exposes required standard embedding, NPU FLM embedding when
+  enabled, required reranker, optional-by-opt-out HQ embedding, and
+  user-selected chat.
+- [x] **LR-10 — Managed standard embedding recipe.** Register and pull
+  `ggml-org/embeddinggemma-300M-GGUF` from
+  `ggml-org/embeddinggemma-300M-GGUF:Q8_0` as a llama.cpp embedding model,
+  accept the former `user.`-prefixed ID as a detection-only compatibility
+  alias, and detect/provision `embed-gemma-300m-FLM` for enabled NPU
+  embeddings; reject conflicting existing registrations.
+- [x] **LR-11 — Durable provisioning.** Select/install compatible backends from
+  live system information, start server-owned model downloads, restore
+  `/v1/downloads` state, expose pause/cancel/remove, and implement resume/retry
+  by repeating the exact durable pull after a stopped job is removed, without
+  tying jobs to the setup view lifetime.
+- [x] **LR-12 — TOML-backed settings.** Preserve comments and unknown keys,
+  write atomically to the active/per-user config, and persist HQ selection,
+  preferred chat device/model, and `chat.reasoning_control`. Do not create a
+  second settings store.
+- [x] **LR-13 — Guarded external management.** Require both credentials plus
+  explicit confirmation for external pull/install. Keep older/incomplete
+  external servers usable for discovery/inference but read-only for setup.
 
 ## Effective profiles and selection
 
-- [ ] **LR-06 — Unified selected profile.** Resolve model, recipe, backend,
-  device, load options, context limit, sampling options, tool capability, and
-  reasoning policy together. Device fallback changes the entire profile and
-  produces a visible diagnostic.
-- [ ] **LR-07 — Context reconciliation.** Clamp or reject configured load,
-  history, reserve, direct-generation, and agent limits against the catalog's
-  model context window. Use the same effective limits on direct and agent paths.
-- [ ] **LR-08 — Capacity-aware embeddings.** Respect server capacity by model
-  type. With one embedding slot, choose HQ when explicitly enabled and standard
-  otherwise; build both only when capacity supports both.
-- [ ] **LR-09 — Tool capability gating.** Register graph tools only for models
-  whose catalog capabilities support tool calling. Fall back to direct chat
+- [x] **LR-14 — Unified effective profile.** Resolve selection, recipe,
+  backend/device, load options, loaded identity, catalog context, request
+  sampling, tool capability, reasoning policy/strategy, and diagnostics
+  together. Rebuild the whole profile on device fallback.
+- [x] **LR-15 — Context reconciliation.** Clamp load, chat, history, reserve,
+  direct-generation, and agent limits to one catalog-backed effective budget;
+  explain every clamp and reject only unusable prompt/response allocations.
+- [x] **LR-16 — Capacity-aware embeddings.** With one embedding slot, activate
+  HQ when enabled and standard otherwise; activate both only when capacity
+  supports both, and conservatively assume one slot when capacity is absent.
+- [x] **LR-17 — Tool capability gating.** Register graph tools only for models
+  advertising tool calling. Keep non-tool models available through direct chat
   with a clear UI explanation.
 
 ## Reasoning and serialized execution
 
-- [ ] **LR-10 — Three-state policy.** Add `Default`, `Enabled`, and `Disabled`
-  reasoning modes. The UI toggle maps to explicit enabled/disabled; callers may
-  retain a model/server default.
-- [ ] **LR-11 — Recipe-aware load adapter.** For llama.cpp reasoning-capable
-  models, generate the managed chat-template configuration required at load.
-  Reject conflicts with user-provided flags owned by u-forge. Do not forward
-  llama.cpp arguments to FLM or unrelated recipes.
-- [ ] **LR-12 — Request compatibility hint.** Continue sending
-  `enable_thinking` where supported in addition to the effective reload; do not
-  treat the request Boolean as proof the backend changed mode.
-- [ ] **LR-13 — Runtime execution lease.** Replace activation-only locking with
-  a coordinator/lease held across health comparison, reload, request startup,
-  and the complete response stream. Cancellation/drop releases the lease.
-- [ ] **LR-14 — External reload detection.** Invalidate local state when health
-  reports a different recipe/profile or the server was changed by another
-  client.
+- [x] **LR-18 — Three-state request policy.** Add `Default`, `Enabled`, and
+  `Disabled`; omit the request field for default and send explicit
+  `enable_thinking` for enabled/disabled across direct and Rig paths.
+- [x] **LR-19 — Configured reload fallback.** Default the global strategy to
+  `request`. Under `reload`, include reasoning in llama.cpp loaded identity,
+  generate the owned chat-template argument, reject flag conflicts, and never
+  forward llama.cpp arguments to other recipes.
+- [x] **LR-20 — Runtime execution lease.** Replace activation-only locking with
+  an RAII coordinator held across live comparison, reload, request startup, and
+  complete direct stream or Rig tool loop. Cancellation/drop/error releases it;
+  device guards cover actual inference rather than tool execution.
+- [x] **LR-21 — Coordinated queue generation.** Route `InferenceQueue`
+  generation and streaming through the same effective-profile/coordinator
+  contract and remove the direct-provider streaming bypass.
 
-## Transport responsibilities
+## Transport and failure semantics
 
-- [ ] **LR-15 — Keep the intentional split.** Custom HTTP owns management,
-  reranking, and direct-chat deviations. `async-openai` owns compatible
-  embedding/audio calls. Rig owns the agent/tool loop.
-- [ ] **LR-16 — Shared chat semantics.** Normalize request options, reasoning
-  events, text, finish reason, usage, and errors above direct and Rig adapters.
-- [ ] **LR-17 — Coordinated queue generation.** Route `InferenceQueue`
-  generation and streaming through the same profile/coordinator contract;
-  remove direct-provider stream bypasses.
-- [ ] **LR-18 — Strict SSE parser.** Support arbitrary byte fragmentation and
-  multiple events per chunk; surface malformed protocol payloads, finish
-  reasons, usage, and server error bodies instead of silently dropping them.
-
-## Timeout policy
-
-- [ ] **LR-19 — Separate timeout classes.** Configure connect, metadata,
-  load/readiness, first-token, stream-idle, and total non-stream completion
-  independently. Defaults: 5s connect, 30s metadata, 300s load, 120s first
-  token, 60s stream idle, and 300s non-stream completion.
-- [ ] **LR-20 — GPU release.** Every timeout/error/cancel path must release the
-  runtime and GPU guards before reporting failure. Do not use the archived
-  blanket five-second generation timeout.
+- [x] **LR-22 — Preserve transport responsibilities.** Custom HTTP owns
+  management, reranking, and direct-chat deviations; `async-openai` owns
+  compatible embedding/audio calls; Rig owns the agent/tool loop. All consume
+  the shared connection.
+- [x] **LR-23 — Shared chat events.** Normalize request options, reasoning/text,
+  tool activity, terminal reason, usage, and fatal errors above direct and Rig
+  adapters without fabricating unavailable Rig finish reasons.
+- [x] **LR-24 — Strict shared SSE parser.** Support byte/UTF-8 fragmentation,
+  CRLF, multi-line data, and multiple events per chunk for chat and any future
+  subscribed setup operation; the current durable setup path consumes the
+  immediate JSON snapshot returned by `subscribe=false`. Surface malformed
+  payloads, finish/usage, SSE errors, and bounded HTTP error bodies.
+- [x] **LR-25 — Timeout classes.** Use 5s connect, 30s metadata, 300s
+  readiness/load/backend install, 120s first token, 60s stream idle, and 300s
+  non-stream completion. Do not impose a total timeout on streams or
+  server-owned downloads.
+- [x] **LR-26 — Resource release.** Every timeout, HTTP/protocol error, child
+  exit, receiver cancellation, and task abort releases runtime/device guards
+  before reporting failure.
 
 ## Tests and acceptance
 
-- Use an in-process mock server for API-key propagation, partial discovery,
-  current health shapes, unknown fields, capacity, context validation, and
-  profile comparison; no live server is required.
-- Verify default/on/off effective load bodies, exactly one reload per effective
-  change, no reload for an unchanged live profile, external reload detection,
-  and serialization through stream completion.
-- Cover preferred-device fallback as a coherent profile and prove non-tool
-  models never receive graph tool declarations.
-- Cover SSE fragmentation, multiple buffered events, reasoning deltas,
-  malformed JSON, server errors, finish reason, usage, timeout, and receiver
-  cancellation.
-- Optional live tests remain skip-guarded and recipe/model-specific.
+- [x] Use an in-process mock server for URL/auth routing, redaction, partial
+  discovery, current v11.5.1 shapes, unknown fields, capacity/context, external
+  management gates, setup jobs, and server error bodies.
+- [x] Verify exact custom embedding registration, fixed/optional setup roles,
+  backend choice, durable download restoration/control, and preserving atomic
+  TOML edits.
+- [x] Verify default/on/off request bodies, global reload fallback, flag
+  conflicts, no cross-recipe leakage, exactly one necessary reload, unchanged
+  live profiles, and external reload detection.
+- [x] Cover coherent device fallback, context clamp diagnostics,
+  capacity-aware embedding activation, and non-tool model declarations.
+- [x] Cover lease serialization through direct and Rig completion, queue
+  coordination, guard release, cancellation, timeout, and child failure.
+- [x] Cover SSE fragmentation, multiple buffered events, reasoning deltas,
+  malformed UTF-8/JSON, server errors, terminal reason, usage, timeout, and
+  receiver cancellation.
+- [x] Test owned process lookup/private data, port retry, readiness, shutdown
+  escalation, missing artifacts, and strict external non-ownership with a fake
+  child/spawner.
+- [x] Keep optional live tests skip-guarded and v11.5.1 recipe/model-specific;
+  finish with `make fmt-check`, `make check`, `make clippy`, and `make test`.
+
+## Deferred from this feature
+
+- AUR and non-Ubuntu-x64 packaging.
+- Bundled models or backends.
+- Setup/UI for STT, TTS, image, audio generation, or 3D/STL generation.
+- Generic provider abstraction and the broader cancellation/observability work
+  owned by `feature_InferenceLifecycle.md`.
 
 ## Primary external references
 
+- <https://github.com/lemonade-sdk/lemonade/releases/tag/v11.5.1>
+- <https://lemonade-server.ai/docs/embeddable/>
+- <https://lemonade-server.ai/docs/embeddable/runtime/>
+- <https://lemonade-server.ai/docs/embeddable/backends/>
+- <https://lemonade-server.ai/docs/embeddable/models/>
 - <https://lemonade-server.ai/docs/api/openai/>
 - <https://lemonade-server.ai/docs/api/lemonade/>
 - <https://lemonade-server.ai/docs/guide/configuration/>
-- <https://lemonade-server.ai/docs/guide/cli-chat/>
+- <https://github.com/lemonade-sdk/lemonade/blob/v11.5.1/src/cpp/server/thinking_controls.cpp>
 - <https://github.com/lemonade-sdk/lemonade/issues/1511>

@@ -8,11 +8,12 @@ use gpui::{
     MouseButton, MouseDownEvent, Pixels, Point, Window, anchored, deferred, div, linear_color_stop,
     linear_gradient, list, prelude::*, px, relative, rems, rgb, rgba,
 };
-use u_forge_agent::{GraphAgent, HistoryMessage, select_history_window};
+use u_forge_agent::{AgentParams, GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
-    ChatMessage, ChatRequest, LemonadeRuntime, LemonadeRuntimeProfile, ModelLoadOptions,
-    StreamToken,
-    lemonade::{LemonadeChatProvider, SelectedModel},
+    ChatDeviceConfig, ChatMessage, ChatRequest, LemonadeRuntime, LemonadeRuntimeLease,
+    LemonadeRuntimeProfile, ModelLoadOptions, ReasoningPolicy, StreamToken,
+    config::ReasoningControl,
+    lemonade::{EffectiveChatLimits, LemonadeChatProvider, SelectedModel},
 };
 
 use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessage};
@@ -68,6 +69,7 @@ pub(crate) struct ChatPanel {
     runtime: Option<Arc<LemonadeRuntime>>,
     /// Lemonade applies this mode only after a full profile reload.
     reasoning_enabled: bool,
+    reasoning_control: ReasoningControl,
     /// True while a do_init_lemonade call is in flight (after ConnectRequested emitted).
     connecting: bool,
     /// Brief error string shown under the button when the last connect attempt failed.
@@ -112,9 +114,15 @@ pub(crate) struct ChatPanel {
 #[derive(Debug, Clone)]
 pub(crate) struct AvailableModel {
     pub(crate) model_id: String,
+    pub(crate) checkpoint: String,
     pub(crate) recipe: String,
     pub(crate) backend: Option<String>,
     pub(crate) load_options: ModelLoadOptions,
+    pub(crate) tool_capable: bool,
+    pub(crate) reasoning_capable: bool,
+    pub(crate) sampling: ChatDeviceConfig,
+    pub(crate) effective_limits: Option<EffectiveChatLimits>,
+    pub(crate) max_tool_turns: usize,
 }
 
 impl From<&SelectedModel> for AvailableModel {
@@ -123,12 +131,60 @@ impl From<&SelectedModel> for AvailableModel {
         if sel.recipe == "llamacpp" {
             load_options.llamacpp_backend = sel.backend.clone();
         }
+        if let (Some(configured), Some(maximum)) = (load_options.ctx_size, sel.max_context_window) {
+            load_options.ctx_size = Some(configured.min(maximum));
+        }
         Self {
             model_id: sel.model_id.clone(),
+            checkpoint: sel.checkpoint.clone(),
             recipe: sel.recipe.clone(),
             backend: sel.backend.clone(),
             load_options,
+            tool_capable: sel.tool_capable,
+            reasoning_capable: sel.reasoning_capable,
+            sampling: ChatDeviceConfig::default(),
+            effective_limits: None,
+            max_tool_turns: 5,
         }
+    }
+}
+
+impl AvailableModel {
+    pub(crate) fn with_chat_profile(
+        mut self,
+        sampling: ChatDeviceConfig,
+        effective_limits: Option<EffectiveChatLimits>,
+        max_tool_turns: usize,
+    ) -> Self {
+        self.sampling = sampling;
+        self.effective_limits = effective_limits;
+        self.max_tool_turns = max_tool_turns;
+        self
+    }
+
+    fn agent_params(&self) -> AgentParams {
+        AgentParams {
+            temperature: self.sampling.temperature.map(f64::from),
+            max_tokens: self
+                .effective_limits
+                .as_ref()
+                .map(|limits| limits.agent_generation as u64)
+                .or_else(|| self.sampling.max_tokens.map(u64::from)),
+            top_p: self.sampling.top_p.map(f64::from),
+            top_k: self.sampling.top_k,
+            min_p: self.sampling.min_p.map(f64::from),
+            frequency_penalty: self.sampling.frequency_penalty.map(f64::from),
+            presence_penalty: self.sampling.presence_penalty.map(f64::from),
+            repetition_penalty: self.sampling.repetition_penalty.map(f64::from),
+            seed: self.sampling.seed,
+            stop: self.sampling.stop.clone(),
+            max_tool_turns: self.max_tool_turns,
+        }
+    }
+
+    fn uses_gpu(&self) -> bool {
+        self.recipe == "llamacpp"
+            && matches!(self.backend.as_deref(), Some("rocm" | "vulkan" | "metal"))
     }
 }
 
@@ -197,6 +253,7 @@ impl ChatPanel {
             chat_provider: None,
             runtime: None,
             reasoning_enabled: true,
+            reasoning_control: ReasoningControl::Request,
             connecting: false,
             connect_error: None,
             agent: None,
@@ -224,22 +281,80 @@ impl ChatPanel {
         models: Vec<AvailableModel>,
         preferred_idx: usize,
         runtime: Arc<LemonadeRuntime>,
+        reasoning_control: ReasoningControl,
     ) {
-        self.chat_provider = Some(provider);
         self.available_models = models;
         self.selected_model_idx = preferred_idx;
         self.runtime = Some(runtime);
+        self.reasoning_control = reasoning_control;
+        self.chat_provider = Some(provider);
+        self.apply_selected_chat_profile();
         self.connecting = false;
-        self.connect_error = None;
+    }
+
+    fn apply_selected_chat_profile(&mut self) {
+        let Some(model) = self.available_models.get(self.selected_model_idx) else {
+            return;
+        };
+        let tool_capable = model.tool_capable;
+        let limits = model.effective_limits.clone();
+        self.connect_error = (!tool_capable).then(|| {
+            "Selected model does not advertise tool calling; using direct chat.".to_string()
+        });
+        if let Some(limits) = limits {
+            self.max_context_tokens = limits.context;
+            self.response_reserve = limits.response_reserve;
+            if let Some(provider) = &mut self.chat_provider {
+                provider.default_max_tokens =
+                    limits.direct_generation.min(u32::MAX as usize) as u32;
+            }
+            if !limits.diagnostics.is_empty() {
+                let diagnostics = limits.diagnostics.join("; ");
+                self.connect_error = Some(match self.connect_error.take() {
+                    Some(existing) => format!("{existing} {diagnostics}"),
+                    None => diagnostics,
+                });
+            }
+        }
     }
 
     fn selected_runtime_profile(&self) -> Option<LemonadeRuntimeProfile> {
         let model = self.available_models.get(self.selected_model_idx)?;
-        Some(LemonadeRuntimeProfile::new(
-            model.model_id.clone(),
-            self.reasoning_enabled,
-            model.load_options.clone(),
-        ))
+        let reasoning_enabled = self.reasoning_enabled && model.reasoning_capable;
+        let device = match model.recipe.as_str() {
+            "flm" => Some("npu".to_string()),
+            "llamacpp" => Some(match model.backend.as_deref() {
+                Some("rocm" | "vulkan" | "metal") => "gpu".to_string(),
+                _ => "cpu".to_string(),
+            }),
+            _ => None,
+        };
+        Some(
+            LemonadeRuntimeProfile::new(
+                model.model_id.clone(),
+                reasoning_enabled,
+                model.load_options.clone(),
+            )
+            .with_checkpoint(model.checkpoint.clone())
+            .with_backend_profile(model.recipe.clone(), model.backend.clone(), device)
+            .with_reasoning(
+                if reasoning_enabled {
+                    ReasoningPolicy::Enabled
+                } else {
+                    ReasoningPolicy::Disabled
+                },
+                self.reasoning_control,
+                model.reasoning_capable,
+            ),
+        )
+    }
+
+    fn selected_reasoning_enabled(&self) -> bool {
+        self.reasoning_enabled
+            && self
+                .available_models
+                .get(self.selected_model_idx)
+                .is_some_and(|model| model.reasoning_capable)
     }
 
     /// Called from AppView once the graph, inference queue, and Lemonade URL
@@ -397,23 +512,23 @@ impl ChatPanel {
     /// `retry_message`.
     fn send_with_text(&mut self, text: String, cx: &mut Context<Self>) {
         let Some(runtime) = self.runtime.clone() else {
-            self.start_send_with_text(text, cx);
+            self.start_send_with_text(text, None, cx);
             return;
         };
         let Some(profile) = self.selected_runtime_profile() else {
-            self.start_send_with_text(text, cx);
+            self.start_send_with_text(text, None, cx);
             return;
         };
         let tokio_rt = self.tokio_rt.clone();
         self.streaming = true;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
-            let activation = cx
+            let lease = cx
                 .background_executor()
-                .spawn(async move { tokio_rt.block_on(runtime.activate(&profile)) })
+                .spawn(async move { tokio_rt.block_on(runtime.acquire(&profile)) })
                 .await;
-            this.update(cx, |view: &mut ChatPanel, cx| match activation {
-                Ok(_) => view.start_send_with_text(text, cx),
+            this.update(cx, |view: &mut ChatPanel, cx| match lease {
+                Ok(lease) => view.start_send_with_text(text, Some(lease), cx),
                 Err(error) => {
                     view.push_text_message(ChatMessageRole::User, text, cx);
                     view.push_text_message(
@@ -429,7 +544,12 @@ impl ChatPanel {
         self.stream_task = Some(task);
     }
 
-    fn start_send_with_text(&mut self, text: String, cx: &mut Context<Self>) {
+    fn start_send_with_text(
+        &mut self,
+        text: String,
+        runtime_lease: Option<LemonadeRuntimeLease>,
+        cx: &mut Context<Self>,
+    ) {
         // Build token-windowed history from prior User/Assistant turns before
         // recording the current prompt. GraphAgent receives the current prompt
         // separately, so including it here would send it twice.
@@ -468,15 +588,16 @@ impl ChatPanel {
         // ── Agent path ────────────────────────────────────────────────────────
         // When a GraphAgent is wired up, route through the tool-calling loop
         // with streaming output. Tool calls appear as collapsible entries.
-        if let Some(agent) = self.agent.clone() {
-            let model_id = if !self.available_models.is_empty() {
-                self.available_models[self.selected_model_idx]
-                    .model_id
-                    .clone()
-            } else {
-                String::new()
-            };
-            let reasoning_enabled = self.reasoning_enabled;
+        let selected_supports_tools = self
+            .available_models
+            .get(self.selected_model_idx)
+            .is_some_and(|model| model.tool_capable);
+        if let Some(agent) = self.agent.clone().filter(|_| selected_supports_tools) {
+            let selected_model = self.available_models[self.selected_model_idx].clone();
+            let model_id = selected_model.model_id.clone();
+            let agent_params = selected_model.agent_params();
+            let uses_gpu = selected_model.uses_gpu();
+            let reasoning_enabled = self.selected_reasoning_enabled();
             let tokio_rt = self.tokio_rt.clone();
 
             let task = cx.spawn(async move |this, cx| {
@@ -484,11 +605,18 @@ impl ChatPanel {
                 let mut rx = cx
                     .background_executor()
                     .spawn(async move {
-                        tokio_rt.block_on(agent.prompt_stream(
+                        tokio_rt.block_on(agent.prompt_stream_with_profile(
                             &model_id,
                             &text,
                             &history,
-                            reasoning_enabled,
+                            if reasoning_enabled {
+                                ReasoningPolicy::Enabled
+                            } else {
+                                ReasoningPolicy::Disabled
+                            },
+                            agent_params,
+                            runtime_lease,
+                            uses_gpu,
                         ))
                     })
                     .await;
@@ -575,14 +703,15 @@ impl ChatPanel {
                             })
                             .ok();
                         }
-                        Some(AgentStreamEvent::Done(_)) => {
+                        Some(AgentStreamEvent::Usage(_)) => {}
+                        Some(AgentStreamEvent::Finished { .. }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 view.finalize_stream(cx);
                             })
                             .ok();
                             break;
                         }
-                        Some(AgentStreamEvent::Error(e)) => {
+                        Some(AgentStreamEvent::FatalError(e)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
                                     let m = view.push_text_message(
@@ -637,19 +766,17 @@ impl ChatPanel {
         api_messages.push(ChatMessage::user(&text));
 
         // Determine model override if user selected a different model.
-        let model_override = if !self.available_models.is_empty() {
-            Some(
-                self.available_models[self.selected_model_idx]
-                    .model_id
-                    .clone(),
-            )
-        } else {
-            None
-        };
+        let selected_model = self.available_models.get(self.selected_model_idx).cloned();
 
-        let mut req = ChatRequest::new(api_messages).with_thinking(self.reasoning_enabled);
-        if let Some(model) = model_override {
-            req = req.with_model(model);
+        let mut req =
+            ChatRequest::new(api_messages).with_thinking(self.selected_reasoning_enabled());
+        if let Some(model) = selected_model {
+            req = req
+                .with_model(model.model_id)
+                .with_sampling(&model.sampling);
+            if let Some(limits) = model.effective_limits {
+                req = req.with_max_tokens(limits.direct_generation.min(u32::MAX as usize) as u32);
+            }
         }
 
         let tokio_rt = self.tokio_rt.clone();
@@ -658,7 +785,14 @@ impl ChatPanel {
         let task = cx.spawn(async move |this, cx| {
             let rx = cx
                 .background_executor()
-                .spawn(async move { tokio_rt.block_on(async { provider.complete_stream(req) }) })
+                .spawn(async move {
+                    tokio_rt.block_on(async {
+                        match runtime_lease {
+                            Some(lease) => provider.complete_stream_with_lease(req, lease),
+                            None => provider.complete_stream(req),
+                        }
+                    })
+                })
                 .await;
 
             // Consume tokens from the stream.
@@ -705,6 +839,8 @@ impl ChatPanel {
                         })
                         .ok();
                     }
+                    Some(Ok(StreamToken::FinishReason(_reason))) => {}
+                    Some(Ok(StreamToken::Usage(_usage))) => {}
                     Some(Err(e)) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
                             let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
@@ -949,7 +1085,11 @@ impl Render for ChatPanel {
         let connecting = self.connecting;
         let connect_error = self.connect_error.clone();
         let model_dropdown_open = self.model_dropdown_open;
-        let reasoning_enabled = self.reasoning_enabled;
+        let reasoning_capable = self
+            .available_models
+            .get(self.selected_model_idx)
+            .is_some_and(|model| model.reasoning_capable);
+        let reasoning_enabled = self.reasoning_enabled && reasoning_capable;
         let has_provider = self.chat_provider.is_some() || self.agent.is_some();
         let model_label = self.selected_model_label();
         let history_dropdown_open = self.history_dropdown_open;
@@ -1262,6 +1402,7 @@ impl Render for ChatPanel {
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                                 if !this.streaming {
                                     this.selected_model_idx = idx;
+                                    this.apply_selected_chat_profile();
                                 }
                                 this.model_dropdown_open = false;
                                 cx.notify();
@@ -1665,7 +1806,9 @@ impl Render for ChatPanel {
                                             } else {
                                                 rgba(0x6c7086ff)
                                             })
-                                            .cursor_pointer()
+                                            .when(reasoning_capable, |toggle| {
+                                                toggle.cursor_pointer()
+                                            })
                                             .overflow_x_hidden()
                                             .on_mouse_down(
                                                 MouseButton::Left,
@@ -1705,7 +1848,14 @@ impl Render for ChatPanel {
                                                 MouseButton::Left,
                                                 cx.listener(
                                                     |this, _: &MouseDownEvent, _window, cx| {
-                                                        if !this.streaming {
+                                                        if !this.streaming
+                                                            && this
+                                                                .available_models
+                                                                .get(this.selected_model_idx)
+                                                                .is_some_and(|model| {
+                                                                    model.reasoning_capable
+                                                                })
+                                                        {
                                                             this.reasoning_enabled =
                                                                 !this.reasoning_enabled;
                                                             cx.notify();
@@ -1713,7 +1863,9 @@ impl Render for ChatPanel {
                                                     },
                                                 ),
                                             )
-                                            .child(if reasoning_enabled {
+                                            .child(if !reasoning_capable {
+                                                "Thinking unavailable"
+                                            } else if reasoning_enabled {
                                                 "Thinking on"
                                             } else {
                                                 "Thinking off"
@@ -1785,5 +1937,47 @@ impl Render for ChatPanel {
 
         self.last_render_us = render_start.elapsed().as_micros() as u64;
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_model_maps_one_profile_to_rig_parameters() {
+        let model = AvailableModel {
+            model_id: "model".into(),
+            checkpoint: "checkpoint".into(),
+            recipe: "llamacpp".into(),
+            backend: Some("vulkan".into()),
+            load_options: ModelLoadOptions::default(),
+            tool_capable: true,
+            reasoning_capable: true,
+            sampling: ChatDeviceConfig {
+                temperature: Some(0.25),
+                top_p: Some(0.8),
+                repetition_penalty: Some(1.1),
+                max_tokens: Some(999),
+                ..ChatDeviceConfig::default()
+            },
+            effective_limits: Some(EffectiveChatLimits {
+                load_context: Some(4096),
+                context: 4096,
+                response_reserve: 512,
+                direct_generation: 400,
+                agent_generation: 300,
+                history_budget: 3584,
+                diagnostics: Vec::new(),
+            }),
+            max_tool_turns: 7,
+        };
+        let params = model.agent_params();
+        assert_eq!(params.max_tokens, Some(300));
+        assert_eq!(params.temperature, Some(0.25));
+        assert!((params.top_p.unwrap() - 0.8).abs() < 1e-6);
+        assert!((params.repetition_penalty.unwrap() - 1.1).abs() < 1e-6);
+        assert_eq!(params.max_tool_turns, 7);
+        assert!(model.uses_gpu());
     }
 }

@@ -15,14 +15,16 @@
 //!     ctx_size: Some(4096),
 //!     ..Default::default()
 //! };
-//! load_model("http://localhost:13305/api/v1", "user.ggml-org/embeddinggemma-300M-GGUF", &opts, &[]).await?;
+//! load_model("http://localhost:13305/api/v1", "ggml-org/embeddinggemma-300M-GGUF", &opts, &[]).await?;
 //! # Ok(()) }
 //! ```
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use super::client::LemonadeHttpClient;
+use super::client::{LemonadeConnection, LemonadeHttpClient};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -166,6 +168,38 @@ pub async fn load_model(
     opts: &ModelLoadOptions,
     already_loaded: &[String],
 ) -> Result<()> {
+    let connection = Arc::new(LemonadeConnection::external(base_url)?);
+    load_model_with_connection(connection, model_name, opts, already_loaded).await
+}
+
+pub async fn load_model_with_connection(
+    connection: Arc<LemonadeConnection>,
+    model_name: &str,
+    opts: &ModelLoadOptions,
+    already_loaded: &[String],
+) -> Result<()> {
+    let inferred_recipe = if is_flm_model(model_name) {
+        "flm"
+    } else {
+        "llamacpp"
+    };
+    load_model_for_recipe_with_connection(
+        connection,
+        model_name,
+        inferred_recipe,
+        opts,
+        already_loaded,
+    )
+    .await
+}
+
+pub async fn load_model_for_recipe_with_connection(
+    connection: Arc<LemonadeConnection>,
+    model_name: &str,
+    recipe: &str,
+    opts: &ModelLoadOptions,
+    already_loaded: &[String],
+) -> Result<()> {
     if already_loaded.iter().any(|id| id == model_name) {
         tracing::debug!(
             model = model_name,
@@ -174,19 +208,22 @@ pub async fn load_model(
         return Ok(());
     }
 
-    let client = LemonadeHttpClient::new(base_url);
+    let client = LemonadeHttpClient::from_connection(connection);
 
-    // FLM (NPU) models do not use llama-server and will reject llamacpp params.
-    let flm = is_flm_model(model_name);
-    let effective_args: Option<String> = if flm { None } else { build_llamacpp_args(opts) };
+    let llamacpp = recipe == "llamacpp";
+    let effective_args: Option<String> = if llamacpp {
+        build_llamacpp_args(opts)
+    } else {
+        None
+    };
 
     let body = LoadRequest {
         model_name,
         ctx_size: opts.ctx_size,
-        llamacpp_backend: if flm {
-            None
-        } else {
+        llamacpp_backend: if llamacpp {
             opts.llamacpp_backend.as_deref()
+        } else {
+            None
         },
         llamacpp_args: effective_args.as_deref(),
     };
@@ -194,14 +231,14 @@ pub async fn load_model(
     // The /load endpoint returns a JSON object; we don't need its contents —
     // error_for_status() inside post_json() is the signal we care about.
     let _: serde_json::Value = client
-        .post_json("/load", &body)
+        .post_json_load("/load", &body)
         .await
         .with_context(|| format!("Failed to load model '{model_name}' via Lemonade Server"))?;
 
     tracing::info!(
         model = model_name,
         ctx_size = ?opts.ctx_size,
-        flm,
+        recipe,
         effective_llamacpp_args = ?effective_args,
         "Model loaded via Lemonade Server"
     );
@@ -216,6 +253,23 @@ pub async fn reload_model(base_url: &str, model_name: &str, opts: &ModelLoadOpti
     load_model(base_url, model_name, opts, &[]).await
 }
 
+pub async fn reload_model_with_connection(
+    connection: Arc<LemonadeConnection>,
+    model_name: &str,
+    opts: &ModelLoadOptions,
+) -> Result<()> {
+    load_model_with_connection(connection, model_name, opts, &[]).await
+}
+
+pub async fn reload_model_for_recipe_with_connection(
+    connection: Arc<LemonadeConnection>,
+    model_name: &str,
+    recipe: &str,
+    opts: &ModelLoadOptions,
+) -> Result<()> {
+    load_model_for_recipe_with_connection(connection, model_name, recipe, opts, &[]).await
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -228,7 +282,7 @@ mod tests {
     fn test_is_flm_model() {
         assert!(is_flm_model("embed-gemma-300m-FLM"));
         assert!(is_flm_model("qwen3.5-4B-FLM"));
-        assert!(!is_flm_model("user.ggml-org/embeddinggemma-300M-GGUF"));
+        assert!(!is_flm_model("ggml-org/embeddinggemma-300M-GGUF"));
         assert!(!is_flm_model("bge-reranker-v2-m3-GGUF"));
     }
 
@@ -370,7 +424,7 @@ mod tests {
             ..Default::default()
         };
         let body = LoadRequest {
-            model_name: "user.ggml-org/embeddinggemma-300M-GGUF",
+            model_name: "ggml-org/embeddinggemma-300M-GGUF",
             ctx_size: opts.ctx_size,
             llamacpp_backend: opts.llamacpp_backend.as_deref(),
             llamacpp_args: opts.llamacpp_args.as_deref(),
@@ -397,7 +451,7 @@ mod tests {
         assert!(result.is_err(), "Expected error for unreachable server");
     }
 
-    /// Integration test: explicitly load `user.ggml-org/embeddinggemma-300M-GGUF` with
+    /// Integration test: explicitly load `ggml-org/embeddinggemma-300M-GGUF` with
     /// `DEFAULT_EMBEDDING_CONTEXT_TOKENS` and verify the server accepts the request.
     ///
     /// Skips automatically when no Lemonade Server is reachable.
@@ -410,7 +464,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = load_model(&url, "user.ggml-org/embeddinggemma-300M-GGUF", &opts, &[]).await;
+        let result = load_model(&url, "ggml-org/embeddinggemma-300M-GGUF", &opts, &[]).await;
         assert!(
             result.is_ok(),
             "load_model failed: {:?}",

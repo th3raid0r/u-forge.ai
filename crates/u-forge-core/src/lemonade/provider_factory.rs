@@ -26,10 +26,12 @@ use crate::ai::embeddings::EmbeddingProvider;
 use crate::ai::transcription::TranscriptionProvider;
 
 use super::chat::LemonadeChatProvider;
+use super::client::LemonadeConnection;
 use super::embedding::LemonadeProvider;
 use super::gpu_manager::GpuResourceManager;
-use super::load::{ModelLoadOptions, load_model};
+use super::load::{ModelLoadOptions, load_model_for_recipe_with_connection};
 use super::rerank::{LemonadeRerankProvider, RerankProvider};
+use super::runtime::{LemonadeRuntime, LemonadeRuntimeProfile, ReasoningPolicy};
 use super::selector::SelectedModel;
 use super::stt::LemonadeSttProvider;
 use super::transcription::LemonadeTranscriptionProvider;
@@ -62,9 +64,18 @@ pub enum Capability {
 pub enum ProviderSlot {
     Embedding(Arc<dyn EmbeddingProvider>),
     Transcription(Arc<dyn TranscriptionProvider>),
-    Chat(LemonadeChatProvider),
+    Chat(Box<CoordinatedChatProvider>),
     Tts(Box<LemonadeTtsProvider>),
     Rerank(Arc<dyn RerankProvider>),
+}
+
+/// Chat provider plus the live profile coordinator required by every queued
+/// non-streaming or streaming generation.
+#[derive(Clone)]
+pub struct CoordinatedChatProvider {
+    pub provider: LemonadeChatProvider,
+    pub runtime: Arc<LemonadeRuntime>,
+    pub profile: LemonadeRuntimeProfile,
 }
 
 // ── BuiltProvider ─────────────────────────────────────────────────────────────
@@ -120,20 +131,56 @@ impl ProviderFactory {
         gpu_manager: Option<Arc<GpuResourceManager>>,
         already_loaded: &[String],
     ) -> Result<BuiltProvider> {
+        let connection = Arc::new(LemonadeConnection::external(base_url)?);
+        Self::build_with_connection(
+            selected,
+            capability,
+            connection,
+            weight,
+            gpu_manager,
+            already_loaded,
+        )
+        .await
+    }
+
+    pub async fn build_with_connection(
+        selected: &SelectedModel,
+        capability: Capability,
+        connection: Arc<LemonadeConnection>,
+        weight: u32,
+        gpu_manager: Option<Arc<GpuResourceManager>>,
+        already_loaded: &[String],
+    ) -> Result<BuiltProvider> {
         let model_id = &selected.model_id;
         let load_opts = Self::merge_backend(&selected.load_opts, selected.backend.as_deref());
         let name = Self::provider_name(selected);
 
         let provider = match capability {
             Capability::Embedding => {
-                Self::build_embedding(base_url, model_id, &load_opts, already_loaded, &name).await?
+                Self::build_embedding(
+                    &connection,
+                    model_id,
+                    &selected.recipe,
+                    &load_opts,
+                    already_loaded,
+                    &name,
+                )
+                .await?
             }
             Capability::Reranking => {
-                Self::build_reranker(base_url, model_id, &load_opts, already_loaded, &name).await?
+                Self::build_reranker(
+                    &connection,
+                    model_id,
+                    &selected.recipe,
+                    &load_opts,
+                    already_loaded,
+                    &name,
+                )
+                .await?
             }
             Capability::Transcription => {
                 Self::build_stt(
-                    base_url,
+                    &connection,
                     model_id,
                     &load_opts,
                     &selected.recipe,
@@ -145,7 +192,7 @@ impl ProviderFactory {
             }
             Capability::TextGeneration => {
                 Self::build_llm(
-                    base_url,
+                    &connection,
                     model_id,
                     &load_opts,
                     selected,
@@ -155,7 +202,7 @@ impl ProviderFactory {
                 )
                 .await?
             }
-            Capability::TextToSpeech => Self::build_tts(base_url, model_id, &name),
+            Capability::TextToSpeech => Self::build_tts(&connection, model_id, &name),
         };
 
         Ok(BuiltProvider {
@@ -169,33 +216,49 @@ impl ProviderFactory {
     // ── Private build helpers ─────────────────────────────────────────────────
 
     async fn build_embedding(
-        base_url: &str,
+        connection: &Arc<LemonadeConnection>,
         model_id: &str,
+        recipe: &str,
         load_opts: &ModelLoadOptions,
         already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
-        let provider =
-            LemonadeProvider::new_with_load(base_url, model_id, load_opts, already_loaded).await?;
+        load_model_for_recipe_with_connection(
+            connection.clone(),
+            model_id,
+            recipe,
+            load_opts,
+            already_loaded,
+        )
+        .await?;
+        let provider = LemonadeProvider::from_connection(connection.clone(), model_id).await?;
         info!(model = model_id, name, dimensions = ?provider.dimensions(), "Embedding provider built");
         Ok(ProviderSlot::Embedding(Arc::new(provider)))
     }
 
     async fn build_reranker(
-        base_url: &str,
+        connection: &Arc<LemonadeConnection>,
         model_id: &str,
+        recipe: &str,
         load_opts: &ModelLoadOptions,
         already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
-        let provider = LemonadeRerankProvider::new(base_url, model_id);
-        provider.load(load_opts, already_loaded).await?;
+        let provider = LemonadeRerankProvider::from_connection(connection.clone(), model_id);
+        load_model_for_recipe_with_connection(
+            connection.clone(),
+            model_id,
+            recipe,
+            load_opts,
+            already_loaded,
+        )
+        .await?;
         info!(model = model_id, name, "Reranker provider built");
         Ok(ProviderSlot::Rerank(Arc::new(provider)))
     }
 
     async fn build_stt(
-        base_url: &str,
+        connection: &Arc<LemonadeConnection>,
         model_id: &str,
         _load_opts: &ModelLoadOptions,
         recipe: &str,
@@ -208,10 +271,17 @@ impl ProviderFactory {
         let provider: Arc<dyn TranscriptionProvider> = if recipe == "whispercpp" {
             if let Some(gpu) = gpu_manager {
                 info!(model = model_id, name, "STT provider built (GPU-locked)");
-                Arc::new(LemonadeSttProvider::new(base_url, model_id, gpu))
+                Arc::new(LemonadeSttProvider::from_connection(
+                    connection.clone(),
+                    model_id,
+                    gpu,
+                ))
             } else {
                 info!(model = model_id, name, "STT provider built (no GPU lock)");
-                Arc::new(LemonadeTranscriptionProvider::new(base_url, model_id))
+                Arc::new(LemonadeTranscriptionProvider::from_connection(
+                    connection.clone(),
+                    model_id,
+                ))
             }
         } else {
             // FLM (NPU) or any other recipe — no GPU contention.
@@ -219,40 +289,72 @@ impl ProviderFactory {
                 model = model_id,
                 name, "STT provider built (NPU/CPU, no GPU lock)"
             );
-            Arc::new(LemonadeTranscriptionProvider::new(base_url, model_id))
+            Arc::new(LemonadeTranscriptionProvider::from_connection(
+                connection.clone(),
+                model_id,
+            ))
         };
 
         Ok(ProviderSlot::Transcription(provider))
     }
 
     async fn build_llm(
-        base_url: &str,
+        connection: &Arc<LemonadeConnection>,
         model_id: &str,
         load_opts: &ModelLoadOptions,
         selected: &SelectedModel,
         gpu_manager: Option<Arc<GpuResourceManager>>,
-        already_loaded: &[String],
+        _already_loaded: &[String],
         name: &str,
     ) -> Result<ProviderSlot> {
-        load_model(base_url, model_id, load_opts, already_loaded).await?;
-
         let gpu = if Self::backend_uses_gpu(selected) {
             gpu_manager
         } else {
             None
         };
-        let provider = LemonadeChatProvider::new(base_url, model_id, gpu);
+        let provider = LemonadeChatProvider::from_connection(connection.clone(), model_id, gpu);
+        let runtime = Arc::new(LemonadeRuntime::from_connection(connection.clone()));
+        let device = match selected.recipe.as_str() {
+            "flm" => Some("npu".to_string()),
+            "llamacpp" => Some(
+                if matches!(
+                    selected.backend.as_deref(),
+                    Some("rocm" | "vulkan" | "metal")
+                ) {
+                    "gpu"
+                } else {
+                    "cpu"
+                }
+                .to_string(),
+            ),
+            _ => None,
+        };
+        let profile = LemonadeRuntimeProfile::new(model_id, false, load_opts.clone())
+            .with_checkpoint(selected.checkpoint.clone())
+            .with_backend_profile(selected.recipe.clone(), selected.backend.clone(), device)
+            .with_reasoning(
+                ReasoningPolicy::Default,
+                crate::config::ReasoningControl::Request,
+                selected.reasoning_capable,
+            );
+        // Build-time activation also uses live health authority; the lease is
+        // released immediately because no request has started yet.
+        drop(runtime.acquire(&profile).await?);
         info!(
             model = model_id,
             name,
             gpu_locked = provider.gpu.is_some(),
             "LLM provider built"
         );
-        Ok(ProviderSlot::Chat(provider))
+        Ok(ProviderSlot::Chat(Box::new(CoordinatedChatProvider {
+            provider,
+            runtime,
+            profile,
+        })))
     }
 
-    fn build_tts(base_url: &str, model_id: &str, name: &str) -> ProviderSlot {
-        let provider = LemonadeTtsProvider::new(base_url, model_id);
+    fn build_tts(connection: &Arc<LemonadeConnection>, model_id: &str, name: &str) -> ProviderSlot {
+        let provider = LemonadeTtsProvider::from_connection(connection.clone(), model_id);
         info!(model = model_id, name, "TTS provider built");
         ProviderSlot::Tts(Box::new(provider))
     }
@@ -314,6 +416,11 @@ mod tests {
             backend: backend.map(String::from),
             load_opts: ModelLoadOptions::default(),
             quality_tier: QualityTier::NotApplicable,
+            checkpoint: String::new(),
+            max_context_window: None,
+            tool_capable: false,
+            reasoning_capable: false,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -482,6 +589,11 @@ mod tests {
             backend: None,
             load_opts: ModelLoadOptions::default(),
             quality_tier: QualityTier::Standard,
+            checkpoint: model.checkpoint.clone(),
+            max_context_window: model.max_context_window,
+            tool_capable: model.supports_tool_calling(),
+            reasoning_capable: model.supports_reasoning(),
+            diagnostics: Vec::new(),
         };
 
         let built = ProviderFactory::build(&selected, Capability::Embedding, &url, 100, None, &[])

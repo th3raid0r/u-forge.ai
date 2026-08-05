@@ -30,6 +30,7 @@ impl Render for AppView {
 
         let file_menu_open = self.file_menu_open;
         let view_menu_open = self.view_menu_open;
+        let setup_open = self.setup_open;
         let sidebar_open = self.sidebar_open;
         let sidebar_tab = self.sidebar_tab;
         let right_panel_open = self.right_panel_open;
@@ -668,6 +669,30 @@ impl Render for AppView {
                                 )
                                 // ── separator ──
                                 .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                                .child(
+                                    div()
+                                        .id("lemonade-setup-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.file_menu_open = false;
+                                                this.setup_open = true;
+                                                this.do_refresh_lemonade_setup(cx);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child("Lemonade AI Setup…"),
+                                )
+                                // ── separator ──
+                                .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
                                 // Import Schema… — always enabled
                                 .child(
                                     div()
@@ -884,6 +909,8 @@ impl Render for AppView {
             .when(self.confirmation.is_some(), |root| {
                 root.child(self.confirmation.as_ref().unwrap().clone())
             })
+            // ── Reopenable Lemonade setup ───────────────────────────────────
+            .when(setup_open, |root| root.child(self.setup_panel.clone()))
             // ── Frame-cost timing canvas ──────────────────────────────────────
             // Zero-size absolute element; its paint closure fires after GPUI
             // completes the full layout pass, making elapsed() an honest measure

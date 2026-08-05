@@ -5,6 +5,8 @@
 //! [`crate::ai::embeddings`] and are dependency-free; this module handles
 //! all Lemonade-specific HTTP logic.
 
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use async_openai::types::embeddings::{CreateEmbeddingRequest, EmbeddingInput};
 use async_openai::{Client, config::OpenAIConfig};
@@ -13,7 +15,9 @@ use tracing::info;
 
 use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
 
-use super::client::make_lemonade_openai_client;
+use super::client::{
+    LemonadeConnection, make_lemonade_openai_client, make_lemonade_openai_client_for,
+};
 
 // ── LemonadeProvider ──────────────────────────────────────────────────────────
 
@@ -46,7 +50,15 @@ impl LemonadeProvider {
     /// Returns an error if the server is unreachable or the model is not loaded.
     pub async fn new(base_url: &str, model: &str) -> Result<Self> {
         let client = make_lemonade_openai_client(base_url);
+        Self::probe(client, base_url, model).await
+    }
 
+    pub async fn from_connection(connection: Arc<LemonadeConnection>, model: &str) -> Result<Self> {
+        let client = make_lemonade_openai_client_for(&connection);
+        Self::probe(client, connection.api_base(), model).await
+    }
+
+    async fn probe(client: Client<OpenAIConfig>, base_url: &str, model: &str) -> Result<Self> {
         let probe_req = CreateEmbeddingRequest {
             model: model.to_string(),
             input: EmbeddingInput::StringArray(vec!["dimension probe".to_string()]),
@@ -107,6 +119,23 @@ impl LemonadeProvider {
                 )
             })?;
         Self::new(base_url, model).await
+    }
+
+    pub async fn from_connection_with_load(
+        connection: Arc<LemonadeConnection>,
+        model: &str,
+        load_opts: &crate::lemonade::ModelLoadOptions,
+        already_loaded: &[String],
+    ) -> Result<Self> {
+        crate::lemonade::load_model_with_connection(
+            connection.clone(),
+            model,
+            load_opts,
+            already_loaded,
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to load model '{model}' before connecting: {e}"))?;
+        Self::from_connection(connection, model).await
     }
 }
 

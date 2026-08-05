@@ -128,6 +128,11 @@ mod tests {
             backend: backend.map(String::from),
             load_opts: ModelLoadOptions::default(),
             quality_tier: QualityTier::NotApplicable,
+            checkpoint: String::new(),
+            max_context_window: None,
+            tool_capable: false,
+            reasoning_capable: false,
+            diagnostics: Vec::new(),
         }
     }
 

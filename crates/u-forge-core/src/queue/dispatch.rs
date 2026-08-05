@@ -7,11 +7,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::instrument;
 
 use crate::lemonade::{
-    ChatCompletionResponse, ChatRequest, KokoroVoice, LemonadeChatProvider, RerankDocument,
-    StreamToken,
+    ChatCompletionResponse, ChatRequest, KokoroVoice, RerankDocument, StreamToken,
 };
 
-use super::jobs::{EmbedJob, GenerateJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue};
+use super::jobs::{
+    EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
+};
 use super::weighted::WeightedEmbedDispatcher;
 
 // ── Public queue state exposed via QueueStats ─────────────────────────────────
@@ -47,11 +48,9 @@ pub struct InferenceQueue {
     pub(super) transcribe_queue: Arc<WorkQueue<TranscribeJob>>,
     pub(super) synthesize_queue: Arc<WorkQueue<SynthesizeJob>>,
     pub(super) generate_queue: Arc<WorkQueue<GenerateJob>>,
+    pub(super) generate_stream_queue: Arc<WorkQueue<GenerateStreamJob>>,
     pub(super) rerank_queue: Arc<WorkQueue<RerankJob>>,
 
-    /// Cloned providers used for streaming (bypasses the job queue — the
-    /// provider's internal GPU lock handles serialisation).
-    pub(super) chat_providers: Arc<Vec<LemonadeChatProvider>>,
     /// Stable identity of all embedding providers eligible for this lane.
     pub(super) embedding_space_fingerprint: Option<Arc<str>>,
 
@@ -265,8 +264,8 @@ impl InferenceQueue {
     /// Submit a streaming LLM request; returns an mpsc receiver that yields
     /// text deltas as the model generates them.
     ///
-    /// Uses the first registered chat provider directly (bypassing the job
-    /// queue) — the provider's internal GPU lock serialises concurrent calls.
+    /// The selected worker remains occupied through stream completion or
+    /// receiver cancellation.
     ///
     /// # Errors
     ///
@@ -281,11 +280,12 @@ impl InferenceQueue {
                 "InferenceQueue: no LLM-capable device is registered."
             ));
         }
-        let provider = self
-            .chat_providers
-            .first()
-            .expect("llm_workers > 0 but chat_providers is empty");
-        Ok(provider.complete_stream(request))
+        let (tx, rx) = mpsc::channel(64);
+        self.generate_stream_queue.push(GenerateStreamJob {
+            request,
+            response: tx,
+        });
+        Ok(rx)
     }
 
     /// Convenience wrapper: submit a single-turn user prompt and return the
@@ -576,8 +576,8 @@ mod tests {
             transcribe_queue,
             synthesize_queue,
             generate_queue: Arc::new(WorkQueue::new()),
+            generate_stream_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
-            chat_providers: Arc::new(Vec::new()),
             embedding_space_fingerprint: Some(Arc::from("mock@768")),
             embedding_workers: 1,
             transcription_workers: 2,
@@ -702,8 +702,8 @@ mod tests {
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
+            generate_stream_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
-            chat_providers: Arc::new(Vec::new()),
             embedding_space_fingerprint: None,
             embedding_workers: 0,
             transcription_workers: 0,
@@ -727,8 +727,8 @@ mod tests {
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
+            generate_stream_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
-            chat_providers: Arc::new(Vec::new()),
             embedding_space_fingerprint: None,
             embedding_workers: 0,
             transcription_workers: 0,
@@ -788,8 +788,8 @@ mod tests {
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
+            generate_stream_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
-            chat_providers: Arc::new(Vec::new()),
             embedding_space_fingerprint: Some(Arc::from("slow@768")),
             embedding_workers: 1,
             transcription_workers: 0,
@@ -833,8 +833,8 @@ mod tests {
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
+            generate_stream_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
-            chat_providers: Arc::new(Vec::new()),
             embedding_space_fingerprint: Some(Arc::from("mock@768")),
             embedding_workers: 1,
             transcription_workers: 2,
@@ -864,8 +864,8 @@ mod tests {
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
+            generate_stream_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
-            chat_providers: Arc::new(Vec::new()),
             embedding_space_fingerprint: Some(Arc::from("mock@768")),
             embedding_workers: 1,
             transcription_workers: 2,
@@ -885,8 +885,8 @@ mod tests {
             transcribe_queue: Arc::new(WorkQueue::new()),
             synthesize_queue: Arc::new(WorkQueue::new()),
             generate_queue: Arc::new(WorkQueue::new()),
+            generate_stream_queue: Arc::new(WorkQueue::new()),
             rerank_queue: Arc::new(WorkQueue::new()),
-            chat_providers: Arc::new(Vec::new()),
             embedding_space_fingerprint: Some(Arc::from("mock@768")),
             embedding_workers: 1,
             transcription_workers: 0,

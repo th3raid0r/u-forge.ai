@@ -22,14 +22,18 @@
 //!
 //! RAII guards ([`SttGuard`], [`LlmGuard`]) automatically release the GPU when dropped.
 
+use std::sync::Arc;
+
 pub mod catalog;
 pub mod chat;
 pub(crate) mod client;
 pub mod duplicate_guard;
+pub mod embedded;
 pub mod embedding;
 pub mod gpu_manager;
 pub mod health;
 pub mod load;
+pub mod management;
 pub mod provider_factory;
 pub mod rerank;
 pub mod runtime;
@@ -43,19 +47,37 @@ pub mod tts;
 
 pub use catalog::{CatalogModel, InstalledBackend, LemonadeServerCatalog, LoadedModel};
 pub use chat::{
-    ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, LemonadeChatProvider,
-    StreamToken,
+    ChatChoice, ChatCompletionResponse, ChatEvent, ChatMessage, ChatRequest, ChatTerminalReason,
+    ChatUsage, LemonadeChatProvider, StreamToken,
 };
-pub use client::{LemonadeHttpClient, make_lemonade_openai_client};
+pub use client::{
+    LemonadeConnection, LemonadeHttpClient, LemonadeOwnership, LemonadeSecret, LemonadeTimeouts,
+    make_lemonade_openai_client, make_lemonade_openai_client_for,
+};
 pub use duplicate_guard::DuplicateGuard;
+pub use embedded::{EmbeddedLemonade, EmbeddedRuntimeError};
 pub use embedding::LemonadeProvider;
 pub use gpu_manager::{GpuResourceManager, GpuWorkload, LlmGuard, SttGuard};
 pub use health::{LemonadeHealth, LoadedModelEntry};
-pub use load::{ModelLoadOptions, load_model, reload_model};
-pub use provider_factory::{BuiltProvider, Capability, ProviderFactory, ProviderSlot};
+pub use load::{
+    ModelLoadOptions, load_model, load_model_for_recipe_with_connection,
+    load_model_with_connection, reload_model, reload_model_for_recipe_with_connection,
+    reload_model_with_connection,
+};
+pub use management::{
+    DownloadAction, LemonadeManagement, SetupBackendChoice, SetupComponent, SetupComponentState,
+    SetupRole, chat_component_state, component_state, initial_setup_components,
+    select_setup_backend, setup_chat_models,
+};
+pub use provider_factory::{
+    BuiltProvider, Capability, CoordinatedChatProvider, ProviderFactory, ProviderSlot,
+};
 pub use rerank::{LemonadeRerankProvider, RerankDocument, RerankProvider};
-pub use runtime::{LemonadeRuntime, LemonadeRuntimeProfile};
-pub use selector::{ModelSelector, QualityTier, SelectedModel};
+pub use runtime::{
+    LemonadeRuntime, LemonadeRuntimeLease, LemonadeRuntimeProfile, LoadedProfileKey,
+    ReasoningPolicy,
+};
+pub use selector::{EffectiveChatLimits, ModelSelector, QualityTier, SelectedModel};
 pub use stt::{LemonadeSttProvider, TranscriptionResult};
 pub use system_info::{RecipeBackendInfo, SystemDeviceInfo, SystemInfo};
 pub use transcription::LemonadeTranscriptionProvider;
@@ -96,12 +118,17 @@ pub async fn resolve_provider_url(
 ///
 /// Resolution order:
 ///
-/// 1. `http://localhost:13305/api/v1` — probed via `GET /api/v1/health`.
-/// 2. `http://127.0.0.1:13305/api/v1` — same probe against explicit IPv4 loopback.
-/// 3. The `LEMONADE_URL` environment variable — accepted as-is with no liveness check.
+/// 1. `LEMONADE_URL`, normalized to a supported API prefix.
+/// 2. `http://localhost:13305/v1` — probed via `GET /v1/health`.
+/// 3. `http://127.0.0.1:13305/v1` — explicit IPv4 loopback fallback.
 ///
 /// Returns `None` when none of the above sources yield a reachable server.
 pub async fn resolve_lemonade_url() -> Option<String> {
+    if let Ok(url) = std::env::var("LEMONADE_URL") {
+        return LemonadeConnection::external(&url)
+            .ok()
+            .map(|connection| connection.api_base().to_string());
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
@@ -109,15 +136,27 @@ pub async fn resolve_lemonade_url() -> Option<String> {
 
     for base in &["http://localhost:13305", "http://127.0.0.1:13305"] {
         if client
-            .get(format!("{}/api/v1/health", base))
+            .get(format!("{}/v1/health", base))
             .send()
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
         {
-            return Some(format!("{}/api/v1", base));
+            return Some(format!("{}/v1", base));
         }
     }
 
-    std::env::var("LEMONADE_URL").ok()
+    None
+}
+
+/// Select an explicit external connection or launch the private embedded
+/// runtime. The embedded path never adopts an unrelated process already bound
+/// to a candidate port.
+pub async fn resolve_runtime_connection()
+-> anyhow::Result<(Arc<LemonadeConnection>, Option<Arc<EmbeddedLemonade>>)> {
+    if let Ok(url) = std::env::var("LEMONADE_URL") {
+        return Ok((Arc::new(LemonadeConnection::external(&url)?), None));
+    }
+    let embedded = EmbeddedLemonade::launch().await?;
+    Ok((embedded.connection(), Some(embedded)))
 }

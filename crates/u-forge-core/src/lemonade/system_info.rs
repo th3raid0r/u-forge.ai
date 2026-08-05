@@ -5,13 +5,18 @@
 //! capability display; for model selection and provider construction use
 //! [`LemonadeServerCatalog`](super::catalog::LemonadeServerCatalog).
 
-use anyhow::{Context, Result};
+use std::sync::Arc;
+
+use anyhow::Result;
 use serde::Deserialize;
 use tracing::info;
+
+use super::client::{LemonadeConnection, LemonadeHttpClient};
 
 /// Raw device info from the `devices` section of `/system-info`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemDeviceInfo {
+    #[serde(default)]
     pub available: bool,
     #[serde(default)]
     pub family: String,
@@ -28,6 +33,12 @@ pub struct RecipeBackendInfo {
     /// Lemonade device ids this backend runs on (e.g. `["amd_igpu"]`).
     #[serde(default)]
     pub devices: Vec<String>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// Snapshot of the Lemonade server's hardware state.
@@ -46,43 +57,38 @@ pub struct SystemInfo {
     pub npu: Option<SystemDeviceInfo>,
     /// AMD integrated GPU device info, if present.
     pub igpu: Option<SystemDeviceInfo>,
+    /// Discrete GPUs reported by current Lemonade releases.
+    pub gpus: Vec<SystemDeviceInfo>,
 }
 
 impl SystemInfo {
     /// Fetch system info from `GET {base_url}/system-info`.
     pub async fn fetch(base_url: &str) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .connect_timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap_or_default();
-        let base = base_url.trim_end_matches('/');
-        let url = format!("{base}/system-info");
+        let connection = Arc::new(LemonadeConnection::external(base_url)?);
+        Self::fetch_with_connection(connection).await
+    }
 
-        let raw: serde_json::Value = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to reach Lemonade system-info at {url}"))?
-            .error_for_status()
-            .context("Lemonade /system-info returned an error status")?
-            .json()
-            .await
-            .context("Failed to parse /system-info JSON")?;
+    pub async fn fetch_with_connection(connection: Arc<LemonadeConnection>) -> Result<Self> {
+        let raw: serde_json::Value = LemonadeHttpClient::from_connection(connection)
+            .get_json("/system-info")
+            .await?;
 
         let processor = raw
             .get("Processor")
             .and_then(|v| v.as_str())
+            .or_else(|| raw.pointer("/cpu/name").and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
         let physical_memory = raw
             .get("Physical Memory")
             .and_then(|v| v.as_str())
+            .or_else(|| raw.pointer("/memory/physical").and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
         let os_version = raw
             .get("OS Version")
             .and_then(|v| v.as_str())
+            .or_else(|| raw.pointer("/os/version").and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
 
@@ -92,6 +98,17 @@ impl SystemInfo {
         let igpu = raw
             .pointer("/devices/amd_igpu")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let gpus = raw
+            .get("gpus")
+            .or_else(|| raw.pointer("/devices/gpus"))
+            .and_then(|v| v.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| serde_json::from_value(value.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let info = Self {
             processor,
@@ -99,6 +116,7 @@ impl SystemInfo {
             os_version,
             npu,
             igpu,
+            gpus,
         };
 
         info!(

@@ -10,6 +10,7 @@ mod panel_contracts;
 pub mod path_picker;
 pub mod search_panel;
 pub mod selection_model;
+mod setup_panel;
 pub mod text_field;
 
 pub use app_view::AppView;
