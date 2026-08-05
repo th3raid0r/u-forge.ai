@@ -86,9 +86,9 @@ Lemonade runtime redesign or the Zed workspace refactor.
 
 ## Maintenance closure
 
-- [ ] **AC-20** Reject unknown keys on `AppConfig` and nested configuration
+- [x] **AC-20** Reject unknown keys on `AppConfig` and nested configuration
   sections, with path-specific parse tests.
-- [ ] **AC-21** Make schema saving synchronous and update all callers.
+- [x] **AC-21** Make schema saving synchronous and update all callers.
 - [ ] **AC-22** Keep one FTS sanitizer implementation and reuse it from agent
   tools.
 - [x] **AC-23** Do not install cursor-blink tasks for read-only text fields.

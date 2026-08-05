@@ -1361,11 +1361,7 @@ mod tests {
                 .with_property("role".to_string(), PropertySchema::string("role"))
                 .with_required_property("name".to_string()),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon","role":"Mathematician","secret":"psychohistory"}}"#;
@@ -1407,11 +1403,7 @@ mod tests {
                 .with_required_property("name".to_string())
                 .with_required_property("role".to_string()),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon"}}
@@ -1445,11 +1437,7 @@ mod tests {
                 .with_property("name".to_string(), PropertySchema::string("name"))
                 .with_required_property("name".to_string()),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon"}}
@@ -1489,11 +1477,7 @@ mod tests {
                 .with_source_types(vec!["npc".to_string()])
                 .with_target_types(vec!["npc".to_string()]),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon"}}
@@ -1540,11 +1524,7 @@ mod tests {
                 .with_source_types(vec!["npc".to_string()])
                 .with_target_types(vec!["location".to_string()]),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let mut ingestion = DataIngestion::new(&graph);
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Hari Seldon"}}
@@ -1614,11 +1594,7 @@ mod tests {
                 .with_source_types(vec!["npc".to_string()])
                 .with_target_types(vec!["location".to_string()]),
         );
-        graph
-            .get_schema_manager()
-            .save_schema(&schema)
-            .await
-            .unwrap();
+        graph.get_schema_manager().save_schema(&schema).unwrap();
 
         let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"npc","properties":{"name":"Echo"}}
 {"entitytype":"node","id":"00000000-0000-0000-0000-000000000002","nodetype":"location","properties":{"name":"Echo"}}

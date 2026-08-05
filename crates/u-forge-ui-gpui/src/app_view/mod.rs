@@ -726,7 +726,7 @@ impl AppView {
                     let save_start = std::time::Instant::now();
                     // Remove the built-in placeholder before saving the imported schema set.
                     let _ = mgr.delete_schema("default");
-                    let result = mgr.save_schema(&schema_def).await;
+                    let result = mgr.save_schema(&schema_def);
                     tracing::info!(
                         ui_action = "import_schema",
                         phase = "schema_saved",

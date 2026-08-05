@@ -50,6 +50,7 @@ use crate::lemonade::load::ModelLoadOptions;
 ///
 /// Corresponds to the `[embedding]` section of `u-forge.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingDeviceConfig {
     /// Whether to use the NPU embedding worker (FLM model, highest quality).
     #[serde(default = "default_true")]
@@ -113,6 +114,7 @@ impl Default for EmbeddingDeviceConfig {
 /// "bge-reranker-v2-m3-GGUF" = { ctx_size = 8192, batch_size = 512, ubatch_size = 512 }
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelLoadParams {
     /// Context window size in tokens passed to `POST /api/v1/load`.
     pub ctx_size: Option<usize>,
@@ -139,6 +141,7 @@ pub struct ModelLoadParams {
 /// `u-forge.toml` under `[models.load_params]` to tune new models without
 /// recompiling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Per-model load parameters (ctx window, batch sizes).
     ///
@@ -256,6 +259,7 @@ pub enum ChatDevice {
 /// `u-forge.toml`.  All fields are optional; `None` falls back to the
 /// provider default baked into [`LemonadeChatProvider`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ChatDeviceConfig {
     /// Override the model id for this device (e.g. `"Gemma-4-26B-A4B-it-GGUF"`).
     ///
@@ -305,6 +309,7 @@ pub struct ChatDeviceConfig {
 ///
 /// Corresponds to the `[chat]` section of `u-forge.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatConfig {
     /// Preferred inference device (`auto` | `gpu` | `npu` | `cpu`).
     #[serde(default)]
@@ -448,6 +453,7 @@ impl Default for ChatConfig {
 ///
 /// Corresponds to the `[storage]` section of `u-forge.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     /// Path to the SQLite database directory.
     ///
@@ -500,6 +506,7 @@ impl Default for StorageConfig {
 ///
 /// Corresponds to the `[data]` section of `u-forge.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataConfig {
     /// Path to the JSONL file loaded on startup (and by File > Import Data).
     ///
@@ -546,6 +553,7 @@ impl Default for DataConfig {
 ///
 /// Corresponds to the `[ui]` section of `u-forge.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UiConfig {
     /// Base font size in pixels, used as the rem unit for all UI text.
     ///
@@ -581,6 +589,7 @@ impl Default for UiConfig {
 /// Loaded from `u-forge.toml` by [`AppConfig::load_default`].
 /// Use [`AppConfig::default`] when no config file is present or required.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Embedding-specific device settings.
     #[serde(default)]
@@ -936,5 +945,54 @@ cpu_enabled = false
         assert_eq!(cfg.embedding.npu_weight, 100);
         assert_eq!(cfg.embedding.gpu_weight, 50);
         assert_eq!(cfg.embedding.cpu_weight, 10);
+    }
+
+    #[test]
+    fn test_unknown_keys_are_rejected_at_each_config_path() {
+        let cases = [
+            ("top level", "unexpected_root = true\n", "unexpected_root"),
+            (
+                "embedding",
+                "[embedding]\nunexpected_embedding = true\n",
+                "unexpected_embedding",
+            ),
+            (
+                "models",
+                "[models]\nunexpected_models = true\n",
+                "unexpected_models",
+            ),
+            (
+                "model load params",
+                "[models.load_params]\ncustom = { ctx_sze = 12 }\n",
+                "ctx_sze",
+            ),
+            ("chat", "[chat]\nsearch_limt = 4\n", "search_limt"),
+            (
+                "chat device",
+                "[chat.gpu]\ntemprature = 0.5\n",
+                "temprature",
+            ),
+            (
+                "storage",
+                "[storage]\nembedding_dimensons = 768\n",
+                "embedding_dimensons",
+            ),
+            (
+                "data",
+                "[data]\nimport_flie = 'world.jsonl'\n",
+                "import_flie",
+            ),
+            ("ui", "[ui]\nfont_sze = 14.0\n", "font_sze"),
+        ];
+
+        for (path, source, unknown_key) in cases {
+            let mut file = NamedTempFile::new().unwrap();
+            write!(file, "{source}").unwrap();
+            let error = AppConfig::load(file.path()).unwrap_err().to_string();
+            assert!(
+                error.contains(unknown_key),
+                "error for {path} did not identify {unknown_key:?}: {error}"
+            );
+        }
     }
 }

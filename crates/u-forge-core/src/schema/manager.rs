@@ -56,7 +56,7 @@ impl SchemaManager {
                     )
                 };
 
-                self.save_schema(&default_schema).await?;
+                self.save_schema(&default_schema)?;
                 let schema_arc = Arc::new(default_schema);
                 self.schema_cache
                     .write()
@@ -67,7 +67,7 @@ impl SchemaManager {
     }
 
     /// Save a schema to storage and update cache
-    pub async fn save_schema(&self, schema: &SchemaDefinition) -> Result<()> {
+    pub fn save_schema(&self, schema: &SchemaDefinition) -> Result<()> {
         self.storage.save_schema(schema)?;
 
         // Update cache
@@ -240,7 +240,7 @@ impl SchemaManager {
     ) -> Result<()> {
         let mut schema = (*self.load_schema(schema_name).await?).clone();
         schema.add_object_type(type_name.to_string(), type_schema);
-        self.save_schema(&schema).await?;
+        self.save_schema(&schema)?;
 
         // Invalidate cache to force reload
         self.schema_cache.write().remove(schema_name);
@@ -257,7 +257,7 @@ impl SchemaManager {
     ) -> Result<()> {
         let mut schema = (*self.load_schema(schema_name).await?).clone();
         schema.add_edge_type(edge_name.to_string(), edge_schema);
-        self.save_schema(&schema).await?;
+        self.save_schema(&schema)?;
 
         // Invalidate cache to force reload
         self.schema_cache.write().remove(schema_name);
@@ -1028,7 +1028,7 @@ mod tests {
                 .with_required_property("name".to_string())
                 .with_required_property("role".to_string()),
         );
-        manager.save_schema(&schema).await.unwrap();
+        manager.save_schema(&schema).unwrap();
 
         let mut missing = serde_json::Map::new();
         let issues = manager.validate_and_coerce_properties("npc", &mut missing);
