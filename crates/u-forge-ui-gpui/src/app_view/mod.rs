@@ -2,10 +2,7 @@ mod render;
 mod state;
 
 use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use gpui::{Context, Empty, Entity, Subscription, prelude::*};
 use parking_lot::RwLock;
@@ -812,7 +809,9 @@ impl AppView {
     ///
     /// Replaces the former `do_rechunk_and_embed` / `do_embed_all` /
     /// `spawn_embedding_sampler` / `stop_embedding_sampler` quartet.
-    /// Any previously running plan is implicitly cancelled via epoch bump.
+    /// A newer plan supersedes older UI progress. Queue work already dispatched
+    /// by an older plan continues in the background until queue cancellation is
+    /// supported.
     pub(crate) fn run_embedding_plan(&mut self, plan: EmbeddingPlan, cx: &mut Context<Self>) {
         let queue = match self.state.inference_queue.clone() {
             Some(q) => q,
@@ -872,41 +871,38 @@ impl AppView {
             hq_enabled = hq_queue.as_ref().is_some_and(|q| q.has_embedding()),
             "UI action scheduled"
         );
-        self.state.embedding_status = Some(plan.label());
+        let (generation, superseded) = self.state.embedding_plan.start();
+        self.state.embedding_status = Some(if superseded {
+            format!("{} (previous work still finishing)", plan.label())
+        } else {
+            plan.label()
+        });
+        if superseded {
+            tracing::info!(
+                ui_action = "embedding",
+                phase = "superseded",
+                plan_kind,
+                "Previous embedding work remains queued but may no longer update UI status"
+            );
+        }
         cx.notify();
-
-        // Cancel any previously running pipeline (sets the old flag → tasks exit on next tick).
-        self.state.embedding_cancel.store(true, Ordering::Relaxed);
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.state.embedding_cancel = Arc::clone(&cancel);
-
-        // Bump epoch to cancel any previously running poller.
-        self.state.embedding_plan_epoch = self.state.embedding_plan_epoch.wrapping_add(1);
-        let epoch = self.state.embedding_plan_epoch;
 
         // Shared progress state written by the tokio worker, read by the poller.
         let progress_state: Arc<parking_lot::Mutex<Option<EmbeddingProgress>>> =
             Arc::new(parking_lot::Mutex::new(None));
         let progress_write = Arc::clone(&progress_state);
 
-        let cancel_poller = Arc::clone(&cancel);
         // Poller: reads shared progress every 500 ms and refreshes the status bar.
         cx.spawn(async move |this, cx| {
             loop {
-                if cancel_poller.load(Ordering::Relaxed) {
-                    return;
-                }
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
                     .await;
-                if cancel_poller.load(Ordering::Relaxed) {
-                    return;
-                }
                 let Some(this) = this.upgrade() else { return };
                 let snap = progress_state.lock().clone();
                 let keep_running = this
                     .update(cx, |view: &mut AppView, cx| {
-                        if view.state.embedding_plan_epoch != epoch {
+                        if !view.state.embedding_plan.is_current(generation) {
                             return false;
                         }
                         if let Some(EmbeddingProgress::Rechunking { done, total }) = snap {
@@ -924,11 +920,9 @@ impl AppView {
         })
         .detach();
 
-        // Worker: runs the plan on the tokio runtime and reports outcome.
-        // `_cancel_guard` sets the cancel flag on drop (including panic), which
-        // stops the poller immediately rather than waiting for an epoch bump.
+        // Worker: runs the plan on the tokio runtime and reports its outcome only
+        // while its generation remains authoritative for UI state.
         cx.spawn(async move |this, cx| {
-            let _cancel_guard = state::CancelOnDrop(Arc::clone(&cancel));
             let outcome = cx
                 .background_executor()
                 .spawn(
@@ -963,8 +957,9 @@ impl AppView {
                 .await;
 
             this.update(cx, |view: &mut AppView, cx| {
-                // Stop the poller by advancing the epoch.
-                view.state.embedding_plan_epoch = view.state.embedding_plan_epoch.wrapping_add(1);
+                if !view.state.embedding_plan.finish(generation) {
+                    return;
+                }
                 view.state.embedding_status = Self::format_embedding_outcome(&outcome);
                 cx.notify();
             })

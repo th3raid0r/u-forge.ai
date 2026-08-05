@@ -61,9 +61,9 @@ Lemonade runtime redesign or the Zed workspace refactor.
 - [x] **AC-12 — Editor measurement outside paint.** Move `NodeEditorPanel`
   size measurement out of its paint closure. The perf timing canvas and
   GraphCanvas's local bounds cell remain documented exceptions.
-- [ ] **AC-13 — Path picker task ownership.** Store and replace the browse task
+- [x] **AC-13 — Path picker task ownership.** Store and replace the browse task
   so stale portal results cannot update a newer modal state.
-- [ ] **AC-14 — Embedding UI lifecycle.** Replace the epoch plus atomic cancel
+- [x] **AC-14 — Embedding UI lifecycle.** Replace the epoch plus atomic cancel
   split with one authority. Until queue cancellation lands, label superseded
   work accurately rather than claiming it was cancelled.
 - [ ] **AC-15 — Event propagation and confirmation.** Stop delete-button events

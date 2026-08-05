@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, Task,
     Window, deferred, div, prelude::*, px, rgb, rgba,
 };
 
@@ -34,6 +34,8 @@ pub(crate) struct PathPickerModal {
     confirm_label: String,
     pub(crate) path_field: Entity<TextFieldView>,
     focus: FocusHandle,
+    browse_generation: u64,
+    browse_task: Option<Task<()>>,
 }
 
 impl EventEmitter<PathConfirmed> for PathPickerModal {}
@@ -65,6 +67,8 @@ impl PathPickerModal {
             confirm_label: confirm_label.to_string(),
             path_field,
             focus: cx.focus_handle(),
+            browse_generation: 0,
+            browse_task: None,
         }
     }
 
@@ -79,8 +83,10 @@ impl PathPickerModal {
             multiple: false,
             prompt: None,
         });
-        let field = self.path_field.clone();
-        cx.spawn(async move |_this, cx| {
+        self.browse_generation = self.browse_generation.wrapping_add(1);
+        let generation = self.browse_generation;
+        self.browse_task.take();
+        self.browse_task = Some(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
                 return;
             };
@@ -88,22 +94,33 @@ impl PathPickerModal {
                 return;
             };
             let path_str = path.to_string_lossy().into_owned();
-            field
-                .update(cx, |f, cx| {
-                    f.set_content(&path_str, cx);
-                })
-                .ok();
-        })
-        .detach();
+            let Some(this) = this.upgrade() else { return };
+            this.update(cx, |modal, cx| {
+                if modal.browse_generation != generation {
+                    return;
+                }
+                modal.path_field.update(cx, |field, cx| {
+                    field.set_content(&path_str, cx);
+                });
+            })
+            .ok();
+        }));
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_browse();
         let path = PathBuf::from(self.path_field.read(cx).content.clone());
         cx.emit(PathConfirmed(path));
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_browse();
         cx.emit(PathCancelled);
+    }
+
+    fn invalidate_browse(&mut self) {
+        self.browse_generation = self.browse_generation.wrapping_add(1);
+        self.browse_task = None;
     }
 }
 
