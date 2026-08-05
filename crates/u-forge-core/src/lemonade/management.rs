@@ -135,8 +135,34 @@ pub fn component_state(
         .iter()
         .find(|model| component.matches_model_id(&model.id))
     else {
+        tracing::debug!(
+            model_id = component.model_id,
+            legacy_model_ids = ?component.legacy_model_ids,
+            candidate_model_ids = ?catalog
+                .models
+                .iter()
+                .filter(|model| {
+                    model.recipe == "flm"
+                        || model.labels.iter().any(|label| label == "embeddings")
+                })
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            "setup component was not present in the live Lemonade catalog"
+        );
         return SetupComponentState::Missing;
     };
+
+    tracing::debug!(
+        model_id = component.model_id,
+        catalog_model_id = %model.id,
+        expected_checkpoint = ?component.checkpoint,
+        catalog_checkpoint = ?model.checkpoint,
+        expected_recipe = ?component.recipe,
+        catalog_recipe = %model.recipe,
+        catalog_labels = ?model.labels,
+        downloaded = model.downloaded,
+        "matched setup component against the live Lemonade catalog"
+    );
 
     if let Some(expected) = component.checkpoint
         && model.checkpoint != expected

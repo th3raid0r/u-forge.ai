@@ -106,6 +106,7 @@ impl EmbeddedLemonade {
                 capture_output(
                     stdout,
                     diagnostics.clone(),
+                    "stdout",
                     api_key.clone(),
                     admin_key.clone(),
                 );
@@ -114,6 +115,7 @@ impl EmbeddedLemonade {
                 capture_output(
                     stderr,
                     diagnostics.clone(),
+                    "stderr",
                     api_key.clone(),
                     admin_key.clone(),
                 );
@@ -411,6 +413,7 @@ fn random_secret() -> String {
 fn capture_output<R>(
     reader: R,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
+    stream: &'static str,
     api: String,
     admin: String,
 ) where
@@ -419,11 +422,16 @@ fn capture_output<R>(
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            push_diagnostic(
-                &diagnostics,
-                line.replace(&api, "<redacted>")
-                    .replace(&admin, "<redacted>"),
+            let line = line
+                .replace(&api, "<redacted>")
+                .replace(&admin, "<redacted>");
+            tracing::debug!(
+                target: "u_forge_core::lemonade::embedded::lemond",
+                stream,
+                message = %line,
+                "embedded Lemonade output"
             );
+            push_diagnostic(&diagnostics, line);
         }
     });
 }
@@ -586,6 +594,7 @@ mod tests {
         capture_output(
             reader,
             diagnostics.clone(),
+            "stdout",
             "api-secret".to_string(),
             "admin-secret".to_string(),
         );

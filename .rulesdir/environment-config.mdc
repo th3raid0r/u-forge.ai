@@ -36,7 +36,17 @@ at the top level.
 
 ```bash
 export RUST_LOG=u_forge_core::graph::storage=debug,u_forge_core::ai::embeddings=info
+
+# Lemonade discovery plus redacted stdout/stderr from the owned lemond child.
+export RUST_LOG=info,u_forge_core::lemonade::management=debug,u_forge_core::lemonade::embedded::lemond=debug
 ```
+
+`RUST_LOG` controls u-forge's tracing filter. Embeddable Lemonade has its own
+`log_level` setting in `$XDG_DATA_HOME/u-forge/lemonade/config.json`, or
+`~/.local/share/u-forge/lemonade/config.json` when `XDG_DATA_HOME` is unset.
+Set that JSON field to `"debug"` when Lemonade's default informational child
+events are insufficient; u-forge forwards those lines only when the dedicated
+`lemond` tracing target above is enabled and redacts both runtime credentials.
 
 ## Path Resolution
 
