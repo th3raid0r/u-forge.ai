@@ -55,10 +55,10 @@ Lemonade runtime redesign or the Zed workspace refactor.
 
 ## GPUI state and destructive actions
 
-- [ ] **AC-11 — Text layout outside paint.** Move `TextFieldView` shaping,
+- [x] **AC-11 — Text layout outside paint.** Move `TextFieldView` shaping,
   hit-test layout, origin, visible-size, and content-height updates into
   layout/prepaint preparation. Paint consumes prepared state only.
-- [ ] **AC-12 — Editor measurement outside paint.** Move `NodeEditorPanel`
+- [x] **AC-12 — Editor measurement outside paint.** Move `NodeEditorPanel`
   size measurement out of its paint closure. The perf timing canvas and
   GraphCanvas's local bounds cell remain documented exceptions.
 - [ ] **AC-13 — Path picker task ownership.** Store and replace the browse task
@@ -91,7 +91,7 @@ Lemonade runtime redesign or the Zed workspace refactor.
 - [ ] **AC-21** Make schema saving synchronous and update all callers.
 - [ ] **AC-22** Keep one FTS sanitizer implementation and reuse it from agent
   tools.
-- [ ] **AC-23** Do not install cursor-blink tasks for read-only text fields.
+- [x] **AC-23** Do not install cursor-blink tasks for read-only text fields.
 - [ ] **AC-24** Compile-check `convert_memorymesh` from the root Makefile/CI.
 - [ ] **AC-25** Remove stale deprecated `EdgeType` guidance without changing
   backward-compatible code unless separately justified.
