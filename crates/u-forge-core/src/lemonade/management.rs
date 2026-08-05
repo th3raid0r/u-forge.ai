@@ -22,10 +22,14 @@ pub enum SetupRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupComponent {
     pub role: SetupRole,
+    /// Canonical ID used for catalog matching, selection, and inference.
     pub model_id: &'static str,
-    /// Older IDs accepted as the same managed component. New pulls always use
-    /// `model_id`, so compatibility aliases cannot create new stale names.
-    pub legacy_model_ids: &'static [&'static str],
+    /// Additional catalog IDs accepted as the same managed component.
+    pub catalog_aliases: &'static [&'static str],
+    /// Custom-registration name required by `/pull` when the model is not in
+    /// Lemonade's built-in registry. `None` means pull the built-in model by
+    /// canonical ID without forwarding registration metadata.
+    pull_registration_id: Option<&'static str>,
     pub checkpoint: Option<&'static str>,
     pub recipe: Option<&'static str>,
     pub required: bool,
@@ -33,9 +37,38 @@ pub struct SetupComponent {
     pub required_label: Option<&'static str>,
 }
 
+/// Registration inputs for `/pull`. Built-in models intentionally omit all
+/// optional registration fields; adding any of them changes the operation into
+/// a user-model registration in Lemonade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupPullSpec {
+    pub model_name: &'static str,
+    pub checkpoint: Option<&'static str>,
+    pub recipe: Option<&'static str>,
+    pub embedding: Option<bool>,
+}
+
 impl SetupComponent {
     pub fn matches_model_id(&self, model_id: &str) -> bool {
-        self.model_id == model_id || self.legacy_model_ids.contains(&model_id)
+        self.model_id == model_id || self.catalog_aliases.contains(&model_id)
+    }
+
+    pub fn pull_spec(&self) -> SetupPullSpec {
+        if let Some(model_name) = self.pull_registration_id {
+            SetupPullSpec {
+                model_name,
+                checkpoint: self.checkpoint,
+                recipe: self.recipe,
+                embedding: Some(self.is_embedding()),
+            }
+        } else {
+            SetupPullSpec {
+                model_name: self.model_id,
+                checkpoint: None,
+                recipe: None,
+                embedding: None,
+            }
+        }
     }
 
     pub fn is_embedding(&self) -> bool {
@@ -85,7 +118,8 @@ pub fn initial_setup_components() -> Vec<SetupComponent> {
         SetupComponent {
             role: SetupRole::StandardEmbedding,
             model_id: "ggml-org/embeddinggemma-300M-GGUF",
-            legacy_model_ids: &["user.ggml-org/embeddinggemma-300M-GGUF"],
+            catalog_aliases: &["user.ggml-org/embeddinggemma-300M-GGUF"],
+            pull_registration_id: Some("user.ggml-org/embeddinggemma-300M-GGUF"),
             checkpoint: Some("ggml-org/embeddinggemma-300M-GGUF:Q8_0"),
             recipe: Some("llamacpp"),
             required: true,
@@ -95,7 +129,8 @@ pub fn initial_setup_components() -> Vec<SetupComponent> {
         SetupComponent {
             role: SetupRole::NpuEmbedding,
             model_id: "embed-gemma-300m-FLM",
-            legacy_model_ids: &[],
+            catalog_aliases: &["user.embed-gemma-300m-FLM"],
+            pull_registration_id: None,
             checkpoint: Some("embed-gemma:300m"),
             recipe: Some("flm"),
             required: false,
@@ -105,7 +140,8 @@ pub fn initial_setup_components() -> Vec<SetupComponent> {
         SetupComponent {
             role: SetupRole::Reranking,
             model_id: "bge-reranker-v2-m3-GGUF",
-            legacy_model_ids: &[],
+            catalog_aliases: &[],
+            pull_registration_id: None,
             checkpoint: None,
             recipe: None,
             required: true,
@@ -115,7 +151,8 @@ pub fn initial_setup_components() -> Vec<SetupComponent> {
         SetupComponent {
             role: SetupRole::HighQualityEmbedding,
             model_id: "Qwen3-Embedding-8B-GGUF",
-            legacy_model_ids: &[],
+            catalog_aliases: &[],
+            pull_registration_id: None,
             checkpoint: None,
             recipe: None,
             required: false,
@@ -133,11 +170,17 @@ pub fn component_state(
     let Some(model) = catalog
         .models
         .iter()
-        .find(|model| component.matches_model_id(&model.id))
+        .find(|model| model.id == component.model_id)
+        .or_else(|| {
+            catalog
+                .models
+                .iter()
+                .find(|model| component.catalog_aliases.contains(&model.id.as_str()))
+        })
     else {
         tracing::debug!(
             model_id = component.model_id,
-            legacy_model_ids = ?component.legacy_model_ids,
+            catalog_aliases = ?component.catalog_aliases,
             candidate_model_ids = ?catalog
                 .models
                 .iter()
@@ -328,7 +371,7 @@ impl LemonadeManagement {
         model_name: &str,
         checkpoint: Option<&str>,
         recipe: Option<&str>,
-        embedding: bool,
+        embedding: Option<bool>,
         confirmed_external: bool,
     ) -> Result<serde_json::Value> {
         self.authorize_mutation(confirmed_external).await?;
@@ -376,11 +419,10 @@ fn pull_body(
     model_name: &str,
     checkpoint: Option<&str>,
     recipe: Option<&str>,
-    embedding: bool,
+    embedding: Option<bool>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model_name": model_name,
-        "embedding": embedding,
         "stream": true,
         "subscribe": false,
     });
@@ -389,6 +431,9 @@ fn pull_body(
     }
     if let Some(recipe) = recipe {
         body["recipe"] = serde_json::Value::String(recipe.to_string());
+    }
+    if let Some(embedding) = embedding {
+        body["embedding"] = serde_json::Value::Bool(embedding);
     }
     body
 }
@@ -461,12 +506,16 @@ mod tests {
     }
 
     #[test]
-    fn current_and_legacy_standard_embedding_ids_are_detected() {
+    fn canonical_and_custom_registration_standard_embedding_ids_are_detected() {
         let component = initial_setup_components()
             .into_iter()
             .find(|component| component.role == SetupRole::StandardEmbedding)
             .unwrap();
         assert_eq!(component.model_id, "ggml-org/embeddinggemma-300M-GGUF");
+        assert_eq!(
+            component.pull_spec().model_name,
+            "user.ggml-org/embeddinggemma-300M-GGUF"
+        );
 
         let mut current = catalog_model(&component, true);
         let mut catalog = LemonadeServerCatalog {
@@ -487,19 +536,49 @@ mod tests {
     }
 
     #[test]
-    fn downloaded_flm_embedding_is_detected_as_ready() {
+    fn canonical_and_legacy_registration_flm_embedding_ids_are_detected() {
         let component = initial_setup_components()
             .into_iter()
             .find(|component| component.role == SetupRole::NpuEmbedding)
             .unwrap();
-        let catalog = LemonadeServerCatalog {
-            models: vec![catalog_model(&component, true)],
+        assert_eq!(component.model_id, "embed-gemma-300m-FLM");
+        assert_eq!(component.pull_spec().model_name, "embed-gemma-300m-FLM");
+
+        let mut model = catalog_model(&component, true);
+        let mut catalog = LemonadeServerCatalog {
+            models: vec![model.clone()],
             ..Default::default()
         };
-        assert_eq!(component.model_id, "embed-gemma-300m-FLM");
         assert_eq!(
             component_state(&catalog, &component),
             SetupComponentState::Ready
+        );
+
+        model.id = "user.embed-gemma-300m-FLM".to_string();
+        catalog.models = vec![model];
+        assert_eq!(
+            component_state(&catalog, &component),
+            SetupComponentState::Ready
+        );
+    }
+
+    #[test]
+    fn canonical_catalog_entry_wins_over_legacy_registration_alias() {
+        let component = initial_setup_components()
+            .into_iter()
+            .find(|component| component.role == SetupRole::NpuEmbedding)
+            .unwrap();
+        let mut legacy = catalog_model(&component, true);
+        legacy.id = "user.embed-gemma-300m-FLM".to_string();
+        let canonical = catalog_model(&component, false);
+        let catalog = LemonadeServerCatalog {
+            models: vec![legacy, canonical],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            component_state(&catalog, &component),
+            SetupComponentState::NeedsDownload
         );
     }
 
@@ -509,18 +588,41 @@ mod tests {
             .into_iter()
             .find(|component| component.role == SetupRole::StandardEmbedding)
             .unwrap();
+        let pull = component.pull_spec();
         assert_eq!(
             pull_body(
-                component.model_id,
-                component.checkpoint,
-                component.recipe,
-                true
+                pull.model_name,
+                pull.checkpoint,
+                pull.recipe,
+                pull.embedding
             ),
             serde_json::json!({
-                "model_name": "ggml-org/embeddinggemma-300M-GGUF",
+                "model_name": "user.ggml-org/embeddinggemma-300M-GGUF",
                 "checkpoint": "ggml-org/embeddinggemma-300M-GGUF:Q8_0",
                 "recipe": "llamacpp",
                 "embedding": true,
+                "stream": true,
+                "subscribe": false,
+            })
+        );
+    }
+
+    #[test]
+    fn exact_flm_pull_body_uses_builtin_model_name_only() {
+        let component = initial_setup_components()
+            .into_iter()
+            .find(|component| component.role == SetupRole::NpuEmbedding)
+            .unwrap();
+        let pull = component.pull_spec();
+        assert_eq!(
+            pull_body(
+                pull.model_name,
+                pull.checkpoint,
+                pull.recipe,
+                pull.embedding
+            ),
+            serde_json::json!({
+                "model_name": "embed-gemma-300m-FLM",
                 "stream": true,
                 "subscribe": false,
             })

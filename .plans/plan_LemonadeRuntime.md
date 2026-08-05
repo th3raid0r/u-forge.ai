@@ -192,23 +192,38 @@ Represent setup work as role-based component descriptors and states rather
 than hard-wiring the view to three models. The initial visible roles are:
 
 - Standard embedding, required:
-  - model: `ggml-org/embeddinggemma-300M-GGUF`
-  - compatibility alias: `user.ggml-org/embeddinggemma-300M-GGUF`
+  - canonical catalog/inference model: `ggml-org/embeddinggemma-300M-GGUF`
+  - `/pull` registration name: `user.ggml-org/embeddinggemma-300M-GGUF`
+  - accepted catalog IDs: both prefixed and unprefixed forms
   - checkpoint: `ggml-org/embeddinggemma-300M-GGUF:Q8_0`
   - recipe: `llamacpp`
   - registration flag: `embedding=true`
 - NPU embedding, selected when NPU embeddings are enabled:
-  `embed-gemma-300m-FLM` (`embed-gemma:300m`, `flm`).
+  - canonical catalog/inference model: `embed-gemma-300m-FLM`
+  - `/pull` built-in model name: `embed-gemma-300m-FLM`
+  - pull mode: built-in (omit checkpoint, recipe, and capability registration
+    fields; retain only the durable job controls)
+  - accepted catalog IDs: both prefixed and unprefixed forms, preferring the
+    canonical entry when both exist
+  - checkpoint: `embed-gemma:300m`
+  - recipe: `flm`
 - Reranking, required: `bge-reranker-v2-m3-GGUF`.
 - HQ embedding, default selected but optional:
   `Qwen3-Embedding-8B-GGUF`.
 - Chat, required: one user-selected compatible catalog model.
 
 If the canonical standard embedding registration is absent, register and pull
-it through `/v1/pull`. Accept the older `user.`-prefixed ID when detecting an
-existing compatible registration. If an existing entry has a different
-checkpoint, recipe, or capability, block that component with an actionable
-conflict instead of silently overwriting it.
+it through `/v1/pull` using the required `user.`-prefixed registration name.
+Continue to use the unprefixed canonical ID for selection/inference, and accept
+either form when detecting an existing compatible registration. If an existing
+entry has a different checkpoint, recipe, or capability, block that component
+with an actionable conflict instead of silently overwriting it.
+
+FLM Embed Gemma is already in Lemonade's built-in registry. Pull it by the
+canonical `embed-gemma-300m-FLM` model name only; including checkpoint, recipe,
+or embedding fields turns the request into custom registration and incorrectly
+requires a `user.` namespace. Discovery tolerates the legacy prefixed form but
+uses the canonical catalog entry when both are present.
 
 Use live system information and the configured backend preference order to
 choose/install the backend for each selected model. Device fallback rebuilds

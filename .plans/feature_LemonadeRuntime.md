@@ -64,12 +64,14 @@ fallback is selected.
   flow that exposes required standard embedding, NPU FLM embedding when
   enabled, required reranker, optional-by-opt-out HQ embedding, and
   user-selected chat.
-- [x] **LR-10 — Managed standard embedding recipe.** Register and pull
-  `ggml-org/embeddinggemma-300M-GGUF` from
-  `ggml-org/embeddinggemma-300M-GGUF:Q8_0` as a llama.cpp embedding model,
-  accept the former `user.`-prefixed ID as a detection-only compatibility
-  alias, and detect/provision `embed-gemma-300m-FLM` for enabled NPU
-  embeddings; reject conflicting existing registrations.
+- [x] **LR-10 — Managed standard embedding recipe.** Pull the registration name
+  `user.ggml-org/embeddinggemma-300M-GGUF` from
+  `ggml-org/embeddinggemma-300M-GGUF:Q8_0` as a llama.cpp embedding model, while
+  using `ggml-org/embeddinggemma-300M-GGUF` as the canonical catalog/inference
+  ID and accepting either form during discovery. Pull the built-in FLM model
+  by its canonical `embed-gemma-300m-FLM` ID without custom-registration
+  fields; tolerate the legacy `user.` form during discovery, but prefer the
+  canonical entry when both exist. Reject conflicting existing registrations.
 - [x] **LR-11 — Durable provisioning.** Select/install compatible backends from
   live system information, start server-owned model downloads, restore
   `/v1/downloads` state, expose pause/cancel/remove, and implement resume/retry
