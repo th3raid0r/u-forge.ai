@@ -78,10 +78,10 @@ Lemonade runtime redesign or the Zed workspace refactor.
 - [x] **AC-17 — Runtime failure propagation.** Refactor hybrid search so embed,
   ANN, and rerank failures contribute outcomes while successful fallback
   results are retained.
-- [ ] **AC-18 — UI presentation.** Preserve the structured response through
+- [x] **AC-18 — UI presentation.** Preserve the structured response through
   `SearchPanel`; show a concise Zed-style status hint for degraded results and
   keep detailed diagnostics available for logs/tooltips.
-- [ ] **AC-19 — Mode enablement.** Derive semantic availability from an actual
+- [x] **AC-19 — Mode enablement.** Derive semantic availability from an actual
   compatible embedding lane, not merely `Option<InferenceQueue>` presence.
 
 ## Maintenance closure

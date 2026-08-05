@@ -5,8 +5,10 @@ use gpui::{
 };
 use tracing::Instrument;
 use u_forge_core::{
-    AppConfig, EmbeddingTarget, HybridSearchConfig, KnowledgeGraph, ObjectId,
-    queue::InferenceQueue, search_hybrid_response,
+    AppConfig, EmbeddingTarget, HybridSearchConfig, KnowledgeGraph, ObjectId, SearchStageOutcomes,
+    SearchStageStatus,
+    queue::{InferenceQueue, InferenceQueueBuilder},
+    search_hybrid_response,
 };
 use u_forge_ui_traits::node_color_for_type;
 
@@ -30,6 +32,40 @@ struct SearchResult {
     object_type: String,
 }
 
+struct CompletedSearch {
+    node_ids: Vec<ObjectId>,
+    outcomes: SearchStageOutcomes,
+}
+
+fn degradation_hint(outcomes: &SearchStageOutcomes) -> Option<String> {
+    let degraded = |status| {
+        matches!(
+            status,
+            SearchStageStatus::Unavailable | SearchStageStatus::Failed
+        )
+    };
+    let mut stages = Vec::new();
+    if degraded(outcomes.fts.status) {
+        stages.push("FTS5");
+    }
+    let standard = outcomes.standard_semantic.status;
+    let hq = outcomes.high_quality_semantic.status;
+    let semantic_failed = standard == SearchStageStatus::Failed || hq == SearchStageStatus::Failed;
+    let no_semantic_lane_applied =
+        standard != SearchStageStatus::Applied && hq != SearchStageStatus::Applied;
+    if semantic_failed || (no_semantic_lane_applied && (degraded(standard) || degraded(hq))) {
+        stages.push("semantic");
+    }
+    if degraded(outcomes.reranking.status) {
+        stages.push("reranking");
+    }
+    if stages.is_empty() {
+        None
+    } else {
+        Some(format!("Results degraded · {}", stages.join(", ")))
+    }
+}
+
 // ── Search panel ─────────────────────────────────────────────────────────────
 
 pub(crate) struct SearchPanel {
@@ -40,6 +76,8 @@ pub(crate) struct SearchPanel {
     results: Vec<SearchResult>,
     searching: bool,
     error: Option<String>,
+    stage_outcomes: Option<SearchStageOutcomes>,
+    degradation_hint: Option<String>,
     /// Monotonically identifies the latest requested search so a slower prior
     /// request cannot overwrite newer results.
     search_generation: u64,
@@ -48,6 +86,7 @@ pub(crate) struct SearchPanel {
     search_limit: usize,
     inference_queue: Option<InferenceQueue>,
     hq_queue: Option<InferenceQueue>,
+    compatible_semantic_lane: Option<EmbeddingTarget>,
     app_config: Arc<AppConfig>,
     tokio_rt: Arc<tokio::runtime::Runtime>,
     #[allow(dead_code)]
@@ -78,11 +117,14 @@ impl SearchPanel {
             results: Vec::new(),
             searching: false,
             error: None,
+            stage_outcomes: None,
+            degradation_hint: None,
             search_generation: 0,
             search_task: None,
             search_limit,
             inference_queue: None,
             hq_queue: None,
+            compatible_semantic_lane: None,
             app_config,
             tokio_rt,
             submit_sub,
@@ -93,6 +135,28 @@ impl SearchPanel {
     pub(crate) fn set_queues(&mut self, queue: Option<InferenceQueue>, hq: Option<InferenceQueue>) {
         self.inference_queue = queue;
         self.hq_queue = hq;
+        self.compatible_semantic_lane = self.resolve_compatible_semantic_lane();
+    }
+
+    fn resolve_compatible_semantic_lane(&self) -> Option<EmbeddingTarget> {
+        let lanes = [
+            (EmbeddingTarget::HighQuality, self.hq_queue.as_ref()),
+            (EmbeddingTarget::Standard, self.inference_queue.as_ref()),
+        ];
+        lanes.into_iter().find_map(|(target, queue)| {
+            let queue = queue?;
+            if !queue.has_embedding() {
+                return None;
+            }
+            let fingerprint = queue.embedding_space_fingerprint()?;
+            match self.graph.ensure_embedding_space(target, fingerprint) {
+                Ok(()) => Some(target),
+                Err(error) => {
+                    tracing::warn!(?target, %error, "Search embedding lane is incompatible");
+                    None
+                }
+            }
+        })
     }
 
     /// Execute a search using the current query and mode.
@@ -103,22 +167,16 @@ impl SearchPanel {
         }
 
         // Validate queue availability for modes that need it.
-        match self.mode {
-            SearchMode::Semantic
-                if !self
-                    .inference_queue
-                    .as_ref()
-                    .is_some_and(InferenceQueue::has_embedding) =>
-            {
-                self.error = Some("Lemonade not available — use FTS5".to_string());
-                cx.notify();
-                return;
-            }
-            _ => {}
+        if self.mode == SearchMode::Semantic && self.compatible_semantic_lane.is_none() {
+            self.error = Some("No compatible semantic index — use FTS5 or Hybrid".to_string());
+            cx.notify();
+            return;
         }
 
         self.searching = true;
         self.error = None;
+        self.stage_outcomes = None;
+        self.degradation_hint = None;
         self.results.clear();
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
@@ -131,6 +189,7 @@ impl SearchPanel {
         let limit = self.search_limit;
         let queue = self.inference_queue.clone();
         let hq_queue = self.hq_queue.clone();
+        let semantic_available = self.compatible_semantic_lane.is_some();
         let app_config = self.app_config.clone();
         let tokio_rt = self.tokio_rt.clone();
         let mode_str = match mode {
@@ -140,106 +199,49 @@ impl SearchPanel {
         };
 
         let task = cx.spawn(async move |this, cx| {
-            let result: Result<Vec<ObjectId>, anyhow::Error> = cx
+            let result: Result<CompletedSearch, anyhow::Error> = cx
                 .background_executor()
                 .spawn(
                     async move {
                         tokio_rt.block_on(async move {
-                            let r: anyhow::Result<Vec<ObjectId>> = match mode {
-                                SearchMode::Fts5 => {
-                                    // FTS5: call directly, no embedding needed.
-                                    let fts_limit = limit * 4;
-                                    let raw = graph.search_chunks_fts(&query, fts_limit)?;
-                                    // Deduplicate by ObjectId, preserving first-seen order.
-                                    let mut seen = std::collections::HashSet::new();
-                                    let mut node_ids = Vec::new();
-                                    for (_, obj_id, _) in raw {
-                                        if seen.insert(obj_id) {
-                                            node_ids.push(obj_id);
-                                            if node_ids.len() >= limit {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Ok(node_ids)
-                                }
-                                SearchMode::Semantic => {
-                                    let q = queue.as_ref().unwrap();
-                                    // Prefer HQ (4096-dim) embeddings when available — they
-                                    // were used during bulk indexing if HQ is enabled, so
-                                    // querying them gives meaningfully better recall.
-                                    let raw: Vec<(_, ObjectId, _, _)> = if let Some(hq_q) =
-                                        hq_queue.as_ref()
-                                    {
-                                        let fingerprint = hq_q
-                                            .embedding_space_fingerprint()
-                                            .ok_or_else(|| {
-                                                anyhow::anyhow!(
-                                                    "HQ embedding model identity unavailable"
-                                                )
-                                            })?;
-                                        graph.ensure_embedding_space(
-                                            EmbeddingTarget::HighQuality,
-                                            fingerprint,
-                                        )?;
-                                        let embedding: Vec<f32> = hq_q.embed(&query).await?;
-                                        graph.search_chunks_semantic_hq(&embedding, limit * 4)?
-                                    } else {
-                                        let fingerprint =
-                                            q.embedding_space_fingerprint().ok_or_else(|| {
-                                                anyhow::anyhow!(
-                                                    "Embedding model identity unavailable"
-                                                )
-                                            })?;
-                                        graph.ensure_embedding_space(
-                                            EmbeddingTarget::Standard,
-                                            fingerprint,
-                                        )?;
-                                        let embedding: Vec<f32> = q.embed(&query).await?;
-                                        graph.search_chunks_semantic(&embedding, limit * 4)?
-                                    };
-                                    let mut seen = std::collections::HashSet::new();
-                                    let mut node_ids = Vec::new();
-                                    for (_, obj_id, _, _) in raw {
-                                        if seen.insert(obj_id) {
-                                            node_ids.push(obj_id);
-                                            if node_ids.len() >= limit {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Ok(node_ids)
-                                }
-                                SearchMode::Hybrid => {
-                                    let q = queue.as_ref().unwrap();
-                                    let cfg = HybridSearchConfig {
-                                        alpha: if q.has_embedding() {
-                                            app_config.chat.alpha
-                                        } else {
-                                            0.0
-                                        },
-                                        fts_limit: limit * 4,
-                                        semantic_limit: limit * 4,
-                                        rerank: q.has_reranking(),
-                                        limit,
-                                        hq_semantic_boost: app_config.chat.hq_semantic_boost,
-                                    };
-                                    let response = search_hybrid_response(
-                                        &graph,
-                                        q,
-                                        hq_queue.as_ref(),
-                                        &query,
-                                        &cfg,
-                                    )
-                                    .await?;
-                                    Ok(response
-                                        .results
-                                        .into_iter()
-                                        .map(|result| result.node.id)
-                                        .collect::<Vec<_>>())
+                            let fallback_queue;
+                            let queue = match queue.as_ref() {
+                                Some(queue) => queue,
+                                None => {
+                                    fallback_queue = InferenceQueueBuilder::new().build();
+                                    &fallback_queue
                                 }
                             };
-                            r
+                            let (alpha, rerank) = match mode {
+                                SearchMode::Fts5 => (0.0, false),
+                                SearchMode::Semantic => (1.0, false),
+                                SearchMode::Hybrid => (app_config.chat.alpha, true),
+                            };
+                            debug_assert!(mode != SearchMode::Semantic || semantic_available);
+                            let config = HybridSearchConfig {
+                                alpha,
+                                fts_limit: limit * 4,
+                                semantic_limit: limit * 4,
+                                rerank,
+                                limit,
+                                hq_semantic_boost: app_config.chat.hq_semantic_boost,
+                            };
+                            let response = search_hybrid_response(
+                                &graph,
+                                queue,
+                                hq_queue.as_ref(),
+                                &query,
+                                &config,
+                            )
+                            .await?;
+                            Ok(CompletedSearch {
+                                node_ids: response
+                                    .results
+                                    .into_iter()
+                                    .map(|result| result.node.id)
+                                    .collect(),
+                                outcomes: response.outcomes,
+                            })
                         })
                     }
                     .instrument(tracing::info_span!(
@@ -256,9 +258,18 @@ impl SearchPanel {
                 }
                 panel.searching = false;
                 match result {
-                    Ok(node_ids) => {
+                    Ok(completed) => {
+                        panel.degradation_hint = degradation_hint(&completed.outcomes);
+                        if panel.degradation_hint.is_some() {
+                            tracing::warn!(
+                                outcomes = ?completed.outcomes,
+                                "Search completed with degraded stages"
+                            );
+                        }
+                        panel.stage_outcomes = Some(completed.outcomes);
                         // Resolve node names from the graph.
-                        panel.results = node_ids
+                        panel.results = completed
+                            .node_ids
                             .iter()
                             .filter_map(|id| {
                                 panel.graph.get_object(*id).ok().flatten().map(|meta| {
@@ -298,7 +309,7 @@ fn result_type_color(object_type: &str) -> u32 {
 impl Render for SearchPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_id = self.selection.read(cx).selected_node_id;
-        let has_queue = self.inference_queue.is_some();
+        let semantic_available = self.compatible_semantic_lane.is_some();
         let mode = self.mode;
 
         let mut panel = div()
@@ -375,17 +386,17 @@ impl Render for SearchPanel {
                     .h(px(20.0))
                     .rounded(px(3.0))
                     .text_base()
-                    .text_color(if !has_queue {
+                    .text_color(if !semantic_available {
                         rgba(0x45475aff)
                     } else if mode == SearchMode::Semantic {
                         rgba(0xcdd6f4ff)
                     } else {
                         rgba(0x6c7086ff)
                     })
-                    .when(mode == SearchMode::Semantic && has_queue, |el| {
+                    .when(mode == SearchMode::Semantic && semantic_available, |el| {
                         el.bg(rgba(0x45475a88))
                     })
-                    .when(has_queue, |el| {
+                    .when(semantic_available, |el| {
                         el.cursor_pointer().on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -405,25 +416,20 @@ impl Render for SearchPanel {
                     .h(px(20.0))
                     .rounded(px(3.0))
                     .text_base()
-                    .text_color(if !has_queue {
-                        rgba(0x45475aff)
-                    } else if mode == SearchMode::Hybrid {
+                    .text_color(if mode == SearchMode::Hybrid {
                         rgba(0xcdd6f4ff)
                     } else {
                         rgba(0x6c7086ff)
                     })
-                    .when(mode == SearchMode::Hybrid && has_queue, |el| {
-                        el.bg(rgba(0x45475a88))
-                    })
-                    .when(has_queue, |el| {
-                        el.cursor_pointer().on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                this.mode = SearchMode::Hybrid;
-                                cx.notify();
-                            }),
-                        )
-                    })
+                    .when(mode == SearchMode::Hybrid, |el| el.bg(rgba(0x45475a88)))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.mode = SearchMode::Hybrid;
+                            cx.notify();
+                        }),
+                    )
                     .child("Hybrid"),
             );
 
@@ -500,6 +506,19 @@ impl Render for SearchPanel {
                     .text_color(rgba(0xf38ba8ff))
                     .child(err),
             );
+        } else if let Some(hint) = &self.degradation_hint {
+            panel = panel.child(
+                div()
+                    .id("search-degradation")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .min_h(px(22.0))
+                    .px_3()
+                    .text_xs()
+                    .text_color(rgba(0xf9e2afff))
+                    .child(hint.clone()),
+            );
         }
 
         // ── Results list ──────────────────────────────────────────────────────
@@ -566,5 +585,57 @@ impl Render for SearchPanel {
         }
 
         panel.child(scroll_area)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::degradation_hint;
+    use u_forge_core::{SearchStageOutcome, SearchStageOutcomes, SearchStageStatus};
+
+    fn outcome(status: SearchStageStatus, diagnostic: Option<&str>) -> SearchStageOutcome {
+        SearchStageOutcome {
+            status,
+            diagnostic: diagnostic.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn degradation_hint_lists_only_unavailable_or_failed_stages() {
+        let outcomes = SearchStageOutcomes {
+            fts: outcome(SearchStageStatus::Applied, None),
+            standard_semantic: outcome(SearchStageStatus::Failed, Some("safe detail")),
+            high_quality_semantic: outcome(SearchStageStatus::Unavailable, Some("safe detail")),
+            reranking: outcome(SearchStageStatus::IntentionallySkipped, None),
+        };
+
+        assert_eq!(
+            degradation_hint(&outcomes).as_deref(),
+            Some("Results degraded · semantic")
+        );
+    }
+
+    #[test]
+    fn degradation_hint_is_absent_for_applied_and_intentional_stages() {
+        let outcomes = SearchStageOutcomes {
+            fts: outcome(SearchStageStatus::Applied, None),
+            standard_semantic: outcome(SearchStageStatus::IntentionallySkipped, None),
+            high_quality_semantic: outcome(SearchStageStatus::IntentionallySkipped, None),
+            reranking: outcome(SearchStageStatus::Applied, None),
+        };
+
+        assert_eq!(degradation_hint(&outcomes), None);
+    }
+
+    #[test]
+    fn compatible_hq_lane_prevents_false_semantic_degradation() {
+        let outcomes = SearchStageOutcomes {
+            fts: outcome(SearchStageStatus::IntentionallySkipped, None),
+            standard_semantic: outcome(SearchStageStatus::Unavailable, Some("safe detail")),
+            high_quality_semantic: outcome(SearchStageStatus::Applied, None),
+            reranking: outcome(SearchStageStatus::IntentionallySkipped, None),
+        };
+
+        assert_eq!(degradation_hint(&outcomes), None);
     }
 }
