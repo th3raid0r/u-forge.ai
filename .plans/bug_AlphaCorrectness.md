@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved, not implemented. This plan consolidates verified correctness work
+Implemented and verified on 2026-08-04. This plan consolidates correctness work
 from the 2026-04 audit and the 2026-08 source review. It does not include the
 Lemonade runtime redesign or the Zed workspace refactor.
 
@@ -89,11 +89,11 @@ Lemonade runtime redesign or the Zed workspace refactor.
 - [x] **AC-20** Reject unknown keys on `AppConfig` and nested configuration
   sections, with path-specific parse tests.
 - [x] **AC-21** Make schema saving synchronous and update all callers.
-- [ ] **AC-22** Keep one FTS sanitizer implementation and reuse it from agent
+- [x] **AC-22** Keep one FTS sanitizer implementation and reuse it from agent
   tools.
 - [x] **AC-23** Do not install cursor-blink tasks for read-only text fields.
-- [ ] **AC-24** Compile-check `convert_memorymesh` from the root Makefile/CI.
-- [ ] **AC-25** Remove stale deprecated `EdgeType` guidance without changing
+- [x] **AC-24** Compile-check `convert_memorymesh` from the root Makefile/CI.
+- [x] **AC-25** Remove stale deprecated `EdgeType` guidance without changing
   backward-compatible code unless separately justified.
 
 ## Tests and acceptance
@@ -106,5 +106,5 @@ Lemonade runtime redesign or the Zed workspace refactor.
   reach the UI-facing boundary.
 - GPUI logic is separated into testable state reducers; manual verification
   uses the frame overlay to confirm paint changes do not create redraw loops.
-- Final verification: `make fmt-check`, `make check`, `make clippy`, and the
-  unfiltered `make test`, with no environment variables or live server.
+- Final verification passed: `make fmt-check`, `make check`, `make clippy`, and
+  the unfiltered `make test`, with no environment variables or live server.

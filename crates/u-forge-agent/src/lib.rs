@@ -21,7 +21,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
 use u_forge_core::ingest::rechunk_and_embed;
-use u_forge_core::search::{HybridSearchConfig, NodeSearchResult, search_hybrid};
+use u_forge_core::search::{HybridSearchConfig, NodeSearchResult, fts5_sanitize, search_hybrid};
 use u_forge_core::types::ObjectMetadata;
 use u_forge_core::{KnowledgeGraph, queue::InferenceQueue, types::ObjectId};
 
@@ -199,23 +199,6 @@ pub(crate) mod tool_validation {
         Err(ToolError(format!(
             "Tool args invalid for {tool_name}: {formatted}"
         )))
-    }
-}
-
-// ── FTS5 sanitisation (mirrors search/sanitize.rs — not exported from core) ──
-
-/// Strip characters that cause FTS5 syntax errors from a free-text query.
-/// Returns `None` when no searchable tokens remain.
-fn fts5_sanitize(query: &str) -> Option<String> {
-    let sanitized: String = query
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect();
-    let collapsed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        None
-    } else {
-        Some(collapsed)
     }
 }
 

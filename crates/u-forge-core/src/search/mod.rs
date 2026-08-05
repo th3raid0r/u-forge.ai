@@ -68,6 +68,8 @@
 
 mod sanitize;
 
+pub use sanitize::fts5_sanitize;
+
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -76,8 +78,6 @@ use tracing::{debug, info, instrument, warn};
 use crate::KnowledgeGraph;
 use crate::queue::InferenceQueue;
 use crate::types::{Edge, ObjectId, ObjectMetadata, TextChunk};
-
-use sanitize::fts5_sanitize;
 
 // ── Public configuration ──────────────────────────────────────────────────────
 
