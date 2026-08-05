@@ -20,9 +20,6 @@ jobs:
   package:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      LEMONADE_VERSION: 11.5.1
-      LEMONADE_ASSET: lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,14 +37,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build u-forge
+        env:
+          UFORGE_REQUIRE_EMBEDDED_LEMONADE: "1"
         run: cargo build --locked --release -p u-forge-ui-gpui
-
-      - name: Download and verify Embeddable Lemonade
-        run: |
-          curl --fail --location --retry 3 \
-            --output "$LEMONADE_ASSET" \
-            "https://github.com/lemonade-sdk/lemonade/releases/download/v${LEMONADE_VERSION}/${LEMONADE_ASSET}"
-          sha256sum --check packaging/lemonade-embeddable.sha256
 
       - name: Assemble stable bundle layout
         env:
@@ -55,16 +47,9 @@ jobs:
         run: |
           set -euo pipefail
           bundle="u-forge-${RELEASE_TAG}-ubuntu-x64"
-          mkdir -p extracted "$bundle/lemonade/resources"
-          tar -xzf "$LEMONADE_ASSET" -C extracted
+          mkdir -p "$bundle"
           install -m 0755 target/release/u-forge-ui-gpui "$bundle/u-forge-ui-gpui"
-          install -m 0755 "$(find extracted -type f -name lemond -print -quit)" "$bundle/lemonade/lemond"
-          install -m 0644 "$(find extracted -type f -name LICENSE -print -quit)" "$bundle/lemonade/LICENSE"
-          for resource in server_models.json backend_versions.json defaults.json; do
-            install -m 0644 \
-              "$(find extracted -type f -path "*/resources/$resource" -print -quit)" \
-              "$bundle/lemonade/resources/$resource"
-          done
+          cp -a target/release/lemonade "$bundle/lemonade"
           test -x "$bundle/u-forge-ui-gpui"
           test -x "$bundle/lemonade/lemond"
           "$bundle/lemonade/lemond" --version

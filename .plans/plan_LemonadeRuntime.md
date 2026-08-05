@@ -2,7 +2,8 @@
 
 ## Status and upstream basis
 
-Approved on 2026-08-04. This is the decision-complete implementation plan for
+Approved on 2026-08-04 and updated with the verified Cargo bootstrap on
+2026-08-05. This is the decision-complete implementation plan for
 the active checklist in `feature_LemonadeRuntime.md`. Source remains
 authoritative where the repository has already implemented part of the older
 runtime plan.
@@ -63,14 +64,21 @@ Primary upstream sources:
 
 ### GitHub Release workflow
 
-Add a manual `workflow_dispatch` workflow that creates a complete draft GitHub
-Release for a requested u-forge tag/ref:
+Provision the supported Embeddable Lemonade artifact from the UI crate's Cargo
+build, and make the manual `workflow_dispatch` release consume that exact
+output:
 
-1. Build `u-forge-ui-gpui` in release mode on Ubuntu x64.
-2. Download the exact v11.5.1 Ubuntu x64 embeddable archive and verify a
-   committed SHA-256 digest before extraction.
-3. Exclude the optional `lemonade` CLI and web application. Package this stable
-   relative layout:
+1. For Linux x86_64 GNU builds, download the exact v11.5.1 Ubuntu x64
+   embeddable archive into Cargo's ignored `target/` cache and verify the
+   committed SHA-256 digest before extraction. A normal offline build warns
+   and remains graph-only when no artifact is available; release CI makes
+   provisioning mandatory.
+2. Patch `resources/server_models.json` idempotently so every built-in model
+   named `Gemma-4-*GGUF` includes the empirically verified `reasoning` label.
+   Reject an unexpected manifest shape or a pinned manifest with no matching
+   models.
+3. Exclude the optional `lemonade` CLI and web application. Install this stable
+   relative layout beside the Cargo-built executable:
 
    ```text
    u-forge-<version>-ubuntu-x64/
@@ -84,7 +92,9 @@ Release for a requested u-forge tag/ref:
          defaults.json
    ```
 
-4. Verify the executable modes, `lemond --version`, required files, and dynamic
+4. Build `u-forge-ui-gpui` in release mode and have the Ubuntu x64 workflow copy
+   Cargo's already verified and patched `target/release/lemonade/` directory.
+   Verify executable modes, `lemond --version`, required files, and dynamic
    library resolution.
 5. Produce `u-forge-<version>-ubuntu-x64.tar.gz` and its SHA-256 file, then
    create a draft GitHub Release containing both. GitHub-generated source

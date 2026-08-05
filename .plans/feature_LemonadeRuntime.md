@@ -2,7 +2,7 @@
 
 ## Status and authority
 
-Implemented and verified on 2026-08-04. `plan_LemonadeRuntime.md` is the
+Implemented and verified on 2026-08-05. `plan_LemonadeRuntime.md` is the
 decision-complete specification for this checklist. Source is authoritative for
 the existing connection probing, providers, model selection, activation-only
 runtime cache, reasoning request hint, and UI integration introduced before
@@ -20,10 +20,12 @@ fallback is selected.
 
 ## Embedded runtime and release
 
-- [x] **LR-01 — Draft release workflow.** Add a manual Ubuntu x64 GitHub
-  workflow that pins and verifies the v11.5.1 embeddable archive, builds
-  u-forge, packages the executable with sibling `lemonade/` runtime resources,
-  and creates a complete draft GitHub Release with archive and checksum.
+- [x] **LR-01 — Cargo bootstrap and draft release workflow.** The UI Cargo
+  build pins, downloads, and verifies the v11.5.1 embeddable archive; patches
+  all built-in Gemma 4 GGUF entries with the empirically verified `reasoning`
+  label; and installs the minimal sibling `lemonade/` runtime. The manual
+  Ubuntu x64 workflow requires that bootstrap, packages its exact output, and
+  creates a complete draft GitHub Release with archive and checksum.
 - [x] **LR-02 — Private runtime root.** Locate `lemonade/lemond` relative to the
   installed executable, support `UFORGE_LEMOND_PATH` for owned development,
   and initialize versioned resources plus persistent config/backends/models in

@@ -23,9 +23,13 @@ cargo run -p u-forge-ui-gpui                                   # Run the desktop
 
 1. Install Rust stable ([rustup.rs](https://rustup.rs)) and a C compiler
    (`gcc`, `clang`, or MSVC) — needed for `openssl-sys` (reqwest TLS).
-2. *(Optional)* Install [Lemonade Server](https://github.com/lemonade-sdk/lemonade)
-   for AI features. See `environment-config.mdc` for pulls.
-3. `make build` — first build is ~30 s (bundled SQLite compilation).
+2. `make build` — the first Ubuntu x64 build also downloads the pinned
+   Embeddable Lemonade artifact. Set `UFORGE_SKIP_EMBEDDED_LEMONADE=1` to skip
+   automatic provisioning; without an existing artifact the app stays
+   graph-only.
+3. Optionally install a standalone
+   [Lemonade Server](https://github.com/lemonade-sdk/lemonade) when developing
+   against an externally managed service.
 4. `make test` — tests pass with no
    server required.
 5. `cargo run -p u-forge-ui-gpui` — launch the desktop app.

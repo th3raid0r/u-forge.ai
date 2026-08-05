@@ -22,6 +22,7 @@ export RUST_LOG=info                                 # Log verbosity
 # Integration test control (default: auto-skip when no server found)
 export UFORGE_INTEGRATION_TESTS=require  # Panic instead of skip when server unreachable
 export UFORGE_INTEGRATION_TESTS=skip     # Force-skip even when a server is present
+export UFORGE_SKIP_EMBEDDED_LEMONADE=1   # Skip automatic runtime provisioning
 ```
 
 ### Why env vars are overrides, not requirements
@@ -67,9 +68,12 @@ The desktop app uses a persistent database. Set `UFORGE_DATA_FILE` /
 ## Lemonade Server
 
 Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
-TTS) via an OpenAI-compatible HTTP API. u-forge.ai does **not** fall back to a
-local model if Lemonade is unavailable — features degrade gracefully and a
-clear error is returned to the user.
+TTS) via an OpenAI-compatible HTTP API. On Ubuntu x64, building the desktop UI
+downloads the checksum-pinned Embeddable Lemonade release into `target/` and
+places its runtime beside the application executable. The build adds the
+`reasoning` catalog label to built-in Gemma 4 GGUF models before installation.
+If provisioning is skipped or unavailable, AI features degrade gracefully and
+the knowledge graph remains usable.
 
 ### Setup
 
