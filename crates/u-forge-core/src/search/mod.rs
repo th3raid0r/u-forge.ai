@@ -1091,25 +1091,49 @@ pub async fn search_hybrid_response(
                 // Fall through — results already in RRF order.
             }
             Ok(ranked) => {
-                outcomes.reranking = SearchStageOutcome::applied();
-                // Apply rerank scores and re-sort.
+                // `top_n` requests one score per candidate. Treat malformed
+                // successful responses as a failed stage instead of claiming
+                // reranking was applied to a partially scored result set.
+                let mut scores = vec![None; results.len()];
+                let mut invalid_reason = (ranked.len() != results.len())
+                    .then_some("reranker returned an incomplete result set");
                 for rd in &ranked {
-                    if rd.index < results.len() {
-                        results[rd.index].sources.rerank_score = Some(rd.score);
-                        results[rd.index].score = rd.score;
-                    } else {
-                        warn!(
-                            "Reranker returned out-of-bounds index {} (pool size {}), skipping",
-                            rd.index,
-                            results.len()
-                        );
+                    if rd.index >= results.len() {
+                        invalid_reason = Some("reranker returned an out-of-bounds index");
+                        break;
+                    }
+                    if !rd.score.is_finite() {
+                        invalid_reason = Some("reranker returned a non-finite score");
+                        break;
+                    }
+                    if scores[rd.index].replace(rd.score).is_some() {
+                        invalid_reason = Some("reranker returned a duplicate index");
+                        break;
                     }
                 }
-                results.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+
+                if let Some(reason) = invalid_reason {
+                    warn!(
+                        reason,
+                        "Reranking response was invalid; retaining RRF scores"
+                    );
+                    outcomes.reranking = SearchStageOutcome::failed(
+                        "reranking returned an invalid response; reciprocal-rank scores were retained",
+                    );
+                } else {
+                    outcomes.reranking = SearchStageOutcome::applied();
+                    for (result, score) in results.iter_mut().zip(scores) {
+                        let score =
+                            score.expect("validated reranking response covers every result");
+                        result.sources.rerank_score = Some(score);
+                        result.score = score;
+                    }
+                    results.sort_by(|a, b| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
 
                 // ── Diagnostic: Stage 7 (Rerank output) ─────────────────────
                 {
@@ -1290,6 +1314,8 @@ mod tests {
 
     struct FailingRerankProvider;
 
+    struct EmptyRerankProvider;
+
     #[async_trait]
     impl RerankProvider for FailingRerankProvider {
         async fn rerank(
@@ -1299,6 +1325,18 @@ mod tests {
             _top_n: Option<usize>,
         ) -> anyhow::Result<Vec<RerankDocument>> {
             anyhow::bail!("secret reranker backend detail")
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for EmptyRerankProvider {
+        async fn rerank(
+            &self,
+            _query: &str,
+            _documents: Vec<String>,
+            _top_n: Option<usize>,
+        ) -> anyhow::Result<Vec<RerankDocument>> {
+            Ok(Vec::new())
         }
     }
 
@@ -1478,6 +1516,16 @@ mod tests {
             name: "mock-rerank".to_string(),
             capability: Capability::Reranking,
             provider: ProviderSlot::Rerank(Arc::new(FailingRerankProvider)),
+            weight: 100,
+        };
+        InferenceQueueBuilder::new().with_provider(built).build()
+    }
+
+    fn make_empty_rerank_queue() -> InferenceQueue {
+        let built = BuiltProvider {
+            name: "mock-rerank".to_string(),
+            capability: Capability::Reranking,
+            provider: ProviderSlot::Rerank(Arc::new(EmptyRerankProvider)),
             weight: 100,
         };
         InferenceQueueBuilder::new().with_provider(built).build()
@@ -2089,6 +2137,33 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("secret")
+        );
+        assert!(
+            response
+                .results
+                .iter()
+                .all(|result| result.sources.rerank_score.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_rerank_success_retains_rrf_results_and_reports_failed_stage() {
+        let (graph, _tmp) = make_graph_with_data();
+        let queue = make_empty_rerank_queue();
+        let config = HybridSearchConfig {
+            alpha: 0.0,
+            rerank: true,
+            ..Default::default()
+        };
+
+        let response = search_hybrid_response(&graph, &queue, None, "wizard", &config)
+            .await
+            .unwrap();
+
+        assert!(!response.results.is_empty());
+        assert_eq!(
+            response.outcomes.reranking.status,
+            SearchStageStatus::Failed
         );
         assert!(
             response

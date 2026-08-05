@@ -366,7 +366,7 @@ impl AppView {
             }
         };
         match result {
-            Ok(snap) => {
+            Ok(mut snap) => {
                 let duration_ms = snapshot_start.elapsed().as_millis() as u64;
                 tracing::info!(
                     nodes = snap.nodes.len(),
@@ -379,9 +379,10 @@ impl AppView {
                     .read(cx)
                     .selected_node_id
                     .is_none_or(|selected| snap.nodes.iter().any(|node| node.id == selected));
+                self.graph_canvas.update(cx, |canvas, _cx| {
+                    canvas.reconcile_snapshot_refresh(&mut snap)
+                });
                 *self.state.snapshot.write() = snap;
-                self.graph_canvas
-                    .update(cx, |canvas, _cx| canvas.reconcile_snapshot_refresh());
                 if !selected_still_exists {
                     self.selection
                         .update(cx, |selection, cx| selection.clear(cx));

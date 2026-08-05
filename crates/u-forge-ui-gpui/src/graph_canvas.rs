@@ -126,19 +126,28 @@ impl GraphCanvas {
         }
     }
 
-    /// Cancel a drag whose node disappeared during a committed snapshot refresh.
-    pub(crate) fn reconcile_snapshot_refresh(&mut self) {
-        self.dragging_node = reconcile_dragged_node(self.dragging_node, |id| {
-            self.snapshot.read().id_to_idx.contains_key(&id)
-        });
+    /// Preserve an active drag across a committed snapshot refresh, or cancel
+    /// it if the dragged node was deleted.
+    pub(crate) fn reconcile_snapshot_refresh(&mut self, refreshed: &mut GraphSnapshot) {
+        let current = self.snapshot.read();
+        self.dragging_node = reconcile_dragged_node(self.dragging_node, &current, refreshed);
     }
 }
 
 fn reconcile_dragged_node(
     dragging: Option<ObjectId>,
-    contains_node: impl FnOnce(ObjectId) -> bool,
+    current: &GraphSnapshot,
+    refreshed: &mut GraphSnapshot,
 ) -> Option<ObjectId> {
-    dragging.filter(|id| contains_node(*id))
+    let id = dragging?;
+    let transient_position = current
+        .id_to_idx
+        .get(&id)
+        .map(|index| current.nodes[*index].position)?;
+    let refreshed_index = refreshed.id_to_idx.get(&id).copied()?;
+    refreshed.nodes[refreshed_index].position = transient_position;
+    refreshed.rebuild_spatial_index();
+    Some(id)
 }
 
 /// Convert draw-command color `[u8;4]` → gpui `rgb` u32 (ignores alpha).
@@ -472,16 +481,43 @@ impl Render for GraphCanvas {
 #[cfg(test)]
 mod tests {
     use super::reconcile_dragged_node;
-    use u_forge_core::ObjectId;
+    use glam::Vec2;
+    use tempfile::TempDir;
+    use u_forge_core::{KnowledgeGraph, ObjectBuilder};
+    use u_forge_graph_view::{build_snapshot, build_snapshot_incremental};
 
     #[test]
-    fn snapshot_refresh_cancels_only_a_deleted_node_drag() {
-        let dragged = ObjectId::new_v4();
+    fn snapshot_refresh_preserves_drag_position_and_cancels_deleted_drag() {
+        let temp = TempDir::new().unwrap();
+        let graph = KnowledgeGraph::new(temp.path()).unwrap();
+        let dragged = ObjectBuilder::character("Dragged".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph.save_layout(&[(dragged, 10.0, 20.0)]).unwrap();
+        let mut current = build_snapshot(&graph).unwrap();
+        let transient = Vec2::new(345.0, -210.0);
+        current.nodes[current.id_to_idx[&dragged]].position = transient;
+
+        let mut refreshed = build_snapshot_incremental(&graph, &current).unwrap();
         assert_eq!(
-            reconcile_dragged_node(Some(dragged), |id| id == dragged),
+            reconcile_dragged_node(Some(dragged), &current, &mut refreshed),
             Some(dragged)
         );
-        assert_eq!(reconcile_dragged_node(Some(dragged), |_| false), None);
-        assert_eq!(reconcile_dragged_node(None, |_| false), None);
+        assert_eq!(
+            refreshed.nodes[refreshed.id_to_idx[&dragged]].position,
+            transient
+        );
+        assert_eq!(
+            refreshed.node_at_position(transient, 1.0),
+            Some(refreshed.id_to_idx[&dragged])
+        );
+
+        graph.delete_object(dragged).unwrap();
+        let mut deleted = build_snapshot_incremental(&graph, &refreshed).unwrap();
+        assert_eq!(
+            reconcile_dragged_node(Some(dragged), &refreshed, &mut deleted),
+            None
+        );
+        assert_eq!(reconcile_dragged_node(None, &refreshed, &mut deleted), None);
     }
 }

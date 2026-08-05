@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use glam::Vec2;
+use glam::{DVec2, Vec2};
 
 use crate::snapshot::{EdgeView, NodeView};
 
@@ -95,14 +95,14 @@ pub fn force_directed_layout_with_fixed(
     };
 
     for iteration in 0..ITERATIONS {
-        let mut displacements = vec![Vec2::ZERO; n];
+        let mut displacements = vec![DVec2::ZERO; n];
 
         // ── Repulsion via grid-cell bucketing ────────────────────────────
         // Assign each node to a grid cell, then only check neighboring cells.
-        let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
         for (i, node) in nodes.iter().enumerate() {
-            let cx = (node.position.x / CELL_SIZE).floor() as i32;
-            let cy = (node.position.y / CELL_SIZE).floor() as i32;
+            let cx = (f64::from(node.position.x) / f64::from(CELL_SIZE)).floor() as i64;
+            let cy = (f64::from(node.position.y) / f64::from(CELL_SIZE)).floor() as i64;
             grid.entry((cx, cy)).or_default().push(i);
         }
 
@@ -110,7 +110,7 @@ pub fn force_directed_layout_with_fixed(
             // Check this cell and all 8 neighbors
             for dx in -1..=1 {
                 for dy in -1..=1 {
-                    let neighbor_key = (cx + dx, cy + dy);
+                    let neighbor_key = (cx.saturating_add(dx), cy.saturating_add(dy));
                     let Some(neighbor_nodes) = grid.get(&neighbor_key) else {
                         continue;
                     };
@@ -120,14 +120,17 @@ pub fn force_directed_layout_with_fixed(
                             if i >= j {
                                 continue; // process each pair once
                             }
-                            let delta = nodes[i].position - nodes[j].position;
+                            let delta = DVec2::new(
+                                f64::from(nodes[i].position.x) - f64::from(nodes[j].position.x),
+                                f64::from(nodes[i].position.y) - f64::from(nodes[j].position.y),
+                            );
                             let dist_sq = delta.length_squared();
-                            let max_sq = MAX_REPULSION_DIST * MAX_REPULSION_DIST;
+                            let max_sq = f64::from(MAX_REPULSION_DIST).powi(2);
                             if dist_sq > max_sq || dist_sq < 0.01 {
                                 continue;
                             }
                             let dist = dist_sq.sqrt();
-                            let force = REPULSION / dist_sq;
+                            let force = f64::from(REPULSION) / dist_sq;
                             let dir = delta / dist;
                             displacements[i] += dir * force;
                             displacements[j] -= dir * force;
@@ -139,19 +142,24 @@ pub fn force_directed_layout_with_fixed(
 
         // ── Attraction along edges ───────────────────────────────────────
         for edge in edges {
-            let delta = nodes[edge.target_idx].position - nodes[edge.source_idx].position;
+            let delta = DVec2::new(
+                f64::from(nodes[edge.target_idx].position.x)
+                    - f64::from(nodes[edge.source_idx].position.x),
+                f64::from(nodes[edge.target_idx].position.y)
+                    - f64::from(nodes[edge.source_idx].position.y),
+            );
             let dist = delta.length();
             if dist < 0.01 {
                 continue;
             }
-            let force = ATTRACTION * (dist - IDEAL_LENGTH);
+            let force = f64::from(ATTRACTION) * (dist - f64::from(IDEAL_LENGTH));
             let dir = delta / dist;
             displacements[edge.source_idx] += dir * force;
             displacements[edge.target_idx] -= dir * force;
         }
 
         // ── Apply displacements with temperature clamping ────────────────
-        let max_disp = MAX_DISPLACEMENT * temperature;
+        let max_disp = f64::from(MAX_DISPLACEMENT * temperature);
         let mut applied_max = 0.0_f32;
         let mut applied_total = 0.0_f32;
         let mut movable_count = 0_usize;
@@ -168,8 +176,10 @@ pub fn force_directed_layout_with_fixed(
                 } else {
                     d
                 };
-                node.position += clamped;
-                let applied = clamped.length();
+                let next =
+                    DVec2::new(f64::from(node.position.x), f64::from(node.position.y)) + clamped;
+                node.position = finite_vec2(next);
+                let applied = clamped.length() as f32;
                 applied_max = applied_max.max(applied);
                 applied_total += applied;
             }
@@ -185,9 +195,15 @@ pub fn force_directed_layout_with_fixed(
 
     // Center the layout around the origin
     if !fixed.iter().any(|is_fixed| *is_fixed) {
-        let center: Vec2 = nodes.iter().map(|n| n.position).sum::<Vec2>() / n as f32;
+        let center = nodes
+            .iter()
+            .map(|node| DVec2::new(f64::from(node.position.x), f64::from(node.position.y)))
+            .sum::<DVec2>()
+            / n as f64;
         for node in nodes.iter_mut() {
-            node.position -= center;
+            node.position = finite_vec2(
+                DVec2::new(f64::from(node.position.x), f64::from(node.position.y)) - center,
+            );
         }
     }
 
@@ -196,6 +212,15 @@ pub fn force_directed_layout_with_fixed(
         "force-directed layout produced a non-finite position"
     );
     metrics
+}
+
+fn finite_vec2(value: DVec2) -> Vec2 {
+    debug_assert!(value.is_finite());
+    Vec2::new(finite_f32(value.x), finite_f32(value.y))
+}
+
+fn finite_f32(value: f64) -> f32 {
+    value.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32
 }
 
 #[cfg(test)]

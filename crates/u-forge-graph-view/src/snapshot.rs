@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, ensure};
-use glam::Vec2;
+use glam::{DVec2, Vec2};
 use rstar::RTree;
 use serde_json::Value as JsonValue;
 use u_forge_core::{KnowledgeGraph, ObjectId};
@@ -390,28 +390,33 @@ fn apply_saved_and_layout_new_nodes(
     let saved_points = nodes
         .iter()
         .zip(&fixed)
-        .filter_map(|(node, fixed)| fixed.then_some(node.position))
+        .filter_map(|(node, fixed)| {
+            fixed.then_some(DVec2::new(
+                f64::from(node.position.x),
+                f64::from(node.position.y),
+            ))
+        })
         .collect::<Vec<_>>();
     let center = if saved_points.is_empty() {
-        Vec2::ZERO
+        DVec2::ZERO
     } else {
         let min = saved_points
             .iter()
             .copied()
-            .reduce(Vec2::min)
-            .unwrap_or(Vec2::ZERO);
+            .reduce(DVec2::min)
+            .unwrap_or(DVec2::ZERO);
         let max = saved_points
             .iter()
             .copied()
-            .reduce(Vec2::max)
-            .unwrap_or(Vec2::ZERO);
+            .reduce(DVec2::max)
+            .unwrap_or(DVec2::ZERO);
         (min + max) * 0.5
     };
     let base_radius = saved_points
         .iter()
         .map(|point| (*point - center).length())
-        .fold(0.0_f32, f32::max)
-        + RING_GAP;
+        .fold(0.0_f64, f64::max)
+        + f64::from(RING_GAP);
 
     let mut unsaved = fixed
         .iter()
@@ -420,11 +425,11 @@ fn apply_saved_and_layout_new_nodes(
         .collect::<Vec<_>>();
     unsaved.sort_by_key(|index| nodes[*index].id.to_string());
     let count = unsaved.len();
-    let ring_radius = base_radius.max(RING_GAP + count as f32 * 8.0);
+    let ring_radius = base_radius.max(f64::from(RING_GAP) + count as f64 * 8.0);
 
     for (rank, index) in unsaved.into_iter().enumerate() {
         let angle = std::f32::consts::TAU * rank as f32 / count.max(1) as f32;
-        let direction = Vec2::new(angle.cos(), angle.sin());
+        let direction = DVec2::new(f64::from(angle.cos()), f64::from(angle.sin()));
         let saved_neighbours = edges
             .iter()
             .filter_map(|edge| {
@@ -435,19 +440,31 @@ fn apply_saved_and_layout_new_nodes(
                 } else {
                     return None;
                 };
-                fixed[other].then_some(nodes[other].position)
+                fixed[other].then_some(DVec2::new(
+                    f64::from(nodes[other].position.x),
+                    f64::from(nodes[other].position.y),
+                ))
             })
             .collect::<Vec<_>>();
-        nodes[index].position = if saved_neighbours.is_empty() {
+        let seeded = if saved_neighbours.is_empty() {
             center + direction * ring_radius
         } else {
             let neighbour_center =
-                saved_neighbours.iter().copied().sum::<Vec2>() / saved_neighbours.len() as f32;
-            neighbour_center + direction * NEIGHBOUR_OFFSET
+                saved_neighbours.iter().copied().sum::<DVec2>() / saved_neighbours.len() as f64;
+            neighbour_center + direction * f64::from(NEIGHBOUR_OFFSET)
         };
+        nodes[index].position = finite_vec2(seeded);
     }
 
     force_directed_layout_with_fixed(nodes, edges, &fixed);
+}
+
+fn finite_vec2(value: DVec2) -> Vec2 {
+    debug_assert!(value.is_finite());
+    Vec2::new(
+        value.x.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32,
+        value.y.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32,
+    )
 }
 
 /// Build `(legend_types, type_counts)` from a node slice in O(N).
@@ -743,5 +760,28 @@ mod tests {
 
         assert_eq!(anchor_position, Vec2::ZERO);
         assert!((isolated_position - anchor_position).length() >= 100.0);
+    }
+
+    #[test]
+    fn extreme_finite_saved_position_keeps_snapshot_finite() {
+        let (_dir, graph) = test_graph();
+        let anchor = ObjectBuilder::character("Extreme anchor".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph.save_layout(&[(anchor, f32::MAX, 0.0)]).unwrap();
+        let newcomer = ObjectBuilder::character("Newcomer".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph
+            .connect_objects(newcomer, anchor, EdgeType::new("knows"))
+            .unwrap();
+
+        let snapshot = build_snapshot(&graph).unwrap();
+
+        assert_eq!(
+            snapshot.nodes[snapshot.id_to_idx[&anchor]].position,
+            Vec2::new(f32::MAX, 0.0)
+        );
+        assert!(snapshot.nodes.iter().all(|node| node.position.is_finite()));
     }
 }

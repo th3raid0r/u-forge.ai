@@ -34,6 +34,7 @@ impl Render for ConfirmationModal {
                 .top_0()
                 .left_0()
                 .size_full()
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
