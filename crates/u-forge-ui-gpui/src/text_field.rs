@@ -615,7 +615,7 @@ impl EntityInputHandler for TextFieldView {
 impl Render for TextFieldView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
-        let entity = cx.entity().clone();
+        let input_entity = cx.entity().clone();
         let prepare_entity = cx.entity().clone();
 
         // Start or stop the blink cycle when focus changes. Losing focus also
@@ -801,16 +801,6 @@ impl Render for TextFieldView {
                     }
                 });
 
-                // Install the IME input handler (editable fields only).
-                if !is_read_only {
-                    let focus2 = entity.read(cx).focus.clone();
-                    window.handle_input(
-                        &focus2,
-                        ElementInputHandler::new(bounds, entity.clone()),
-                        cx,
-                    );
-                }
-
                 PreparedTextFieldPaint {
                     lines: prepared_lines,
                     text_origin,
@@ -821,7 +811,7 @@ impl Render for TextFieldView {
                     paint_cursor: !is_read_only && is_focused && cursor_visible,
                 }
             },
-            move |_bounds, prepared, window, cx| {
+            move |bounds, prepared, window, cx| {
                 for line in prepared.lines {
                     let line_end = line.byte_start + line.byte_len;
                     if let Some(ref selection) = prepared.selection
@@ -880,6 +870,17 @@ impl Render for TextFieldView {
                         Bounds::new(cursor_origin, size(px(1.5), prepared.line_height)),
                         rgba(0xcdd6f4ff),
                     ));
+                }
+
+                // GPUI requires input-handler registration during paint. This
+                // is frame instrumentation, not a mutation of TextFieldView.
+                if !is_read_only {
+                    let focus = input_entity.read(cx).focus.clone();
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(bounds, input_entity.clone()),
+                        cx,
+                    );
                 }
             },
         )
@@ -1254,7 +1255,8 @@ impl Render for TextFieldView {
 
 #[cfg(test)]
 mod tests {
-    use super::should_install_blink;
+    use super::{TextFieldView, should_install_blink};
+    use gpui::TestAppContext;
 
     #[test]
     fn cursor_blink_tasks_are_only_installed_for_focused_editable_fields() {
@@ -1262,5 +1264,16 @@ mod tests {
         assert!(!should_install_blink(false, false));
         assert!(!should_install_blink(true, true));
         assert!(!should_install_blink(true, false));
+    }
+
+    #[gpui::test]
+    fn editable_text_field_window_launches_paints_and_closes(cx: &mut TestAppContext) {
+        let (_field, cx) = cx.add_window_view(|window, cx| {
+            window.on_window_should_close(cx, |_window, _cx| true);
+            TextFieldView::new(false, "Search", cx)
+        });
+        cx.update(|window, _cx| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.simulate_close());
     }
 }
