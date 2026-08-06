@@ -35,8 +35,7 @@ use crate::confirmation_modal::{
 use crate::dock_state::DockState;
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::{
-    CloseDirtyTabRequested, DiscardActiveRequested, NodeEditorPanel, SaveActiveRequested,
-    SaveAllRequested,
+    CloseDirtyTabRequested, NodeEditorPanel, SaveActiveRequested, SaveAllRequested,
 };
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
 use crate::panel_contracts::PanelId;
@@ -738,12 +737,6 @@ impl AppView {
                 this.do_save_active(cx);
             },
         );
-        let discard_active_sub = cx.subscribe(
-            &node_editor,
-            |this: &mut Self, _editor, _event: &DiscardActiveRequested, cx| {
-                this.discard_active_editor_changes(cx);
-            },
-        );
         let close_dirty_tab_sub = cx.subscribe(
             &node_editor,
             |this: &mut Self, _editor, event: &CloseDirtyTabRequested, cx| {
@@ -881,7 +874,6 @@ impl AppView {
                 selection_sub,
                 save_all_sub,
                 save_active_sub,
-                discard_active_sub,
                 close_dirty_tab_sub,
                 connect_sub,
                 assistant_zoom_sub,
@@ -1094,7 +1086,7 @@ impl AppView {
                 "This Details tab has unsaved changes.".to_string(),
                 "Save Changes".to_string(),
             )
-            .with_alternative("Discard Changes")
+            .with_alternative("Don't Save")
             .non_destructive()
         });
         let accepted = cx.subscribe(
@@ -1144,23 +1136,6 @@ impl AppView {
         } else {
             self.node_editor
                 .update(cx, |editor, cx| editor.close_tab(index, cx));
-        }
-    }
-
-    fn discard_active_editor_changes(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.node_editor.read(cx).active_tab else {
-            return;
-        };
-        let discarded = self
-            .node_editor
-            .update(cx, |editor, cx| editor.discard_tab_changes(index, cx));
-        if let Some((node_id, was_new)) = discarded {
-            if was_new && self.selection.read(cx).selected_node_id == Some(node_id) {
-                self.selection
-                    .update(cx, |selection, cx| selection.clear(cx));
-            }
-            self.state.data_status = Some("Changes discarded.".to_string());
-            cx.notify();
         }
     }
 

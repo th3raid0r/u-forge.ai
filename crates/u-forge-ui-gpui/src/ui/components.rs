@@ -191,6 +191,8 @@ pub struct IconButton {
     accessible_label: SharedString,
     disabled: bool,
     selected: bool,
+    color: Option<gpui::Rgba>,
+    rotation_degrees: f32,
     on_click: Option<ClickHandler>,
 }
 
@@ -206,6 +208,8 @@ impl IconButton {
             accessible_label: accessible_label.into(),
             disabled: false,
             selected: false,
+            color: None,
+            rotation_degrees: 0.0,
             on_click: None,
         }
     }
@@ -217,6 +221,16 @@ impl IconButton {
 
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    pub fn color(mut self, color: gpui::Rgba) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    pub fn rotate_degrees(mut self, degrees: f32) -> Self {
+        self.rotation_degrees = degrees;
         self
     }
 
@@ -237,7 +251,7 @@ impl RenderOnce for IconButton {
         } else if self.selected {
             theme.colors.accent
         } else {
-            theme.colors.text_muted
+            self.color.unwrap_or(theme.colors.text_muted)
         };
         let mut button = div()
             .id(self.id)
@@ -248,7 +262,7 @@ impl RenderOnce for IconButton {
             .size(px(theme.metrics.control_height_small))
             .rounded(px(theme.metrics.radius_small))
             .when(self.selected, |button| button.bg(theme.colors.selected))
-            .child(Icon::new(self.icon, 13.0, color))
+            .child(Icon::new(self.icon, 13.0, color).rotate_degrees(self.rotation_degrees))
             .tooltip(Tooltip::text(self.accessible_label));
         if !self.disabled {
             button = button
@@ -323,6 +337,7 @@ pub enum StatusTone {
 pub struct StatusItem {
     id: ElementId,
     label: SharedString,
+    icon: Option<IconName>,
     active: bool,
     tone: StatusTone,
     tooltip: Option<SharedString>,
@@ -334,6 +349,7 @@ impl StatusItem {
         Self {
             id: id.into(),
             label: label.into(),
+            icon: None,
             active: false,
             tone: StatusTone::Normal,
             tooltip: None,
@@ -343,6 +359,11 @@ impl StatusItem {
 
     pub fn active(mut self, active: bool) -> Self {
         self.active = active;
+        self
+    }
+
+    pub fn icon(mut self, icon: IconName) -> Self {
+        self.icon = Some(icon);
         self
     }
 
@@ -368,24 +389,27 @@ impl StatusItem {
 impl RenderOnce for StatusItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = *UiTheme::get(cx);
+        let color = match self.tone {
+            StatusTone::Muted => theme.colors.text_muted,
+            StatusTone::Normal => theme.colors.text,
+            StatusTone::Success => theme.colors.success,
+            StatusTone::Warning => theme.colors.warning,
+            StatusTone::Danger => theme.colors.danger,
+        };
         let mut item = div()
             .id(self.id)
             .flex()
             .items_center()
+            .gap(px(theme.metrics.space_2))
             .h(px(theme.metrics.control_height_small))
             .max_w(px(360.0))
             .px(px(theme.metrics.space_2))
             .rounded(px(theme.metrics.radius_small))
             .truncate()
             .text_xs()
-            .text_color(match self.tone {
-                StatusTone::Muted => theme.colors.text_muted,
-                StatusTone::Normal => theme.colors.text,
-                StatusTone::Success => theme.colors.success,
-                StatusTone::Warning => theme.colors.warning,
-                StatusTone::Danger => theme.colors.danger,
-            })
+            .text_color(color)
             .when(self.active, |item| item.bg(theme.colors.selected))
+            .children(self.icon.map(|icon| Icon::new(icon, 12.0, color)))
             .child(self.label);
         if let Some(handler) = self.on_click {
             item = item

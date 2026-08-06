@@ -15,6 +15,8 @@ use u_forge_core::{
 };
 
 use crate::startup::{StartupMilestone, StartupTimeline};
+use crate::ui::components::Tooltip;
+use crate::ui::icons::{Icon, IconName};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SetupRequested {
@@ -949,6 +951,23 @@ impl Render for SetupPanel {
             );
             let primary_job_id = job_id.clone();
             let primary_model_name = model_name.clone();
+            let operation_content = match operation {
+                SetupDownloadOperation::Retry => {
+                    Icon::new(IconName::Refresh, 13.0, rgba(0xcdd6f4ff)).into_any_element()
+                }
+                SetupDownloadOperation::Control(DownloadAction::Remove) => {
+                    Icon::new(IconName::MinusCircle, 13.0, rgba(0xf38ba8ff)).into_any_element()
+                }
+                _ => div().child(format!("{operation:?}")).into_any_element(),
+            };
+            let operation_tooltip = match operation {
+                SetupDownloadOperation::Retry => "Retry download",
+                SetupDownloadOperation::Control(DownloadAction::Remove) => {
+                    "Remove completed download from this list"
+                }
+                SetupDownloadOperation::Control(DownloadAction::Pause) => "Pause download",
+                SetupDownloadOperation::Control(DownloadAction::Cancel) => "Cancel download",
+            };
             let mut controls = div().flex().flex_row().gap(px(4.0)).child(
                 div()
                     .id(format!("setup-download-action-{index}"))
@@ -958,6 +977,7 @@ impl Render for SetupPanel {
                     .items_center()
                     .bg(rgb(0x45475a))
                     .cursor_pointer()
+                    .tooltip(Tooltip::text(operation_tooltip))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -969,7 +989,7 @@ impl Render for SetupPanel {
                             );
                         }),
                     )
-                    .child(format!("{operation:?}")),
+                    .child(operation_content),
             );
             if active {
                 let cancel_job_id = job_id;

@@ -4,15 +4,14 @@ use gpui::{
 };
 
 use crate::text_field::{TextFieldView, TextSubmit};
-use crate::ui::components::IconButton;
-use crate::ui::icons::IconName;
+use crate::ui::components::{IconButton, Tooltip};
+use crate::ui::icons::{Icon, IconName};
 
 use u_forge_core::PropertyType;
 
 use super::field_spec::SubTab;
 use super::{
-    CloseDirtyTabRequested, DiscardActiveRequested, NodeEditorPanel, SaveActiveRequested,
-    SaveAllRequested,
+    CloseDirtyTabRequested, NodeEditorPanel, SaveActiveRequested, SaveAllRequested,
     field_spec::{
         COLUMN_W, DETAIL_TAB_H, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H, PAGE_NAV_H,
         SUBTAB_BAR_H,
@@ -212,79 +211,38 @@ impl Render for NodeEditorPanel {
         }
         let dirty = self.has_dirty_tabs();
         let active_dirty = self.tabs.get(active_idx).is_some_and(|tab| tab.dirty);
-        let mut save_active = div()
-            .id("details-save-active")
-            .flex()
-            .flex_none()
-            .items_center()
-            .h_full()
-            .px_3()
-            .text_base()
-            .text_color(if active_dirty {
-                rgba(0xa6e3a1ff)
-            } else {
-                rgba(0x6c7086ff)
-            })
-            .child("Save Changes");
-        if active_dirty {
-            save_active = save_active.cursor_pointer().on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
-                    cx.emit(SaveActiveRequested);
-                }),
-            );
-        }
-        let mut discard_active = div()
-            .id("details-discard-active")
-            .flex()
-            .flex_none()
-            .items_center()
-            .h_full()
-            .px_3()
-            .text_base()
-            .text_color(if active_dirty {
-                rgba(0xfab387ff)
-            } else {
-                rgba(0x6c7086ff)
-            })
-            .child("Discard Changes");
-        if active_dirty {
-            discard_active = discard_active.cursor_pointer().on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
-                    cx.emit(DiscardActiveRequested);
-                }),
-            );
-        }
-        let mut save_all = div()
-            .id("details-save-all")
-            .flex()
-            .flex_none()
-            .items_center()
-            .h_full()
-            .px_3()
-            .text_base()
-            .text_color(if dirty {
-                rgba(0xa6e3a1ff)
-            } else {
-                rgba(0x6c7086ff)
-            })
-            .child("Save All");
-        if dirty {
-            save_all = save_all.cursor_pointer().on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
-                    cx.emit(SaveAllRequested);
-                }),
-            );
-        }
+        let save_active_panel = cx.weak_entity();
+        let save_active = IconButton::new(
+            "details-save-active",
+            IconName::FloppyDisc,
+            "Save changes (Ctrl+S)",
+        )
+        .disabled(!active_dirty)
+        .color(rgba(0xa6e3a1ff))
+        .on_click(move |_, _, cx| {
+            save_active_panel
+                .update(cx, |_this, cx| cx.emit(SaveActiveRequested))
+                .ok();
+        });
+        let save_all_panel = cx.weak_entity();
+        let save_all = IconButton::new(
+            "details-save-all",
+            IconName::SaveAll,
+            "Save all changed tabs (Ctrl+Shift+S)",
+        )
+        .disabled(!dirty)
+        .color(rgba(0xa6e3a1ff))
+        .on_click(move |_, _, cx| {
+            save_all_panel
+                .update(cx, |_this, cx| cx.emit(SaveAllRequested))
+                .ok();
+        });
         tab_bar = tab_bar.child({
             let mut spacer = div();
             spacer.style().flex_grow = Some(1.0);
             spacer
         });
         tab_bar = tab_bar.child(save_active);
-        tab_bar = tab_bar.child(discard_active);
         tab_bar = tab_bar.child(save_all);
 
         // ── Form content for active tab ──────────────────────────────────────
@@ -682,6 +640,7 @@ impl Render for NodeEditorPanel {
                                             .text_base()
                                             .text_color(rgba(0xf38ba8ff))
                                             .cursor_pointer()
+                                            .tooltip(Tooltip::text("Remove this list item"))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
@@ -704,7 +663,11 @@ impl Render for NodeEditorPanel {
                                                     },
                                                 ),
                                             )
-                                            .child("x"),
+                                            .child(Icon::new(
+                                                IconName::MinusCircle,
+                                                12.0,
+                                                rgba(0xf38ba8ff),
+                                            )),
                                     ),
                             );
                         }
@@ -763,7 +726,7 @@ impl Render for NodeEditorPanel {
                                             cx.notify();
                                         }),
                                     )
-                                    .child("+"),
+                                    .child(Icon::new(IconName::Plus, 12.0, rgba(0x89b4faff))),
                             );
                         }
 
@@ -1057,6 +1020,7 @@ impl NodeEditorPanel {
                 .cursor_pointer()
                 .text_base()
                 .text_color(rgba(0xf38ba8aa))
+                .tooltip(Tooltip::text("Remove this relationship"))
                 .hover(|style| style.bg(rgba(0xf38ba822)).text_color(rgba(0xf38ba8ff)))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1064,7 +1028,7 @@ impl NodeEditorPanel {
                         this.remove_edge_row(ei, cx);
                     }),
                 )
-                .child("\u{2715}"); // ✕
+                .child(Icon::new(IconName::MinusCircle, 13.0, rgba(0xf38ba8ff)));
 
             // Assemble the edge row — no dropdown inline; overlay is rendered
             // after the add button so it paints on top.
@@ -1088,6 +1052,7 @@ impl NodeEditorPanel {
             .id("edge-add-btn")
             .flex()
             .items_center()
+            .gap(px(4.0))
             .h(px(EDGE_ADD_BTN_H))
             .px(px(8.0))
             .bg(rgba(0x89b4fa1a))
@@ -1102,7 +1067,8 @@ impl NodeEditorPanel {
                     this.add_edge_row(cx);
                 }),
             )
-            .child("+ Add Relationship");
+            .child(Icon::new(IconName::Plus, 13.0, rgba(0x89b4faff)))
+            .child("Add Relationship");
         // Shrink to content width instead of stretching to fill the column.
         add_btn.style().align_self = Some(gpui::AlignItems::Start);
         section = section.child(add_btn);

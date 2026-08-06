@@ -13,6 +13,7 @@ use u_forge_ui_traits::node_color_for_type;
 
 use crate::selection_model::SelectionModel;
 use crate::ui::components::{ContextMenu, Tooltip};
+use crate::ui::icons::{Icon, IconName};
 use crate::{
     WorldActivateRow, WorldDeleteRow, WorldNextRow, WorldOpenContextMenu, WorldPreviousRow,
 };
@@ -286,6 +287,7 @@ impl Render for NodePanel {
                                     .id(("world-group-toggle", index))
                                     .flex()
                                     .items_center()
+                                    .gap(px(4.0))
                                     .min_w_0()
                                     .text_color(rgb(node_type_color(&type_name)))
                                     .cursor_pointer()
@@ -300,10 +302,16 @@ impl Render for NodePanel {
                                             });
                                         },
                                     )
-                                    .child(format!(
-                                        "{} {type_name} ({count})",
-                                        if collapsed { "▸" } else { "▾" }
-                                    )),
+                                    .child(Icon::new(
+                                        if collapsed {
+                                            IconName::ChevronRight
+                                        } else {
+                                            IconName::ChevronDown
+                                        },
+                                        12.0,
+                                        rgb(node_type_color(&type_name)),
+                                    ))
+                                    .child(format!("{type_name} ({count})")),
                             )
                             .child(
                                 div()
@@ -329,7 +337,7 @@ impl Render for NodePanel {
                                             });
                                         },
                                     )
-                                    .child("+"),
+                                    .child(Icon::new(IconName::Plus, 12.0, rgba(0xa6e3a1ff))),
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -431,7 +439,7 @@ impl Render for NodePanel {
                                             });
                                         },
                                     )
-                                    .child("−"),
+                                    .child(Icon::new(IconName::Trash, 12.0, rgba(0xf38ba8ff))),
                             )
                             .into_any_element()
                     }

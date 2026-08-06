@@ -20,6 +20,8 @@ use u_forge_core::{
 use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessage};
 use crate::chat_message::{ChatMessageRole, ChatMessageView};
 use crate::text_field::{TextFieldView, TextSubmit};
+use crate::ui::components::Tooltip;
+use crate::ui::icons::{Icon, IconName};
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
@@ -1236,7 +1238,8 @@ impl Render for ChatPanel {
                                     });
                                 },
                             )
-                            .child("✕"),
+                            .tooltip(Tooltip::text("Delete conversation"))
+                            .child(Icon::new(IconName::Trash, 12.0, rgba(0xf38ba8ff))),
                     )
                     .into_any_element()
             },
@@ -1330,7 +1333,8 @@ impl Render for ChatPanel {
                                     this.retry_message(msg_entity_id, cx);
                                 });
                             })
-                            .child("⟳"),
+                            .tooltip(Tooltip::text("Try this response again"))
+                            .child(Icon::new(IconName::Refresh, 12.0, rgba(0xa6adc8ff))),
                     );
                 }
 
@@ -1355,7 +1359,8 @@ impl Render for ChatPanel {
                                 cx.notify();
                             });
                         })
-                        .child("⎘"),
+                        .tooltip(Tooltip::text("Copy message"))
+                        .child(Icon::new(IconName::Copy, 12.0, rgba(0xa6adc8ff))),
                 );
 
                 if show_delete {
@@ -1378,7 +1383,8 @@ impl Render for ChatPanel {
                                     this.delete_message_at(last, cx);
                                 });
                             })
-                            .child("x"),
+                            .tooltip(Tooltip::text("Delete message"))
+                            .child(Icon::new(IconName::Trash, 12.0, rgba(0xf38ba8ff))),
                     );
                 }
 
@@ -1543,6 +1549,11 @@ impl Render for ChatPanel {
                                     .text_sm()
                                     .text_color(rgba(0xa6adc8ff))
                                     .cursor_pointer()
+                                    .tooltip(Tooltip::text(if self.zoomed {
+                                        "Restore Assistant panel"
+                                    } else {
+                                        "Maximize Assistant panel"
+                                    }))
                                     .hover(|style| style.bg(rgba(0x45475a88)))
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -1550,7 +1561,7 @@ impl Render for ChatPanel {
                                             cx.emit(ToggleAssistantZoomRequested);
                                         }),
                                     )
-                                    .child(if self.zoomed { "Restore" } else { "Maximize" }),
+                                    .child(Icon::new(IconName::Maximize, 13.0, rgba(0xa6adc8ff))),
                             )
                             .child(
                                 div()
@@ -1569,6 +1580,7 @@ impl Render for ChatPanel {
                                     } else {
                                         rgba(0x1e1e2eff)
                                     })
+                                    .tooltip(Tooltip::text("Start a new conversation"))
                                     .when(!streaming, |button| {
                                         button.cursor_pointer().on_mouse_down(
                                             MouseButton::Left,
@@ -1577,7 +1589,15 @@ impl Render for ChatPanel {
                                             }),
                                         )
                                     })
-                                    .child("New"),
+                                    .child(Icon::new(
+                                        IconName::Plus,
+                                        13.0,
+                                        if streaming {
+                                            rgba(0x6c7086ff)
+                                        } else {
+                                            rgba(0x1e1e2eff)
+                                        },
+                                    )),
                             ),
                     )
                     .when(history_dropdown_open, |header| {
@@ -1791,6 +1811,13 @@ impl Render for ChatPanel {
                                         ("Stop", rgb(0xf38ba8_u32), rgba(0x1e1e2eff_u32))
                                     }
                                 };
+                                let button_child = if matches!(btn_state, BtnState::Send) {
+                                    Icon::new(IconName::Send, 16.0, fg)
+                                        .rotate_degrees(90.0)
+                                        .into_any_element()
+                                } else {
+                                    div().child(label).into_any_element()
+                                };
                                 div()
                                     .id("send-btn")
                                     .flex()
@@ -1804,6 +1831,12 @@ impl Render for ChatPanel {
                                     .text_base()
                                     .text_color(fg)
                                     .cursor_pointer()
+                                    .tooltip(Tooltip::text(match btn_state {
+                                        BtnState::Connect => "Connect the Assistant",
+                                        BtnState::Connecting => "Connecting the Assistant",
+                                        BtnState::Send => "Send message",
+                                        BtnState::Stop => "Stop response",
+                                    }))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
@@ -1817,7 +1850,7 @@ impl Render for ChatPanel {
                                             },
                                         ),
                                     )
-                                    .child(label)
+                                    .child(button_child)
                             }),
                     )
                     .when_some(connect_error, |el, err| {
@@ -1884,7 +1917,8 @@ impl Render for ChatPanel {
                                             .id("reasoning-toggle")
                                             .flex()
                                             .items_center()
-                                            .px_2()
+                                            .justify_center()
+                                            .w(px(22.0))
                                             .h(px(22.0))
                                             .bg(if reasoning_enabled {
                                                 rgb(0x45475a)
@@ -1900,6 +1934,13 @@ impl Render for ChatPanel {
                                             } else {
                                                 rgba(0x6c7086ff)
                                             })
+                                            .tooltip(Tooltip::text(if !reasoning_capable {
+                                                "Thinking follows the model default"
+                                            } else if reasoning_enabled {
+                                                "Thinking on — click to turn off"
+                                            } else {
+                                                "Thinking off — click to turn on"
+                                            }))
                                             .when(!streaming && reasoning_capable, |toggle| {
                                                 toggle.cursor_pointer().on_mouse_down(
                                                     MouseButton::Left,
@@ -1912,13 +1953,17 @@ impl Render for ChatPanel {
                                                     ),
                                                 )
                                             })
-                                            .child(if !reasoning_capable {
-                                                "Thinking unavailable"
-                                            } else if reasoning_enabled {
-                                                "Thinking on"
-                                            } else {
-                                                "Thinking off"
-                                            }),
+                                            .child(Icon::new(
+                                                IconName::Thinking,
+                                                14.0,
+                                                if !reasoning_capable {
+                                                    rgba(0xa6adc8ff)
+                                                } else if reasoning_enabled {
+                                                    rgba(0xa6e3a1ff)
+                                                } else {
+                                                    rgba(0xf38ba8ff)
+                                                },
+                                            )),
                                     ),
                             )
                             .when(model_dropdown_open, |container| {

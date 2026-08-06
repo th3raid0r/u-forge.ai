@@ -20,8 +20,6 @@ pub(crate) struct SaveActiveRequested;
 impl gpui::EventEmitter<SaveActiveRequested> for NodeEditorPanel {}
 pub(crate) struct SaveAllRequested;
 impl gpui::EventEmitter<SaveAllRequested> for NodeEditorPanel {}
-pub(crate) struct DiscardActiveRequested;
-impl gpui::EventEmitter<DiscardActiveRequested> for NodeEditorPanel {}
 pub(crate) struct CloseDirtyTabRequested(pub usize);
 impl gpui::EventEmitter<CloseDirtyTabRequested> for NodeEditorPanel {}
 
@@ -333,39 +331,6 @@ impl NodeEditorPanel {
         self.array_add_field = None;
         self.rebuild_field_subscriptions(cx);
         cx.notify();
-    }
-
-    pub(crate) fn discard_tab_changes(
-        &mut self,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) -> Option<(ObjectId, bool)> {
-        let tab = self.tabs.get(index)?;
-        let node_id = tab.node_id;
-        let is_new = tab.is_new;
-        let was_pinned = tab.pinned;
-        self.close_tab(index, cx);
-
-        if !is_new {
-            let pin_states = self
-                .tabs
-                .iter()
-                .map(|tab| (tab.node_id, tab.pinned))
-                .collect::<HashMap<_, _>>();
-            for tab in &mut self.tabs {
-                tab.pinned = true;
-            }
-            self.open_or_focus_tab(node_id, cx);
-            for tab in &mut self.tabs {
-                tab.pinned = if tab.node_id == node_id {
-                    was_pinned
-                } else {
-                    pin_states.get(&tab.node_id).copied().unwrap_or(tab.pinned)
-                };
-            }
-        }
-        cx.notify();
-        Some((node_id, is_new))
     }
 
     /// Remove stale edge references to a deleted node from all open tabs.

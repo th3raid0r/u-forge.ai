@@ -21,6 +21,7 @@ use crate::panel_contracts::{DockPosition, PanelId, WorkspaceItemId, WorldCanvas
 use crate::search_panel::SearchPanelStatus;
 use crate::startup::StartupMilestone;
 use crate::ui::components::{Button, ButtonStyle, Dialog, StatusItem, StatusTone, Tab as UiTab};
+use crate::ui::icons::IconName;
 use crate::ui::theme::UiTheme;
 
 fn operation_status_tone(message: &str) -> StatusTone {
@@ -711,6 +712,7 @@ impl Render for AppView {
                             .px_1()
                             .child(
                                 StatusItem::new("status-world", PanelId::World.title())
+                                    .icon(IconName::World)
                                     .active(sidebar_open && sidebar_tab == PanelId::World)
                                     .tooltip("Show or hide the World panel (Ctrl+B)")
                                     .on_click(|_, window, cx| {
@@ -719,6 +721,7 @@ impl Render for AppView {
                             )
                             .child(
                                 StatusItem::new("status-search", PanelId::Search.title())
+                                    .icon(IconName::Search)
                                     .active(sidebar_open && sidebar_tab == PanelId::Search)
                                     .tooltip("Show or hide Search (Ctrl+Shift+F)")
                                     .on_click(|_, window, cx| {
