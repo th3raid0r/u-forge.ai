@@ -32,7 +32,7 @@ use crate::chat_panel::{
 use crate::confirmation_modal::{
     ConfirmationAccepted, ConfirmationAlternative, ConfirmationCancelled, ConfirmationModal,
 };
-use crate::dock_state::DockState;
+use crate::dock_state::{DockFocusIntent, DockState};
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::{
     CloseDirtyTabRequested, NodeEditorPanel, SaveActiveRequested, SaveAllRequested,
@@ -433,6 +433,32 @@ async fn activate_lemonade_capabilities(
 }
 
 impl AppView {
+    pub(crate) fn toggle_dock_panel(
+        &mut self,
+        panel: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if panel == PanelId::Assistant && self.dock_state.is_panel_active(panel) {
+            self.chat_panel
+                .update(cx, |chat, _cx| chat.last_render_us = 0);
+        }
+        let focus = self.dock_state.toggle_panel(panel);
+        self.sync_dock_presentational_state(cx);
+        self.apply_dock_focus_intent(focus, window, cx);
+        self.schedule_workspace_persist(cx);
+        cx.notify();
+    }
+
+    fn apply_dock_focus_intent(&self, intent: DockFocusIntent, window: &mut Window, cx: &App) {
+        match intent {
+            DockFocusIntent::Panel(panel) => {
+                self.focus_region(FocusRegion::Panel(panel), window, cx)
+            }
+            DockFocusIntent::WorldCanvas => self.focus_region(FocusRegion::WorldCanvas, window, cx),
+        }
+    }
+
     pub(crate) fn cycle_workspace_focus(
         &mut self,
         reverse: bool,
@@ -1631,7 +1657,11 @@ impl AppView {
         let tokio_rt = self.state.tokio_rt.clone();
 
         let plan_kind = plan.kind();
-        match plan.has_pending_work(&graph, hq_queue.as_ref().is_some_and(|q| q.has_embedding())) {
+        match plan.has_pending_work(
+            &graph,
+            queue.has_embedding(),
+            hq_queue.as_ref().is_some_and(|q| q.has_embedding()),
+        ) {
             Ok(true) => {}
             Ok(false) => {
                 self.state.embedding_status = None;

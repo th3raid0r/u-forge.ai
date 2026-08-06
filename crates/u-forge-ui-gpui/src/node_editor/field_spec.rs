@@ -393,41 +393,55 @@ impl EditorTab {
     /// Compare `edited_edges` against `original_edges` to decide if edges
     /// have been modified.
     ///
-    /// Only *complete* edited edges (both endpoints + non-empty type) are
-    /// considered — incomplete placeholder rows are ignored for the purpose
-    /// of dirty tracking because they will be discarded on save anyway.
     fn are_edges_dirty(&self) -> bool {
-        // Collect the set of complete edited edges as (from, to, type) tuples.
-        let edited_set: Vec<(ObjectId, ObjectId, &str)> = self
-            .edited_edges
-            .iter()
-            .filter(|e| e.is_complete())
-            .map(|e| (e.from.unwrap(), e.to.unwrap(), e.edge_type.trim()))
-            .collect();
+        relationships_are_dirty(&self.edited_edges, &self.original_edges)
+    }
+}
 
-        let orig_set: Vec<(ObjectId, ObjectId, &str)> = self
-            .original_edges
-            .iter()
-            .map(|e| (e.from, e.to, e.edge_type.as_str()))
-            .collect();
+fn relationships_are_dirty(edited_edges: &[EditableEdge], original_edges: &[Edge]) -> bool {
+    // An unfinished row is user work, not a disposable placeholder. Marking it
+    // dirty pins a preview tab and lets the save path explain what is missing.
+    if edited_edges.iter().any(|edge| !edge.is_complete()) {
+        return true;
+    }
 
-        if edited_set.len() != orig_set.len() {
+    // Collect the set of complete edited edges as (from, to, type) tuples.
+    let edited_set: Vec<(ObjectId, ObjectId, &str)> = edited_edges
+        .iter()
+        .map(|e| (e.from.unwrap(), e.to.unwrap(), e.edge_type.trim()))
+        .collect();
+
+    let orig_set: Vec<(ObjectId, ObjectId, &str)> = original_edges
+        .iter()
+        .map(|e| (e.from, e.to, e.edge_type.as_str()))
+        .collect();
+
+    if edited_set.len() != orig_set.len() {
+        return true;
+    }
+
+    // Order-independent comparison: every original edge must appear in
+    // edited and vice-versa.
+    for triple in &orig_set {
+        if !edited_set.contains(triple) {
             return true;
         }
-
-        // Order-independent comparison: every original edge must appear in
-        // edited and vice-versa.
-        for triple in &orig_set {
-            if !edited_set.contains(triple) {
-                return true;
-            }
+    }
+    for triple in &edited_set {
+        if !orig_set.contains(triple) {
+            return true;
         }
-        for triple in &edited_set {
-            if !orig_set.contains(triple) {
-                return true;
-            }
-        }
+    }
 
-        false
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EditableEdge, relationships_are_dirty};
+
+    #[test]
+    fn unfinished_relationships_are_dirty_even_before_other_edits() {
+        assert!(relationships_are_dirty(&[EditableEdge::empty()], &[]));
     }
 }

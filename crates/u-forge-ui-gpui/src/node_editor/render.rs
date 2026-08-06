@@ -1,10 +1,10 @@
 use gpui::{
-    Context, MouseButton, MouseDownEvent, Render, SharedString, Window, canvas, div, prelude::*,
-    px, relative, rgb, rgba,
+    App, Context, Corner, MouseButton, MouseDownEvent, Render, SharedString, Window, anchored,
+    canvas, deferred, div, prelude::*, px, relative, rgb, rgba,
 };
 
 use crate::text_field::{TextFieldView, TextSubmit};
-use crate::ui::components::{IconButton, Tooltip};
+use crate::ui::components::{ContextMenu, IconButton, Tooltip};
 use crate::ui::icons::{Icon, IconName};
 
 use u_forge_core::PropertyType;
@@ -12,6 +12,7 @@ use u_forge_core::PropertyType;
 use super::field_spec::SubTab;
 use super::{
     CloseDirtyTabRequested, NodeEditorPanel, SaveActiveRequested, SaveAllRequested,
+    TabContextMenuState,
     field_spec::{
         COLUMN_W, DETAIL_TAB_H, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H, PAGE_NAV_H,
         SUBTAB_BAR_H,
@@ -21,6 +22,7 @@ use super::{
 impl Render for NodeEditorPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let panel_focused = self.focus.contains_focused(window, cx);
+        let tab_context_menu = self.tab_context_menu.clone();
         // Measure panel size each frame so column layout adapts to window resizes.
         let entity_for_measure = cx.entity().clone();
         let measure_canvas = canvas(
@@ -51,6 +53,14 @@ impl Render for NodeEditorPanel {
             .min_h_0()
             .key_context("DetailsPanel")
             .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    if this.tab_context_menu.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .overflow_hidden()
             .bg(rgb(0x1e1e2e))
             .border_b_1()
@@ -81,16 +91,43 @@ impl Render for NodeEditorPanel {
             .flex_row()
             .flex_none()
             .h(px(DETAIL_TAB_H))
-            .overflow_x_scroll()
             .bg(rgb(0x181825))
             .border_b_1()
             .border_color(rgb(0x313244));
+        let mut tab_strip = div()
+            .id("editor-tab-strip")
+            .flex()
+            .flex_row()
+            .min_w_0()
+            .h_full()
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_bar_scroll);
+        tab_strip.style().flex_grow = Some(1.0);
+        tab_strip.style().flex_shrink = Some(1.0);
+        tab_strip.style().flex_basis = Some(relative(0.0).into());
 
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == active_idx;
             let is_dirty = tab.dirty;
             let is_pinned = tab.pinned;
-            let tab_name: SharedString = tab.name.clone().into();
+            let display_name = if tab.name.trim().is_empty() {
+                format!("New {}", tab.object_type)
+            } else {
+                tab.name.clone()
+            };
+            let tab_name: SharedString = display_name.clone().into();
+            let tab_tooltip: SharedString = format!(
+                "{} — {}",
+                display_name,
+                if is_dirty {
+                    "unsaved changes"
+                } else if is_pinned {
+                    "kept open"
+                } else {
+                    "preview; may be replaced"
+                }
+            )
+            .into();
 
             let accent_color = if is_dirty {
                 rgb(0xfab387) // Catppuccin peach (orange) for dirty
@@ -118,7 +155,19 @@ impl Render for NodeEditorPanel {
                     rgb(0x1e1e2e)
                 } else {
                     rgb(0x181825)
-                });
+                })
+                .tooltip(Tooltip::text(tab_tooltip))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.tab_context_menu = Some(TabContextMenuState {
+                            position: event.position,
+                            index: i,
+                        });
+                        cx.notify();
+                    }),
+                );
 
             if is_active {
                 tab_el = tab_el.border_b_2().border_color(accent_color);
@@ -135,11 +184,16 @@ impl Render for NodeEditorPanel {
                     IconName::TabPinOutline
                 },
                 if is_pinned {
-                    "Pinned — click to allow this clean tab to be replaced"
+                    if is_dirty {
+                        "Kept open while it has unsaved changes"
+                    } else {
+                        "Kept open — click to allow preview replacement"
+                    }
                 } else {
                     "Preview tab — click to keep it open"
                 },
             )
+            .disabled(is_dirty)
             .selected(is_pinned)
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
@@ -160,11 +214,11 @@ impl Render for NodeEditorPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        this.active_tab = Some(i);
-                        this.rebuild_field_subscriptions(cx);
-                        cx.notify();
+                        this.activate_tab(i, cx);
                     }),
                 )
+                .max_w(px(180.0))
+                .truncate()
                 .child(tab_name);
 
             // Close button
@@ -207,7 +261,7 @@ impl Render for NodeEditorPanel {
 
             tab_el = tab_el.child(close_btn);
 
-            tab_bar = tab_bar.child(tab_el);
+            tab_strip = tab_strip.child(tab_el);
         }
         let dirty = self.has_dirty_tabs();
         let active_dirty = self.tabs.get(active_idx).is_some_and(|tab| tab.dirty);
@@ -237,11 +291,7 @@ impl Render for NodeEditorPanel {
                 .update(cx, |_this, cx| cx.emit(SaveAllRequested))
                 .ok();
         });
-        tab_bar = tab_bar.child({
-            let mut spacer = div();
-            spacer.style().flex_grow = Some(1.0);
-            spacer
-        });
+        tab_bar = tab_bar.child(tab_strip);
         tab_bar = tab_bar.child(save_active);
         tab_bar = tab_bar.child(save_all);
 
@@ -776,7 +826,7 @@ impl Render for NodeEditorPanel {
 
         let base = outer.child(measure_canvas).child(tab_bar).child(subtab_bar);
 
-        if active_subtab == SubTab::Properties {
+        let root = if active_subtab == SubTab::Properties {
             // ── Properties sub-tab: scrollable form columns + page nav ────────
             let has_prev = current_page_idx > 0;
             let has_next = current_page_idx + 1 < total_pages;
@@ -861,7 +911,112 @@ impl Render for NodeEditorPanel {
             // ── Edges sub-tab: edge editor fills remaining height ─────────────
             let edges_section = self.render_edges_section(active_idx, true, cx);
             base.child(edges_section)
-        }
+        };
+
+        root.when_some(tab_context_menu, |root, menu| {
+            let index = menu.index;
+            let Some(tab) = self.tabs.get(index) else {
+                return root;
+            };
+            let dirty = tab.dirty;
+            let pinned = tab.pinned;
+            let can_move_left = index > 0;
+            let can_move_right = index + 1 < self.tabs.len();
+            let pin_entity = cx.entity().clone();
+            let move_left_entity = cx.entity().clone();
+            let move_right_entity = cx.entity().clone();
+            let close_entity = cx.entity().clone();
+            let menu_body = div()
+                .w(px(220.0))
+                .child(tab_context_menu_item(
+                    if pinned {
+                        "Allow Preview Replacement"
+                    } else {
+                        "Keep Open"
+                    },
+                    !dirty,
+                    move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        pin_entity.update(cx, |panel, cx| {
+                            if let Some(tab) = panel.tabs.get_mut(index) {
+                                tab.pinned = !tab.pinned;
+                            }
+                            panel.tab_context_menu = None;
+                            cx.notify();
+                        });
+                    },
+                ))
+                .child(tab_context_menu_item(
+                    "Move Left",
+                    can_move_left,
+                    move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        move_left_entity.update(cx, |panel, cx| {
+                            panel.move_tab(index, index.saturating_sub(1), cx);
+                        });
+                    },
+                ))
+                .child(tab_context_menu_item(
+                    "Move Right",
+                    can_move_right,
+                    move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        move_right_entity.update(cx, |panel, cx| {
+                            panel.move_tab(index, index + 1, cx);
+                        });
+                    },
+                ))
+                .child(div().h(px(1.0)).bg(rgb(0x45475a)))
+                .child(tab_context_menu_item(
+                    "Close",
+                    true,
+                    move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        close_entity.update(cx, |panel, cx| {
+                            panel.tab_context_menu = None;
+                            if dirty {
+                                cx.emit(CloseDirtyTabRequested(index));
+                            } else {
+                                panel.close_tab(index, cx);
+                                cx.notify();
+                            }
+                        });
+                    },
+                ));
+            root.child(deferred(
+                anchored()
+                    .position(menu.position)
+                    .anchor(Corner::TopLeft)
+                    .child(ContextMenu::new("details-tab-context-menu", menu_body)),
+            ))
+        })
+    }
+}
+
+fn tab_context_menu_item(
+    label: &'static str,
+    enabled: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let item = div()
+        .id(label)
+        .flex()
+        .items_center()
+        .h(px(26.0))
+        .px_3()
+        .text_sm()
+        .text_color(if enabled {
+            rgba(0xcdd6f4ff)
+        } else {
+            rgba(0x6c7086ff)
+        })
+        .child(label);
+    if enabled {
+        item.cursor_pointer()
+            .hover(|style| style.bg(rgba(0x45475a88)))
+            .on_mouse_down(MouseButton::Left, listener)
+    } else {
+        item
     }
 }
 

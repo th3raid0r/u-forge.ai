@@ -17,6 +17,12 @@ pub(crate) const MIN_WORLD_CANVAS_WIDTH: f32 = 360.0;
 pub(crate) const MIN_WORLD_CANVAS_HEIGHT: f32 = 240.0;
 const WORKSPACE_SNAPSHOT_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockFocusIntent {
+    Panel(PanelId),
+    WorldCanvas,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceSnapshotV1 {
@@ -197,16 +203,18 @@ impl DockState {
 
     /// Zed-style panel toggle: activating a different panel switches to it;
     /// invoking the already-visible panel closes its dock.
-    pub(crate) fn toggle_panel(&mut self, panel: PanelId) {
+    pub(crate) fn toggle_panel(&mut self, panel: PanelId) -> DockFocusIntent {
         let slot = self.slot_mut(panel.position());
         if slot.open && slot.active == panel {
             slot.open = false;
             if self.zoomed == Some(panel) {
                 self.zoomed = None;
             }
+            DockFocusIntent::WorldCanvas
         } else {
             slot.active = panel;
             slot.open = true;
+            DockFocusIntent::Panel(panel)
         }
     }
 
@@ -283,9 +291,15 @@ mod tests {
     #[test]
     fn switching_left_panels_does_not_close_the_dock() {
         let mut state = DockState::default();
-        state.toggle_panel(PanelId::Search);
+        assert_eq!(
+            state.toggle_panel(PanelId::Search),
+            DockFocusIntent::Panel(PanelId::Search)
+        );
         assert!(state.is_panel_active(PanelId::Search));
-        state.toggle_panel(PanelId::Search);
+        assert_eq!(
+            state.toggle_panel(PanelId::Search),
+            DockFocusIntent::WorldCanvas
+        );
         assert!(!state.is_open(DockPosition::Left));
     }
 

@@ -57,7 +57,7 @@ Primary Zed references:
 
 ## Behavioral dock and World Canvas
 
-- [ ] **UI-06 — Dock reducer.** Add a pure/minimally GPUI-coupled `DockState`
+- [x] **UI-06 — Dock reducer.** Add a pure/minimally GPUI-coupled `DockState`
   owning open/active state, focus intent, canonical valid position, size,
   reset, zoom, and panel toggle behavior.
 - [x] **UI-07 — Canonical composition.** Left contains World and Search; right
@@ -108,12 +108,13 @@ Primary Zed references:
   retain owned search tasks, virtualize results, and present structured
   degradation outcomes from `bug_AlphaCorrectness.md` with concise hints and
   detailed tooltips.
-- [ ] **UI-18 — Details tabs and saving.** Model preview versus pinned items,
+- [x] **UI-18 — Details tabs and saving.** Model preview versus pinned items,
   active tab, dirty state, reorder, tooltips, context actions, and active-tab
   scrolling. First edit pins a preview; dirty/pinned tabs are never replaced.
-  Add visible Save Changes and Discard Changes controls plus Save/Discard/Cancel
-  confirmation on dirty close. Rename visible Edges UI to Relationships and
-  block saves with incomplete relationships rather than silently dropping them.
+  Add visible Save Changes and Save All controls. Offer Don't Save only through
+  Save/Don't Save/Cancel confirmation on dirty close, rather than as a standing
+  destructive action. Rename visible Edges UI to Relationships and block saves
+  with incomplete relationships rather than silently dropping them.
 - [ ] **UI-19 — Assistant toolbar.** Match Zed's toolbar semantics for title,
   new conversation, maximize/restore, overflow, tooltips, friendly model
   selection, Think Longer, and explicit reload/busy/failure states. Conflicting

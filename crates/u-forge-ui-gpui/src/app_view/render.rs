@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyView, App, ClickEvent, Context, Corner, Focusable, MouseButton, MouseDownEvent, Render,
+    AnyView, App, ClickEvent, Context, Corner, MouseButton, MouseDownEvent, Render,
     StyleRefinement, Window, anchored, canvas, deferred, div, point, prelude::*, px, relative, rgb,
     rgba,
 };
@@ -151,41 +151,16 @@ impl Render for AppView {
                     .update(cx, |canvas, cx| canvas.fit_graph(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
-                this.dock_state.toggle_panel(PanelId::World);
-                if this.dock_state.is_panel_active(PanelId::World) {
-                    this.node_panel.read(cx).focus_handle(cx).focus(window);
-                }
-                this.schedule_workspace_persist(cx);
-                cx.notify();
+                this.toggle_dock_panel(PanelId::World, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSearchPanel, window, cx| {
-                this.dock_state.toggle_panel(PanelId::Search);
-                if this.dock_state.is_panel_active(PanelId::Search) {
-                    this.search_panel.read(cx).focus_handle(cx).focus(window);
-                }
-                this.schedule_workspace_persist(cx);
-                cx.notify();
+                this.toggle_dock_panel(PanelId::Search, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| {
-                if this.dock_state.is_panel_active(PanelId::Assistant) {
-                    this.chat_panel
-                        .update(cx, |panel, _cx| panel.last_render_us = 0);
-                }
-                this.dock_state.toggle_panel(PanelId::Assistant);
-                this.sync_dock_presentational_state(cx);
-                if this.dock_state.is_panel_active(PanelId::Assistant) {
-                    this.chat_panel.read(cx).focus_handle(cx).focus(window);
-                }
-                this.schedule_workspace_persist(cx);
-                cx.notify();
+                this.toggle_dock_panel(PanelId::Assistant, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleDetailsPanel, window, cx| {
-                this.dock_state.toggle_panel(PanelId::Details);
-                if this.dock_state.is_panel_active(PanelId::Details) {
-                    this.node_editor.read(cx).focus_handle(cx).focus(window);
-                }
-                this.schedule_workspace_persist(cx);
-                cx.notify();
+                this.toggle_dock_panel(PanelId::Details, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ClearData, _window, cx| {
                 this.request_clear_data(cx);
@@ -1103,14 +1078,7 @@ impl Render for AppView {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                                this.dock_state.toggle_panel(PanelId::World);
-                                                if this.dock_state.is_panel_active(PanelId::World) {
-                                                    this.node_panel
-                                                        .read(cx)
-                                                        .focus_handle(cx)
-                                                        .focus(window);
-                                                }
-                                                this.schedule_workspace_persist(cx);
+                                                this.toggle_dock_panel(PanelId::World, window, cx);
                                                 this.view_menu_open = false;
                                                 cx.notify();
                                             }),
@@ -1136,26 +1104,11 @@ impl Render for AppView {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                                if this
-                                                    .dock_state
-                                                    .is_panel_active(PanelId::Assistant)
-                                                {
-                                                    this.chat_panel.update(cx, |panel, _cx| {
-                                                        panel.last_render_us = 0;
-                                                    });
-                                                }
-                                                this.dock_state.toggle_panel(PanelId::Assistant);
-                                                this.sync_dock_presentational_state(cx);
-                                                if this
-                                                    .dock_state
-                                                    .is_panel_active(PanelId::Assistant)
-                                                {
-                                                    this.chat_panel
-                                                        .read(cx)
-                                                        .focus_handle(cx)
-                                                        .focus(window);
-                                                }
-                                                this.schedule_workspace_persist(cx);
+                                                this.toggle_dock_panel(
+                                                    PanelId::Assistant,
+                                                    window,
+                                                    cx,
+                                                );
                                                 this.view_menu_open = false;
                                                 cx.notify();
                                             }),
@@ -1181,15 +1134,11 @@ impl Render for AppView {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                                this.dock_state.toggle_panel(PanelId::Details);
-                                                if this.dock_state.is_panel_active(PanelId::Details)
-                                                {
-                                                    this.node_editor
-                                                        .read(cx)
-                                                        .focus_handle(cx)
-                                                        .focus(window);
-                                                }
-                                                this.schedule_workspace_persist(cx);
+                                                this.toggle_dock_panel(
+                                                    PanelId::Details,
+                                                    window,
+                                                    cx,
+                                                );
                                                 this.view_menu_open = false;
                                                 cx.notify();
                                             }),

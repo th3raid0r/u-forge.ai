@@ -4,7 +4,9 @@ mod render;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{Context, Entity, FocusHandle, Focusable, Pixels, Subscription, prelude::*};
+use gpui::{
+    Context, Entity, FocusHandle, Focusable, Pixels, Point, ScrollHandle, Subscription, prelude::*,
+};
 use parking_lot::RwLock;
 use u_forge_core::{
     EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyType, SchemaManager,
@@ -46,6 +48,12 @@ pub(crate) struct EdgeNodeDropdown {
     pub(crate) highlighted_idx: usize,
 }
 
+#[derive(Clone)]
+struct TabContextMenuState {
+    position: Point<Pixels>,
+    index: usize,
+}
+
 // ── Node editor panel ─────────────────────────────────────────────────────────
 
 /// Editor panel with browser-style tabs for editing nodes.
@@ -55,6 +63,10 @@ pub(crate) struct NodeEditorPanel {
     pub(crate) focus: FocusHandle,
     pub(crate) tabs: Vec<EditorTab>,
     pub(crate) active_tab: Option<usize>,
+    /// Keeps the active tab visible when tabs are opened, selected, or moved.
+    tab_bar_scroll: ScrollHandle,
+    /// Right-click actions for a Details tab.
+    tab_context_menu: Option<TabContextMenuState>,
     #[allow(dead_code)]
     selection: Entity<SelectionModel>,
     #[allow(dead_code)]
@@ -99,6 +111,8 @@ impl NodeEditorPanel {
             focus: cx.focus_handle(),
             tabs: Vec::new(),
             active_tab: None,
+            tab_bar_scroll: ScrollHandle::new(),
+            tab_context_menu: None,
             selection,
             snapshot,
             graph,
@@ -122,8 +136,7 @@ impl NodeEditorPanel {
     pub(crate) fn open_or_focus_tab(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
         // Already open?
         if let Some(idx) = self.tabs.iter().position(|t| t.node_id == node_id) {
-            self.active_tab = Some(idx);
-            self.rebuild_field_subscriptions(cx);
+            self.activate_tab(idx, cx);
             return;
         }
 
@@ -147,6 +160,7 @@ impl NodeEditorPanel {
         is_new: bool,
         cx: &mut Context<Self>,
     ) {
+        self.tab_context_menu = None;
         let node_id = meta.id;
 
         // Load schema for this object type. File-loaded schemas live under
@@ -296,7 +310,21 @@ impl NodeEditorPanel {
             self.active_tab = Some(self.tabs.len() - 1);
         }
 
+        self.reveal_active_tab();
         self.rebuild_field_subscriptions(cx);
+    }
+
+    pub(crate) fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.active_tab = Some(index);
+        self.tab_context_menu = None;
+        self.edge_node_dropdown = None;
+        self.array_add_field = None;
+        self.reveal_active_tab();
+        self.rebuild_field_subscriptions(cx);
+        cx.notify();
     }
 
     /// Close a tab by index.
@@ -306,6 +334,7 @@ impl NodeEditorPanel {
         }
         self.edge_node_dropdown = None;
         self.array_add_field = None;
+        self.tab_context_menu = None;
         self.tabs.remove(idx);
         if self.tabs.is_empty() {
             self.active_tab = None;
@@ -316,6 +345,7 @@ impl NodeEditorPanel {
                 self.active_tab = Some(active - 1);
             }
         }
+        self.reveal_active_tab();
         self.rebuild_field_subscriptions(cx);
     }
 
@@ -326,11 +356,30 @@ impl NodeEditorPanel {
         let Some(next) = relative_tab_index(active, self.tabs.len(), previous) else {
             return;
         };
-        self.active_tab = Some(next);
+        self.activate_tab(next, cx);
+    }
+
+    pub(crate) fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = self
+            .active_tab
+            .map(|active| remap_index_after_move(active, from, to));
+        self.tab_context_menu = None;
         self.edge_node_dropdown = None;
         self.array_add_field = None;
+        self.reveal_active_tab();
         self.rebuild_field_subscriptions(cx);
         cx.notify();
+    }
+
+    fn reveal_active_tab(&self) {
+        if let Some(active) = self.active_tab {
+            self.tab_bar_scroll.scroll_to_item(active);
+        }
     }
 
     /// Remove stale edge references to a deleted node from all open tabs.
@@ -424,6 +473,7 @@ impl NodeEditorPanel {
         }
         // Empty drafts have never reached storage; removing their tabs is enough.
         for &idx in discard_indices.iter().rev() {
+            self.tab_context_menu = None;
             self.tabs.remove(idx);
             self.active_tab = match self.active_tab {
                 _ if self.tabs.is_empty() => None,
@@ -437,6 +487,7 @@ impl NodeEditorPanel {
         } else {
             target
         };
+        self.reveal_active_tab();
 
         // Second pass: persist dirty tabs.
         for (index, tab) in self.tabs.iter_mut().enumerate() {
@@ -859,9 +910,21 @@ fn relative_tab_index(active: usize, len: usize, previous: bool) -> Option<usize
     })
 }
 
+fn remap_index_after_move(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::relative_tab_index;
+    use super::{relative_tab_index, remap_index_after_move};
 
     #[test]
     fn relative_tab_navigation_wraps_and_rejects_stale_state() {
@@ -871,5 +934,16 @@ mod tests {
         assert_eq!(relative_tab_index(2, 3, true), Some(1));
         assert_eq!(relative_tab_index(0, 0, false), None);
         assert_eq!(relative_tab_index(3, 3, false), None);
+    }
+
+    #[test]
+    fn tab_reordering_preserves_the_active_item() {
+        assert_eq!(remap_index_after_move(1, 1, 3), 3);
+        assert_eq!(remap_index_after_move(2, 1, 3), 1);
+        assert_eq!(remap_index_after_move(3, 1, 3), 2);
+        assert_eq!(remap_index_after_move(3, 3, 0), 0);
+        assert_eq!(remap_index_after_move(0, 3, 0), 1);
+        assert_eq!(remap_index_after_move(1, 3, 0), 2);
+        assert_eq!(remap_index_after_move(4, 1, 3), 4);
     }
 }
