@@ -104,7 +104,7 @@ Primary Zed references:
   against authoritative loaded schemas, with plain-language validation and a
   structured completion summary. Keep raw schema maintenance advanced. Make
   recommended Lemonade setup the normal path and backend matrices advanced.
-- [ ] **UI-17 — Search panel.** Use shared fields/buttons/status components,
+- [x] **UI-17 — Search panel.** Use shared fields/buttons/status components,
   retain owned search tasks, virtualize results, and present structured
   degradation outcomes from `bug_AlphaCorrectness.md` with concise hints and
   detailed tooltips.

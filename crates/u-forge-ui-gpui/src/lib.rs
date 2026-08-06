@@ -1,4 +1,5 @@
 pub mod app_view;
+mod assets;
 pub mod chat_history;
 pub mod chat_message;
 pub mod chat_panel;
@@ -20,6 +21,7 @@ pub mod ui;
 mod startup_tests;
 
 pub use app_view::AppView;
+pub use assets::Assets;
 pub use ui::theme::UiTheme;
 
 use gpui::actions;

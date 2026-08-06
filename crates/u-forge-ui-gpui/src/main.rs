@@ -6,7 +6,7 @@ use gpui::{
 };
 use u_forge_core::AppConfig;
 use u_forge_ui_gpui::{
-    AppView, ClearData, ClearSchema, DetailsCloseTab, DetailsNextTab, DetailsPreviousTab,
+    AppView, Assets, ClearData, ClearSchema, DetailsCloseTab, DetailsNextTab, DetailsPreviousTab,
     ExportData, FitGraph, FocusNextRegion, FocusPreviousRegion, ImportData, ImportSchema,
     OpenSettings, SaveActiveItem, SaveAllItems, ToggleDetailsPanel, ToggleFocusedPanelZoom,
     TogglePerfOverlay, ToggleRightPanel, ToggleSearchPanel, ToggleSidebar, UiTheme,
@@ -42,7 +42,8 @@ fn main() {
     let graph = prepared.graph;
     let schema_mgr = prepared.schema_manager;
 
-    Application::new().run(move |cx: &mut App| {
+    let application = Application::new().with_assets(Assets);
+    application.run(move |cx: &mut App| {
         let _phase = startup.phase("gpui_application_start");
         UiTheme::init(cx);
         // Register keybindings.

@@ -11,6 +11,7 @@ use gpui::{
     RenderOnce, SharedString, Window, div, prelude::*, px,
 };
 
+use super::icons::{Icon, IconName};
 use super::theme::UiTheme;
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -185,27 +186,37 @@ impl RenderOnce for Button {
 
 #[derive(IntoElement)]
 pub struct IconButton {
-    button: Button,
+    id: ElementId,
+    icon: IconName,
+    accessible_label: SharedString,
+    disabled: bool,
+    selected: bool,
+    on_click: Option<ClickHandler>,
 }
 
 impl IconButton {
     pub fn new(
         id: impl Into<ElementId>,
-        icon: impl Into<SharedString>,
+        icon: IconName,
         accessible_label: impl Into<SharedString>,
     ) -> Self {
         Self {
-            button: Button::new(id, icon).tooltip(accessible_label),
+            id: id.into(),
+            icon,
+            accessible_label: accessible_label.into(),
+            disabled: false,
+            selected: false,
+            on_click: None,
         }
     }
 
     pub fn disabled(mut self, disabled: bool) -> Self {
-        self.button = self.button.disabled(disabled);
+        self.disabled = disabled;
         self
     }
 
     pub fn selected(mut self, selected: bool) -> Self {
-        self.button = self.button.selected(selected);
+        self.selected = selected;
         self
     }
 
@@ -213,7 +224,7 @@ impl IconButton {
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.button = self.button.on_click(handler);
+        self.on_click = Some(Rc::new(handler));
         self
     }
 }
@@ -221,9 +232,33 @@ impl IconButton {
 impl RenderOnce for IconButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = *UiTheme::get(cx);
-        div()
-            .size(px(theme.metrics.control_height))
-            .child(self.button)
+        let color = if self.disabled {
+            theme.colors.text_disabled
+        } else if self.selected {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        };
+        let mut button = div()
+            .id(self.id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(theme.metrics.control_height_small))
+            .rounded(px(theme.metrics.radius_small))
+            .when(self.selected, |button| button.bg(theme.colors.selected))
+            .child(Icon::new(self.icon, 13.0, color))
+            .tooltip(Tooltip::text(self.accessible_label));
+        if !self.disabled {
+            button = button
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.colors.selected));
+            if let Some(handler) = self.on_click {
+                button = button.on_click(move |event, window, cx| handler(event, window, cx));
+            }
+        }
+        button
     }
 }
 
@@ -243,6 +278,11 @@ impl Tab {
 
     pub fn dirty(mut self, dirty: bool) -> Self {
         self.dirty = dirty;
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.button = self.button.disabled(disabled);
         self
     }
 

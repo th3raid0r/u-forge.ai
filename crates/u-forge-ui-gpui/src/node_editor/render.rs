@@ -4,6 +4,8 @@ use gpui::{
 };
 
 use crate::text_field::{TextFieldView, TextSubmit};
+use crate::ui::components::IconButton;
+use crate::ui::icons::IconName;
 
 use u_forge_core::PropertyType;
 
@@ -123,32 +125,34 @@ impl Render for NodeEditorPanel {
                 tab_el = tab_el.border_b_2().border_color(accent_color);
             }
 
-            // Pin indicator
-            let pin_label: SharedString = if is_pinned {
-                "Pinned".into()
-            } else {
-                "Pin".into()
-            };
-            let pin_btn = div()
-                .id(("tab-pin", i))
-                .text_base()
-                .text_color(if is_pinned {
-                    rgba(0xf9e2afff)
+            // Pinned and preview tabs use distinct glyphs. The tooltip explains
+            // the replacement behavior without spending tab width on labels.
+            let pin_panel = cx.weak_entity();
+            let pin_btn = IconButton::new(
+                ("tab-pin", i),
+                if is_pinned {
+                    IconName::TabPinFilled
                 } else {
-                    rgba(0x6c7086ff)
-                })
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        cx.stop_propagation();
+                    IconName::TabPinOutline
+                },
+                if is_pinned {
+                    "Pinned — click to allow this clean tab to be replaced"
+                } else {
+                    "Preview tab — click to keep it open"
+                },
+            )
+            .selected(is_pinned)
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                pin_panel
+                    .update(cx, |this, cx| {
                         if let Some(tab) = this.tabs.get_mut(i) {
                             tab.pinned = !tab.pinned;
                         }
                         cx.notify();
-                    }),
-                )
-                .child(pin_label);
+                    })
+                    .ok();
+            });
 
             // Tab name — click to activate
             let name_el = div()
@@ -165,26 +169,31 @@ impl Render for NodeEditorPanel {
                 .child(tab_name);
 
             // Close button
-            let close_btn = div()
-                .id(("tab-close", i))
-                .text_base()
-                .text_color(rgba(0x6c7086ff))
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        cx.stop_propagation();
+            let close_panel = cx.weak_entity();
+            let close_btn = IconButton::new(
+                ("tab-close", i),
+                IconName::TabClose,
+                if is_dirty {
+                    "Close tab — unsaved changes will require confirmation"
+                } else {
+                    "Close tab (Ctrl+W)"
+                },
+            )
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                close_panel
+                    .update(cx, |this, cx| {
                         if is_dirty {
                             cx.emit(CloseDirtyTabRequested(i));
                         } else {
                             this.close_tab(i, cx);
                             cx.notify();
                         }
-                    }),
-                )
-                .child("Close");
+                    })
+                    .ok();
+            });
 
-            tab_el = tab_el.child(pin_btn).child(name_el).child(close_btn);
+            tab_el = tab_el.child(pin_btn).child(name_el);
 
             // Dirty indicator dot
             if is_dirty {
@@ -196,6 +205,8 @@ impl Render for NodeEditorPanel {
                         .bg(rgb(0xfab387)),
                 );
             }
+
+            tab_el = tab_el.child(close_btn);
 
             tab_bar = tab_bar.child(tab_el);
         }

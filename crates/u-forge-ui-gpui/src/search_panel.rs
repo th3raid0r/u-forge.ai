@@ -15,6 +15,8 @@ use u_forge_ui_traits::node_color_for_type;
 
 use crate::selection_model::SelectionModel;
 use crate::text_field::{TextFieldView, TextSubmit};
+use crate::ui::components::{Button, ButtonStyle, Label, LabelSize, LabelTone, Tab, Tooltip};
+use crate::ui::theme::UiTheme;
 
 // ── Search mode ───────────────────────────────────────────────────────────────
 
@@ -55,7 +57,7 @@ fn degradation_hint(outcomes: &SearchStageOutcomes) -> Option<String> {
     };
     let mut stages = Vec::new();
     if degraded(outcomes.fts.status) {
-        stages.push("FTS5");
+        stages.push("words");
     }
     let standard = outcomes.standard_semantic.status;
     let hq = outcomes.high_quality_semantic.status;
@@ -63,16 +65,71 @@ fn degradation_hint(outcomes: &SearchStageOutcomes) -> Option<String> {
     let no_semantic_lane_applied =
         standard != SearchStageStatus::Applied && hq != SearchStageStatus::Applied;
     if semantic_failed || (no_semantic_lane_applied && (degraded(standard) || degraded(hq))) {
-        stages.push("semantic");
+        stages.push("meaning");
     }
     if degraded(outcomes.reranking.status) {
-        stages.push("reranking");
+        stages.push("ordering");
     }
     if stages.is_empty() {
         None
     } else {
-        Some(format!("Results degraded · {}", stages.join(", ")))
+        Some(format!("Search limited · {}", stages.join(", ")))
     }
+}
+
+fn stage_status_label(status: SearchStageStatus) -> &'static str {
+    match status {
+        SearchStageStatus::Applied => "used",
+        SearchStageStatus::IntentionallySkipped => "not needed",
+        SearchStageStatus::Unavailable => "unavailable",
+        SearchStageStatus::Failed => "could not complete",
+    }
+}
+
+fn stage_detail(label: &str, status: SearchStageStatus, diagnostic: Option<&str>) -> String {
+    let mut detail = format!("{label}: {}", stage_status_label(status));
+    if let Some(diagnostic) = diagnostic {
+        detail.push_str(" — ");
+        detail.push_str(diagnostic);
+    }
+    detail
+}
+
+fn degradation_detail(outcomes: &SearchStageOutcomes) -> String {
+    let semantic_status = if outcomes.standard_semantic.status == SearchStageStatus::Applied
+        || outcomes.high_quality_semantic.status == SearchStageStatus::Applied
+    {
+        SearchStageStatus::Applied
+    } else if outcomes.standard_semantic.status == SearchStageStatus::Failed
+        || outcomes.high_quality_semantic.status == SearchStageStatus::Failed
+    {
+        SearchStageStatus::Failed
+    } else if outcomes.standard_semantic.status == SearchStageStatus::Unavailable
+        || outcomes.high_quality_semantic.status == SearchStageStatus::Unavailable
+    {
+        SearchStageStatus::Unavailable
+    } else {
+        SearchStageStatus::IntentionallySkipped
+    };
+    let semantic_diagnostic = [&outcomes.standard_semantic, &outcomes.high_quality_semantic]
+        .into_iter()
+        .find(|outcome| outcome.status == semantic_status)
+        .and_then(|outcome| outcome.diagnostic.as_deref());
+
+    [
+        stage_detail(
+            "Words",
+            outcomes.fts.status,
+            outcomes.fts.diagnostic.as_deref(),
+        ),
+        stage_detail("Meaning", semantic_status, semantic_diagnostic),
+        stage_detail(
+            "Result ordering",
+            outcomes.reranking.status,
+            outcomes.reranking.diagnostic.as_deref(),
+        ),
+    ]
+    .join("\n")
 }
 
 // ── Search panel ─────────────────────────────────────────────────────────────
@@ -86,6 +143,7 @@ pub(crate) struct SearchPanel {
     results: Vec<SearchResult>,
     results_list: ListState,
     searching: bool,
+    empty: bool,
     error: Option<String>,
     stage_outcomes: Option<SearchStageOutcomes>,
     degradation_hint: Option<String>,
@@ -125,10 +183,11 @@ impl SearchPanel {
             selection,
             graph,
             query_field,
-            mode: SearchMode::Fts5,
+            mode: SearchMode::Hybrid,
             results: Vec::new(),
             results_list: ListState::new(0, ListAlignment::Top, px(22.0)),
             searching: false,
+            empty: false,
             error: None,
             stage_outcomes: None,
             degradation_hint: None,
@@ -193,12 +252,14 @@ impl SearchPanel {
 
         // Validate queue availability for modes that need it.
         if self.mode == SearchMode::Semantic && self.compatible_semantic_lane.is_none() {
-            self.error = Some("No compatible semantic index — use FTS5 or Hybrid".to_string());
+            self.error =
+                Some("Meaning search is not ready. Try Words or Best Match instead.".to_string());
             cx.notify();
             return;
         }
 
         self.searching = true;
+        self.empty = false;
         self.error = None;
         self.stage_outcomes = None;
         self.degradation_hint = None;
@@ -308,9 +369,7 @@ impl SearchPanel {
                             })
                             .collect();
                         panel.results_list.reset(panel.results.len());
-                        if panel.results.is_empty() {
-                            panel.error = Some("No results found.".to_string());
-                        }
+                        panel.empty = panel.results.is_empty();
                     }
                     Err(e) => {
                         panel.error = Some(format!("Search error: {e}"));
@@ -341,6 +400,7 @@ fn result_type_color(object_type: &str) -> u32 {
 
 impl Render for SearchPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
         let panel_focused = self.focus.contains_focused(window, cx);
         let semantic_available = self.compatible_semantic_lane.is_some();
         let mode = self.mode;
@@ -379,6 +439,9 @@ impl Render for SearchPanel {
         );
 
         // ── Mode selector ─────────────────────────────────────────────────────
+        let words = cx.weak_entity();
+        let meaning = cx.weak_entity();
+        let best_match = cx.weak_entity();
         let mode_row = div()
             .id("search-mode-row")
             .flex()
@@ -389,86 +452,47 @@ impl Render for SearchPanel {
             .px_2()
             .gap(px(2.0))
             .border_b_1()
-            .border_color(rgb(0x313244))
+            .border_color(theme.colors.border_subtle)
             .child(
-                div()
-                    .id("mode-fts5")
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .h(px(20.0))
-                    .rounded(px(3.0))
-                    .cursor_pointer()
-                    .text_base()
-                    .text_color(if mode == SearchMode::Fts5 {
-                        rgba(0xcdd6f4ff)
-                    } else {
-                        rgba(0x6c7086ff)
-                    })
-                    .when(mode == SearchMode::Fts5, |el| el.bg(rgba(0x45475a88)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                            this.mode = SearchMode::Fts5;
-                            cx.notify();
-                        }),
-                    )
-                    .child("FTS5"),
-            )
-            .child(
-                div()
-                    .id("mode-semantic")
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .h(px(20.0))
-                    .rounded(px(3.0))
-                    .text_base()
-                    .text_color(if !semantic_available {
-                        rgba(0x45475aff)
-                    } else if mode == SearchMode::Semantic {
-                        rgba(0xcdd6f4ff)
-                    } else {
-                        rgba(0x6c7086ff)
-                    })
-                    .when(mode == SearchMode::Semantic && semantic_available, |el| {
-                        el.bg(rgba(0x45475a88))
-                    })
-                    .when(semantic_available, |el| {
-                        el.cursor_pointer().on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                this.mode = SearchMode::Semantic;
+                Tab::new("mode-words", "Words", mode == SearchMode::Fts5)
+                    .tooltip("Find exact words and phrases. This always works offline.")
+                    .on_click(move |_, _, cx| {
+                        words
+                            .update(cx, |panel, cx| {
+                                panel.mode = SearchMode::Fts5;
                                 cx.notify();
-                            }),
-                        )
-                    })
-                    .child("Semantic"),
+                            })
+                            .ok();
+                    }),
             )
             .child(
-                div()
-                    .id("mode-hybrid")
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .h(px(20.0))
-                    .rounded(px(3.0))
-                    .text_base()
-                    .text_color(if mode == SearchMode::Hybrid {
-                        rgba(0xcdd6f4ff)
+                Tab::new("mode-meaning", "Meaning", mode == SearchMode::Semantic)
+                    .disabled(!semantic_available)
+                    .tooltip(if semantic_available {
+                        "Find related ideas even when they use different words."
                     } else {
-                        rgba(0x6c7086ff)
+                        "Meaning search becomes available after AI search is set up."
                     })
-                    .when(mode == SearchMode::Hybrid, |el| el.bg(rgba(0x45475a88)))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                            this.mode = SearchMode::Hybrid;
-                            cx.notify();
-                        }),
-                    )
-                    .child("Hybrid"),
+                    .on_click(move |_, _, cx| {
+                        meaning
+                            .update(cx, |panel, cx| {
+                                panel.mode = SearchMode::Semantic;
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+            )
+            .child(
+                Tab::new("mode-best-match", "Best Match", mode == SearchMode::Hybrid)
+                    .tooltip("Combine exact words and related ideas, using what is available.")
+                    .on_click(move |_, _, cx| {
+                        best_match
+                            .update(cx, |panel, cx| {
+                                panel.mode = SearchMode::Hybrid;
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
             );
 
         panel = panel.child(mode_row);
@@ -480,6 +504,7 @@ impl Render for SearchPanel {
         field_container.style().flex_shrink = Some(1.0);
         field_container.style().flex_basis = Some(relative(0.).into());
 
+        let search = cx.weak_entity();
         let input_row = div()
             .id("search-input-row")
             .flex()
@@ -490,28 +515,15 @@ impl Render for SearchPanel {
             .px_2()
             .py(px(4.0))
             .border_b_1()
-            .border_color(rgb(0x313244))
+            .border_color(theme.colors.border_subtle)
             .child(field_container.child(self.query_field.clone()))
             .child(
-                div()
-                    .id("search-btn")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .px_2()
-                    .h(px(24.0))
-                    .rounded(px(4.0))
-                    .bg(rgb(0x313244))
-                    .text_base()
-                    .text_color(rgba(0xcdd6f4ff))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                            this.do_search(cx);
-                        }),
-                    )
-                    .child("Search"),
+                Button::new("search-btn", "Search")
+                    .style(ButtonStyle::Filled)
+                    .tooltip("Search the world (Enter)")
+                    .on_click(move |_, _, cx| {
+                        search.update(cx, |panel, cx| panel.do_search(cx)).ok();
+                    }),
             );
 
         panel = panel.child(input_row);
@@ -526,9 +538,11 @@ impl Render for SearchPanel {
                     .items_center()
                     .h(px(22.0))
                     .px_3()
-                    .text_base()
-                    .text_color(rgba(0xa6adc8ff))
-                    .child("Searching…"),
+                    .child(
+                        Label::new("Searching…")
+                            .size(LabelSize::Small)
+                            .tone(LabelTone::Muted),
+                    ),
             );
         } else if let Some(err) = &self.error {
             let err = err.clone();
@@ -540,11 +554,33 @@ impl Render for SearchPanel {
                     .items_center()
                     .h(px(22.0))
                     .px_3()
-                    .text_base()
-                    .text_color(rgba(0xf38ba8ff))
-                    .child(err),
+                    .child(
+                        Label::new(err)
+                            .size(LabelSize::Small)
+                            .tone(LabelTone::Danger),
+                    ),
+            );
+        } else if self.empty {
+            panel = panel.child(
+                div()
+                    .id("search-empty")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .min_h(px(22.0))
+                    .px_3()
+                    .child(
+                        Label::new("No matches. Try fewer or different words.")
+                            .size(LabelSize::Small)
+                            .tone(LabelTone::Muted),
+                    ),
             );
         } else if let Some(hint) = &self.degradation_hint {
+            let detail = self
+                .stage_outcomes
+                .as_ref()
+                .map(degradation_detail)
+                .unwrap_or_else(|| hint.clone());
             panel = panel.child(
                 div()
                     .id("search-degradation")
@@ -553,9 +589,12 @@ impl Render for SearchPanel {
                     .items_center()
                     .min_h(px(22.0))
                     .px_3()
-                    .text_xs()
-                    .text_color(rgba(0xf9e2afff))
-                    .child(hint.clone()),
+                    .child(
+                        Label::new(hint.clone())
+                            .size(LabelSize::Small)
+                            .tone(LabelTone::Warning),
+                    )
+                    .tooltip(Tooltip::text(detail)),
             );
         }
 
@@ -640,7 +679,7 @@ impl Render for SearchPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::degradation_hint;
+    use super::{degradation_detail, degradation_hint};
     use u_forge_core::{SearchStageOutcome, SearchStageOutcomes, SearchStageStatus};
 
     fn outcome(status: SearchStageStatus, diagnostic: Option<&str>) -> SearchStageOutcome {
@@ -661,7 +700,11 @@ mod tests {
 
         assert_eq!(
             degradation_hint(&outcomes).as_deref(),
-            Some("Results degraded · semantic")
+            Some("Search limited · meaning")
+        );
+        assert_eq!(
+            degradation_detail(&outcomes),
+            "Words: used\nMeaning: could not complete — safe detail\nResult ordering: not needed"
         );
     }
 
