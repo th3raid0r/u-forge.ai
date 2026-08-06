@@ -6,8 +6,8 @@ use gpui::{
 };
 use u_forge_core::AppConfig;
 use u_forge_ui_gpui::{
-    AppView, ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, SaveLayout,
-    TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
+    AppView, ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, OpenSettings,
+    SaveLayout, ToggleDetailsPanel, TogglePerfOverlay, ToggleRightPanel, ToggleSidebar, UiTheme,
     startup::{StartupTimeline, prepare_app},
 };
 
@@ -38,11 +38,14 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         let _phase = startup.phase("gpui_application_start");
+        UiTheme::init(cx);
         // Register keybindings.
         cx.bind_keys([
             KeyBinding::new("ctrl-s", SaveLayout, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("ctrl-j", ToggleRightPanel, None),
+            KeyBinding::new("ctrl-shift-j", ToggleDetailsPanel, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
             KeyBinding::new("ctrl-shift-p", TogglePerfOverlay, None),
             KeyBinding::new("ctrl-shift-0", FitGraph, None),
         ]);
@@ -65,9 +68,11 @@ fn main() {
             Menu {
                 name: "View".into(),
                 items: vec![
-                    MenuItem::action("Toggle Left Panel", ToggleSidebar),
-                    MenuItem::action("Toggle Right Panel", ToggleRightPanel),
-                    MenuItem::action("Fit Graph", FitGraph),
+                    MenuItem::action("Toggle World", ToggleSidebar),
+                    MenuItem::action("Toggle Assistant", ToggleRightPanel),
+                    MenuItem::action("Toggle Details", ToggleDetailsPanel),
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::action("Fit Connections", FitGraph),
                     MenuItem::separator(),
                     MenuItem::action("Toggle Perf Overlay", TogglePerfOverlay),
                 ],

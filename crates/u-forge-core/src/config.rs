@@ -582,6 +582,13 @@ pub struct UiConfig {
     /// high-DPI displays or accessibility; decrease for a more compact UI.
     #[serde(default = "UiConfig::default_font_size")]
     pub font_size: f32,
+
+    /// Reveal diagnostics and low-level runtime controls intended for
+    /// troubleshooting or expert configuration. Ordinary worldbuilding,
+    /// relationships, import, model choice, and reasoning on/off remain
+    /// available when this is false.
+    #[serde(default)]
+    pub show_advanced_controls: bool,
 }
 
 impl UiConfig {
@@ -594,6 +601,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             font_size: Self::default_font_size(),
+            show_advanced_controls: false,
         }
     }
 }
@@ -782,6 +790,41 @@ impl AppConfig {
         std::fs::rename(temp, &path)?;
         Ok(path)
     }
+
+    /// Persist user-facing UI choices while preserving comments and unrelated
+    /// configuration keys.
+    pub fn persist_ui_settings(
+        &self,
+        font_size: f32,
+        show_advanced_controls: bool,
+    ) -> Result<PathBuf> {
+        use toml_edit::{DocumentMut, Item, Table, value};
+
+        let path = self
+            .source_path
+            .clone()
+            .or_else(Self::per_user_config_path)
+            .ok_or_else(|| anyhow::anyhow!("cannot determine a configuration path"))?;
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut document = if text.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            text.parse::<DocumentMut>()?
+        };
+        if document.get("ui").is_none_or(|item| !item.is_table()) {
+            document["ui"] = Item::Table(Table::new());
+        }
+        document["ui"]["font_size"] = value(font_size as f64);
+        document["ui"]["show_advanced_controls"] = value(show_advanced_controls);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp, document.to_string())?;
+        std::fs::rename(temp, &path)?;
+        Ok(path)
+    }
 }
 
 /// Helper: `$HOME` path, if determinable.
@@ -938,6 +981,33 @@ mod tests {
         assert!(text.contains("preferred_device = \"npu\""));
         assert!(text.contains("reasoning_control = \"reload\""));
         assert!(text.contains("model = \"chat-model-FLM\""));
+    }
+
+    #[test]
+    fn ui_persistence_preserves_comments_and_unrelated_sections() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\n\n[chat]\npreferred_device = \"cpu\"\n",
+        )
+        .unwrap();
+        let config = AppConfig {
+            source_path: Some(path.clone()),
+            ..AppConfig::default()
+        };
+
+        let written = config.persist_ui_settings(18.0, true).unwrap();
+        assert_eq!(written, path);
+        let text = std::fs::read_to_string(written).unwrap();
+        assert!(text.contains("# keep this comment"));
+        assert!(text.contains("preferred_device = \"cpu\""));
+        assert!(text.contains("font_size = 18.0"));
+        assert!(text.contains("show_advanced_controls = true"));
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        assert_eq!(reloaded.ui.font_size, 18.0);
+        assert!(reloaded.ui.show_advanced_controls);
     }
 
     #[test]

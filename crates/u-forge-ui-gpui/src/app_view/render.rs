@@ -1,26 +1,29 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyView, App, ClickEvent, Context, Corner, MouseButton, MouseDownEvent, Render,
+    AnyView, App, ClickEvent, Context, Corner, Focusable, MouseButton, MouseDownEvent, Render,
     StyleRefinement, Window, anchored, canvas, deferred, div, point, prelude::*, px, relative, rgb,
     rgba,
 };
 
 use crate::{
-    ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, SaveLayout,
-    TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
+    ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, OpenSettings,
+    SaveLayout, ToggleDetailsPanel, TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
 };
 
 use super::{
-    AppView, DEFAULT_EDITOR_RATIO, DEFAULT_RIGHT_PANEL_W, DEFAULT_SIDEBAR_W, MAX_PANE_RATIO,
-    MENU_BAR_H, MIN_PANE_RATIO, MIN_PANEL_W, MIN_WORKSPACE_W, RESIZE_HANDLE_SIZE,
-    ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H, SidebarTab,
+    AppView, MENU_BAR_H, ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H,
 };
+use crate::dock_state::RESIZE_HANDLE_SIZE;
+use crate::panel_contracts::{DockPosition, PanelId, WorkspaceItemId, WorldCanvasViewId};
 use crate::startup::StartupMilestone;
+use crate::ui::components::{Button, ButtonStyle, Dialog, Tab as UiTab};
+use crate::ui::theme::UiTheme;
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.set_rem_size(px(self.state.app_config.ui.font_size));
+        window.set_rem_size(px(self.ui_font_size));
+        let theme = *UiTheme::get(cx);
 
         // Capture frame start time. The canvas element appended at the end of the
         // tree records elapsed time in its paint closure — after GPUI's full layout
@@ -32,12 +35,16 @@ impl Render for AppView {
         let file_menu_open = self.file_menu_open;
         let view_menu_open = self.view_menu_open;
         let setup_open = self.setup_open;
-        let sidebar_open = self.sidebar_open;
-        let sidebar_tab = self.sidebar_tab;
-        let right_panel_open = self.right_panel_open;
-        let sidebar_width = self.sidebar_width;
-        let editor_ratio = self.editor_ratio;
-        let right_panel_width = self.right_panel_width;
+        let settings_open = self.settings_open;
+        let show_advanced_controls = self.show_advanced_controls;
+        let sidebar_open = self.dock_state.is_open(DockPosition::Left);
+        let sidebar_tab = self.dock_state.active_panel(DockPosition::Left);
+        let right_panel_open = self.dock_state.is_open(DockPosition::Right);
+        let details_open = self.dock_state.is_open(DockPosition::Bottom);
+        let assistant_zoomed = self.dock_state.zoomed_panel() == Some(PanelId::Assistant);
+        let sidebar_width = self.dock_state.size(DockPosition::Left);
+        let details_height = self.dock_state.size(DockPosition::Bottom);
+        let right_panel_width = self.dock_state.size(DockPosition::Right);
         let embedding_status = self.state.embedding_status.clone();
         let perf_enabled = self.perf_enabled;
         let startup = self.startup.clone();
@@ -79,26 +86,46 @@ impl Render for AppView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.colors.app_surface)
             // Handle actions dispatched from native menu or keybindings.
             .on_action(cx.listener(|this, _: &SaveLayout, _window, cx| {
                 this.do_save(cx);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
+                this.open_settings(cx);
+            }))
             .on_action(cx.listener(|this, _: &FitGraph, _window, cx| {
                 this.graph_canvas
                     .update(cx, |canvas, cx| canvas.fit_graph(cx));
             }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
-                this.sidebar_open = !this.sidebar_open;
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                this.dock_state.toggle_panel(PanelId::World);
+                if this.dock_state.is_panel_active(PanelId::World) {
+                    this.node_panel.read(cx).focus_handle(cx).focus(window);
+                }
+                this.schedule_workspace_persist(cx);
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleRightPanel, _window, cx| {
-                if this.right_panel_open {
+            .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| {
+                if this.dock_state.is_panel_active(PanelId::Assistant) {
                     this.chat_panel
                         .update(cx, |panel, _cx| panel.last_render_us = 0);
                 }
-                this.right_panel_open = !this.right_panel_open;
+                this.dock_state.toggle_panel(PanelId::Assistant);
+                this.sync_dock_presentational_state(cx);
+                if this.dock_state.is_panel_active(PanelId::Assistant) {
+                    this.chat_panel.read(cx).focus_handle(cx).focus(window);
+                }
+                this.schedule_workspace_persist(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDetailsPanel, window, cx| {
+                this.dock_state.toggle_panel(PanelId::Details);
+                if this.dock_state.is_panel_active(PanelId::Details) {
+                    this.node_editor.read(cx).focus_handle(cx).focus(window);
+                }
+                this.schedule_workspace_persist(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ClearData, _window, cx| {
@@ -131,9 +158,9 @@ impl Render for AppView {
                     .flex_none()
                     .h(px(MENU_BAR_H))
                     .w_full()
-                    .bg(rgb(0x181825))
+                    .bg(theme.colors.panel_surface)
                     .border_b_1()
-                    .border_color(rgb(0x313244))
+                    .border_color(theme.colors.border_subtle)
                     .items_center()
                     .child(
                         // "File" menu button
@@ -143,7 +170,7 @@ impl Render for AppView {
                             .items_center()
                             .h_full()
                             .px_3()
-                            .text_color(rgba(0xcdd6f4ff))
+                            .text_color(theme.colors.text)
                             .text_xs()
                             .cursor_pointer()
                             .on_mouse_down(
@@ -164,7 +191,7 @@ impl Render for AppView {
                             .items_center()
                             .h_full()
                             .px_3()
-                            .text_color(rgba(0xcdd6f4ff))
+                            .text_color(theme.colors.text)
                             .text_xs()
                             .cursor_pointer()
                             .on_mouse_down(
@@ -209,13 +236,12 @@ impl Render for AppView {
                         let new_width = mouse_x - body_left;
                         handle_sidebar
                             .update(cx, |view, cx| {
-                                let right_w = if view.right_panel_open {
-                                    view.right_panel_width + RESIZE_HANDLE_SIZE
-                                } else {
-                                    0.0
-                                };
-                                let max_w = (body_w - MIN_WORKSPACE_W - right_w).max(MIN_PANEL_W);
-                                view.sidebar_width = new_width.clamp(MIN_PANEL_W, max_w);
+                                view.dock_state.resize_horizontal(
+                                    DockPosition::Left,
+                                    new_width,
+                                    body_w,
+                                );
+                                view.schedule_workspace_persist(cx);
                                 cx.notify();
                             })
                             .ok();
@@ -229,13 +255,12 @@ impl Render for AppView {
                         let new_width = body_right - mouse_x;
                         handle_right
                             .update(cx, |view, cx| {
-                                let sidebar_w = if view.sidebar_open {
-                                    view.sidebar_width + RESIZE_HANDLE_SIZE
-                                } else {
-                                    0.0
-                                };
-                                let max_w = (body_w - MIN_WORKSPACE_W - sidebar_w).max(MIN_PANEL_W);
-                                view.right_panel_width = new_width.clamp(MIN_PANEL_W, max_w);
+                                view.dock_state.resize_horizontal(
+                                    DockPosition::Right,
+                                    new_width,
+                                    body_w,
+                                );
+                                view.schedule_workspace_persist(cx);
                                 cx.notify();
                             })
                             .ok();
@@ -244,53 +269,104 @@ impl Render for AppView {
                 body.style().flex_shrink = Some(1.0);
                 body.style().flex_basis = Some(relative(0.).into());
 
-                // Left sidebar (node panel) + resize handle
-                if sidebar_open {
-                    let handle_reset = handle.clone();
-                    body = body
-                        .child(
+                // World and Search remain mounted even while inactive or while
+                // the left dock is closed. Each cached inner view keeps stable
+                // bounds; zero-sized outer layers remove inactive hitboxes.
+                let left_open_width = if sidebar_open && !assistant_zoomed {
+                    sidebar_width
+                } else {
+                    0.0
+                };
+                let left_handle_width = if sidebar_open && !assistant_zoomed {
+                    RESIZE_HANDLE_SIZE
+                } else {
+                    0.0
+                };
+                body = body.child(
+                    div()
+                        .id("left-dock-container")
+                        .relative()
+                        .flex_none()
+                        .w(px(left_open_width))
+                        .h_full()
+                        .overflow_hidden()
+                        .child({
+                            let active = sidebar_tab == PanelId::World;
                             div()
-                                .id("sidebar-container")
-                                .flex()
-                                .flex_col()
-                                .flex_none()
-                                .w(px(sidebar_width))
+                                .id("world-panel-mount")
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w(px(if active { sidebar_width } else { 0.0 }))
                                 .h_full()
-                                .min_h_0()
                                 .overflow_hidden()
-                                .child(match sidebar_tab {
-                                    SidebarTab::Nodes => self.node_panel.clone().into_any_element(),
-                                    SidebarTab::Search => {
-                                        self.search_panel.clone().into_any_element()
-                                    }
-                                }),
-                        )
-                        .child(
-                            // Sidebar resize handle — 6px wide, full height.
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .w(px(sidebar_width))
+                                        .h_full()
+                                        .child(
+                                            AnyView::from(self.node_panel.clone())
+                                                .cached(StyleRefinement::default().size_full()),
+                                        ),
+                                )
+                        })
+                        .child({
+                            let active = sidebar_tab == PanelId::Search;
                             div()
-                                .id("sidebar-resize-handle")
-                                .flex_none()
-                                .w(px(RESIZE_HANDLE_SIZE))
+                                .id("search-panel-mount")
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w(px(if active { sidebar_width } else { 0.0 }))
                                 .h_full()
-                                .cursor_col_resize()
-                                .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
-                                .on_drag(ResizeSidebar, |_, _, _, cx: &mut App| {
-                                    cx.new(|_| ResizeSidebar)
-                                })
-                                .on_click(move |event: &ClickEvent, _window, cx: &mut App| {
-                                    if event.click_count() == 2 {
-                                        handle_reset
-                                            .update(cx, |view, cx| {
-                                                view.sidebar_width = DEFAULT_SIDEBAR_W;
-                                                cx.notify();
-                                            })
-                                            .ok();
-                                    }
-                                }),
-                        );
-                }
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .w(px(sidebar_width))
+                                        .h_full()
+                                        .child(
+                                            AnyView::from(self.search_panel.clone())
+                                                .cached(StyleRefinement::default().size_full()),
+                                        ),
+                                )
+                        }),
+                );
 
-                // Main workspace: editor + canvas (vertical split)
+                let handle_reset = handle.clone();
+                let mut left_resize_handle = div()
+                    .id("sidebar-resize-handle")
+                    .flex_none()
+                    .w(px(left_handle_width))
+                    .h_full()
+                    .overflow_hidden();
+                if sidebar_open {
+                    left_resize_handle = left_resize_handle
+                        .cursor_col_resize()
+                        .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                        .on_drag(ResizeSidebar, |_, _, _, cx: &mut App| {
+                            cx.new(|_| ResizeSidebar)
+                        })
+                        .on_click(move |event: &ClickEvent, _window, cx: &mut App| {
+                            if event.click_count() == 2 {
+                                handle_reset
+                                    .update(cx, |view, cx| {
+                                        view.dock_state.reset_size(DockPosition::Left);
+                                        view.schedule_workspace_persist(cx);
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                        });
+                }
+                body = body.child(left_resize_handle);
+
+                // Main workspace: World Canvas with an optional bottom Details dock.
                 let handle_editor = handle.clone();
                 let mut workspace = div()
                     .id("workspace")
@@ -299,17 +375,18 @@ impl Render for AppView {
                     .min_h_0()
                     .min_w_0()
                     .overflow_hidden()
-                    // Handle editor/canvas resize drags
+                    // Handle Details/World Canvas resize drags.
                     .on_drag_move::<ResizeEditorCanvas>(move |event, _window, cx: &mut App| {
                         let mouse_y = f32::from(event.event.position.y);
-                        let ws_top = f32::from(event.bounds.origin.y);
+                        let ws_bottom =
+                            f32::from(event.bounds.origin.y) + f32::from(event.bounds.size.height);
                         let ws_h = f32::from(event.bounds.size.height);
                         if ws_h > 0.0 {
-                            let ratio =
-                                ((mouse_y - ws_top) / ws_h).clamp(MIN_PANE_RATIO, MAX_PANE_RATIO);
+                            let requested = ws_bottom - mouse_y;
                             handle_editor
                                 .update(cx, |view, cx| {
-                                    view.editor_ratio = ratio;
+                                    view.dock_state.resize_bottom(requested, ws_h);
+                                    view.schedule_workspace_persist(cx);
                                     cx.notify();
                                 })
                                 .ok();
@@ -318,58 +395,122 @@ impl Render for AppView {
                 workspace.style().flex_grow = Some(1.0);
                 workspace.style().flex_shrink = Some(1.0);
                 workspace.style().flex_basis = Some(relative(0.).into());
+                if assistant_zoomed {
+                    workspace = workspace.w(px(0.0));
+                    workspace.style().flex_grow = Some(0.0);
+                    workspace.style().flex_shrink = Some(0.0);
+                }
 
-                // Node detail pane — proportional to editor_ratio.
-                let mut editor = div()
-                    .id("editor-pane")
+                // Details/World Canvas resize handle — zero-height when closed.
+                let handle_editor_reset = handle.clone();
+                let mut editor_canvas_handle = div()
+                    .id("editor-canvas-resize-handle")
+                    .flex_none()
+                    .w_full()
+                    .h(px(if details_open {
+                        RESIZE_HANDLE_SIZE
+                    } else {
+                        0.0
+                    }))
+                    .overflow_hidden();
+                if details_open {
+                    editor_canvas_handle = editor_canvas_handle
+                        .cursor_row_resize()
+                        .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                        .on_drag(ResizeEditorCanvas, |_, _, _, cx: &mut App| {
+                            cx.new(|_| ResizeEditorCanvas)
+                        })
+                        .on_click(move |event: &ClickEvent, _window, cx: &mut App| {
+                            if event.click_count() == 2 {
+                                handle_editor_reset
+                                    .update(cx, |view, cx| {
+                                        view.dock_state.reset_size(DockPosition::Bottom);
+                                        view.schedule_workspace_persist(cx);
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                        });
+                }
+
+                // World Canvas — Connections is today's center view. The tab
+                // boundary is deliberate: Timeline and Map can become sibling
+                // center views later without renaming the workspace again.
+                let mut graph_pane = div()
+                    .id("world-canvas")
                     .flex()
                     .flex_col()
                     .w_full()
                     .min_h_0()
-                    .child(self.node_editor.clone());
-                editor.style().flex_grow = Some(editor_ratio);
-                editor.style().flex_shrink = Some(1.0);
-                editor.style().flex_basis = Some(relative(0.).into());
-
-                // Editor/canvas resize handle — full width, 6px tall.
-                let handle_editor_reset = handle.clone();
-                let editor_canvas_handle = div()
-                    .id("editor-canvas-resize-handle")
-                    .flex_none()
-                    .w_full()
-                    .h(px(RESIZE_HANDLE_SIZE))
-                    .cursor_row_resize()
-                    .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
-                    .on_drag(ResizeEditorCanvas, |_, _, _, cx: &mut App| {
-                        cx.new(|_| ResizeEditorCanvas)
-                    })
-                    .on_click(move |event: &ClickEvent, _window, cx: &mut App| {
-                        if event.click_count() == 2 {
-                            handle_editor_reset
-                                .update(cx, |view, cx| {
-                                    view.editor_ratio = DEFAULT_EDITOR_RATIO;
-                                    cx.notify();
-                                })
-                                .ok();
-                        }
-                    });
-
-                // Graph canvas pane — remainder of workspace height.
-                let canvas_ratio = 1.0 - editor_ratio;
-                let mut graph_pane = div()
-                    .w_full()
-                    .min_h_0()
                     .overflow_hidden()
-                    .child(self.graph_canvas.clone());
-                graph_pane.style().flex_grow = Some(canvas_ratio);
+                    .child(
+                        div()
+                            .id("world-canvas-tab-bar")
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(px(theme.metrics.panel_header_height))
+                            .px_3()
+                            .gap(px(theme.metrics.space_4))
+                            .bg(theme.colors.panel_surface)
+                            .border_b_1()
+                            .border_color(theme.colors.border_subtle)
+                            .text_sm()
+                            .text_color(theme.colors.text)
+                            .child(WorkspaceItemId::WorldCanvas.title())
+                            .child(
+                                UiTab::new(
+                                    "connections-tab",
+                                    WorldCanvasViewId::Connections.title(),
+                                    true,
+                                )
+                                .tooltip("Show relationships between world items"),
+                            ),
+                    )
+                    .child({
+                        let mut canvas = div()
+                            .id("connections-view")
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(self.graph_canvas.clone());
+                        canvas.style().flex_grow = Some(1.0);
+                        canvas.style().flex_shrink = Some(1.0);
+                        canvas.style().flex_basis = Some(relative(0.).into());
+                        canvas
+                    });
+                graph_pane.style().flex_grow = Some(1.0);
                 graph_pane.style().flex_shrink = Some(1.0);
                 graph_pane.style().flex_basis = Some(relative(0.).into());
 
+                // Details remains mounted with stable inner bounds. Closing the
+                // dock clips the cached editor to a zero-height outer wrapper.
+                let details_open_height = if details_open { details_height } else { 0.0 };
+                let editor = div()
+                    .id("details-dock-container")
+                    .relative()
+                    .flex_none()
+                    .w_full()
+                    .h(px(details_open_height))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .w_full()
+                            .h(px(details_height))
+                            .overflow_hidden()
+                            .child(
+                                AnyView::from(self.node_editor.clone())
+                                    .cached(StyleRefinement::default().size_full()),
+                            ),
+                    );
+
                 body = body.child(
                     workspace
-                        .child(editor)
+                        .child(graph_pane)
                         .child(editor_canvas_handle)
-                        .child(graph_pane),
+                        .child(editor),
                 );
 
                 // Right panel + resize handle.
@@ -384,12 +525,12 @@ impl Render for AppView {
                 // The AnyView::cached wrapper lets GPUI skip the chat panel's
                 // layout + paint on frames where no ChatPanel / ChatMessageView
                 // entity was notified (e.g. sidebar drags, status bar ticks).
-                let right_open_w = if right_panel_open {
+                let right_open_w = if right_panel_open && !assistant_zoomed {
                     right_panel_width
                 } else {
                     0.0
                 };
-                let handle_w = if right_panel_open {
+                let handle_w = if right_panel_open && !assistant_zoomed {
                     RESIZE_HANDLE_SIZE
                 } else {
                     0.0
@@ -415,7 +556,8 @@ impl Render for AppView {
                             if event.click_count() == 2 {
                                 handle_right_reset
                                     .update(cx, |view, cx| {
-                                        view.right_panel_width = DEFAULT_RIGHT_PANEL_W;
+                                        view.dock_state.reset_size(DockPosition::Right);
+                                        view.schedule_workspace_persist(cx);
                                         cx.notify();
                                     })
                                     .ok();
@@ -424,29 +566,37 @@ impl Render for AppView {
                 }
                 body = body.child(resize_handle);
 
-                body = body.child(
-                    div()
+                body = body.child({
+                    let outer = div()
                         .id("right-panel-container")
                         .relative()
                         .flex_none()
-                        .w(px(right_open_w))
                         .h_full()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id("right-panel-inner")
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .w(px(right_panel_width))
-                                .h_full()
-                                .overflow_hidden()
-                                .child(
-                                    AnyView::from(self.chat_panel.clone())
-                                        .cached(StyleRefinement::default().size_full()),
-                                ),
-                        ),
-                );
+                        .overflow_hidden();
+                    let outer = if assistant_zoomed {
+                        outer.w_full()
+                    } else {
+                        outer.w(px(right_open_w))
+                    };
+                    outer.child({
+                        let inner = div()
+                            .id("right-panel-inner")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h_full()
+                            .overflow_hidden();
+                        let inner = if assistant_zoomed {
+                            inner.w_full()
+                        } else {
+                            inner.w(px(right_panel_width))
+                        };
+                        inner.child(
+                            AnyView::from(self.chat_panel.clone())
+                                .cached(StyleRefinement::default().size_full()),
+                        )
+                    })
+                });
 
                 body
             })
@@ -459,9 +609,9 @@ impl Render for AppView {
                     .flex_row()
                     .h(px(STATUS_BAR_H))
                     .w_full()
-                    .bg(rgb(0x181825))
+                    .bg(theme.colors.panel_surface)
                     .border_t_1()
-                    .border_color(rgb(0x313244))
+                    .border_color(theme.colors.border_subtle)
                     .items_center()
                     .text_sm()
                     // ── Left: panel toggle buttons ────────────────────────────
@@ -483,31 +633,29 @@ impl Render for AppView {
                                     .px_2()
                                     .h(px(STATUS_BAR_H - 4.0))
                                     .cursor_pointer()
-                                    .text_color(
-                                        if sidebar_open && sidebar_tab == SidebarTab::Nodes {
-                                            rgba(0xcdd6f4ff)
-                                        } else {
-                                            rgba(0x6c7086ff)
-                                        },
-                                    )
-                                    .when(sidebar_open && sidebar_tab == SidebarTab::Nodes, |el| {
+                                    .text_color(if sidebar_open && sidebar_tab == PanelId::World {
+                                        rgba(0xcdd6f4ff)
+                                    } else {
+                                        rgba(0x6c7086ff)
+                                    })
+                                    .when(sidebar_open && sidebar_tab == PanelId::World, |el| {
                                         el.bg(rgba(0x45475a88))
                                     })
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            if this.sidebar_open
-                                                && this.sidebar_tab == SidebarTab::Nodes
-                                            {
-                                                this.sidebar_open = false;
-                                            } else {
-                                                this.sidebar_open = true;
-                                                this.sidebar_tab = SidebarTab::Nodes;
+                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                            this.dock_state.toggle_panel(PanelId::World);
+                                            if this.dock_state.is_panel_active(PanelId::World) {
+                                                this.node_panel
+                                                    .read(cx)
+                                                    .focus_handle(cx)
+                                                    .focus(window);
                                             }
+                                            this.schedule_workspace_persist(cx);
                                             cx.notify();
                                         }),
                                     )
-                                    .child("Nodes"),
+                                    .child(PanelId::World.title()),
                             )
                             // Search button
                             .child(
@@ -518,31 +666,29 @@ impl Render for AppView {
                                     .px_2()
                                     .h(px(STATUS_BAR_H - 4.0))
                                     .cursor_pointer()
-                                    .text_color(
-                                        if sidebar_open && sidebar_tab == SidebarTab::Search {
-                                            rgba(0xcdd6f4ff)
-                                        } else {
-                                            rgba(0x6c7086ff)
-                                        },
-                                    )
-                                    .when(sidebar_open && sidebar_tab == SidebarTab::Search, |el| {
+                                    .text_color(if sidebar_open && sidebar_tab == PanelId::Search {
+                                        rgba(0xcdd6f4ff)
+                                    } else {
+                                        rgba(0x6c7086ff)
+                                    })
+                                    .when(sidebar_open && sidebar_tab == PanelId::Search, |el| {
                                         el.bg(rgba(0x45475a88))
                                     })
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            if this.sidebar_open
-                                                && this.sidebar_tab == SidebarTab::Search
-                                            {
-                                                this.sidebar_open = false;
-                                            } else {
-                                                this.sidebar_open = true;
-                                                this.sidebar_tab = SidebarTab::Search;
+                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                            this.dock_state.toggle_panel(PanelId::Search);
+                                            if this.dock_state.is_panel_active(PanelId::Search) {
+                                                this.search_panel
+                                                    .read(cx)
+                                                    .focus_handle(cx)
+                                                    .focus(window);
                                             }
+                                            this.schedule_workspace_persist(cx);
                                             cx.notify();
                                         }),
                                     )
-                                    .child("Search"),
+                                    .child(PanelId::Search.title()),
                             ),
                     )
                     // ── Center: graph stats + operation status ────────────────
@@ -557,8 +703,10 @@ impl Render for AppView {
                             .gap(px(12.0))
                             .text_color(rgba(0xa6adc8ff));
                         center.style().flex_grow = Some(1.0);
-                        center =
-                            center.child(format!("{} nodes  ·  {} edges", node_count, edge_count));
+                        center = center.child(format!(
+                            "{} world items  ·  {} relationships",
+                            node_count, edge_count
+                        ));
                         if let Some(msg) = data_status {
                             center = center.child(div().text_color(rgba(0xa6e3a1ff)).child(msg));
                         }
@@ -582,6 +730,36 @@ impl Render for AppView {
                             .px_1()
                             .child(
                                 div()
+                                    .id("status-details-btn")
+                                    .flex()
+                                    .items_center()
+                                    .px_2()
+                                    .h(px(STATUS_BAR_H - 4.0))
+                                    .cursor_pointer()
+                                    .text_color(if details_open {
+                                        rgba(0xcdd6f4ff)
+                                    } else {
+                                        rgba(0x6c7086ff)
+                                    })
+                                    .when(details_open, |el| el.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                            this.dock_state.toggle_panel(PanelId::Details);
+                                            if this.dock_state.is_panel_active(PanelId::Details) {
+                                                this.node_editor
+                                                    .read(cx)
+                                                    .focus_handle(cx)
+                                                    .focus(window);
+                                            }
+                                            this.schedule_workspace_persist(cx);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(PanelId::Details.title()),
+                            )
+                            .child(
+                                div()
                                     .id("status-chat-btn")
                                     .flex()
                                     .items_center()
@@ -596,44 +774,54 @@ impl Render for AppView {
                                     .when(right_panel_open, |el| el.bg(rgba(0x45475a88)))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            if this.right_panel_open {
+                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                            if this.dock_state.is_panel_active(PanelId::Assistant) {
                                                 this.chat_panel.update(cx, |panel, _cx| {
                                                     panel.last_render_us = 0
                                                 });
                                             }
-                                            this.right_panel_open = !this.right_panel_open;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child("Chat"),
-                            )
-                            .child(
-                                div()
-                                    .id("status-perf-btn")
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .h(px(STATUS_BAR_H - 4.0))
-                                    .cursor_pointer()
-                                    .text_color(if perf_enabled {
-                                        rgba(0xa6e3a1ff)
-                                    } else {
-                                        rgba(0x6c7086ff)
-                                    })
-                                    .when(perf_enabled, |el| el.bg(rgba(0x45475a88)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.perf_enabled = !this.perf_enabled;
-                                            if !this.perf_enabled {
-                                                this.frame_times_us.clear();
+                                            this.dock_state.toggle_panel(PanelId::Assistant);
+                                            this.sync_dock_presentational_state(cx);
+                                            if this.dock_state.is_panel_active(PanelId::Assistant) {
+                                                this.chat_panel
+                                                    .read(cx)
+                                                    .focus_handle(cx)
+                                                    .focus(window);
                                             }
+                                            this.schedule_workspace_persist(cx);
                                             cx.notify();
                                         }),
                                     )
-                                    .child("Perf"),
-                            ),
+                                    .child(PanelId::Assistant.title()),
+                            )
+                            .when(show_advanced_controls, |status| {
+                                status.child(
+                                    div()
+                                        .id("status-perf-btn")
+                                        .flex()
+                                        .items_center()
+                                        .px_2()
+                                        .h(px(STATUS_BAR_H - 4.0))
+                                        .cursor_pointer()
+                                        .text_color(if perf_enabled {
+                                            rgba(0xa6e3a1ff)
+                                        } else {
+                                            rgba(0x6c7086ff)
+                                        })
+                                        .when(perf_enabled, |el| el.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.perf_enabled = !this.perf_enabled;
+                                                if !this.perf_enabled {
+                                                    this.frame_times_us.clear();
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child("Perf"),
+                                )
+                            }),
                     ),
             )
             // ── File dropdown overlay ─────────────────────────────────────────
@@ -858,16 +1046,23 @@ impl Render for AppView {
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                                this.sidebar_open = !this.sidebar_open;
+                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                                this.dock_state.toggle_panel(PanelId::World);
+                                                if this.dock_state.is_panel_active(PanelId::World) {
+                                                    this.node_panel
+                                                        .read(cx)
+                                                        .focus_handle(cx)
+                                                        .focus(window);
+                                                }
+                                                this.schedule_workspace_persist(cx);
                                                 this.view_menu_open = false;
                                                 cx.notify();
                                             }),
                                         )
-                                        .child(if sidebar_open {
-                                            "  Left Panel       Ctrl+B"
+                                        .child(if sidebar_open && sidebar_tab == PanelId::World {
+                                            "  World            Ctrl+B"
                                         } else {
-                                            "    Left Panel       Ctrl+B"
+                                            "    World            Ctrl+B"
                                         }),
                                 )
                                 // Right Panel toggle
@@ -884,22 +1079,91 @@ impl Render for AppView {
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                                if this.right_panel_open {
+                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                                if this
+                                                    .dock_state
+                                                    .is_panel_active(PanelId::Assistant)
+                                                {
                                                     this.chat_panel.update(cx, |panel, _cx| {
                                                         panel.last_render_us = 0;
                                                     });
                                                 }
-                                                this.right_panel_open = !this.right_panel_open;
+                                                this.dock_state.toggle_panel(PanelId::Assistant);
+                                                this.sync_dock_presentational_state(cx);
+                                                if this
+                                                    .dock_state
+                                                    .is_panel_active(PanelId::Assistant)
+                                                {
+                                                    this.chat_panel
+                                                        .read(cx)
+                                                        .focus_handle(cx)
+                                                        .focus(window);
+                                                }
+                                                this.schedule_workspace_persist(cx);
                                                 this.view_menu_open = false;
                                                 cx.notify();
                                             }),
                                         )
                                         .child(if right_panel_open {
-                                            "  Right Panel      Ctrl+J"
+                                            "  Assistant        Ctrl+J"
                                         } else {
-                                            "    Right Panel      Ctrl+J"
+                                            "    Assistant        Ctrl+J"
                                         }),
+                                )
+                                // Bottom Details toggle
+                                .child(
+                                    div()
+                                        .id("toggle-details-item")
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                                this.dock_state.toggle_panel(PanelId::Details);
+                                                if this.dock_state.is_panel_active(PanelId::Details)
+                                                {
+                                                    this.node_editor
+                                                        .read(cx)
+                                                        .focus_handle(cx)
+                                                        .focus(window);
+                                                }
+                                                this.schedule_workspace_persist(cx);
+                                                this.view_menu_open = false;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if details_open {
+                                            "  Details      Ctrl+Shift+J"
+                                        } else {
+                                            "    Details      Ctrl+Shift+J"
+                                        }),
+                                )
+                                .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
+                                .child(
+                                    div()
+                                        .id("open-settings-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(theme.colors.text)
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme.colors.selected))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.view_menu_open = false;
+                                                this.open_settings(cx);
+                                            }),
+                                        )
+                                        .child("Settings…               Ctrl+,"),
                                 ),
                         ),
                 ))
@@ -911,6 +1175,114 @@ impl Render for AppView {
             // ── Destructive-action confirmation ──────────────────────────────
             .when(self.confirmation.is_some(), |root| {
                 root.child(self.confirmation.as_ref().unwrap().clone())
+            })
+            // ── User-facing UI settings ─────────────────────────────────────
+            .when(settings_open, |root| {
+                let decrease = handle.clone();
+                let increase = handle.clone();
+                let toggle_advanced = handle.clone();
+                let cancel = handle.clone();
+                let save = handle.clone();
+                let body = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme.metrics.space_6))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child("Text size")
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme.metrics.space_2))
+                                    .child(
+                                        Button::new("settings-font-smaller", "Smaller").on_click(
+                                            move |_, _, cx| {
+                                                decrease
+                                                    .update(cx, |view, cx| {
+                                                        view.settings_draft_font_size =
+                                                            (view.settings_draft_font_size - 1.0)
+                                                                .max(10.0);
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            },
+                                        ),
+                                    )
+                                    .child(format!("{:.0} pt", self.settings_draft_font_size))
+                                    .child(Button::new("settings-font-larger", "Larger").on_click(
+                                        move |_, _, cx| {
+                                            increase
+                                                .update(cx, |view, cx| {
+                                                    view.settings_draft_font_size =
+                                                        (view.settings_draft_font_size + 1.0)
+                                                            .min(28.0);
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                        },
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Button::new(
+                            "settings-advanced",
+                            if self.settings_draft_advanced {
+                                "Advanced controls shown"
+                            } else {
+                                "Advanced controls hidden"
+                            },
+                        )
+                        .selected(self.settings_draft_advanced)
+                        .tooltip("Show technical diagnostics and model-tuning controls")
+                        .on_click(move |_, _, cx| {
+                            toggle_advanced
+                                .update(cx, |view, cx| {
+                                    view.settings_draft_advanced = !view.settings_draft_advanced;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                    )
+                    .child(div().text_xs().text_color(theme.colors.text_muted).child(
+                        if show_advanced_controls {
+                            "Advanced diagnostics are currently available."
+                        } else {
+                            "Everyday worldbuilding features remain visible."
+                        },
+                    ));
+                let dialog = Dialog::new("Settings", body)
+                    .action(
+                        Button::new("settings-cancel", "Cancel").on_click(move |_, _, cx| {
+                            cancel
+                                .update(cx, |view, cx| {
+                                    view.settings_open = false;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                    )
+                    .action(
+                        Button::new("settings-save", "Save Settings")
+                            .style(ButtonStyle::Filled)
+                            .on_click(move |_, _, cx| {
+                                save.update(cx, |view, cx| view.save_settings(cx)).ok();
+                            }),
+                    );
+                root.child(
+                    div()
+                        .id("settings-overlay")
+                        .absolute()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme.colors.overlay)
+                        .child(dialog),
+                )
             })
             // ── Reopenable Lemonade setup ───────────────────────────────────
             .when(setup_open, |root| root.child(self.setup_panel.clone()))

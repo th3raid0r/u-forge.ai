@@ -9,7 +9,7 @@ use u_forge_core::PropertyType;
 
 use super::field_spec::SubTab;
 use super::{
-    NodeEditorPanel,
+    CloseDirtyTabRequested, NodeEditorPanel, SaveAllRequested,
     field_spec::{
         COLUMN_W, DETAIL_TAB_H, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H, PAGE_NAV_H,
         SUBTAB_BAR_H,
@@ -17,7 +17,8 @@ use super::{
 };
 
 impl Render for NodeEditorPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel_focused = self.focus.contains_focused(window, cx);
         // Measure panel size each frame so column layout adapts to window resizes.
         let entity_for_measure = cx.entity().clone();
         let measure_canvas = canvas(
@@ -46,10 +47,15 @@ impl Render for NodeEditorPanel {
             .w_full()
             .h_full()
             .min_h_0()
+            .key_context("DetailsPanel")
+            .track_focus(&self.focus)
             .overflow_hidden()
             .bg(rgb(0x1e1e2e))
             .border_b_1()
-            .border_color(rgb(0x313244));
+            .border_color(rgb(0x313244))
+            .when(panel_focused, |panel| {
+                panel.border_1().border_color(rgba(0xb4befeff))
+            });
 
         if self.tabs.is_empty() {
             return outer
@@ -60,7 +66,7 @@ impl Render for NodeEditorPanel {
                     div()
                         .text_base()
                         .text_color(rgba(0x6c7086ff))
-                        .child("Select a node to view details"),
+                        .child("Select a world item to view details"),
                 );
         }
 
@@ -161,8 +167,12 @@ impl Render for NodeEditorPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        this.close_tab(i, cx);
-                        cx.notify();
+                        if is_dirty {
+                            cx.emit(CloseDirtyTabRequested(i));
+                        } else {
+                            this.close_tab(i, cx);
+                            cx.notify();
+                        }
                     }),
                 )
                 .child("x");
@@ -182,6 +192,35 @@ impl Render for NodeEditorPanel {
 
             tab_bar = tab_bar.child(tab_el);
         }
+        let dirty = self.has_dirty_tabs();
+        let mut save_all = div()
+            .id("details-save-all")
+            .flex()
+            .flex_none()
+            .items_center()
+            .h_full()
+            .px_3()
+            .text_base()
+            .text_color(if dirty {
+                rgba(0xa6e3a1ff)
+            } else {
+                rgba(0x6c7086ff)
+            })
+            .child("Save All");
+        if dirty {
+            save_all = save_all.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
+                    cx.emit(SaveAllRequested);
+                }),
+            );
+        }
+        tab_bar = tab_bar.child({
+            let mut spacer = div();
+            spacer.style().flex_grow = Some(1.0);
+            spacer
+        });
+        tab_bar = tab_bar.child(save_all);
 
         // ── Form content for active tab ──────────────────────────────────────
         if active_idx >= self.tabs.len() {
@@ -260,7 +299,7 @@ impl Render for NodeEditorPanel {
                         cx.notify();
                     }),
                 )
-                .child("Edges");
+                .child("Relationships");
 
             div()
                 .id("subtab-bar")
@@ -979,7 +1018,7 @@ impl NodeEditorPanel {
             section = section.child(row);
         }
 
-        // ── "+ Add Edge" button ───────────────────────────────────────────
+        // ── "+ Add Relationship" button ──────────────────────────────────
         let mut add_btn = div()
             .id("edge-add-btn")
             .flex()
@@ -998,7 +1037,7 @@ impl NodeEditorPanel {
                     this.add_edge_row(cx);
                 }),
             )
-            .child("+ Add Edge");
+            .child("+ Add Relationship");
         // Shrink to content width instead of stretching to fill the column.
         add_btn.style().align_self = Some(gpui::AlignItems::Start);
         section = section.child(add_btn);

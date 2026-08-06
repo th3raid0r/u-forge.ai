@@ -4,6 +4,9 @@
 #   text_sm (body, menus)        = 0.875 × font_size
 # Default: 16.0. Increase for high-DPI or accessibility; decrease for compact UI.
 font_size = 16.0
+# Reveal low-level runtime diagnostics and maintenance controls in the app.
+# Ordinary worldbuilding and AI choices remain visible when this is false.
+show_advanced_controls = false
 
 [storage]
 # Path to the SQLite database directory. Defaults to ./data/db if omitted.

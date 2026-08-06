@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, Pixels, Point, Window, anchored, deferred, div, linear_color_stop,
-    linear_gradient, list, prelude::*, px, relative, rems, rgb, rgba,
+    App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Window, anchored,
+    deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px, relative, rems, rgb,
+    rgba,
 };
 use u_forge_agent::{AgentParams, GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
@@ -24,6 +25,8 @@ use crate::text_field::{TextFieldView, TextSubmit};
 
 pub(crate) struct ConnectRequested;
 impl EventEmitter<ConnectRequested> for ChatPanel {}
+pub(crate) struct ToggleAssistantZoomRequested;
+impl EventEmitter<ToggleAssistantZoomRequested> for ChatPanel {}
 
 // ── ChatPanel ───────────────────────────────────────────────────────────────
 
@@ -33,6 +36,8 @@ struct ContextMenuState {
 }
 
 pub(crate) struct ChatPanel {
+    focus: FocusHandle,
+    zoomed: bool,
     /// The text input field for composing messages.
     input_field: Entity<TextFieldView>,
     /// When true, pressing Enter submits; Shift+Enter inserts a newline.
@@ -195,6 +200,7 @@ impl ChatPanel {
         response_reserve: usize,
         db_path: &Path,
         tokio_rt: Arc<tokio::runtime::Runtime>,
+        zoomed: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let input_field = cx.new(|cx| {
@@ -239,6 +245,8 @@ impl ChatPanel {
         let msg_count = messages.len();
 
         Self {
+            focus: cx.focus_handle(),
+            zoomed,
             input_field,
             enter_to_submit: true,
             messages,
@@ -272,6 +280,10 @@ impl ChatPanel {
             last_render_us: 0,
             context_menu: None,
         }
+    }
+
+    pub(crate) fn set_zoomed(&mut self, zoomed: bool) {
+        self.zoomed = zoomed;
     }
 
     /// Called from AppView after Lemonade init discovers LLM models.
@@ -902,7 +914,7 @@ impl ChatPanel {
                 .iter()
                 .find(|s| s.id == *sid)
                 .map(|s| s.title.clone())
-                .unwrap_or_else(|| "Chat".to_string())
+                .unwrap_or_else(|| "Assistant".to_string())
         } else {
             "New Chat".to_string()
         }
@@ -1077,9 +1089,16 @@ impl ChatPanel {
     }
 }
 
+impl Focusable for ChatPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl Render for ChatPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_start = Instant::now();
+        let panel_focused = self.focus.contains_focused(window, cx);
         let enter_to_submit = self.enter_to_submit;
         let streaming = self.streaming;
         let connecting = self.connecting;
@@ -1442,6 +1461,8 @@ impl Render for ChatPanel {
 
         let root = div()
             .id("chat-panel")
+            .key_context("AssistantPanel")
+            .track_focus(&self.focus)
             .flex()
             .flex_col()
             .w_full()
@@ -1450,6 +1471,9 @@ impl Render for ChatPanel {
             .bg(rgb(0x181825))
             .border_l_1()
             .border_color(rgb(0x313244))
+            .when(panel_focused, |panel| {
+                panel.border_1().border_color(rgba(0xb4befeff))
+            })
             // ── Header: chat history selector ────────────────────────────────
             .child(
                 div()
@@ -1499,6 +1523,28 @@ impl Render for ChatPanel {
                                 spacer.style().flex_grow = Some(1.0);
                                 spacer
                             })
+                            .child(
+                                div()
+                                    .id("assistant-zoom-btn")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .px_2()
+                                    .h(px(22.0))
+                                    .rounded(px(3.0))
+                                    .text_sm()
+                                    .text_color(rgba(0xa6adc8ff))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
+                                            cx.emit(ToggleAssistantZoomRequested);
+                                        }),
+                                    )
+                                    .child(if self.zoomed { "Restore" } else { "Maximize" }),
+                            )
                             .child(
                                 div()
                                     .id("new-chat-btn")

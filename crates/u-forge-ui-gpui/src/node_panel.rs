@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, MouseButton, MouseDownEvent, Window, div, prelude::*, px, relative, rgb, rgba,
+    Context, Entity, FocusHandle, Focusable, MouseButton, MouseDownEvent, Window, div, prelude::*,
+    px, relative, rgb, rgba,
 };
 use parking_lot::RwLock;
 use u_forge_core::ObjectId;
@@ -36,6 +37,7 @@ struct TypeGroup {
 /// parent `AppView` subscribes to in order to perform DB mutations and
 /// refresh the snapshot.
 pub(crate) struct NodePanel {
+    focus: FocusHandle,
     selection: Entity<SelectionModel>,
     snapshot: Arc<RwLock<GraphSnapshot>>,
     /// Pre-sorted groups, rebuilt when the snapshot changes.
@@ -51,12 +53,14 @@ impl NodePanel {
     pub(crate) fn new(
         snapshot: Arc<RwLock<GraphSnapshot>>,
         selection: Entity<SelectionModel>,
+        cx: &mut Context<Self>,
     ) -> Self {
         let groups = Self::build_groups(&snapshot.read());
         // Start with all groups collapsed so the panel fits on screen.
         let collapsed: std::collections::HashSet<String> =
             groups.iter().map(|g| g.type_name.clone()).collect();
         Self {
+            focus: cx.focus_handle(),
             selection,
             snapshot,
             groups,
@@ -92,6 +96,12 @@ impl NodePanel {
     }
 }
 
+impl Focusable for NodePanel {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 /// Color for a type header in the node panel — delegates to the shared palette.
 fn node_type_color(object_type: &str) -> u32 {
     let [r, g, b, _] = node_color_for_type(object_type);
@@ -99,8 +109,9 @@ fn node_type_color(object_type: &str) -> u32 {
 }
 
 impl Render for NodePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_id = self.selection.read(cx).selected_node_id;
+        let panel_focused = self.focus.contains_focused(window, cx);
 
         // Outer shell: fixed width, fills parent height, does not grow vertically.
         let mut panel = div()
@@ -111,9 +122,14 @@ impl Render for NodePanel {
             .w_full()
             .h_full()
             .min_h_0()
+            .key_context("WorldPanel")
+            .track_focus(&self.focus)
             .bg(rgb(0x181825))
             .border_r_1()
-            .border_color(rgb(0x313244));
+            .border_color(rgb(0x313244))
+            .when(panel_focused, |panel| {
+                panel.border_1().border_color(rgba(0xb4befeff))
+            });
 
         // Fixed header
         panel = panel.child(
@@ -128,7 +144,7 @@ impl Render for NodePanel {
                 .border_color(rgb(0x313244))
                 .text_color(rgba(0xcdd6f4ff))
                 .text_base()
-                .child("Nodes"),
+                .child("World"),
         );
 
         // Scrollable content area that fills remaining height.

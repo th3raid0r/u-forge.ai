@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, MouseButton, MouseDownEvent, Window, div, prelude::*, px, relative, rgb, rgba,
+    Context, Entity, FocusHandle, Focusable, MouseButton, MouseDownEvent, Window, div, prelude::*,
+    px, relative, rgb, rgba,
 };
 use tracing::Instrument;
 use u_forge_core::{
@@ -69,6 +70,7 @@ fn degradation_hint(outcomes: &SearchStageOutcomes) -> Option<String> {
 // ── Search panel ─────────────────────────────────────────────────────────────
 
 pub(crate) struct SearchPanel {
+    focus: FocusHandle,
     selection: Entity<SelectionModel>,
     graph: Arc<KnowledgeGraph>,
     query_field: Entity<TextFieldView>,
@@ -110,6 +112,7 @@ impl SearchPanel {
         });
 
         Self {
+            focus: cx.focus_handle(),
             selection,
             graph,
             query_field,
@@ -297,6 +300,12 @@ impl SearchPanel {
     }
 }
 
+impl Focusable for SearchPanel {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 // ── Type color helper (same as node panel) ────────────────────────────────────
 
 fn result_type_color(object_type: &str) -> u32 {
@@ -307,8 +316,9 @@ fn result_type_color(object_type: &str) -> u32 {
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 impl Render for SearchPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_id = self.selection.read(cx).selected_node_id;
+        let panel_focused = self.focus.contains_focused(window, cx);
         let semantic_available = self.compatible_semantic_lane.is_some();
         let mode = self.mode;
 
@@ -320,9 +330,14 @@ impl Render for SearchPanel {
             .w_full()
             .h_full()
             .min_h_0()
+            .key_context("SearchPanel")
+            .track_focus(&self.focus)
             .bg(rgb(0x181825))
             .border_r_1()
-            .border_color(rgb(0x313244));
+            .border_color(rgb(0x313244))
+            .when(panel_focused, |panel| {
+                panel.border_1().border_color(rgba(0xb4befeff))
+            });
 
         // ── Header ────────────────────────────────────────────────────────────
         panel = panel.child(

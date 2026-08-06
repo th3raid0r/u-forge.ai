@@ -4,7 +4,7 @@ mod render;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{Context, Entity, Pixels, Subscription, prelude::*};
+use gpui::{Context, Entity, FocusHandle, Focusable, Pixels, Subscription, prelude::*};
 use parking_lot::RwLock;
 use u_forge_core::{
     EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyType, SchemaManager,
@@ -15,6 +15,11 @@ use crate::selection_model::SelectionModel;
 use crate::text_field::{TextArrowKey, TextChanged, TextFieldView, TextSubmit};
 
 pub(crate) use field_spec::{EditableEdge, EditorTab};
+
+pub(crate) struct SaveAllRequested;
+impl gpui::EventEmitter<SaveAllRequested> for NodeEditorPanel {}
+pub(crate) struct CloseDirtyTabRequested(pub usize);
+impl gpui::EventEmitter<CloseDirtyTabRequested> for NodeEditorPanel {}
 
 // ── Edge node-selector dropdown state ─────────────────────────────────────────
 
@@ -45,6 +50,7 @@ pub(crate) struct EdgeNodeDropdown {
 ///
 /// Observes `SelectionModel` and opens tabs as nodes are selected.
 pub(crate) struct NodeEditorPanel {
+    pub(crate) focus: FocusHandle,
     pub(crate) tabs: Vec<EditorTab>,
     pub(crate) active_tab: Option<usize>,
     #[allow(dead_code)]
@@ -88,6 +94,7 @@ impl NodeEditorPanel {
             cx.notify();
         });
         Self {
+            focus: cx.focus_handle(),
             tabs: Vec::new(),
             active_tab: None,
             selection,
@@ -127,23 +134,7 @@ impl NodeEditorPanel {
         self.open_tab_for_metadata(meta, false, cx);
     }
 
-    /// Open a tab for a **newly created** node (from the node panel "+" button).
-    ///
-    /// The tab is marked `is_new = true` so that on save, if the name is still
-    /// empty, the DB record is deleted and the tab discarded.
-    pub(crate) fn open_new_node_tab(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
-        // If already open, just focus.
-        if let Some(idx) = self.tabs.iter().position(|t| t.node_id == node_id) {
-            self.active_tab = Some(idx);
-            self.rebuild_field_subscriptions(cx);
-            return;
-        }
-
-        let meta = match self.graph.get_object(node_id) {
-            Ok(Some(m)) => m,
-            _ => return,
-        };
-
+    pub(crate) fn open_new_draft(&mut self, meta: ObjectMetadata, cx: &mut Context<Self>) {
         self.open_tab_for_metadata(meta, true, cx);
     }
 
@@ -207,7 +198,7 @@ impl NodeEditorPanel {
             .map(|ee| {
                 let et = ee.edge_type.clone();
                 cx.new(|cx| {
-                    let mut tf = TextFieldView::new(false, "edge type", cx);
+                    let mut tf = TextFieldView::new(false, "relationship type", cx);
                     tf.set_content(&et, cx);
                     tf
                 })
@@ -373,7 +364,7 @@ impl NodeEditorPanel {
     /// Returns `(count, saved_ids, discarded_ids)`:
     /// - `count`: how many nodes were actually persisted.
     /// - `saved_ids`: ObjectIds that need re-chunking/re-embedding.
-    /// - `discarded_ids`: ObjectIds of "empty new" nodes that were deleted.
+    /// - `discarded_ids`: ObjectIds of empty in-memory drafts that were closed.
     pub(crate) fn save_dirty_tabs(
         &mut self,
         cx: &mut Context<Self>,
@@ -391,10 +382,8 @@ impl NodeEditorPanel {
                 discarded_ids.push(tab.node_id);
             }
         }
-        // Delete DB records for discarded nodes (reverse order to keep indices valid).
+        // Empty drafts have never reached storage; removing their tabs is enough.
         for &idx in discard_indices.iter().rev() {
-            let node_id = self.tabs[idx].node_id;
-            let _ = self.graph.delete_object(node_id);
             self.tabs.remove(idx);
         }
         // Fix active_tab after removals.
@@ -445,7 +434,12 @@ impl NodeEditorPanel {
             }
             meta.properties = serde_json::Value::Object(props);
 
-            if self.graph.update_object(meta.clone()).is_ok() {
+            let persist_result = if tab.is_new {
+                self.graph.add_object(meta.clone()).map(|_| ())
+            } else {
+                self.graph.update_object(meta.clone())
+            };
+            if persist_result.is_ok() {
                 // ── Save edge changes ─────────────────────────────────────
                 skipped_edges += Self::save_edges_for_tab(&self.graph, tab);
 
@@ -526,6 +520,17 @@ impl NodeEditorPanel {
         self.tabs.iter().any(|t| t.dirty)
     }
 
+    pub(crate) fn incomplete_relationship_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.dirty)
+            .flat_map(|tab| &tab.edited_edges)
+            .filter(|edge| {
+                edge.from.is_none() || edge.to.is_none() || edge.edge_type.trim().is_empty()
+            })
+            .count()
+    }
+
     // ── Array inline add ──────────────────────────────────────────────────
 
     /// Commit the inline array-add text field: push its content into the array
@@ -563,7 +568,7 @@ impl NodeEditorPanel {
             edge.from = Some(node_id);
             edge.from_name = node_name;
             tab.edited_edges.push(edge);
-            let entity = cx.new(|cx| TextFieldView::new(false, "edge type", cx));
+            let entity = cx.new(|cx| TextFieldView::new(false, "relationship type", cx));
             tab.edge_type_entities.push(entity);
             tab.recompute_dirty();
         }
@@ -775,5 +780,11 @@ impl NodeEditorPanel {
     fn build_node_name_map(&self) -> HashMap<ObjectId, String> {
         let snap = self.snapshot.read();
         snap.nodes.iter().map(|n| (n.id, n.name.clone())).collect()
+    }
+}
+
+impl Focusable for NodeEditorPanel {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus.clone()
     }
 }

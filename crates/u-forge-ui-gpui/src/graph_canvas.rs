@@ -214,9 +214,22 @@ impl Render for GraphCanvas {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                    if this.dragging_node.is_some() {
-                        this.snapshot.write().rebuild_spatial_index();
-                        this.dragging_node = None;
+                    if let Some(node_id) = this.dragging_node.take() {
+                        let position = {
+                            let mut snapshot = this.snapshot.write();
+                            snapshot.rebuild_spatial_index();
+                            snapshot
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == node_id)
+                                .map(|node| node.position)
+                        };
+                        if let Some(position) = position
+                            && let Err(error) =
+                                this.graph.save_layout(&[(node_id, position.x, position.y)])
+                        {
+                            tracing::warn!(%node_id, %error, "Dragged node position was not saved");
+                        }
                         cx.notify();
                     } else {
                         this.panning = false;

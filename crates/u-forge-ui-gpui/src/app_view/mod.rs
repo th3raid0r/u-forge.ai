@@ -26,11 +26,15 @@ use u_forge_graph_view::GraphSnapshot;
 
 use state::AppState;
 
-use crate::chat_panel::{AvailableModel, ChatPanel, ConnectRequested};
+use crate::chat_panel::{
+    AvailableModel, ChatPanel, ConnectRequested, ToggleAssistantZoomRequested,
+};
 use crate::confirmation_modal::{ConfirmationAccepted, ConfirmationCancelled, ConfirmationModal};
+use crate::dock_state::DockState;
 use crate::graph_canvas::GraphCanvas;
-use crate::node_editor::NodeEditorPanel;
+use crate::node_editor::{CloseDirtyTabRequested, NodeEditorPanel, SaveAllRequested};
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
+use crate::panel_contracts::PanelId;
 use crate::path_picker::{
     PathCancelled, PathConfirmed, PathPickerKind, PathPickerModal, PickerMode,
 };
@@ -49,30 +53,6 @@ pub(crate) const MENU_BAR_H: f32 = 28.0;
 
 /// Status bar height in pixels.
 pub(crate) const STATUS_BAR_H: f32 = 24.0;
-
-/// Default sidebar (left panel) width in pixels.
-pub(crate) const DEFAULT_SIDEBAR_W: f32 = 220.0;
-
-/// Default fraction of workspace height allocated to the editor pane.
-pub(crate) const DEFAULT_EDITOR_RATIO: f32 = 0.3;
-
-/// Default right panel width in pixels.
-pub(crate) const DEFAULT_RIGHT_PANEL_W: f32 = 280.0;
-
-/// Minimum width for any side panel.
-pub(crate) const MIN_PANEL_W: f32 = 120.0;
-
-/// Minimum width for the central workspace.
-pub(crate) const MIN_WORKSPACE_W: f32 = 200.0;
-
-/// Minimum fraction for the editor/canvas vertical split.
-pub(crate) const MIN_PANE_RATIO: f32 = 0.1;
-
-/// Maximum fraction for the editor/canvas vertical split.
-pub(crate) const MAX_PANE_RATIO: f32 = 0.9;
-
-/// Width/height of resize drag handles in pixels.
-pub(crate) const RESIZE_HANDLE_SIZE: f32 = 6.0;
 
 // ── Drag marker types ─────────────────────────────────────────────────────────
 
@@ -98,13 +78,6 @@ impl Render for ResizeRightPanel {
     fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
-}
-
-/// Which panel is currently shown in the left sidebar.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum SidebarTab {
-    Nodes,
-    Search,
 }
 
 /// Number of frame-cost samples retained for the rolling perf-overlay average.
@@ -175,15 +148,14 @@ pub struct AppView {
     pub(crate) file_menu_open: bool,
     pub(crate) view_menu_open: bool,
     pub(crate) setup_open: bool,
-    pub(crate) sidebar_open: bool,
-    pub(crate) sidebar_tab: SidebarTab,
-    pub(crate) right_panel_open: bool,
-    /// Current sidebar width in pixels (user-resizable).
-    pub(crate) sidebar_width: f32,
-    /// Fraction of workspace height for the editor pane (0.0..1.0).
-    pub(crate) editor_ratio: f32,
-    /// Current right panel width in pixels (user-resizable).
-    pub(crate) right_panel_width: f32,
+    pub(crate) settings_open: bool,
+    pub(crate) ui_font_size: f32,
+    pub(crate) show_advanced_controls: bool,
+    pub(crate) settings_draft_font_size: f32,
+    pub(crate) settings_draft_advanced: bool,
+    pub(crate) dock_state: DockState,
+    workspace_state_path: std::path::PathBuf,
+    workspace_persist_task: Option<gpui::Task<()>>,
     // ── Path picker modal ─────────────────────────────────────────────────────
     /// Active path-picker dialog and which field it's editing, or None.
     pub(crate) path_picker: Option<(PathPickerKind, Entity<PathPickerModal>)>,
@@ -214,6 +186,7 @@ pub struct AppView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestructiveAction {
     DeleteNode(ObjectId),
+    DiscardEditorTab(usize),
     ClearData,
     ClearSchema,
 }
@@ -439,6 +412,52 @@ async fn activate_lemonade_capabilities(
 }
 
 impl AppView {
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_draft_font_size = self.ui_font_size;
+        self.settings_draft_advanced = self.show_advanced_controls;
+        self.settings_open = true;
+        cx.notify();
+    }
+
+    pub(crate) fn save_settings(&mut self, cx: &mut Context<Self>) {
+        let font_size = self.settings_draft_font_size.clamp(10.0, 28.0);
+        match self
+            .state
+            .app_config
+            .persist_ui_settings(font_size, self.settings_draft_advanced)
+        {
+            Ok(path) => {
+                self.ui_font_size = font_size;
+                self.show_advanced_controls = self.settings_draft_advanced;
+                self.settings_open = false;
+                self.state.data_status = Some(format!("Settings saved to {}", path.display()));
+            }
+            Err(error) => {
+                self.state.data_status = Some(format!("Could not save settings: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn sync_dock_presentational_state(&mut self, cx: &mut Context<Self>) {
+        let assistant_zoomed = self.dock_state.zoomed_panel() == Some(PanelId::Assistant);
+        self.chat_panel
+            .update(cx, |panel, _cx| panel.set_zoomed(assistant_zoomed));
+    }
+
+    pub(crate) fn schedule_workspace_persist(&mut self, cx: &mut Context<Self>) {
+        let state = self.dock_state.clone();
+        let path = self.workspace_state_path.clone();
+        self.workspace_persist_task = Some(cx.spawn(async move |_this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            if let Err(error) = state.save(&path) {
+                tracing::warn!(path = %path.display(), %error, "Workspace UI state was not saved");
+            }
+        }));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: GraphSnapshot,
@@ -482,6 +501,10 @@ impl AppView {
     ) -> Self {
         let _phase = startup.phase("app_view_construct");
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
+        let workspace_state_path = DockState::state_path(&app_config.storage.db_path);
+        let dock_state = DockState::load(&workspace_state_path);
+        let ui_font_size = app_config.ui.font_size;
+        let show_advanced_controls = app_config.ui.show_advanced_controls;
 
         // Build child entities — clone Arc handles before they move into AppState.
         let selection = {
@@ -496,7 +519,7 @@ impl AppView {
         };
         let node_panel = {
             let _phase = startup.phase("node_panel_construct");
-            cx.new(|_cx| NodePanel::new(snapshot_arc.clone(), selection.clone()))
+            cx.new(|cx| NodePanel::new(snapshot_arc.clone(), selection.clone(), cx))
         };
 
         // Subscribe to node panel create/delete events.
@@ -512,6 +535,13 @@ impl AppView {
                 this.request_delete_node(event.0, cx);
             },
         );
+        let selection_sub = cx.observe(&selection, |this: &mut Self, selection, cx| {
+            if selection.read(cx).selected_node_id.is_some() {
+                this.dock_state.activate_panel(PanelId::Details);
+                this.schedule_workspace_persist(cx);
+                cx.notify();
+            }
+        });
         let search_panel = {
             let _phase = startup.phase("search_panel_construct");
             cx.new(|cx| {
@@ -536,7 +566,26 @@ impl AppView {
                 )
             })
         };
+        let save_all_sub = cx.subscribe(
+            &node_editor,
+            |this: &mut Self, _editor, _event: &SaveAllRequested, cx| {
+                this.do_save(cx);
+            },
+        );
+        let close_dirty_tab_sub = cx.subscribe(
+            &node_editor,
+            |this: &mut Self, _editor, event: &CloseDirtyTabRequested, cx| {
+                this.open_confirmation(
+                    DestructiveAction::DiscardEditorTab(event.0),
+                    "Discard unsaved changes?",
+                    "This Details tab has unsaved changes. Discard them and close the tab?",
+                    "Discard Changes",
+                    cx,
+                );
+            },
+        );
         let db_path = app_config.storage.db_path.clone();
+        let assistant_zoomed = dock_state.zoomed_panel() == Some(PanelId::Assistant);
         let chat_panel = {
             let _phase = startup.phase("chat_panel_construct");
             cx.new(|cx| {
@@ -546,6 +595,7 @@ impl AppView {
                     app_config.chat.response_reserve,
                     &db_path,
                     tokio_rt.clone(),
+                    assistant_zoomed,
                     cx,
                 )
             })
@@ -557,6 +607,15 @@ impl AppView {
                     panel.set_connecting(true);
                 });
                 this.do_init_lemonade(cx);
+            },
+        );
+        let assistant_zoom_sub = cx.subscribe(
+            &chat_panel,
+            |this: &mut Self, _panel, _event: &ToggleAssistantZoomRequested, cx| {
+                this.dock_state.toggle_zoom(PanelId::Assistant);
+                this.sync_dock_presentational_state(cx);
+                this.schedule_workspace_persist(cx);
+                cx.notify();
             },
         );
 
@@ -637,12 +696,14 @@ impl AppView {
             file_menu_open: false,
             view_menu_open: false,
             setup_open: false,
-            sidebar_open: false,
-            sidebar_tab: SidebarTab::Nodes,
-            right_panel_open: false,
-            sidebar_width: DEFAULT_SIDEBAR_W,
-            editor_ratio: DEFAULT_EDITOR_RATIO,
-            right_panel_width: DEFAULT_RIGHT_PANEL_W,
+            settings_open: false,
+            ui_font_size,
+            show_advanced_controls,
+            settings_draft_font_size: ui_font_size,
+            settings_draft_advanced: show_advanced_controls,
+            dock_state,
+            workspace_state_path,
+            workspace_persist_task: None,
             path_picker: None,
             _path_picker_subs: vec![],
             confirmation: None,
@@ -651,7 +712,11 @@ impl AppView {
             _node_subs: vec![
                 node_sub_create,
                 node_sub_delete,
+                selection_sub,
+                save_all_sub,
+                close_dirty_tab_sub,
                 connect_sub,
+                assistant_zoom_sub,
                 setup_requested,
                 setup_refresh,
                 setup_backend_install,
@@ -777,7 +842,7 @@ impl AppView {
         self.open_confirmation(
             DestructiveAction::ClearData,
             "Clear all data",
-            "Delete every node, edge, chunk, and saved layout position? This cannot be undone.",
+            "Delete every world item, relationship, text chunk, and saved canvas position? This cannot be undone.",
             "Clear Data",
             cx,
         );
@@ -807,7 +872,7 @@ impl AppView {
             DestructiveAction::DeleteNode(node_id),
             "Delete node",
             &format!(
-                "Delete “{node_name}” and its connected edges and text chunks? This cannot be undone."
+                "Delete “{node_name}” and its connected relationships and text chunks? This cannot be undone."
             ),
             "Delete Node",
             cx,
@@ -857,6 +922,11 @@ impl AppView {
     fn execute_destructive_action(&mut self, action: DestructiveAction, cx: &mut Context<Self>) {
         match action {
             DestructiveAction::DeleteNode(node_id) => self.delete_node_by_id(node_id, cx),
+            DestructiveAction::DiscardEditorTab(index) => {
+                self.node_editor
+                    .update(cx, |editor, cx| editor.close_tab(index, cx));
+                cx.notify();
+            }
             DestructiveAction::ClearData => self.do_clear_data(cx),
             DestructiveAction::ClearSchema => self.do_clear_schema(cx),
         }
@@ -917,7 +987,7 @@ impl AppView {
                             String::new()
                         };
                         let skipped_edges = if stats.edge_records_skipped > 0 {
-                            format!(", {} edges skipped", stats.edge_records_skipped)
+                            format!(", {} relationships skipped", stats.edge_records_skipped)
                         } else {
                             String::new()
                         };
@@ -927,7 +997,7 @@ impl AppView {
                             .map(|path| format!(", diagnostics: {}", path.display()))
                             .unwrap_or_default();
                         view.state.data_status = Some(format!(
-                            "Import done — {} nodes, {} edges{}{}{}{}{}",
+                            "Import done — {} world items, {} relationships{}{}{}{}{}",
                             stats.objects_created,
                             stats.relationships_created,
                             reused,
@@ -1136,6 +1206,15 @@ impl AppView {
         // 1. Save layout positions.
         self.graph_canvas.read(cx).save_layout();
 
+        let incomplete_relationships = self.node_editor.read(cx).incomplete_relationship_count();
+        if incomplete_relationships > 0 {
+            self.state.data_status = Some(format!(
+                "Cannot save: complete all {incomplete_relationships} unfinished relationship(s)."
+            ));
+            cx.notify();
+            return;
+        }
+
         // 2. Save all dirty editor tabs (also discards empty new nodes).
         let (saved, saved_ids, discarded_ids, skipped_edges) = self
             .node_editor
@@ -1143,7 +1222,7 @@ impl AppView {
 
         if skipped_edges > 0 {
             self.state.data_status = Some(format!(
-                "{skipped_edges} incomplete edge(s) skipped — fill both endpoints before saving."
+                "{skipped_edges} incomplete relationship(s) skipped — fill both endpoints before saving."
             ));
         }
 
@@ -1170,36 +1249,14 @@ impl AppView {
 
     // ── Node create / delete (driven by node panel events) ────────────────
 
-    /// Create a new empty node of the given type, persist it, refresh the
-    /// snapshot, and navigate to it in the editor (marked as `is_new`).
+    /// Create an in-memory Details draft. Storage is not touched until Save.
     fn create_node(&mut self, object_type: &str, cx: &mut Context<Self>) {
         let meta = ObjectMetadata::new(object_type.to_string(), String::new());
-        let node_id = meta.id;
-
-        match self.state.graph.add_object(meta) {
-            Ok(_id) => {
-                // Refresh snapshot so the node panel and canvas see the new node.
-                self.refresh_snapshot(cx);
-
-                // Select the new node — this triggers the editor's observer,
-                // but we use `open_new_node_tab` directly so the `is_new` flag
-                // is set correctly.
-                self.selection.update(cx, |sel, cx| {
-                    sel.select_by_id(Some(node_id), cx);
-                });
-                self.node_editor.update(cx, |editor, cx| {
-                    editor.open_new_node_tab(node_id, cx);
-                });
-
-                // Ensure the sidebar is open on the nodes tab so the user sees
-                // the newly created node.
-                self.sidebar_open = true;
-                self.sidebar_tab = SidebarTab::Nodes;
-            }
-            Err(e) => {
-                self.state.data_status = Some(format!("Failed to create node: {e}"));
-            }
-        }
+        self.node_editor
+            .update(cx, |editor, cx| editor.open_new_draft(meta, cx));
+        self.dock_state.activate_panel(PanelId::World);
+        self.dock_state.activate_panel(PanelId::Details);
+        self.schedule_workspace_persist(cx);
         cx.notify();
     }
 
@@ -2079,7 +2136,7 @@ impl AppView {
                             .to_string_lossy()
                             .into_owned();
                         view.state.data_status = Some(format!(
-                            "Exported {node_count} nodes, {edge_count} edges → {filename}"
+                            "Exported {node_count} world items, {edge_count} relationships → {filename}"
                         ));
                     }
                     Err(e) => {

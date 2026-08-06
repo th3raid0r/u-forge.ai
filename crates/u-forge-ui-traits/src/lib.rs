@@ -7,28 +7,6 @@
 use glam::Vec2;
 use u_forge_graph_view::{GraphSnapshot, LodLevel};
 
-/// Stable identity and default docking metadata for a Zed-style panel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PanelMetadata {
-    pub id: &'static str,
-    pub title: &'static str,
-    pub position: PanelPosition,
-    pub closable: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PanelPosition {
-    Left,
-    Right,
-    Bottom,
-    Center,
-}
-
-/// Framework-neutral contract implemented by each application panel.
-pub trait Panel {
-    fn metadata(&self) -> PanelMetadata;
-}
-
 /// A node primitive (circle / squircle) in screen space.
 #[derive(Debug, Clone)]
 pub struct NodeCmd {
