@@ -9,8 +9,8 @@ use u_forge_ui_gpui::{
     AppView, ClearData, ClearSchema, DetailsCloseTab, DetailsNextTab, DetailsPreviousTab,
     ExportData, FitGraph, FocusNextRegion, FocusPreviousRegion, ImportData, ImportSchema,
     OpenSettings, SaveActiveItem, SaveAllItems, ToggleDetailsPanel, ToggleFocusedPanelZoom,
-    TogglePerfOverlay, ToggleRightPanel, ToggleSidebar, UiTheme, WorldActivateRow, WorldDeleteRow,
-    WorldNextRow, WorldOpenContextMenu, WorldPreviousRow,
+    TogglePerfOverlay, ToggleRightPanel, ToggleSearchPanel, ToggleSidebar, UiTheme,
+    WorldActivateRow, WorldDeleteRow, WorldNextRow, WorldOpenContextMenu, WorldPreviousRow,
     startup::{StartupTimeline, prepare_app},
 };
 
@@ -50,6 +50,7 @@ fn main() {
             KeyBinding::new("ctrl-s", SaveActiveItem, None),
             KeyBinding::new("ctrl-shift-s", SaveAllItems, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
+            KeyBinding::new("ctrl-shift-f", ToggleSearchPanel, None),
             KeyBinding::new("ctrl-j", ToggleRightPanel, None),
             KeyBinding::new("ctrl-shift-j", ToggleDetailsPanel, None),
             KeyBinding::new("ctrl-shift-m", ToggleFocusedPanelZoom, None),
@@ -92,6 +93,7 @@ fn main() {
                 name: "View".into(),
                 items: vec![
                     MenuItem::action("Toggle World", ToggleSidebar),
+                    MenuItem::action("Toggle Search", ToggleSearchPanel),
                     MenuItem::action("Toggle Assistant", ToggleRightPanel),
                     MenuItem::action("Toggle Details", ToggleDetailsPanel),
                     MenuItem::action("Maximize Focused Panel", ToggleFocusedPanelZoom),

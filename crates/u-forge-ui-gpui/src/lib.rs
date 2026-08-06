@@ -28,6 +28,7 @@ actions!([
     SaveAllItems,
     OpenSettings,
     ToggleSidebar,
+    ToggleSearchPanel,
     ToggleRightPanel,
     ToggleDetailsPanel,
     ToggleFocusedPanelZoom,

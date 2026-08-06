@@ -270,25 +270,49 @@ impl RenderOnce for Tab {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    Muted,
+    Normal,
+    Success,
+    Warning,
+    Danger,
+}
+
 #[derive(IntoElement)]
 pub struct StatusItem {
-    button: Button,
+    id: ElementId,
+    label: SharedString,
+    active: bool,
+    tone: StatusTone,
+    tooltip: Option<SharedString>,
+    on_click: Option<ClickHandler>,
 }
 
 impl StatusItem {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
         Self {
-            button: Button::new(id, label),
+            id: id.into(),
+            label: label.into(),
+            active: false,
+            tone: StatusTone::Normal,
+            tooltip: None,
+            on_click: None,
         }
     }
 
     pub fn active(mut self, active: bool) -> Self {
-        self.button = self.button.selected(active);
+        self.active = active;
+        self
+    }
+
+    pub fn tone(mut self, tone: StatusTone) -> Self {
+        self.tone = tone;
         self
     }
 
     pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
-        self.button = self.button.tooltip(tooltip);
+        self.tooltip = Some(tooltip.into());
         self
     }
 
@@ -296,7 +320,7 @@ impl StatusItem {
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.button = self.button.on_click(handler);
+        self.on_click = Some(Rc::new(handler));
         self
     }
 }
@@ -304,9 +328,35 @@ impl StatusItem {
 impl RenderOnce for StatusItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = *UiTheme::get(cx);
-        div()
+        let mut item = div()
+            .id(self.id)
+            .flex()
+            .items_center()
             .h(px(theme.metrics.control_height_small))
-            .child(self.button)
+            .max_w(px(360.0))
+            .px(px(theme.metrics.space_2))
+            .rounded(px(theme.metrics.radius_small))
+            .truncate()
+            .text_xs()
+            .text_color(match self.tone {
+                StatusTone::Muted => theme.colors.text_muted,
+                StatusTone::Normal => theme.colors.text,
+                StatusTone::Success => theme.colors.success,
+                StatusTone::Warning => theme.colors.warning,
+                StatusTone::Danger => theme.colors.danger,
+            })
+            .when(self.active, |item| item.bg(theme.colors.selected))
+            .child(self.label);
+        if let Some(handler) = self.on_click {
+            item = item
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.colors.selected))
+                .on_click(move |event, window, cx| handler(event, window, cx));
+        }
+        if let Some(tooltip) = self.tooltip {
+            item = item.tooltip(Tooltip::text(tooltip));
+        }
+        item
     }
 }
 

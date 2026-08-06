@@ -10,7 +10,7 @@ use crate::{
     ClearData, ClearSchema, DetailsCloseTab, DetailsNextTab, DetailsPreviousTab, ExportData,
     FitGraph, FocusNextRegion, FocusPreviousRegion, ImportData, ImportSchema, OpenSettings,
     SaveActiveItem, SaveAllItems, ToggleDetailsPanel, ToggleFocusedPanelZoom, TogglePerfOverlay,
-    ToggleRightPanel, ToggleSidebar,
+    ToggleRightPanel, ToggleSearchPanel, ToggleSidebar,
 };
 
 use super::{
@@ -18,9 +18,27 @@ use super::{
 };
 use crate::dock_state::RESIZE_HANDLE_SIZE;
 use crate::panel_contracts::{DockPosition, PanelId, WorkspaceItemId, WorldCanvasViewId};
+use crate::search_panel::SearchPanelStatus;
 use crate::startup::StartupMilestone;
-use crate::ui::components::{Button, ButtonStyle, Dialog, Tab as UiTab};
+use crate::ui::components::{Button, ButtonStyle, Dialog, StatusItem, StatusTone, Tab as UiTab};
 use crate::ui::theme::UiTheme;
+
+fn operation_status_tone(message: &str) -> StatusTone {
+    let message = message.to_ascii_lowercase();
+    if ["failed", "cannot", "error"]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        StatusTone::Danger
+    } else if ["loading", "importing", "exporting", "checking"]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        StatusTone::Warning
+    } else {
+        StatusTone::Success
+    }
+}
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -52,6 +70,8 @@ impl Render for AppView {
         let details_height = self.dock_state.size(DockPosition::Bottom);
         let right_panel_width = self.dock_state.size(DockPosition::Right);
         let embedding_status = self.state.embedding_status.clone();
+        let search_status = self.search_panel.read(cx).status();
+        let inference_ready = self.state.inference_queue.is_some();
         let perf_enabled = self.perf_enabled;
         let startup = self.startup.clone();
         let app_first_paint_pending = !startup.contains(StartupMilestone::AppFirstPaint);
@@ -133,6 +153,14 @@ impl Render for AppView {
                 this.dock_state.toggle_panel(PanelId::World);
                 if this.dock_state.is_panel_active(PanelId::World) {
                     this.node_panel.read(cx).focus_handle(cx).focus(window);
+                }
+                this.schedule_workspace_persist(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSearchPanel, window, cx| {
+                this.dock_state.toggle_panel(PanelId::Search);
+                if this.dock_state.is_panel_active(PanelId::Search) {
+                    this.search_panel.read(cx).focus_handle(cx).focus(window);
                 }
                 this.schedule_workspace_persist(cx);
                 cx.notify();
@@ -672,7 +700,6 @@ impl Render for AppView {
                     .border_color(theme.colors.border_subtle)
                     .items_center()
                     .text_sm()
-                    // ── Left: panel toggle buttons ────────────────────────────
                     .child(
                         div()
                             .id("status-left")
@@ -682,74 +709,23 @@ impl Render for AppView {
                             .flex_none()
                             .gap(px(2.0))
                             .px_1()
-                            // Tree button
                             .child(
-                                div()
-                                    .id("status-tree-btn")
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .h(px(STATUS_BAR_H - 4.0))
-                                    .cursor_pointer()
-                                    .text_color(if sidebar_open && sidebar_tab == PanelId::World {
-                                        rgba(0xcdd6f4ff)
-                                    } else {
-                                        rgba(0x6c7086ff)
-                                    })
-                                    .when(sidebar_open && sidebar_tab == PanelId::World, |el| {
-                                        el.bg(rgba(0x45475a88))
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                            this.dock_state.toggle_panel(PanelId::World);
-                                            if this.dock_state.is_panel_active(PanelId::World) {
-                                                this.node_panel
-                                                    .read(cx)
-                                                    .focus_handle(cx)
-                                                    .focus(window);
-                                            }
-                                            this.schedule_workspace_persist(cx);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(PanelId::World.title()),
+                                StatusItem::new("status-world", PanelId::World.title())
+                                    .active(sidebar_open && sidebar_tab == PanelId::World)
+                                    .tooltip("Show or hide the World panel (Ctrl+B)")
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ToggleSidebar), cx);
+                                    }),
                             )
-                            // Search button
                             .child(
-                                div()
-                                    .id("status-search-btn")
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .h(px(STATUS_BAR_H - 4.0))
-                                    .cursor_pointer()
-                                    .text_color(if sidebar_open && sidebar_tab == PanelId::Search {
-                                        rgba(0xcdd6f4ff)
-                                    } else {
-                                        rgba(0x6c7086ff)
-                                    })
-                                    .when(sidebar_open && sidebar_tab == PanelId::Search, |el| {
-                                        el.bg(rgba(0x45475a88))
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                            this.dock_state.toggle_panel(PanelId::Search);
-                                            if this.dock_state.is_panel_active(PanelId::Search) {
-                                                this.search_panel
-                                                    .read(cx)
-                                                    .focus_handle(cx)
-                                                    .focus(window);
-                                            }
-                                            this.schedule_workspace_persist(cx);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(PanelId::Search.title()),
+                                StatusItem::new("status-search", PanelId::Search.title())
+                                    .active(sidebar_open && sidebar_tab == PanelId::Search)
+                                    .tooltip("Show or hide Search (Ctrl+Shift+F)")
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ToggleSearchPanel), cx);
+                                    }),
                             ),
                     )
-                    // ── Center: graph stats + operation status ────────────────
                     .child({
                         let data_status = self.state.data_status.clone();
                         let mut center = div()
@@ -758,25 +734,80 @@ impl Render for AppView {
                             .flex_row()
                             .items_center()
                             .justify_center()
-                            .gap(px(12.0))
-                            .text_color(rgba(0xa6adc8ff));
+                            .min_w_0()
+                            .overflow_hidden()
+                            .gap(px(2.0));
                         center.style().flex_grow = Some(1.0);
-                        center = center.child(format!(
-                            "{} world items  ·  {} relationships",
-                            node_count, edge_count
-                        ));
+                        center = center.child(
+                            StatusItem::new(
+                                "status-counts",
+                                format!("{node_count} items · {edge_count} relationships"),
+                            )
+                            .tone(StatusTone::Muted)
+                            .tooltip("World Canvas item and relationship counts"),
+                        );
                         if let Some(msg) = data_status {
-                            center = center.child(div().text_color(rgba(0xa6e3a1ff)).child(msg));
+                            center = center.child(
+                                StatusItem::new("status-data", msg.clone())
+                                    .tone(operation_status_tone(&msg))
+                                    .tooltip(msg),
+                            );
+                        }
+                        if let Some(status) = search_status {
+                            center = center.child(match status {
+                                SearchPanelStatus::Searching => {
+                                    StatusItem::new("status-search-activity", "Searching…")
+                                        .tone(StatusTone::Normal)
+                                        .tooltip("Searching the current world")
+                                }
+                                SearchPanelStatus::Degraded(message) => {
+                                    StatusItem::new("status-search-activity", message.clone())
+                                        .tone(StatusTone::Warning)
+                                        .tooltip(message)
+                                }
+                                SearchPanelStatus::Failed(message) => {
+                                    StatusItem::new("status-search-activity", "Search unavailable")
+                                        .tone(StatusTone::Danger)
+                                        .tooltip(message)
+                                }
+                            });
                         }
                         if let Some(msg) = embedding_status {
-                            center = center.child(div().text_color(rgba(0xf9e2afff)).child(msg));
+                            center = center.child(
+                                StatusItem::new("status-embedding", msg.clone())
+                                    .tone(StatusTone::Warning)
+                                    .tooltip(msg),
+                            );
                         }
                         if let Some(perf) = perf_text {
-                            center = center.child(div().text_color(rgba(0xa6e3a1ff)).child(perf));
+                            center = center.child(
+                                StatusItem::new("status-performance", perf.clone())
+                                    .tone(StatusTone::Success)
+                                    .tooltip(perf),
+                            );
                         }
+                        center = center.child(
+                            StatusItem::new(
+                                "status-inference",
+                                if inference_ready {
+                                    "AI ready"
+                                } else {
+                                    "AI unavailable"
+                                },
+                            )
+                            .tone(if inference_ready {
+                                StatusTone::Success
+                            } else {
+                                StatusTone::Muted
+                            })
+                            .tooltip(if inference_ready {
+                                "Local AI capabilities are ready"
+                            } else {
+                                "Worldbuilding remains available without local AI"
+                            }),
+                        );
                         center
                     })
-                    // ── Right: chat toggle button ─────────────────────────────
                     .child(
                         div()
                             .id("status-right")
@@ -787,97 +818,34 @@ impl Render for AppView {
                             .gap(px(2.0))
                             .px_1()
                             .child(
-                                div()
-                                    .id("status-details-btn")
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .h(px(STATUS_BAR_H - 4.0))
-                                    .cursor_pointer()
-                                    .text_color(if details_open {
-                                        rgba(0xcdd6f4ff)
-                                    } else {
-                                        rgba(0x6c7086ff)
-                                    })
-                                    .when(details_open, |el| el.bg(rgba(0x45475a88)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                            this.dock_state.toggle_panel(PanelId::Details);
-                                            if this.dock_state.is_panel_active(PanelId::Details) {
-                                                this.node_editor
-                                                    .read(cx)
-                                                    .focus_handle(cx)
-                                                    .focus(window);
-                                            }
-                                            this.schedule_workspace_persist(cx);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(PanelId::Details.title()),
+                                StatusItem::new("status-details", PanelId::Details.title())
+                                    .active(details_open)
+                                    .tooltip("Show or hide Details (Ctrl+Shift+J)")
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ToggleDetailsPanel), cx);
+                                    }),
                             )
                             .child(
-                                div()
-                                    .id("status-chat-btn")
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .h(px(STATUS_BAR_H - 4.0))
-                                    .cursor_pointer()
-                                    .text_color(if right_panel_open {
-                                        rgba(0xcdd6f4ff)
-                                    } else {
-                                        rgba(0x6c7086ff)
-                                    })
-                                    .when(right_panel_open, |el| el.bg(rgba(0x45475a88)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                            if this.dock_state.is_panel_active(PanelId::Assistant) {
-                                                this.chat_panel.update(cx, |panel, _cx| {
-                                                    panel.last_render_us = 0
-                                                });
-                                            }
-                                            this.dock_state.toggle_panel(PanelId::Assistant);
-                                            this.sync_dock_presentational_state(cx);
-                                            if this.dock_state.is_panel_active(PanelId::Assistant) {
-                                                this.chat_panel
-                                                    .read(cx)
-                                                    .focus_handle(cx)
-                                                    .focus(window);
-                                            }
-                                            this.schedule_workspace_persist(cx);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(PanelId::Assistant.title()),
+                                StatusItem::new("status-assistant", PanelId::Assistant.title())
+                                    .active(right_panel_open)
+                                    .tooltip("Show or hide Assistant (Ctrl+J)")
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ToggleRightPanel), cx);
+                                    }),
                             )
                             .when(show_advanced_controls, |status| {
                                 status.child(
-                                    div()
-                                        .id("status-perf-btn")
-                                        .flex()
-                                        .items_center()
-                                        .px_2()
-                                        .h(px(STATUS_BAR_H - 4.0))
-                                        .cursor_pointer()
-                                        .text_color(if perf_enabled {
-                                            rgba(0xa6e3a1ff)
+                                    StatusItem::new("status-perf", "Perf")
+                                        .active(perf_enabled)
+                                        .tone(if perf_enabled {
+                                            StatusTone::Success
                                         } else {
-                                            rgba(0x6c7086ff)
+                                            StatusTone::Muted
                                         })
-                                        .when(perf_enabled, |el| el.bg(rgba(0x45475a88)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                                this.perf_enabled = !this.perf_enabled;
-                                                if !this.perf_enabled {
-                                                    this.frame_times_us.clear();
-                                                }
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child("Perf"),
+                                        .tooltip("Toggle performance diagnostics (Ctrl+Shift+P)")
+                                        .on_click(|_, window, cx| {
+                                            window.dispatch_action(Box::new(TogglePerfOverlay), cx);
+                                        }),
                                 )
                             }),
                     ),
@@ -1408,5 +1376,21 @@ impl Render for AppView {
                     .h(px(1.0)),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::operation_status_tone;
+    use crate::ui::components::StatusTone;
+
+    #[test]
+    fn operation_status_tones_distinguish_progress_success_and_failure() {
+        assert_eq!(operation_status_tone("Importing…"), StatusTone::Warning);
+        assert_eq!(operation_status_tone("Data imported."), StatusTone::Success);
+        assert_eq!(
+            operation_status_tone("Cannot save unfinished relationships."),
+            StatusTone::Danger
+        );
     }
 }

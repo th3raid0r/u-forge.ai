@@ -39,6 +39,13 @@ struct CompletedSearch {
     outcomes: SearchStageOutcomes,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SearchPanelStatus {
+    Searching,
+    Degraded(String),
+    Failed(String),
+}
+
 fn degradation_hint(outcomes: &SearchStageOutcomes) -> Option<String> {
     let degraded = |status| {
         matches!(
@@ -142,6 +149,18 @@ impl SearchPanel {
         self.inference_queue = queue;
         self.hq_queue = hq;
         self.compatible_semantic_lane = self.resolve_compatible_semantic_lane();
+    }
+
+    pub(crate) fn status(&self) -> Option<SearchPanelStatus> {
+        if self.searching {
+            Some(SearchPanelStatus::Searching)
+        } else if let Some(error) = &self.error {
+            Some(SearchPanelStatus::Failed(error.clone()))
+        } else {
+            self.degradation_hint
+                .clone()
+                .map(SearchPanelStatus::Degraded)
+        }
     }
 
     fn resolve_compatible_semantic_lane(&self) -> Option<EmbeddingTarget> {

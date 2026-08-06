@@ -88,7 +88,7 @@ Primary Zed references:
   shortcuts, enabled state, advanced visibility, tooltips, context entries,
   and status toggles from shared action descriptors. `Ctrl+S` saves the active
   Details item; `Ctrl+Shift+S` saves all dirty items.
-- [ ] **UI-14 — Composable status bar.** Register status items for docks,
+- [x] **UI-14 — Composable status bar.** Register status items for docks,
   World Canvas counts, data activity, search/inference state, embedding
   progress, and advanced-only performance diagnostics. Compact or truncate
   low-priority content cleanly at narrow widths.
