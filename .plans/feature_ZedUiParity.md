@@ -67,7 +67,7 @@ Primary Zed references:
 - [x] **UI-08 — Stable mounting.** Keep expensive panels mounted behind
   clipped zero-size outer containers and stable-size cached inner containers.
   Switching World/Search or toggling a dock must not cold-mount inactive views.
-- [ ] **UI-09 — Resizing and zoom.** Centralize constraints and double-click
+- [x] **UI-09 — Resizing and zoom.** Centralize constraints and double-click
   reset. Defaults/minima are left 280/220 px, right 360/300 px, bottom 320/200
   px, with at least 360 x 240 px retained for World Canvas. One dock panel may
   zoom over the workspace body while menu/status chrome remains visible.
@@ -81,7 +81,7 @@ Primary Zed references:
 - [ ] **UI-11 — Focus contracts.** Make panels focusable, attach key contexts,
   preserve last descendant focus, expose focus-visible state, and restore focus
   predictably after closing panels, menus, dialogs, and tabs.
-- [ ] **UI-12 — Keyboard navigation.** Support dock activation, F6 region
+- [x] **UI-12 — Keyboard navigation.** Support dock activation, F6 region
   traversal, list/tree navigation, expand/collapse, Details tab switching and
   closing, and Shift+F10 context-menu invocation through typed actions.
 - [ ] **UI-13 — One action source.** Generate native menus, in-app menus,
@@ -95,7 +95,7 @@ Primary Zed references:
 
 ## Guided workflows and panel adaptation
 
-- [ ] **UI-15 — World panel.** Flatten and virtualize ordered group/item rows;
+- [x] **UI-15 — World panel.** Flatten and virtualize ordered group/item rows;
   implement focus-aware selection, expand/collapse, context menus, and
   confirmed deletion. Delete controls stop row-selection propagation. New
   world items start as in-memory pinned Details drafts and reach storage only

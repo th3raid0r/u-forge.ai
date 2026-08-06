@@ -523,6 +523,8 @@ impl ChatPanel {
     /// spawns the agent or direct stream. Used by both `do_send` and
     /// `retry_message`.
     fn send_with_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.model_dropdown_open = false;
+        self.history_dropdown_open = false;
         let Some(runtime) = self.runtime.clone() else {
             self.start_send_with_text(text, None, cx);
             return;
@@ -1505,17 +1507,22 @@ impl Render for ChatPanel {
                                     .border_color(rgb(0x45475a))
                                     .rounded(px(3.0))
                                     .text_sm()
-                                    .text_color(rgba(0xcdd6f4ff))
-                                    .cursor_pointer()
+                                    .text_color(if streaming {
+                                        rgba(0x6c7086ff)
+                                    } else {
+                                        rgba(0xcdd6f4ff)
+                                    })
                                     .overflow_x_hidden()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.history_dropdown_open =
-                                                !this.history_dropdown_open;
-                                            cx.notify();
-                                        }),
-                                    )
+                                    .when(!streaming, |button| {
+                                        button.cursor_pointer().on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.history_dropdown_open =
+                                                    !this.history_dropdown_open;
+                                                cx.notify();
+                                            }),
+                                        )
+                                    })
                                     .child(history_label),
                             )
                             .child({
@@ -1557,14 +1564,19 @@ impl Render for ChatPanel {
                                     .bg(rgb(0xa6e3a1))
                                     .rounded(px(3.0))
                                     .text_sm()
-                                    .text_color(rgba(0x1e1e2eff))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.new_session(cx);
-                                        }),
-                                    )
+                                    .text_color(if streaming {
+                                        rgba(0x6c7086ff)
+                                    } else {
+                                        rgba(0x1e1e2eff)
+                                    })
+                                    .when(!streaming, |button| {
+                                        button.cursor_pointer().on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.new_session(cx);
+                                            }),
+                                        )
+                                    })
                                     .child("New"),
                             ),
                     )
@@ -1852,20 +1864,19 @@ impl Render for ChatPanel {
                                             } else {
                                                 rgba(0x6c7086ff)
                                             })
-                                            .when(reasoning_capable, |toggle| {
-                                                toggle.cursor_pointer()
+                                            .when(!streaming && has_provider, |toggle| {
+                                                toggle.cursor_pointer().on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |this, _: &MouseDownEvent, _window, cx| {
+                                                            this.model_dropdown_open =
+                                                                !this.model_dropdown_open;
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                )
                                             })
                                             .overflow_x_hidden()
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, _window, cx| {
-                                                        this.model_dropdown_open =
-                                                            !this.model_dropdown_open;
-                                                        cx.notify();
-                                                    },
-                                                ),
-                                            )
                                             .child(model_label),
                                     )
                                     .child(
@@ -1889,26 +1900,18 @@ impl Render for ChatPanel {
                                             } else {
                                                 rgba(0x6c7086ff)
                                             })
-                                            .cursor_pointer()
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, _window, cx| {
-                                                        if !this.streaming
-                                                            && this
-                                                                .available_models
-                                                                .get(this.selected_model_idx)
-                                                                .is_some_and(|model| {
-                                                                    model.reasoning_capable
-                                                                })
-                                                        {
+                                            .when(!streaming && reasoning_capable, |toggle| {
+                                                toggle.cursor_pointer().on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |this, _: &MouseDownEvent, _window, cx| {
                                                             this.reasoning_enabled =
                                                                 !this.reasoning_enabled;
                                                             cx.notify();
-                                                        }
-                                                    },
-                                                ),
-                                            )
+                                                        },
+                                                    ),
+                                                )
+                                            })
                                             .child(if !reasoning_capable {
                                                 "Thinking unavailable"
                                             } else if reasoning_enabled {

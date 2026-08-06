@@ -7,8 +7,10 @@ use gpui::{
 };
 
 use crate::{
-    ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, OpenSettings,
-    SaveLayout, ToggleDetailsPanel, TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
+    ClearData, ClearSchema, DetailsCloseTab, DetailsNextTab, DetailsPreviousTab, ExportData,
+    FitGraph, FocusNextRegion, FocusPreviousRegion, ImportData, ImportSchema, OpenSettings,
+    SaveActiveItem, SaveAllItems, ToggleDetailsPanel, ToggleFocusedPanelZoom, TogglePerfOverlay,
+    ToggleRightPanel, ToggleSidebar,
 };
 
 use super::{
@@ -41,7 +43,11 @@ impl Render for AppView {
         let sidebar_tab = self.dock_state.active_panel(DockPosition::Left);
         let right_panel_open = self.dock_state.is_open(DockPosition::Right);
         let details_open = self.dock_state.is_open(DockPosition::Bottom);
-        let assistant_zoomed = self.dock_state.zoomed_panel() == Some(PanelId::Assistant);
+        let zoomed_panel = self.dock_state.zoomed_panel();
+        let left_zoomed = matches!(zoomed_panel, Some(PanelId::World | PanelId::Search));
+        let assistant_zoomed = zoomed_panel == Some(PanelId::Assistant);
+        let details_zoomed = zoomed_panel == Some(PanelId::Details);
+        let any_zoomed = zoomed_panel.is_some();
         let sidebar_width = self.dock_state.size(DockPosition::Left);
         let details_height = self.dock_state.size(DockPosition::Bottom);
         let right_panel_width = self.dock_state.size(DockPosition::Right);
@@ -88,12 +94,36 @@ impl Render for AppView {
             .size_full()
             .bg(theme.colors.app_surface)
             // Handle actions dispatched from native menu or keybindings.
-            .on_action(cx.listener(|this, _: &SaveLayout, _window, cx| {
-                this.do_save(cx);
+            .on_action(cx.listener(|this, _: &SaveActiveItem, _window, cx| {
+                this.do_save_active(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SaveAllItems, _window, cx| {
+                this.do_save_all(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
                 this.open_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFocusedPanelZoom, window, cx| {
+                this.toggle_focused_panel_zoom(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusNextRegion, window, cx| {
+                this.cycle_workspace_focus(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPreviousRegion, window, cx| {
+                this.cycle_workspace_focus(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DetailsNextTab, _window, cx| {
+                this.node_editor
+                    .update(cx, |editor, cx| editor.activate_relative_tab(false, cx));
+            }))
+            .on_action(cx.listener(|this, _: &DetailsPreviousTab, _window, cx| {
+                this.node_editor
+                    .update(cx, |editor, cx| editor.activate_relative_tab(true, cx));
+            }))
+            .on_action(cx.listener(|this, _: &DetailsCloseTab, _window, cx| {
+                this.request_close_active_editor_tab(cx);
             }))
             .on_action(cx.listener(|this, _: &FitGraph, _window, cx| {
                 this.graph_canvas
@@ -272,12 +302,12 @@ impl Render for AppView {
                 // World and Search remain mounted even while inactive or while
                 // the left dock is closed. Each cached inner view keeps stable
                 // bounds; zero-sized outer layers remove inactive hitboxes.
-                let left_open_width = if sidebar_open && !assistant_zoomed {
+                let left_open_width = if sidebar_open && !any_zoomed {
                     sidebar_width
                 } else {
                     0.0
                 };
-                let left_handle_width = if sidebar_open && !assistant_zoomed {
+                let left_handle_width = if sidebar_open && !any_zoomed {
                     RESIZE_HANDLE_SIZE
                 } else {
                     0.0
@@ -287,7 +317,8 @@ impl Render for AppView {
                         .id("left-dock-container")
                         .relative()
                         .flex_none()
-                        .w(px(left_open_width))
+                        .when(left_zoomed, |dock| dock.w_full())
+                        .when(!left_zoomed, |dock| dock.w(px(left_open_width)))
                         .h_full()
                         .overflow_hidden()
                         .child({
@@ -297,7 +328,10 @@ impl Render for AppView {
                                 .absolute()
                                 .top_0()
                                 .left_0()
-                                .w(px(if active { sidebar_width } else { 0.0 }))
+                                .when(left_zoomed && active, |mount| mount.w_full())
+                                .when(!left_zoomed || !active, |mount| {
+                                    mount.w(px(if active { sidebar_width } else { 0.0 }))
+                                })
                                 .h_full()
                                 .overflow_hidden()
                                 .child(
@@ -305,7 +339,8 @@ impl Render for AppView {
                                         .absolute()
                                         .top_0()
                                         .left_0()
-                                        .w(px(sidebar_width))
+                                        .when(left_zoomed, |inner| inner.w_full())
+                                        .when(!left_zoomed, |inner| inner.w(px(sidebar_width)))
                                         .h_full()
                                         .child(
                                             AnyView::from(self.node_panel.clone())
@@ -320,7 +355,10 @@ impl Render for AppView {
                                 .absolute()
                                 .top_0()
                                 .left_0()
-                                .w(px(if active { sidebar_width } else { 0.0 }))
+                                .when(left_zoomed && active, |mount| mount.w_full())
+                                .when(!left_zoomed || !active, |mount| {
+                                    mount.w(px(if active { sidebar_width } else { 0.0 }))
+                                })
                                 .h_full()
                                 .overflow_hidden()
                                 .child(
@@ -328,7 +366,8 @@ impl Render for AppView {
                                         .absolute()
                                         .top_0()
                                         .left_0()
-                                        .w(px(sidebar_width))
+                                        .when(left_zoomed, |inner| inner.w_full())
+                                        .when(!left_zoomed, |inner| inner.w(px(sidebar_width)))
                                         .h_full()
                                         .child(
                                             AnyView::from(self.search_panel.clone())
@@ -395,7 +434,7 @@ impl Render for AppView {
                 workspace.style().flex_grow = Some(1.0);
                 workspace.style().flex_shrink = Some(1.0);
                 workspace.style().flex_basis = Some(relative(0.).into());
-                if assistant_zoomed {
+                if assistant_zoomed || left_zoomed {
                     workspace = workspace.w(px(0.0));
                     workspace.style().flex_grow = Some(0.0);
                     workspace.style().flex_shrink = Some(0.0);
@@ -407,13 +446,13 @@ impl Render for AppView {
                     .id("editor-canvas-resize-handle")
                     .flex_none()
                     .w_full()
-                    .h(px(if details_open {
+                    .h(px(if details_open && !details_zoomed {
                         RESIZE_HANDLE_SIZE
                     } else {
                         0.0
                     }))
                     .overflow_hidden();
-                if details_open {
+                if details_open && !details_zoomed {
                     editor_canvas_handle = editor_canvas_handle
                         .cursor_row_resize()
                         .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
@@ -481,30 +520,49 @@ impl Render for AppView {
                 graph_pane.style().flex_grow = Some(1.0);
                 graph_pane.style().flex_shrink = Some(1.0);
                 graph_pane.style().flex_basis = Some(relative(0.).into());
+                if details_zoomed {
+                    graph_pane = graph_pane.h(px(0.0));
+                    graph_pane.style().flex_grow = Some(0.0);
+                    graph_pane.style().flex_shrink = Some(0.0);
+                }
 
                 // Details remains mounted with stable inner bounds. Closing the
                 // dock clips the cached editor to a zero-height outer wrapper.
-                let details_open_height = if details_open { details_height } else { 0.0 };
-                let editor = div()
+                let details_open_height = if details_open && !details_zoomed {
+                    details_height
+                } else {
+                    0.0
+                };
+                let mut editor = div()
                     .id("details-dock-container")
                     .relative()
                     .flex_none()
                     .w_full()
-                    .h(px(details_open_height))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .absolute()
-                            .bottom_0()
-                            .left_0()
-                            .w_full()
-                            .h(px(details_height))
-                            .overflow_hidden()
-                            .child(
-                                AnyView::from(self.node_editor.clone())
-                                    .cached(StyleRefinement::default().size_full()),
-                            ),
-                    );
+                    .overflow_hidden();
+                if details_zoomed {
+                    editor = editor.h_full();
+                    editor.style().flex_grow = Some(1.0);
+                    editor.style().flex_shrink = Some(1.0);
+                } else {
+                    editor = editor.h(px(details_open_height));
+                }
+                editor = editor.child({
+                    let inner = div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .w_full()
+                        .overflow_hidden();
+                    let inner = if details_zoomed {
+                        inner.h_full()
+                    } else {
+                        inner.h(px(details_height))
+                    };
+                    inner.child(
+                        AnyView::from(self.node_editor.clone())
+                            .cached(StyleRefinement::default().size_full()),
+                    )
+                });
 
                 body = body.child(
                     workspace
@@ -525,12 +583,12 @@ impl Render for AppView {
                 // The AnyView::cached wrapper lets GPUI skip the chat panel's
                 // layout + paint on frames where no ChatPanel / ChatMessageView
                 // entity was notified (e.g. sidebar drags, status bar ticks).
-                let right_open_w = if right_panel_open && !assistant_zoomed {
+                let right_open_w = if right_panel_open && !any_zoomed {
                     right_panel_width
                 } else {
                     0.0
                 };
-                let handle_w = if right_panel_open && !assistant_zoomed {
+                let handle_w = if right_panel_open && !any_zoomed {
                     RESIZE_HANDLE_SIZE
                 } else {
                     0.0
@@ -851,12 +909,33 @@ impl Render for AppView {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                                this.do_save(cx);
+                                                this.do_save_active(cx);
                                                 this.file_menu_open = false;
                                                 cx.notify();
                                             }),
                                         )
-                                        .child("Save                Ctrl+S"),
+                                        .child("Save Changes        Ctrl+S"),
+                                )
+                                .child(
+                                    div()
+                                        .id("save-all-item")
+                                        .flex()
+                                        .items_center()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.do_save_all(cx);
+                                                this.file_menu_open = false;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child("Save All       Ctrl+Shift+S"),
                                 )
                                 // ── separator ──
                                 .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))

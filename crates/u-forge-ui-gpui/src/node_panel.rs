@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, MouseButton, MouseDownEvent, Window, div, prelude::*,
-    px, relative, rgb, rgba,
+    App, Context, Corner, Entity, FocusHandle, Focusable, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, Pixels, Point, Window, anchored, deferred, div, list, point, prelude::*, px,
+    relative, rgb, rgba,
 };
 use parking_lot::RwLock;
 use u_forge_core::ObjectId;
@@ -11,39 +12,54 @@ use u_forge_graph_view::GraphSnapshot;
 use u_forge_ui_traits::node_color_for_type;
 
 use crate::selection_model::SelectionModel;
+use crate::ui::components::{ContextMenu, Tooltip};
+use crate::{
+    WorldActivateRow, WorldDeleteRow, WorldNextRow, WorldOpenContextMenu, WorldPreviousRow,
+};
 
-// ── Events emitted by NodePanel ─────────────────────────────────────────────
-
-/// Emitted when the user clicks the "+" button on a type group header.
-/// Payload is the `object_type` string for the new node.
 pub(crate) struct CreateNodeRequest(pub String);
-
-/// Emitted when the user clicks the delete button next to a node entry.
-/// Payload is the `ObjectId` of the node to delete.
 pub(crate) struct DeleteNodeRequest(pub ObjectId);
 
-// ── Node panel ──────────────────────────────────────────────────────────────
-
-/// A group of nodes sharing the same object_type, for the node panel.
+#[derive(Clone)]
 struct TypeGroup {
     type_name: String,
-    /// (index into snapshot.nodes, display name, ObjectId)
-    entries: Vec<(usize, String, ObjectId)>,
+    entries: Vec<(String, ObjectId)>,
 }
 
-/// Sidebar node view listing all nodes grouped by type, alphabetically.
-///
-/// Emits [`CreateNodeRequest`] and [`DeleteNodeRequest`] events that the
-/// parent `AppView` subscribes to in order to perform DB mutations and
-/// refresh the snapshot.
+#[derive(Clone)]
+enum WorldRow {
+    Group {
+        type_name: String,
+        count: usize,
+        collapsed: bool,
+    },
+    Item {
+        name: String,
+        node_id: ObjectId,
+    },
+}
+
+#[derive(Clone)]
+enum WorldContextTarget {
+    Group(String),
+    Item(ObjectId),
+}
+
+struct WorldContextMenuState {
+    position: Point<Pixels>,
+    target: WorldContextTarget,
+}
+
 pub(crate) struct NodePanel {
     focus: FocusHandle,
     selection: Entity<SelectionModel>,
     snapshot: Arc<RwLock<GraphSnapshot>>,
-    /// Pre-sorted groups, rebuilt when the snapshot changes.
     groups: Vec<TypeGroup>,
-    /// Which type groups are collapsed (by type_name).
-    collapsed: std::collections::HashSet<String>,
+    collapsed: HashSet<String>,
+    visible_rows: Vec<WorldRow>,
+    list_state: ListState,
+    cursor_index: Option<usize>,
+    context_menu: Option<WorldContextMenuState>,
 }
 
 impl gpui::EventEmitter<CreateNodeRequest> for NodePanel {}
@@ -56,210 +72,303 @@ impl NodePanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let groups = Self::build_groups(&snapshot.read());
-        // Start with all groups collapsed so the panel fits on screen.
-        let collapsed: std::collections::HashSet<String> =
-            groups.iter().map(|g| g.type_name.clone()).collect();
+        let collapsed = HashSet::new();
+        let visible_rows = Self::flatten_rows(&groups, &collapsed);
         Self {
             focus: cx.focus_handle(),
             selection,
             snapshot,
             groups,
             collapsed,
+            list_state: ListState::new(visible_rows.len(), ListAlignment::Top, px(200.0)),
+            visible_rows,
+            cursor_index: None,
+            context_menu: None,
         }
     }
 
-    /// Rebuild groups from the current snapshot. Call this after `refresh_snapshot()`.
-    pub(crate) fn refresh_groups(&mut self, cx: &mut gpui::Context<Self>) {
+    pub(crate) fn refresh_groups(&mut self, cx: &mut Context<Self>) {
         self.groups = Self::build_groups(&self.snapshot.read());
+        self.collapsed
+            .retain(|name| self.groups.iter().any(|group| group.type_name == *name));
+        self.rebuild_visible_rows();
         cx.notify();
     }
 
-    fn build_groups(snap: &GraphSnapshot) -> Vec<TypeGroup> {
-        let mut by_type: BTreeMap<String, Vec<(usize, String, ObjectId)>> = BTreeMap::new();
-        for (idx, node) in snap.nodes.iter().enumerate() {
-            by_type.entry(node.object_type.clone()).or_default().push((
-                idx,
-                node.name.clone(),
-                node.id,
-            ));
+    fn build_groups(snapshot: &GraphSnapshot) -> Vec<TypeGroup> {
+        let mut by_type: BTreeMap<String, Vec<(String, ObjectId)>> = BTreeMap::new();
+        for node in &snapshot.nodes {
+            by_type
+                .entry(node.object_type.clone())
+                .or_default()
+                .push((node.name.clone(), node.id));
         }
-        let mut groups: Vec<TypeGroup> = by_type
+        let mut groups = by_type
             .into_iter()
             .map(|(type_name, mut entries)| {
-                entries.sort_by_key(|a| a.1.to_lowercase());
+                entries.sort_by_key(|entry| entry.0.to_lowercase());
                 TypeGroup { type_name, entries }
             })
-            .collect();
-        // BTreeMap already sorts keys, but let's be explicit about case-insensitive sort.
-        groups.sort_by_key(|a| a.type_name.to_lowercase());
+            .collect::<Vec<_>>();
+        groups.sort_by_key(|group| group.type_name.to_lowercase());
         groups
+    }
+
+    fn flatten_rows(groups: &[TypeGroup], collapsed: &HashSet<String>) -> Vec<WorldRow> {
+        let mut rows = Vec::new();
+        for group in groups {
+            let is_collapsed = collapsed.contains(&group.type_name);
+            rows.push(WorldRow::Group {
+                type_name: group.type_name.clone(),
+                count: group.entries.len(),
+                collapsed: is_collapsed,
+            });
+            if !is_collapsed {
+                rows.extend(group.entries.iter().map(|(name, node_id)| WorldRow::Item {
+                    name: name.clone(),
+                    node_id: *node_id,
+                }));
+            }
+        }
+        rows
+    }
+
+    fn rebuild_visible_rows(&mut self) {
+        self.visible_rows = Self::flatten_rows(&self.groups, &self.collapsed);
+        self.list_state.reset(self.visible_rows.len());
+        self.cursor_index = self
+            .cursor_index
+            .map(|index| index.min(self.visible_rows.len().saturating_sub(1)))
+            .filter(|_| !self.visible_rows.is_empty());
+    }
+
+    fn toggle_group(&mut self, type_name: &str) {
+        if !self.collapsed.remove(type_name) {
+            self.collapsed.insert(type_name.to_string());
+        }
+        self.rebuild_visible_rows();
+    }
+
+    fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.visible_rows.is_empty() {
+            self.cursor_index = None;
+            return;
+        }
+        let current = self.cursor_index.unwrap_or(if delta < 0 {
+            self.visible_rows.len()
+        } else {
+            usize::MAX
+        });
+        let next = if delta < 0 {
+            current.wrapping_sub(1) % self.visible_rows.len()
+        } else {
+            current.wrapping_add(1) % self.visible_rows.len()
+        };
+        self.cursor_index = Some(next);
+        self.list_state.scroll_to_reveal_item(next);
+        if let WorldRow::Item { node_id, .. } = self.visible_rows[next] {
+            self.selection.update(cx, |selection, cx| {
+                selection.select_by_id(Some(node_id), cx)
+            });
+        }
+        cx.notify();
+    }
+
+    fn activate_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.cursor_index else {
+            return;
+        };
+        match self.visible_rows.get(index).cloned() {
+            Some(WorldRow::Group { type_name, .. }) => self.toggle_group(&type_name),
+            Some(WorldRow::Item { node_id, .. }) => self.selection.update(cx, |selection, cx| {
+                selection.select_by_id(Some(node_id), cx)
+            }),
+            None => return,
+        }
+        cx.notify();
+    }
+
+    fn delete_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.cursor_index else {
+            return;
+        };
+        if let Some(WorldRow::Item { node_id, .. }) = self.visible_rows.get(index) {
+            cx.emit(DeleteNodeRequest(*node_id));
+        }
+    }
+
+    fn open_cursor_context_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.cursor_index else {
+            return;
+        };
+        let target = match self.visible_rows.get(index) {
+            Some(WorldRow::Group { type_name, .. }) => WorldContextTarget::Group(type_name.clone()),
+            Some(WorldRow::Item { node_id, .. }) => WorldContextTarget::Item(*node_id),
+            None => return,
+        };
+        self.context_menu = Some(WorldContextMenuState {
+            position: point(px(24.0), px(52.0)),
+            target,
+        });
+        cx.notify();
     }
 }
 
 impl Focusable for NodePanel {
-    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus.clone()
     }
 }
 
-/// Color for a type header in the node panel — delegates to the shared palette.
 fn node_type_color(object_type: &str) -> u32 {
-    let [r, g, b, _] = node_color_for_type(object_type);
-    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+    let [red, green, blue, _] = node_color_for_type(object_type);
+    ((red as u32) << 16) | ((green as u32) << 8) | blue as u32
+}
+
+fn display_name(name: &str) -> String {
+    if name.chars().count() <= 32 {
+        return name.to_string();
+    }
+    let mut display = name.chars().take(31).collect::<String>();
+    display.push('…');
+    display
 }
 
 impl Render for NodePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_id = self.selection.read(cx).selected_node_id;
         let panel_focused = self.focus.contains_focused(window, cx);
+        let context_menu = self
+            .context_menu
+            .as_ref()
+            .map(|menu| (menu.position, menu.target.clone()));
+        let entity = cx.entity().clone();
+        let list_entity = entity.clone();
+        let mut rows = list(
+            self.list_state.clone(),
+            move |index, _window, cx: &mut App| {
+                let panel = list_entity.read(cx);
+                let Some(row) = panel.visible_rows.get(index).cloned() else {
+                    return div().into_any_element();
+                };
+                let selected_id = panel.selection.read(cx).selected_node_id;
+                let cursor_index = panel.cursor_index;
 
-        // Outer shell: fixed width, fills parent height, does not grow vertically.
-        let mut panel = div()
-            .id("node-panel")
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w_full()
-            .h_full()
-            .min_h_0()
-            .key_context("WorldPanel")
-            .track_focus(&self.focus)
-            .bg(rgb(0x181825))
-            .border_r_1()
-            .border_color(rgb(0x313244))
-            .when(panel_focused, |panel| {
-                panel.border_1().border_color(rgba(0xb4befeff))
-            });
-
-        // Fixed header
-        panel = panel.child(
-            div()
-                .id("node-header")
-                .flex()
-                .items_center()
-                .h(px(28.0))
-                .px_3()
-                .flex_none()
-                .border_b_1()
-                .border_color(rgb(0x313244))
-                .text_color(rgba(0xcdd6f4ff))
-                .text_base()
-                .child("World"),
-        );
-
-        // Scrollable content area that fills remaining height.
-        let mut scroll_area = div()
-            .id("node-scroll")
-            .flex()
-            .flex_col()
-            .overflow_y_scroll()
-            .min_h_0();
-        scroll_area.style().flex_grow = Some(1.0);
-        scroll_area.style().flex_shrink = Some(1.0);
-        scroll_area.style().flex_basis = Some(relative(0.).into());
-
-        // Groups
-        for (group_idx, group) in self.groups.iter().enumerate() {
-            let type_name = group.type_name.clone();
-            let is_collapsed = self.collapsed.contains(&type_name);
-            let type_color = node_type_color(&type_name);
-            let count = group.entries.len();
-            let collapse_label = format!(
-                "{} {} ({})",
-                if is_collapsed { "\u{25B8}" } else { "\u{25BE}" },
-                type_name,
-                count
-            );
-            let type_name_for_click = type_name.clone();
-            let type_name_for_add = type_name.clone();
-
-            // Type group header row: collapse toggle on the left, "+" button on the right.
-            scroll_area = scroll_area.child(
-                div()
-                    .id(("type-group", group_idx))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .h(px(24.0))
-                    .px_2()
-                    .flex_none()
-                    .text_base()
-                    // Collapse/expand label (left side) — clicking toggles collapse.
-                    .child(
+                match row {
+                    WorldRow::Group {
+                        type_name,
+                        count,
+                        collapsed,
+                    } => {
+                        let toggle_entity = list_entity.clone();
+                        let toggle_name = type_name.clone();
+                        let add_entity = list_entity.clone();
+                        let add_name = type_name.clone();
+                        let cursor_entity = list_entity.clone();
+                        let context_entity = list_entity.clone();
+                        let context_name = type_name.clone();
+                        let toggle_tooltip = if collapsed {
+                            format!("Expand {type_name}")
+                        } else {
+                            format!("Collapse {type_name}")
+                        };
+                        let add_tooltip = format!("Add {type_name}");
                         div()
-                            .id(("type-collapse", group_idx))
+                            .id(("world-group", index))
                             .flex()
-                            .items_center()
-                            .text_color(rgb(type_color))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener({
-                                    let tn = type_name_for_click.clone();
-                                    move |this, _: &MouseDownEvent, _window, cx| {
-                                        if this.collapsed.contains(&tn) {
-                                            this.collapsed.remove(&tn);
-                                        } else {
-                                            this.collapsed.insert(tn.clone());
-                                        }
-                                        cx.notify();
-                                    }
-                                }),
-                            )
-                            .child(collapse_label),
-                    )
-                    // "+" add-node button (right side).
-                    .child(
-                        div()
-                            .id(("type-add", group_idx))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded(px(3.0))
-                            .cursor_pointer()
-                            .text_color(rgba(0xa6e3a1ff)) // Catppuccin green
-                            .hover(|style| style.bg(rgba(0xa6e3a122)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                    cx.emit(CreateNodeRequest(type_name_for_add.clone()));
-                                    // Auto-expand the group so the new node is visible.
-                                    this.collapsed.remove(&type_name_for_click);
-                                    cx.notify();
-                                }),
-                            )
-                            .child("+"),
-                    ),
-            );
-
-            // Node entries (if not collapsed)
-            if !is_collapsed {
-                for (entry_idx, (_node_idx, name, node_id)) in group.entries.iter().enumerate() {
-                    let is_selected = selected_id == Some(*node_id);
-                    let node_id = *node_id;
-                    let node_id_for_delete = node_id;
-                    let display_name = if name.len() > 24 {
-                        let mut s: String = name.chars().take(23).collect();
-                        s.push('\u{2026}');
-                        s
-                    } else {
-                        name.clone()
-                    };
-
-                    scroll_area = scroll_area.child(
-                        div()
-                            .id(("node-entry", group_idx * 10000 + entry_idx))
-                            .flex()
-                            .flex_row()
                             .items_center()
                             .justify_between()
-                            .h(px(22.0))
+                            .h(px(24.0))
+                            .px_2()
+                            .text_base()
+                            .when(cursor_index == Some(index), |row| row.bg(rgba(0x45475a66)))
+                            .child(
+                                div()
+                                    .id(("world-group-toggle", index))
+                                    .flex()
+                                    .items_center()
+                                    .min_w_0()
+                                    .text_color(rgb(node_type_color(&type_name)))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text(toggle_tooltip))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                                            toggle_entity.update(cx, |panel, cx| {
+                                                panel.cursor_index = Some(index);
+                                                panel.toggle_group(&toggle_name);
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                    .child(format!(
+                                        "{} {type_name} ({count})",
+                                        if collapsed { "▸" } else { "▾" }
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id(("world-group-add", index))
+                                    .flex()
+                                    .items_center()
+                                    .h(px(20.0))
+                                    .px_2()
+                                    .rounded(px(3.0))
+                                    .text_xs()
+                                    .text_color(rgba(0xa6e3a1ff))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text(add_tooltip))
+                                    .hover(|style| style.bg(rgba(0xa6e3a122)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                                            add_entity.update(cx, |panel, cx| {
+                                                panel.collapsed.remove(&add_name);
+                                                panel.rebuild_visible_rows();
+                                                cx.emit(CreateNodeRequest(add_name.clone()));
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                    .child("+"),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                                    cursor_entity.update(cx, |panel, _cx| {
+                                        panel.cursor_index = Some(index);
+                                    });
+                                },
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                move |event: &MouseDownEvent, window, cx: &mut App| {
+                                    context_entity.update(cx, |panel, cx| {
+                                        panel.cursor_index = Some(index);
+                                        panel.focus.focus(window);
+                                        panel.context_menu = Some(WorldContextMenuState {
+                                            position: event.position,
+                                            target: WorldContextTarget::Group(context_name.clone()),
+                                        });
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .into_any_element()
+                    }
+                    WorldRow::Item { name, node_id } => {
+                        let is_selected = selected_id == Some(node_id);
+                        let select_entity = list_entity.clone();
+                        let delete_entity = list_entity.clone();
+                        let context_entity = list_entity.clone();
+                        let delete_tooltip = format!("Delete {name}");
+                        div()
+                            .id(("world-item", index))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .h(px(24.0))
                             .pl(px(20.0))
-                            .pr(px(4.0))
-                            .flex_none()
+                            .pr_1()
                             .text_base()
                             .cursor_pointer()
                             .text_color(if is_selected {
@@ -267,59 +376,290 @@ impl Render for NodePanel {
                             } else {
                                 rgba(0xa6adc8ff)
                             })
-                            .when(is_selected, |el| el.bg(rgba(0x45475aaa)))
-                            // Click on the node name area to select it.
+                            .when(is_selected, |row| row.bg(rgba(0x45475aaa)))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                    this.selection.update(cx, |sel, cx| {
-                                        sel.select_by_id(Some(node_id), cx);
+                                move |_event: &MouseDownEvent, window, cx: &mut App| {
+                                    select_entity.update(cx, |panel, cx| {
+                                        panel.cursor_index = Some(index);
+                                        panel.focus.focus(window);
+                                        panel.selection.update(cx, |selection, cx| {
+                                            selection.select_by_id(Some(node_id), cx);
+                                        });
                                     });
-                                }),
+                                },
                             )
-                            // Node name on the left.
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                move |event: &MouseDownEvent, window, cx: &mut App| {
+                                    context_entity.update(cx, |panel, cx| {
+                                        panel.cursor_index = Some(index);
+                                        panel.focus.focus(window);
+                                        panel.selection.update(cx, |selection, cx| {
+                                            selection.select_by_id(Some(node_id), cx);
+                                        });
+                                        panel.context_menu = Some(WorldContextMenuState {
+                                            position: event.position,
+                                            target: WorldContextTarget::Item(node_id),
+                                        });
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .child(div().min_w_0().overflow_hidden().child(display_name(&name)))
                             .child(
                                 div()
+                                    .id(("world-item-delete", index))
                                     .flex()
                                     .items_center()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .child(display_name),
-                            )
-                            // Delete button on the right.
-                            .child(
-                                div()
-                                    .id(("node-delete", group_idx * 10000 + entry_idx))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .w(px(18.0))
                                     .h(px(18.0))
+                                    .px_1()
                                     .rounded(px(3.0))
-                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgba(0xf38ba8aa))
                                     .cursor_pointer()
-                                    .text_color(rgba(0xf38ba8aa)) // Catppuccin red (muted)
+                                    .tooltip(Tooltip::text(delete_tooltip))
                                     .hover(|style| {
                                         style.bg(rgba(0xf38ba822)).text_color(rgba(0xf38ba8ff))
                                     })
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(
-                                            move |_this, _event: &MouseDownEvent, _window, cx| {
-                                                // Stop propagation: prevent the parent row's
-                                                // on_mouse_down from selecting the node.
-                                                cx.stop_propagation();
-                                                cx.emit(DeleteNodeRequest(node_id_for_delete));
-                                            },
-                                        ),
+                                        move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                                            cx.stop_propagation();
+                                            delete_entity.update(cx, |_panel, cx| {
+                                                cx.emit(DeleteNodeRequest(node_id));
+                                            });
+                                        },
                                     )
-                                    .child("\u{2715}"), // ✕ multiplication sign
-                            ),
-                    );
+                                    .child("−"),
+                            )
+                            .into_any_element()
+                    }
                 }
-            }
-        }
+            },
+        );
+        rows.style().flex_grow = Some(1.0);
+        rows.style().flex_shrink = Some(1.0);
+        rows.style().flex_basis = Some(relative(0.0).into());
 
-        panel.child(scroll_area)
+        let mut list_container = div()
+            .id("world-list")
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .overflow_hidden()
+            .child(rows);
+        list_container.style().flex_grow = Some(1.0);
+        list_container.style().flex_shrink = Some(1.0);
+        list_container.style().flex_basis = Some(relative(0.0).into());
+
+        let root = div()
+            .id("node-panel")
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .key_context("WorldPanel")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &WorldNextRow, _window, cx| {
+                this.move_cursor(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &WorldPreviousRow, _window, cx| {
+                this.move_cursor(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &WorldActivateRow, _window, cx| {
+                this.activate_cursor(cx);
+            }))
+            .on_action(cx.listener(|this, _: &WorldDeleteRow, _window, cx| {
+                this.delete_cursor(cx);
+            }))
+            .on_action(cx.listener(|this, _: &WorldOpenContextMenu, _window, cx| {
+                this.open_cursor_context_menu(cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    if this.context_menu.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .bg(rgb(0x181825))
+            .border_r_1()
+            .border_color(rgb(0x313244))
+            .when(panel_focused, |panel| {
+                panel.border_1().border_color(rgba(0xb4befeff))
+            })
+            .child(
+                div()
+                    .id("node-header")
+                    .flex()
+                    .items_center()
+                    .h(px(28.0))
+                    .px_3()
+                    .flex_none()
+                    .border_b_1()
+                    .border_color(rgb(0x313244))
+                    .text_color(rgba(0xcdd6f4ff))
+                    .text_base()
+                    .child("World"),
+            )
+            .child(list_container);
+
+        root.when_some(context_menu, |root, (position, target)| {
+            let menu_body = match target {
+                WorldContextTarget::Group(type_name) => {
+                    let toggle_entity = entity.clone();
+                    let toggle_name = type_name.clone();
+                    let create_entity = entity.clone();
+                    div()
+                        .w(px(180.0))
+                        .child(context_menu_item(
+                            "Show / Hide Group",
+                            move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                                cx.stop_propagation();
+                                toggle_entity.update(cx, |panel, cx| {
+                                    panel.toggle_group(&toggle_name);
+                                    panel.context_menu = None;
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .child(context_menu_item(
+                            "New World Item",
+                            move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                                cx.stop_propagation();
+                                create_entity.update(cx, |panel, cx| {
+                                    panel.context_menu = None;
+                                    panel.collapsed.remove(&type_name);
+                                    panel.rebuild_visible_rows();
+                                    cx.emit(CreateNodeRequest(type_name.clone()));
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .into_any_element()
+                }
+                WorldContextTarget::Item(node_id) => {
+                    let open_entity = entity.clone();
+                    let delete_entity = entity.clone();
+                    div()
+                        .w(px(180.0))
+                        .child(context_menu_item(
+                            "Open Details",
+                            move |_event: &MouseDownEvent, window, cx: &mut App| {
+                                cx.stop_propagation();
+                                open_entity.update(cx, |panel, cx| {
+                                    panel.context_menu = None;
+                                    panel.focus.focus(window);
+                                    panel.selection.update(cx, |selection, cx| {
+                                        selection.select_by_id(Some(node_id), cx);
+                                    });
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .child(context_menu_item(
+                            "Delete…",
+                            move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                                cx.stop_propagation();
+                                delete_entity.update(cx, |panel, cx| {
+                                    panel.context_menu = None;
+                                    cx.emit(DeleteNodeRequest(node_id));
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .into_any_element()
+                }
+            };
+            root.child(deferred(
+                anchored()
+                    .position(position)
+                    .anchor(Corner::TopLeft)
+                    .child(ContextMenu::new("world-context-menu", menu_body)),
+            ))
+        })
+    }
+}
+
+fn context_menu_item(
+    label: &'static str,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(label)
+        .flex()
+        .items_center()
+        .h(px(26.0))
+        .px_3()
+        .text_sm()
+        .text_color(rgba(0xcdd6f4ff))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0x45475a88)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flattened_rows_preserve_group_and_item_order() {
+        let groups = vec![
+            TypeGroup {
+                type_name: "Location".into(),
+                entries: vec![("Alderaan".into(), ObjectId::new_v4())],
+            },
+            TypeGroup {
+                type_name: "NPC".into(),
+                entries: vec![("Bryn".into(), ObjectId::new_v4())],
+            },
+        ];
+        let collapsed = HashSet::from(["NPC".to_string()]);
+        let rows = NodePanel::flatten_rows(&groups, &collapsed);
+        assert_eq!(rows.len(), 3);
+        assert!(
+            matches!(rows[0], WorldRow::Group { ref type_name, .. } if type_name == "Location")
+        );
+        assert!(matches!(rows[1], WorldRow::Item { ref name, .. } if name == "Alderaan"));
+        assert!(
+            matches!(rows[2], WorldRow::Group { ref type_name, collapsed: true, .. } if type_name == "NPC")
+        );
+    }
+
+    #[test]
+    fn initially_expanded_groups_include_every_item_row() {
+        let groups = vec![
+            TypeGroup {
+                type_name: "Location".into(),
+                entries: vec![
+                    ("Alderaan".into(), ObjectId::new_v4()),
+                    ("Bespin".into(), ObjectId::new_v4()),
+                ],
+            },
+            TypeGroup {
+                type_name: "NPC".into(),
+                entries: vec![("Bryn".into(), ObjectId::new_v4())],
+            },
+        ];
+
+        let rows = NodePanel::flatten_rows(&groups, &HashSet::new());
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, WorldRow::Group { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, WorldRow::Item { .. }))
+                .count(),
+            3
+        );
     }
 }

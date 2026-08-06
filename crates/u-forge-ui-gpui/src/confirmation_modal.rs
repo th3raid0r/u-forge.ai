@@ -4,15 +4,19 @@ use gpui::{
 };
 
 pub(crate) struct ConfirmationAccepted;
+pub(crate) struct ConfirmationAlternative;
 pub(crate) struct ConfirmationCancelled;
 
 pub(crate) struct ConfirmationModal {
     title: String,
     message: String,
     confirm_label: String,
+    alternative_label: Option<String>,
+    destructive: bool,
 }
 
 impl EventEmitter<ConfirmationAccepted> for ConfirmationModal {}
+impl EventEmitter<ConfirmationAlternative> for ConfirmationModal {}
 impl EventEmitter<ConfirmationCancelled> for ConfirmationModal {}
 
 impl ConfirmationModal {
@@ -21,7 +25,19 @@ impl ConfirmationModal {
             title,
             message,
             confirm_label,
+            alternative_label: None,
+            destructive: true,
         }
+    }
+
+    pub(crate) fn with_alternative(mut self, label: impl Into<String>) -> Self {
+        self.alternative_label = Some(label.into());
+        self
+    }
+
+    pub(crate) fn non_destructive(mut self) -> Self {
+        self.destructive = false;
+        self
     }
 }
 
@@ -81,6 +97,37 @@ impl Render for ConfirmationModal {
                                 .border_color(rgb(0x45475a))
                                 .child(
                                     div()
+                                        .id("confirmation-alternative")
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .border_1()
+                                        .border_color(rgb(0xf38ba8))
+                                        .rounded(px(4.0))
+                                        .text_sm()
+                                        .text_color(rgba(0xf38ba8ff))
+                                        .when(self.alternative_label.is_none(), |button| {
+                                            button.hidden()
+                                        })
+                                        .when(self.alternative_label.is_some(), |button| {
+                                            button
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(rgba(0xf38ba822)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |_this, _: &MouseDownEvent, _window, cx| {
+                                                            cx.stop_propagation();
+                                                            cx.emit(ConfirmationAlternative);
+                                                        },
+                                                    ),
+                                                )
+                                        })
+                                        .child(self.alternative_label.clone().unwrap_or_default()),
+                                )
+                                .child(
+                                    div()
                                         .id("confirmation-cancel")
                                         .h(px(28.0))
                                         .px_3()
@@ -111,7 +158,11 @@ impl Render for ConfirmationModal {
                                         .px_3()
                                         .flex()
                                         .items_center()
-                                        .bg(rgb(0xf38ba8))
+                                        .bg(if self.destructive {
+                                            rgb(0xf38ba8)
+                                        } else {
+                                            rgb(0x89b4fa)
+                                        })
                                         .rounded(px(4.0))
                                         .text_sm()
                                         .text_color(rgba(0x1e1e2eff))

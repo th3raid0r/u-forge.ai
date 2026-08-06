@@ -16,8 +16,12 @@ use crate::text_field::{TextArrowKey, TextChanged, TextFieldView, TextSubmit};
 
 pub(crate) use field_spec::{EditableEdge, EditorTab};
 
+pub(crate) struct SaveActiveRequested;
+impl gpui::EventEmitter<SaveActiveRequested> for NodeEditorPanel {}
 pub(crate) struct SaveAllRequested;
 impl gpui::EventEmitter<SaveAllRequested> for NodeEditorPanel {}
+pub(crate) struct DiscardActiveRequested;
+impl gpui::EventEmitter<DiscardActiveRequested> for NodeEditorPanel {}
 pub(crate) struct CloseDirtyTabRequested(pub usize);
 impl gpui::EventEmitter<CloseDirtyTabRequested> for NodeEditorPanel {}
 
@@ -212,7 +216,7 @@ impl NodeEditorPanel {
             node_id,
             name: meta.name.clone(),
             object_type: meta.object_type.clone(),
-            pinned: false,
+            pinned: is_new,
             original: meta.clone(),
             edited_values: edited_values.clone(),
             schema: schema.clone(),
@@ -271,7 +275,7 @@ impl NodeEditorPanel {
             node_id,
             name: meta.name.clone(),
             object_type: meta.object_type.clone(),
-            pinned: false,
+            pinned: is_new,
             original: meta,
             edited_values,
             schema,
@@ -315,6 +319,53 @@ impl NodeEditorPanel {
             }
         }
         self.rebuild_field_subscriptions(cx);
+    }
+
+    pub(crate) fn activate_relative_tab(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let Some(next) = relative_tab_index(active, self.tabs.len(), previous) else {
+            return;
+        };
+        self.active_tab = Some(next);
+        self.edge_node_dropdown = None;
+        self.array_add_field = None;
+        self.rebuild_field_subscriptions(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn discard_tab_changes(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<(ObjectId, bool)> {
+        let tab = self.tabs.get(index)?;
+        let node_id = tab.node_id;
+        let is_new = tab.is_new;
+        let was_pinned = tab.pinned;
+        self.close_tab(index, cx);
+
+        if !is_new {
+            let pin_states = self
+                .tabs
+                .iter()
+                .map(|tab| (tab.node_id, tab.pinned))
+                .collect::<HashMap<_, _>>();
+            for tab in &mut self.tabs {
+                tab.pinned = true;
+            }
+            self.open_or_focus_tab(node_id, cx);
+            for tab in &mut self.tabs {
+                tab.pinned = if tab.node_id == node_id {
+                    was_pinned
+                } else {
+                    pin_states.get(&tab.node_id).copied().unwrap_or(tab.pinned)
+                };
+            }
+        }
+        cx.notify();
+        Some((node_id, is_new))
     }
 
     /// Remove stale edge references to a deleted node from all open tabs.
@@ -369,6 +420,30 @@ impl NodeEditorPanel {
         &mut self,
         cx: &mut Context<Self>,
     ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+        self.save_tabs(None, cx)
+    }
+
+    pub(crate) fn save_active_tab(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+        let active = self.active_tab;
+        self.save_tabs(active, cx)
+    }
+
+    pub(crate) fn save_tab(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+        self.save_tabs(Some(index), cx)
+    }
+
+    fn save_tabs(
+        &mut self,
+        target: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
         let mut saved = 0usize;
         let mut saved_ids = Vec::new();
         let mut discarded_ids = Vec::new();
@@ -377,7 +452,7 @@ impl NodeEditorPanel {
         // First pass: identify empty-new tabs to discard.
         let mut discard_indices = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
-            if tab.is_new && tab.name.trim().is_empty() {
+            if target.is_none_or(|target| target == i) && tab.is_new && tab.name.trim().is_empty() {
                 discard_indices.push(i);
                 discarded_ids.push(tab.node_id);
             }
@@ -385,19 +460,22 @@ impl NodeEditorPanel {
         // Empty drafts have never reached storage; removing their tabs is enough.
         for &idx in discard_indices.iter().rev() {
             self.tabs.remove(idx);
+            self.active_tab = match self.active_tab {
+                _ if self.tabs.is_empty() => None,
+                Some(active) if active == idx => Some(idx.min(self.tabs.len() - 1)),
+                Some(active) if active > idx => Some(active - 1),
+                active => active,
+            };
         }
-        // Fix active_tab after removals.
-        if self.tabs.is_empty() {
-            self.active_tab = None;
-        } else if let Some(active) = self.active_tab
-            && active >= self.tabs.len()
-        {
-            self.active_tab = Some(self.tabs.len() - 1);
-        }
+        let target = if target.is_some() && !discard_indices.is_empty() {
+            Some(usize::MAX)
+        } else {
+            target
+        };
 
         // Second pass: persist dirty tabs.
-        for tab in &mut self.tabs {
-            if !tab.dirty {
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if !tab.dirty || target.is_some_and(|target| target != index) {
                 continue;
             }
             let mut meta = tab.original.clone();
@@ -521,10 +599,26 @@ impl NodeEditorPanel {
     }
 
     pub(crate) fn incomplete_relationship_count(&self) -> usize {
+        self.incomplete_relationship_count_for(None)
+    }
+
+    pub(crate) fn active_incomplete_relationship_count(&self) -> usize {
+        self.active_tab.map_or(0, |active| {
+            self.incomplete_relationship_count_for(Some(active))
+        })
+    }
+
+    pub(crate) fn incomplete_relationship_count_at(&self, index: usize) -> usize {
+        self.incomplete_relationship_count_for(Some(index))
+    }
+
+    fn incomplete_relationship_count_for(&self, target: Option<usize>) -> usize {
         self.tabs
             .iter()
-            .filter(|tab| tab.dirty)
-            .flat_map(|tab| &tab.edited_edges)
+            .enumerate()
+            .filter(|(index, _tab)| target.is_none_or(|target| target == *index))
+            .filter(|(_index, tab)| tab.dirty)
+            .flat_map(|(_index, tab)| &tab.edited_edges)
             .filter(|edge| {
                 edge.from.is_none() || edge.to.is_none() || edge.edge_type.trim().is_empty()
             })
@@ -786,5 +880,31 @@ impl NodeEditorPanel {
 impl Focusable for NodeEditorPanel {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+fn relative_tab_index(active: usize, len: usize, previous: bool) -> Option<usize> {
+    if len == 0 || active >= len {
+        return None;
+    }
+    Some(if previous {
+        active.checked_sub(1).unwrap_or(len - 1)
+    } else {
+        (active + 1) % len
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_tab_index;
+
+    #[test]
+    fn relative_tab_navigation_wraps_and_rejects_stale_state() {
+        assert_eq!(relative_tab_index(0, 3, false), Some(1));
+        assert_eq!(relative_tab_index(2, 3, false), Some(0));
+        assert_eq!(relative_tab_index(0, 3, true), Some(2));
+        assert_eq!(relative_tab_index(2, 3, true), Some(1));
+        assert_eq!(relative_tab_index(0, 0, false), None);
+        assert_eq!(relative_tab_index(3, 3, false), None);
     }
 }

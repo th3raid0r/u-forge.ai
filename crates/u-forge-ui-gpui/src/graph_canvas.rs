@@ -2,9 +2,10 @@ use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use glam::Vec2;
 use gpui::{
-    Bounds, Context, Entity, Font, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, TextRun,
-    Window, canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size,
+    Bounds, Context, Entity, FocusHandle, Focusable, Font, Hsla, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent,
+    SharedString, Subscription, TextRun, Window, canvas, div, fill, font, point, prelude::*, px,
+    rgb, rgba, size,
 };
 use parking_lot::RwLock;
 use u_forge_core::{KnowledgeGraph, ObjectId};
@@ -21,6 +22,7 @@ use crate::selection_model::SelectionModel;
 const EDGE_BATCH_SIZE: usize = 500;
 
 pub(crate) struct GraphCanvas {
+    focus: FocusHandle,
     pub(crate) snapshot: Arc<RwLock<GraphSnapshot>>,
     graph: Arc<KnowledgeGraph>,
     selection: Entity<SelectionModel>,
@@ -62,6 +64,7 @@ impl GraphCanvas {
             cx.notify();
         });
         Self {
+            focus: cx.focus_handle(),
             snapshot,
             graph,
             selection,
@@ -134,6 +137,12 @@ impl GraphCanvas {
     }
 }
 
+impl Focusable for GraphCanvas {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 fn reconcile_dragged_node(
     dragging: Option<ObjectId>,
     current: &GraphSnapshot,
@@ -163,21 +172,28 @@ fn color_to_hsla(c: [u8; 4]) -> Hsla {
 }
 
 impl Render for GraphCanvas {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let zoom = self.zoom;
         let camera = self.camera;
         let snapshot = self.snapshot.clone();
         let selected_node_id = self.selection.read(cx).selected_node_id;
         let canvas_bounds_arc = self.canvas_bounds.clone();
+        let focused = self.focus.contains_focused(window, cx);
 
         div()
             .id("graph-root")
+            .key_context("WorldCanvas")
+            .track_focus(&self.focus)
             .size_full()
             .overflow_hidden()
             .bg(rgb(0x1e1e2e))
+            .when(focused, |canvas| {
+                canvas.border_1().border_color(rgba(0xb4befeff))
+            })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.focus.focus(window);
                     this.last_mouse = event.position;
 
                     let (canvas_size, origin) = this.canvas_metrics();

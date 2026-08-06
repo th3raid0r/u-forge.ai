@@ -9,7 +9,8 @@ use u_forge_core::PropertyType;
 
 use super::field_spec::SubTab;
 use super::{
-    CloseDirtyTabRequested, NodeEditorPanel, SaveAllRequested,
+    CloseDirtyTabRequested, DiscardActiveRequested, NodeEditorPanel, SaveActiveRequested,
+    SaveAllRequested,
     field_spec::{
         COLUMN_W, DETAIL_TAB_H, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H, PAGE_NAV_H,
         SUBTAB_BAR_H,
@@ -123,7 +124,11 @@ impl Render for NodeEditorPanel {
             }
 
             // Pin indicator
-            let pin_label: SharedString = if is_pinned { "P".into() } else { "o".into() };
+            let pin_label: SharedString = if is_pinned {
+                "Pinned".into()
+            } else {
+                "Pin".into()
+            };
             let pin_btn = div()
                 .id(("tab-pin", i))
                 .text_base()
@@ -136,6 +141,7 @@ impl Render for NodeEditorPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
                         if let Some(tab) = this.tabs.get_mut(i) {
                             tab.pinned = !tab.pinned;
                         }
@@ -167,6 +173,7 @@ impl Render for NodeEditorPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
                         if is_dirty {
                             cx.emit(CloseDirtyTabRequested(i));
                         } else {
@@ -175,7 +182,7 @@ impl Render for NodeEditorPanel {
                         }
                     }),
                 )
-                .child("x");
+                .child("Close");
 
             tab_el = tab_el.child(pin_btn).child(name_el).child(close_btn);
 
@@ -193,6 +200,51 @@ impl Render for NodeEditorPanel {
             tab_bar = tab_bar.child(tab_el);
         }
         let dirty = self.has_dirty_tabs();
+        let active_dirty = self.tabs.get(active_idx).is_some_and(|tab| tab.dirty);
+        let mut save_active = div()
+            .id("details-save-active")
+            .flex()
+            .flex_none()
+            .items_center()
+            .h_full()
+            .px_3()
+            .text_base()
+            .text_color(if active_dirty {
+                rgba(0xa6e3a1ff)
+            } else {
+                rgba(0x6c7086ff)
+            })
+            .child("Save Changes");
+        if active_dirty {
+            save_active = save_active.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
+                    cx.emit(SaveActiveRequested);
+                }),
+            );
+        }
+        let mut discard_active = div()
+            .id("details-discard-active")
+            .flex()
+            .flex_none()
+            .items_center()
+            .h_full()
+            .px_3()
+            .text_base()
+            .text_color(if active_dirty {
+                rgba(0xfab387ff)
+            } else {
+                rgba(0x6c7086ff)
+            })
+            .child("Discard Changes");
+        if active_dirty {
+            discard_active = discard_active.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
+                    cx.emit(DiscardActiveRequested);
+                }),
+            );
+        }
         let mut save_all = div()
             .id("details-save-all")
             .flex()
@@ -220,6 +272,8 @@ impl Render for NodeEditorPanel {
             spacer.style().flex_grow = Some(1.0);
             spacer
         });
+        tab_bar = tab_bar.child(save_active);
+        tab_bar = tab_bar.child(discard_active);
         tab_bar = tab_bar.child(save_all);
 
         // ── Form content for active tab ──────────────────────────────────────

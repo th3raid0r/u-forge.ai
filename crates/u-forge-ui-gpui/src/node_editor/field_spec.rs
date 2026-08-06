@@ -385,6 +385,9 @@ impl EditorTab {
             || props_changed
             || tags_changed
             || edges_changed;
+        if self.dirty {
+            self.pinned = true;
+        }
     }
 
     /// Compare `edited_edges` against `original_edges` to decide if edges

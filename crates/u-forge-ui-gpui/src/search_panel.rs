@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, MouseButton, MouseDownEvent, Window, div, prelude::*,
-    px, relative, rgb, rgba,
+    App, Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, Window, div, list, prelude::*, px, relative, rgb, rgba,
 };
 use tracing::Instrument;
 use u_forge_core::{
@@ -27,6 +27,7 @@ pub(crate) enum SearchMode {
 
 // ── Result entry ──────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct SearchResult {
     node_id: ObjectId,
     name: String,
@@ -76,6 +77,7 @@ pub(crate) struct SearchPanel {
     query_field: Entity<TextFieldView>,
     mode: SearchMode,
     results: Vec<SearchResult>,
+    results_list: ListState,
     searching: bool,
     error: Option<String>,
     stage_outcomes: Option<SearchStageOutcomes>,
@@ -118,6 +120,7 @@ impl SearchPanel {
             query_field,
             mode: SearchMode::Fts5,
             results: Vec::new(),
+            results_list: ListState::new(0, ListAlignment::Top, px(22.0)),
             searching: false,
             error: None,
             stage_outcomes: None,
@@ -181,6 +184,7 @@ impl SearchPanel {
         self.stage_outcomes = None;
         self.degradation_hint = None;
         self.results.clear();
+        self.results_list.reset(0);
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
         self.search_task.take();
@@ -284,6 +288,7 @@ impl SearchPanel {
                                 })
                             })
                             .collect();
+                        panel.results_list.reset(panel.results.len());
                         if panel.results.is_empty() {
                             panel.error = Some("No results found.".to_string());
                         }
@@ -317,7 +322,6 @@ fn result_type_color(object_type: &str) -> u32 {
 
 impl Render for SearchPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_id = self.selection.read(cx).selected_node_id;
         let panel_focused = self.focus.contains_focused(window, cx);
         let semantic_available = self.compatible_semantic_lane.is_some();
         let mode = self.mode;
@@ -537,29 +541,26 @@ impl Render for SearchPanel {
         }
 
         // ── Results list ──────────────────────────────────────────────────────
-        let mut scroll_area = div()
-            .id("search-results")
-            .flex()
-            .flex_col()
-            .overflow_y_scroll()
-            .min_h_0();
-        scroll_area.style().flex_grow = Some(1.0);
-        scroll_area.style().flex_shrink = Some(1.0);
-        scroll_area.style().flex_basis = Some(relative(0.).into());
+        let entity = cx.entity().clone();
+        let mut result_rows = list(
+            self.results_list.clone(),
+            move |idx, _window, cx: &mut App| {
+                let panel = entity.read(cx);
+                let Some(result) = panel.results.get(idx).cloned() else {
+                    return div().into_any_element();
+                };
+                let node_id = result.node_id;
+                let is_selected = panel.selection.read(cx).selected_node_id == Some(node_id);
+                let type_color = result_type_color(&result.object_type);
+                let display_name = if result.name.chars().count() > 24 {
+                    let mut name = result.name.chars().take(23).collect::<String>();
+                    name.push('…');
+                    name
+                } else {
+                    result.name
+                };
+                let select_entity = entity.clone();
 
-        for (idx, result) in self.results.iter().enumerate() {
-            let node_id = result.node_id;
-            let is_selected = selected_id == Some(node_id);
-            let type_color = result_type_color(&result.object_type);
-            let display_name = if result.name.len() > 24 {
-                let mut s: String = result.name.chars().take(23).collect();
-                s.push('…');
-                s
-            } else {
-                result.name.clone()
-            };
-
-            scroll_area = scroll_area.child(
                 div()
                     .id(("search-result", idx))
                     .flex()
@@ -568,7 +569,6 @@ impl Render for SearchPanel {
                     .h(px(22.0))
                     .pl(px(8.0))
                     .pr(px(4.0))
-                    .flex_none()
                     .gap(px(6.0))
                     .text_base()
                     .cursor_pointer()
@@ -580,13 +580,15 @@ impl Render for SearchPanel {
                     .when(is_selected, |el| el.bg(rgba(0x45475aaa)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                            this.selection.update(cx, |sel, cx| {
-                                sel.select_by_id(Some(node_id), cx);
+                        move |_event: &MouseDownEvent, window, cx: &mut App| {
+                            select_entity.update(cx, |panel, cx| {
+                                panel.focus.focus(window);
+                                panel.selection.update(cx, |selection, cx| {
+                                    selection.select_by_id(Some(node_id), cx);
+                                });
                             });
-                        }),
+                        },
                     )
-                    // Colored type dot
                     .child(
                         div()
                             .flex_none()
@@ -595,10 +597,24 @@ impl Render for SearchPanel {
                             .rounded_full()
                             .bg(gpui::rgb(type_color)),
                     )
-                    .child(display_name),
-            );
-        }
+                    .child(display_name)
+                    .into_any_element()
+            },
+        );
+        result_rows.style().flex_grow = Some(1.0);
+        result_rows.style().flex_shrink = Some(1.0);
+        result_rows.style().flex_basis = Some(relative(0.0).into());
 
+        let mut scroll_area = div()
+            .id("search-results")
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .overflow_hidden()
+            .child(result_rows);
+        scroll_area.style().flex_grow = Some(1.0);
+        scroll_area.style().flex_shrink = Some(1.0);
+        scroll_area.style().flex_basis = Some(relative(0.).into());
         panel.child(scroll_area)
     }
 }

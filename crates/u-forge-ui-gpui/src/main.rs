@@ -6,10 +6,16 @@ use gpui::{
 };
 use u_forge_core::AppConfig;
 use u_forge_ui_gpui::{
-    AppView, ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, OpenSettings,
-    SaveLayout, ToggleDetailsPanel, TogglePerfOverlay, ToggleRightPanel, ToggleSidebar, UiTheme,
+    AppView, ClearData, ClearSchema, DetailsCloseTab, DetailsNextTab, DetailsPreviousTab,
+    ExportData, FitGraph, FocusNextRegion, FocusPreviousRegion, ImportData, ImportSchema,
+    OpenSettings, SaveActiveItem, SaveAllItems, ToggleDetailsPanel, ToggleFocusedPanelZoom,
+    TogglePerfOverlay, ToggleRightPanel, ToggleSidebar, UiTheme, WorldActivateRow, WorldDeleteRow,
+    WorldNextRow, WorldOpenContextMenu, WorldPreviousRow,
     startup::{StartupTimeline, prepare_app},
 };
+
+const DETAILS_NEXT_TAB_KEY: &str = "ctrl-pagedown";
+const DETAILS_PREVIOUS_TAB_KEY: &str = "ctrl-pageup";
 
 fn main() {
     let startup = StartupTimeline::from_env();
@@ -41,10 +47,26 @@ fn main() {
         UiTheme::init(cx);
         // Register keybindings.
         cx.bind_keys([
-            KeyBinding::new("ctrl-s", SaveLayout, None),
+            KeyBinding::new("ctrl-s", SaveActiveItem, None),
+            KeyBinding::new("ctrl-shift-s", SaveAllItems, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("ctrl-j", ToggleRightPanel, None),
             KeyBinding::new("ctrl-shift-j", ToggleDetailsPanel, None),
+            KeyBinding::new("ctrl-shift-m", ToggleFocusedPanelZoom, None),
+            KeyBinding::new("f6", FocusNextRegion, None),
+            KeyBinding::new("shift-f6", FocusPreviousRegion, None),
+            KeyBinding::new("down", WorldNextRow, Some("WorldPanel")),
+            KeyBinding::new("up", WorldPreviousRow, Some("WorldPanel")),
+            KeyBinding::new("enter", WorldActivateRow, Some("WorldPanel")),
+            KeyBinding::new("delete", WorldDeleteRow, Some("WorldPanel")),
+            KeyBinding::new("shift-f10", WorldOpenContextMenu, Some("WorldPanel")),
+            KeyBinding::new(DETAILS_NEXT_TAB_KEY, DetailsNextTab, Some("DetailsPanel")),
+            KeyBinding::new(
+                DETAILS_PREVIOUS_TAB_KEY,
+                DetailsPreviousTab,
+                Some("DetailsPanel"),
+            ),
+            KeyBinding::new("ctrl-w", DetailsCloseTab, Some("DetailsPanel")),
             KeyBinding::new("ctrl-,", OpenSettings, None),
             KeyBinding::new("ctrl-shift-p", TogglePerfOverlay, None),
             KeyBinding::new("ctrl-shift-0", FitGraph, None),
@@ -55,7 +77,8 @@ fn main() {
             Menu {
                 name: "File".into(),
                 items: vec![
-                    MenuItem::action("Save", SaveLayout),
+                    MenuItem::action("Save Changes", SaveActiveItem),
+                    MenuItem::action("Save All", SaveAllItems),
                     MenuItem::separator(),
                     MenuItem::action("Import Schema…", ImportSchema),
                     MenuItem::action("Import Data…", ImportData),
@@ -71,6 +94,7 @@ fn main() {
                     MenuItem::action("Toggle World", ToggleSidebar),
                     MenuItem::action("Toggle Assistant", ToggleRightPanel),
                     MenuItem::action("Toggle Details", ToggleDetailsPanel),
+                    MenuItem::action("Maximize Focused Panel", ToggleFocusedPanelZoom),
                     MenuItem::action("Settings…", OpenSettings),
                     MenuItem::action("Fit Connections", FitGraph),
                     MenuItem::separator(),
@@ -96,4 +120,21 @@ fn main() {
         )
         .unwrap();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::Keystroke;
+
+    use super::{DETAILS_NEXT_TAB_KEY, DETAILS_PREVIOUS_TAB_KEY};
+
+    #[test]
+    fn details_tab_keybindings_use_gpui_named_key_syntax() {
+        for binding in [DETAILS_NEXT_TAB_KEY, DETAILS_PREVIOUS_TAB_KEY] {
+            assert!(
+                Keystroke::parse(binding).is_ok(),
+                "invalid binding: {binding}"
+            );
+        }
+    }
 }
