@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use gpui::{
-    Context, EventEmitter, MouseButton, MouseDownEvent, Render, Window, deferred, div, prelude::*,
-    px, rgb, rgba,
+    Context, EventEmitter, MouseButton, MouseDownEvent, Render, Window, canvas, deferred, div,
+    prelude::*, px, rgb, rgba,
 };
 use u_forge_core::{
     ChatDevice, ReasoningControl,
@@ -13,6 +13,8 @@ use u_forge_core::{
         component_state, initial_setup_components, setup_chat_models,
     },
 };
+
+use crate::startup::{StartupMilestone, StartupTimeline};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SetupRequested {
@@ -172,6 +174,7 @@ pub(crate) struct SetupPanel {
     status: String,
     busy: bool,
     external_confirmation_armed: bool,
+    startup: Option<StartupTimeline>,
 }
 
 impl EventEmitter<SetupRequested> for SetupPanel {}
@@ -222,7 +225,13 @@ impl SetupPanel {
                 .to_string(),
             busy: false,
             external_confirmation_armed: false,
+            startup: None,
         }
+    }
+
+    pub(crate) fn with_startup_timeline(mut self, startup: StartupTimeline) -> Self {
+        self.startup = Some(startup);
+        self
     }
 
     pub(crate) fn is_complete(&self) -> bool {
@@ -713,6 +722,7 @@ fn device_text(device: &ChatDevice) -> &'static str {
 
 impl Render for SetupPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let startup = self.startup.clone();
         let mut components = div().flex().flex_col().gap(px(3.0));
         for (index, row) in self.component_rows.iter().enumerate() {
             let ready = row.state == SetupComponentState::Ready && row.backend_ready;
@@ -1365,7 +1375,26 @@ impl Render for SetupPanel {
                                         .child(provision_label),
                                 ),
                         ),
-                ),
+                )
+                .when_some(startup, |root, startup| {
+                    root.child(
+                        canvas(
+                            |_, _, _| {},
+                            move |_, (), _, cx| {
+                                if startup.milestone(StartupMilestone::SetupFirstPaint)
+                                    && startup.should_exit_after(StartupMilestone::SetupFirstPaint)
+                                {
+                                    cx.quit();
+                                }
+                            },
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(1.0))
+                        .h(px(1.0)),
+                    )
+                }),
         )
     }
 }

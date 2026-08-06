@@ -155,11 +155,18 @@ impl GraphSnapshot {
 /// 5. Relaxes only nodes without a saved position
 /// 6. Builds the R-tree spatial index
 pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
+    let total_start = std::time::Instant::now();
+    let object_start = std::time::Instant::now();
     let objects = graph.get_all_objects()?;
+    let object_duration_us = object_start.elapsed().as_micros() as u64;
+    let edge_start = std::time::Instant::now();
     let raw_edges = graph.get_all_edges()?;
+    let edge_duration_us = edge_start.elapsed().as_micros() as u64;
 
     // Load any previously saved UI positions (empty map on first run)
+    let position_start = std::time::Instant::now();
     let saved_positions = graph.load_layout().unwrap_or_default();
+    let position_duration_us = position_start.elapsed().as_micros() as u64;
 
     // Build ObjectId → usize index map
     let id_to_idx: HashMap<ObjectId, usize> = objects
@@ -195,10 +202,13 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
         })
         .collect();
 
+    let layout_start = std::time::Instant::now();
     apply_saved_and_layout_new_nodes(&mut nodes, &edges, &saved_positions);
     ensure_finite_positions(&nodes)?;
+    let layout_duration_us = layout_start.elapsed().as_micros() as u64;
 
     // Build R-tree spatial index from final positions
+    let index_start = std::time::Instant::now();
     let spatial_index = RTree::bulk_load(
         nodes
             .iter()
@@ -208,9 +218,26 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
             })
             .collect(),
     );
+    let index_duration_us = index_start.elapsed().as_micros() as u64;
 
     // Precompute type counts and the sorted unique type list for the legend.
+    let legend_start = std::time::Instant::now();
     let (legend_types, type_counts) = build_legend(&nodes);
+    let legend_duration_us = legend_start.elapsed().as_micros() as u64;
+
+    tracing::info!(
+        nodes = nodes.len(),
+        edges = edges.len(),
+        saved_positions = saved_positions.len(),
+        object_duration_us,
+        edge_duration_us,
+        position_duration_us,
+        layout_duration_us,
+        index_duration_us,
+        legend_duration_us,
+        duration_us = total_start.elapsed().as_micros() as u64,
+        "Graph snapshot built"
+    );
 
     Ok(GraphSnapshot {
         nodes,

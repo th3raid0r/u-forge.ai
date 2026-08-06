@@ -115,14 +115,28 @@ pub(crate) struct ChatHistoryStore {
 impl ChatHistoryStore {
     /// Open (or create) the chat history database at `<db_path>/chat_history.db`.
     pub fn open(db_path: &Path) -> Result<Self> {
+        let total_start = std::time::Instant::now();
+        let directory_start = std::time::Instant::now();
         std::fs::create_dir_all(db_path)
             .with_context(|| format!("creating db directory: {}", db_path.display()))?;
+        let directory_duration_us = directory_start.elapsed().as_micros() as u64;
 
         let db_file = db_path.join("chat_history.db");
+        let open_start = std::time::Instant::now();
         let conn = Connection::open(&db_file)
             .with_context(|| format!("opening chat history db: {}", db_file.display()))?;
+        let open_duration_us = open_start.elapsed().as_micros() as u64;
+        let schema_start = std::time::Instant::now();
         conn.execute_batch(CHAT_SCHEMA)
             .context("initializing chat history schema")?;
+        tracing::info!(
+            db_path = %db_file.display(),
+            directory_duration_us,
+            open_duration_us,
+            schema_duration_us = schema_start.elapsed().as_micros() as u64,
+            duration_us = total_start.elapsed().as_micros() as u64,
+            "Chat history store opened"
+        );
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

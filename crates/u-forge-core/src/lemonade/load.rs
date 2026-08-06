@@ -200,9 +200,11 @@ pub async fn load_model_for_recipe_with_connection(
     opts: &ModelLoadOptions,
     already_loaded: &[String],
 ) -> Result<()> {
+    let start = std::time::Instant::now();
     if already_loaded.iter().any(|id| id == model_name) {
         tracing::debug!(
             model = model_name,
+            duration_us = start.elapsed().as_micros() as u64,
             "Model already loaded — skipping load call"
         );
         return Ok(());
@@ -240,6 +242,7 @@ pub async fn load_model_for_recipe_with_connection(
         ctx_size = ?opts.ctx_size,
         recipe,
         effective_llamacpp_args = ?effective_args,
+        duration_us = start.elapsed().as_micros() as u64,
         "Model loaded via Lemonade Server"
     );
 

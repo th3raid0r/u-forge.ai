@@ -197,15 +197,48 @@ impl LemonadeServerCatalog {
     }
 
     pub async fn discover_with_connection(connection: Arc<LemonadeConnection>) -> Result<Self> {
+        let total_start = std::time::Instant::now();
         let client = LemonadeHttpClient::from_connection(connection);
         let base = client.base_url.clone();
 
         let (models_result, sysinfo_result, health_result) = tokio::join!(
             // Setup needs the full built-in catalog, not OpenAI's default
             // downloaded-only view.
-            client.get_json::<RawModelsResponse>("/models?show_all=true"),
-            Self::fetch_system_info(&client),
-            client.get_json::<RawHealthResponse>("/health"),
+            async {
+                let start = std::time::Instant::now();
+                let result = client
+                    .get_json::<RawModelsResponse>("/models?show_all=true")
+                    .await;
+                info!(
+                    endpoint = "models",
+                    success = result.is_ok(),
+                    duration_us = start.elapsed().as_micros() as u64,
+                    "Lemonade metadata request completed"
+                );
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = Self::fetch_system_info(&client).await;
+                info!(
+                    endpoint = "system_info",
+                    success = result.is_ok(),
+                    duration_us = start.elapsed().as_micros() as u64,
+                    "Lemonade metadata request completed"
+                );
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = client.get_json::<RawHealthResponse>("/health").await;
+                info!(
+                    endpoint = "health",
+                    success = result.is_ok(),
+                    duration_us = start.elapsed().as_micros() as u64,
+                    "Lemonade metadata request completed"
+                );
+                result
+            },
         );
         let models_resp = models_result?;
 
@@ -266,6 +299,7 @@ impl LemonadeServerCatalog {
             loaded_count = loaded.len(),
             %processor,
             memory_gb,
+            duration_us = total_start.elapsed().as_micros() as u64,
             "Lemonade server catalog built",
         );
 
