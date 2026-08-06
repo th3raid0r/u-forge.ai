@@ -28,6 +28,14 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../../../assets/icons/copy.svg"),
     ),
     (
+        "icons/bot.svg",
+        include_bytes!("../../../assets/icons/bot.svg"),
+    ),
+    (
+        "icons/edit.svg",
+        include_bytes!("../../../assets/icons/edit.svg"),
+    ),
+    (
         "icons/floppy-disc.svg",
         include_bytes!("../../../assets/icons/floppy-disc.svg"),
     ),
@@ -137,7 +145,7 @@ mod tests {
         let assets = Assets;
         let listed = assets.list("icons/").unwrap();
 
-        assert_eq!(listed.len(), 25);
+        assert_eq!(listed.len(), 27);
         for path in listed {
             assert!(assets.load(path.as_ref()).unwrap().is_some());
         }

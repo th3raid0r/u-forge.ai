@@ -713,6 +713,7 @@ impl Render for AppView {
                             .child(
                                 StatusItem::new("status-world", PanelId::World.title())
                                     .icon(IconName::World)
+                                    .icon_only()
                                     .active(sidebar_open && sidebar_tab == PanelId::World)
                                     .tooltip("Show or hide the World panel (Ctrl+B)")
                                     .on_click(|_, window, cx| {
@@ -722,6 +723,7 @@ impl Render for AppView {
                             .child(
                                 StatusItem::new("status-search", PanelId::Search.title())
                                     .icon(IconName::Search)
+                                    .icon_only()
                                     .active(sidebar_open && sidebar_tab == PanelId::Search)
                                     .tooltip("Show or hide Search (Ctrl+Shift+F)")
                                     .on_click(|_, window, cx| {
@@ -822,6 +824,8 @@ impl Render for AppView {
                             .px_1()
                             .child(
                                 StatusItem::new("status-details", PanelId::Details.title())
+                                    .icon(IconName::Edit)
+                                    .icon_only()
                                     .active(details_open)
                                     .tooltip("Show or hide Details (Ctrl+Shift+J)")
                                     .on_click(|_, window, cx| {
@@ -830,6 +834,8 @@ impl Render for AppView {
                             )
                             .child(
                                 StatusItem::new("status-assistant", PanelId::Assistant.title())
+                                    .icon(IconName::Bot)
+                                    .icon_only()
                                     .active(right_panel_open)
                                     .tooltip("Show or hide Assistant (Ctrl+J)")
                                     .on_click(|_, window, cx| {

@@ -338,6 +338,7 @@ pub struct StatusItem {
     id: ElementId,
     label: SharedString,
     icon: Option<IconName>,
+    show_label: bool,
     active: bool,
     tone: StatusTone,
     tooltip: Option<SharedString>,
@@ -350,6 +351,7 @@ impl StatusItem {
             id: id.into(),
             label: label.into(),
             icon: None,
+            show_label: true,
             active: false,
             tone: StatusTone::Normal,
             tooltip: None,
@@ -364,6 +366,11 @@ impl StatusItem {
 
     pub fn icon(mut self, icon: IconName) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    pub fn icon_only(mut self) -> Self {
+        self.show_label = false;
         self
     }
 
@@ -410,7 +417,7 @@ impl RenderOnce for StatusItem {
             .text_color(color)
             .when(self.active, |item| item.bg(theme.colors.selected))
             .children(self.icon.map(|icon| Icon::new(icon, 12.0, color)))
-            .child(self.label);
+            .when(self.show_label, |item| item.child(self.label));
         if let Some(handler) = self.on_click {
             item = item
                 .cursor_pointer()

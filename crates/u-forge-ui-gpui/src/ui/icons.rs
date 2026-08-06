@@ -6,11 +6,13 @@ use gpui::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconName {
+    Bot,
     ChevronDown,
     ChevronRight,
     Close,
     CloseCircle,
     Copy,
+    Edit,
     FloppyDisc,
     Maximize,
     Minus,
@@ -36,11 +38,13 @@ pub enum IconName {
 impl IconName {
     const fn path(self) -> &'static str {
         match self {
+            Self::Bot => "icons/bot.svg",
             Self::ChevronDown => "icons/chevron-down.svg",
             Self::ChevronRight => "icons/chevron-right.svg",
             Self::Close => "icons/close.svg",
             Self::CloseCircle => "icons/close-circle.svg",
             Self::Copy => "icons/copy.svg",
+            Self::Edit => "icons/edit.svg",
             Self::FloppyDisc => "icons/floppy-disc.svg",
             Self::Maximize => "icons/maximize.svg",
             Self::Minus => "icons/minus.svg",
