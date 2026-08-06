@@ -5,7 +5,7 @@ TEST_THREADS ?= 1
 CARGO_CLIPPY_FLAGS := --workspace --no-deps
 COSMIC_TEXT_MANIFEST := crates/cosmic-text-patched/Cargo.toml
 
-.PHONY: help build check test fmt fmt-check clippy
+.PHONY: help build check test fmt fmt-check clippy startup-profile-fresh startup-profile-configured
 
 help:
 	@printf '%s\n' 'u-forge.ai development targets'
@@ -15,6 +15,8 @@ help:
 	@printf '%s\n' '  make fmt        Format the workspace'
 	@printf '%s\n' '  make fmt-check  Verify workspace formatting'
 	@printf '%s\n' '  make clippy     Run strict workspace clippy'
+	@printf '%s\n' '  make startup-profile-fresh       Profile isolated first launch'
+	@printf '%s\n' '  make startup-profile-configured  Profile configured metadata readiness'
 
 build:
 	$(CARGO) build --workspace
@@ -39,3 +41,9 @@ fmt-check:
 
 clippy:
 	$(CARGO) clippy $(CARGO_CLIPPY_FLAGS) -- -D warnings
+
+startup-profile-fresh:
+	bash ./scripts/profile-startup.sh fresh
+
+startup-profile-configured:
+	bash ./scripts/profile-startup.sh configured

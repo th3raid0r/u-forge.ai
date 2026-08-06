@@ -393,7 +393,10 @@ impl KnowledgeGraphStorage {
         embedding_dimensions: usize,
         high_quality_embedding_dimensions: usize,
     ) -> Result<Self> {
+        let total_start = std::time::Instant::now();
+        let directory_start = std::time::Instant::now();
         std::fs::create_dir_all(db_path).context("Failed to create database directory")?;
+        let directory_duration_us = directory_start.elapsed().as_micros() as u64;
 
         // Register sqlite-vec as a process-wide SQLite auto-extension so that
         // every subsequent Connection::open automatically gets the vec0
@@ -414,21 +417,26 @@ impl KnowledgeGraphStorage {
         });
 
         let db_file = db_path.join("knowledge.db");
+        let open_start = std::time::Instant::now();
         let conn = Connection::open(&db_file)
             .with_context(|| format!("Failed to open SQLite database at {db_file:?}"))?;
+        let open_duration_us = open_start.elapsed().as_micros() as u64;
 
         // Apply WAL mode, FK enforcement, DDL, indexes, FTS triggers, and the
         // chunks_vec vec0 virtual table in one batch.  `execute_batch` uses
         // sqlite3_exec internally and ignores result rows from PRAGMA statements.
+        let schema_start = std::time::Instant::now();
         conn.execute_batch(&sql_schema(
             embedding_dimensions,
             high_quality_embedding_dimensions,
         ))
         .context("Failed to initialise database schema")?;
+        let schema_duration_us = schema_start.elapsed().as_micros() as u64;
 
         // Verify (or record) the embedding dimensions baked into each vec0 table.
         // Returns EmbeddingDimensionMismatch if the model was changed without
         // recreating the database.
+        let dimensions_start = std::time::Instant::now();
         check_or_init_embedding_dims(
             &conn,
             &[
@@ -436,6 +444,16 @@ impl KnowledgeGraphStorage {
                 ("chunks_vec_hq", high_quality_embedding_dimensions),
             ],
         )?;
+        let dimensions_duration_us = dimensions_start.elapsed().as_micros() as u64;
+        tracing::info!(
+            db_path = %db_file.display(),
+            directory_duration_us,
+            open_duration_us,
+            schema_duration_us,
+            dimensions_duration_us,
+            duration_us = total_start.elapsed().as_micros() as u64,
+            "Knowledge graph storage opened"
+        );
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

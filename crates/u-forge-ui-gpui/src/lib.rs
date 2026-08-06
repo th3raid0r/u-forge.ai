@@ -11,7 +11,11 @@ pub mod path_picker;
 pub mod search_panel;
 pub mod selection_model;
 mod setup_panel;
+pub mod startup;
 pub mod text_field;
+
+#[cfg(test)]
+mod startup_tests;
 
 pub use app_view::AppView;
 

@@ -16,6 +16,7 @@ use super::{
     MENU_BAR_H, MIN_PANE_RATIO, MIN_PANEL_W, MIN_WORKSPACE_W, RESIZE_HANDLE_SIZE,
     ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H, SidebarTab,
 };
+use crate::startup::StartupMilestone;
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -39,6 +40,8 @@ impl Render for AppView {
         let right_panel_width = self.right_panel_width;
         let embedding_status = self.state.embedding_status.clone();
         let perf_enabled = self.perf_enabled;
+        let startup = self.startup.clone();
+        let app_first_paint_pending = !startup.contains(StartupMilestone::AppFirstPaint);
 
         // Build perf overlay text when enabled.
         // `last_frame_cost_us` is populated by the timing canvas at the bottom of
@@ -911,6 +914,26 @@ impl Render for AppView {
             })
             // ── Reopenable Lemonade setup ───────────────────────────────────
             .when(setup_open, |root| root.child(self.setup_panel.clone()))
+            // ── Startup first-paint milestone ────────────────────────────────
+            .when(app_first_paint_pending, |root| {
+                root.child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, (), _, cx| {
+                            if startup.milestone(StartupMilestone::AppFirstPaint)
+                                && startup.should_exit_after(StartupMilestone::AppFirstPaint)
+                            {
+                                cx.quit();
+                            }
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(1.0))
+                    .h(px(1.0)),
+                )
+            })
             // ── Frame-cost timing canvas ──────────────────────────────────────
             // Zero-size absolute element; its paint closure fires after GPUI
             // completes the full layout pass, making elapsed() an honest measure

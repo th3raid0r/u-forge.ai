@@ -10054,6 +10054,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "u-forge-core",
 ]
 
@@ -10079,6 +10080,7 @@ dependencies = [
  "gpui-ce",
  "parking_lot",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

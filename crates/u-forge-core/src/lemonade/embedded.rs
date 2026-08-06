@@ -65,11 +65,14 @@ impl EmbeddedLemonade {
         ports: impl IntoIterator<Item = u16>,
         timeouts: LemonadeTimeouts,
     ) -> Result<Arc<Self>> {
+        let total_start = std::time::Instant::now();
         if !binary.is_file() {
             return Err(EmbeddedRuntimeError::MissingArtifact(binary).into());
         }
         let package_root = binary.parent().context("lemond path has no parent")?;
+        let prepare_start = std::time::Instant::now();
         prepare_private_root(package_root, &data_root)?;
+        let prepare_duration_us = prepare_start.elapsed().as_micros() as u64;
 
         let api_key = std::env::var("LEMONADE_API_KEY")
             .ok()
@@ -81,10 +84,14 @@ impl EmbeddedLemonade {
             .unwrap_or_else(random_secret);
         let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
 
+        let mut port_probe_duration_us = 0_u64;
         for port in ports {
+            let port_start = std::time::Instant::now();
             if !port_is_available(port).await {
+                port_probe_duration_us += port_start.elapsed().as_micros() as u64;
                 continue;
             }
+            port_probe_duration_us += port_start.elapsed().as_micros() as u64;
             let connection = Arc::new(LemonadeConnection::with_credentials(
                 &format!("http://127.0.0.1:{port}/v1"),
                 LemonadeOwnership::Embedded,
@@ -99,9 +106,11 @@ impl EmbeddedLemonade {
                 api_key.as_str(),
                 admin_key.as_str(),
             );
+            let spawn_start = std::time::Instant::now();
             let mut child = command
                 .spawn()
                 .with_context(|| format!("failed to launch {}", binary.display()))?;
+            let spawn_duration_us = spawn_start.elapsed().as_micros() as u64;
             if let Some(stdout) = child.stdout.take() {
                 capture_output(
                     stdout,
@@ -121,8 +130,18 @@ impl EmbeddedLemonade {
                 );
             }
             let child = Arc::new(tokio::sync::Mutex::new(Some(child)));
+            let readiness_start = std::time::Instant::now();
             match wait_until_ready(connection.clone(), child.clone()).await {
                 Ok(()) => {
+                    tracing::info!(
+                        port,
+                        prepare_duration_us,
+                        port_probe_duration_us,
+                        spawn_duration_us,
+                        readiness_duration_us = readiness_start.elapsed().as_micros() as u64,
+                        duration_us = total_start.elapsed().as_micros() as u64,
+                        "Embedded Lemonade launched"
+                    );
                     let shutting_down = Arc::new(AtomicBool::new(false));
                     monitor_child_exit(child.clone(), diagnostics.clone(), shutting_down.clone());
                     return Ok(Arc::new(Self {

@@ -59,6 +59,7 @@ impl LemonadeProvider {
     }
 
     async fn probe(client: Client<OpenAIConfig>, base_url: &str, model: &str) -> Result<Self> {
+        let start = std::time::Instant::now();
         let probe_req = CreateEmbeddingRequest {
             model: model.to_string(),
             input: EmbeddingInput::StringArray(vec!["dimension probe".to_string()]),
@@ -88,7 +89,13 @@ impl LemonadeProvider {
                 )
             })?;
 
-        info!(base_url, model, dimensions, "LemonadeProvider connected");
+        info!(
+            base_url,
+            model,
+            dimensions,
+            duration_us = start.elapsed().as_micros() as u64,
+            "LemonadeProvider connected"
+        );
 
         Ok(Self {
             client,
