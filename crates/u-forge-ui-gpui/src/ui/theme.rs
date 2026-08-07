@@ -108,9 +108,9 @@ impl Default for UiTheme {
                 // the 0.875-rem labels, while remaining below body copy.
                 chrome: rems(0.8125),
                 caption: rems(0.75),
-                icon_small: rems(0.75),
-                icon_medium: rems(0.8125),
-                icon_large: rems(1.0),
+                icon_small: rems(0.875),
+                icon_medium: rems(1.0),
+                icon_large: rems(1.125),
             },
         }
     }
@@ -132,8 +132,10 @@ mod tests {
     fn typography_relative_icons_scale_with_the_root_font() {
         let typography = UiTheme::default().typography;
 
-        assert_eq!(typography.icon_medium.0 * 16.0, 13.0);
-        assert_eq!(typography.icon_medium.0 * 24.0, 19.5);
+        assert_eq!(typography.icon_small.0 * 16.0, 14.0);
+        assert_eq!(typography.icon_medium.0 * 16.0, 16.0);
+        assert_eq!(typography.icon_large.0 * 16.0, 18.0);
+        assert_eq!(typography.icon_medium.0 * 24.0, 24.0);
     }
 }
 
