@@ -16,6 +16,10 @@
 //! | `"skip"`    | Always skip, even if a server is reachable              |
 //! | any URL     | Use that URL directly; **panic** if unreachable         |
 //!
+//! Canonical `make test` starts one checksum-pinned embedded server for the
+//! entire suite and supplies its URL in `require` mode. The table describes
+//! direct Cargo invocations and the environment contract used by that runner.
+//!
 //! ## Usage
 //!
 //! ```ignore

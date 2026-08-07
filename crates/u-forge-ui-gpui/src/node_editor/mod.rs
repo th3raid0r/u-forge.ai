@@ -4,7 +4,9 @@ mod render;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{Context, Entity, Pixels, Subscription, prelude::*};
+use gpui::{
+    Context, Entity, FocusHandle, Focusable, Pixels, Point, ScrollHandle, Subscription, prelude::*,
+};
 use parking_lot::RwLock;
 use u_forge_core::{
     EdgeType, KnowledgeGraph, ObjectId, ObjectMetadata, PropertyType, SchemaManager,
@@ -15,6 +17,9 @@ use crate::selection_model::SelectionModel;
 use crate::text_field::{TextArrowKey, TextChanged, TextFieldView, TextSubmit};
 
 pub(crate) use field_spec::{EditableEdge, EditorTab};
+
+pub(crate) struct CloseDirtyTabRequested(pub usize);
+impl gpui::EventEmitter<CloseDirtyTabRequested> for NodeEditorPanel {}
 
 // ── Edge node-selector dropdown state ─────────────────────────────────────────
 
@@ -39,14 +44,26 @@ pub(crate) struct EdgeNodeDropdown {
     pub(crate) highlighted_idx: usize,
 }
 
+#[derive(Clone)]
+struct TabContextMenuState {
+    position: Point<Pixels>,
+    index: usize,
+    focus: FocusHandle,
+}
+
 // ── Node editor panel ─────────────────────────────────────────────────────────
 
 /// Editor panel with browser-style tabs for editing nodes.
 ///
 /// Observes `SelectionModel` and opens tabs as nodes are selected.
 pub(crate) struct NodeEditorPanel {
+    pub(crate) focus: FocusHandle,
     pub(crate) tabs: Vec<EditorTab>,
     pub(crate) active_tab: Option<usize>,
+    /// Keeps the active tab visible when tabs are opened, selected, or moved.
+    tab_bar_scroll: ScrollHandle,
+    /// Right-click actions for a Details tab.
+    tab_context_menu: Option<TabContextMenuState>,
     #[allow(dead_code)]
     selection: Entity<SelectionModel>,
     #[allow(dead_code)]
@@ -88,8 +105,11 @@ impl NodeEditorPanel {
             cx.notify();
         });
         Self {
+            focus: cx.focus_handle(),
             tabs: Vec::new(),
             active_tab: None,
+            tab_bar_scroll: ScrollHandle::new(),
+            tab_context_menu: None,
             selection,
             snapshot,
             graph,
@@ -113,8 +133,7 @@ impl NodeEditorPanel {
     pub(crate) fn open_or_focus_tab(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
         // Already open?
         if let Some(idx) = self.tabs.iter().position(|t| t.node_id == node_id) {
-            self.active_tab = Some(idx);
-            self.rebuild_field_subscriptions(cx);
+            self.activate_tab(idx, cx);
             return;
         }
 
@@ -127,23 +146,7 @@ impl NodeEditorPanel {
         self.open_tab_for_metadata(meta, false, cx);
     }
 
-    /// Open a tab for a **newly created** node (from the node panel "+" button).
-    ///
-    /// The tab is marked `is_new = true` so that on save, if the name is still
-    /// empty, the DB record is deleted and the tab discarded.
-    pub(crate) fn open_new_node_tab(&mut self, node_id: ObjectId, cx: &mut Context<Self>) {
-        // If already open, just focus.
-        if let Some(idx) = self.tabs.iter().position(|t| t.node_id == node_id) {
-            self.active_tab = Some(idx);
-            self.rebuild_field_subscriptions(cx);
-            return;
-        }
-
-        let meta = match self.graph.get_object(node_id) {
-            Ok(Some(m)) => m,
-            _ => return,
-        };
-
+    pub(crate) fn open_new_draft(&mut self, meta: ObjectMetadata, cx: &mut Context<Self>) {
         self.open_tab_for_metadata(meta, true, cx);
     }
 
@@ -154,6 +157,7 @@ impl NodeEditorPanel {
         is_new: bool,
         cx: &mut Context<Self>,
     ) {
+        self.tab_context_menu = None;
         let node_id = meta.id;
 
         // Load schema for this object type. File-loaded schemas live under
@@ -207,7 +211,7 @@ impl NodeEditorPanel {
             .map(|ee| {
                 let et = ee.edge_type.clone();
                 cx.new(|cx| {
-                    let mut tf = TextFieldView::new(false, "edge type", cx);
+                    let mut tf = TextFieldView::new(false, "relationship type", cx);
                     tf.set_content(&et, cx);
                     tf
                 })
@@ -221,7 +225,7 @@ impl NodeEditorPanel {
             node_id,
             name: meta.name.clone(),
             object_type: meta.object_type.clone(),
-            pinned: false,
+            pinned: is_new,
             original: meta.clone(),
             edited_values: edited_values.clone(),
             schema: schema.clone(),
@@ -280,7 +284,7 @@ impl NodeEditorPanel {
             node_id,
             name: meta.name.clone(),
             object_type: meta.object_type.clone(),
-            pinned: false,
+            pinned: is_new,
             original: meta,
             edited_values,
             schema,
@@ -303,7 +307,21 @@ impl NodeEditorPanel {
             self.active_tab = Some(self.tabs.len() - 1);
         }
 
+        self.reveal_active_tab();
         self.rebuild_field_subscriptions(cx);
+    }
+
+    pub(crate) fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.active_tab = Some(index);
+        self.tab_context_menu = None;
+        self.edge_node_dropdown = None;
+        self.array_add_field = None;
+        self.reveal_active_tab();
+        self.rebuild_field_subscriptions(cx);
+        cx.notify();
     }
 
     /// Close a tab by index.
@@ -313,6 +331,7 @@ impl NodeEditorPanel {
         }
         self.edge_node_dropdown = None;
         self.array_add_field = None;
+        self.tab_context_menu = None;
         self.tabs.remove(idx);
         if self.tabs.is_empty() {
             self.active_tab = None;
@@ -323,7 +342,41 @@ impl NodeEditorPanel {
                 self.active_tab = Some(active - 1);
             }
         }
+        self.reveal_active_tab();
         self.rebuild_field_subscriptions(cx);
+    }
+
+    pub(crate) fn activate_relative_tab(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let Some(next) = relative_tab_index(active, self.tabs.len(), previous) else {
+            return;
+        };
+        self.activate_tab(next, cx);
+    }
+
+    pub(crate) fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = self
+            .active_tab
+            .map(|active| remap_index_after_move(active, from, to));
+        self.tab_context_menu = None;
+        self.edge_node_dropdown = None;
+        self.array_add_field = None;
+        self.reveal_active_tab();
+        self.rebuild_field_subscriptions(cx);
+        cx.notify();
+    }
+
+    fn reveal_active_tab(&self) {
+        if let Some(active) = self.active_tab {
+            self.tab_bar_scroll.scroll_to_item(active);
+        }
     }
 
     /// Remove stale edge references to a deleted node from all open tabs.
@@ -373,9 +426,33 @@ impl NodeEditorPanel {
     /// Returns `(count, saved_ids, discarded_ids)`:
     /// - `count`: how many nodes were actually persisted.
     /// - `saved_ids`: ObjectIds that need re-chunking/re-embedding.
-    /// - `discarded_ids`: ObjectIds of "empty new" nodes that were deleted.
+    /// - `discarded_ids`: ObjectIds of empty in-memory drafts that were closed.
     pub(crate) fn save_dirty_tabs(
         &mut self,
+        cx: &mut Context<Self>,
+    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+        self.save_tabs(None, cx)
+    }
+
+    pub(crate) fn save_active_tab(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+        let active = self.active_tab;
+        self.save_tabs(active, cx)
+    }
+
+    pub(crate) fn save_tab(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+        self.save_tabs(Some(index), cx)
+    }
+
+    fn save_tabs(
+        &mut self,
+        target: Option<usize>,
         cx: &mut Context<Self>,
     ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
         let mut saved = 0usize;
@@ -386,29 +463,32 @@ impl NodeEditorPanel {
         // First pass: identify empty-new tabs to discard.
         let mut discard_indices = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
-            if tab.is_new && tab.name.trim().is_empty() {
+            if target.is_none_or(|target| target == i) && tab.is_new && tab.name.trim().is_empty() {
                 discard_indices.push(i);
                 discarded_ids.push(tab.node_id);
             }
         }
-        // Delete DB records for discarded nodes (reverse order to keep indices valid).
+        // Empty drafts have never reached storage; removing their tabs is enough.
         for &idx in discard_indices.iter().rev() {
-            let node_id = self.tabs[idx].node_id;
-            let _ = self.graph.delete_object(node_id);
+            self.tab_context_menu = None;
             self.tabs.remove(idx);
+            self.active_tab = match self.active_tab {
+                _ if self.tabs.is_empty() => None,
+                Some(active) if active == idx => Some(idx.min(self.tabs.len() - 1)),
+                Some(active) if active > idx => Some(active - 1),
+                active => active,
+            };
         }
-        // Fix active_tab after removals.
-        if self.tabs.is_empty() {
-            self.active_tab = None;
-        } else if let Some(active) = self.active_tab
-            && active >= self.tabs.len()
-        {
-            self.active_tab = Some(self.tabs.len() - 1);
-        }
+        let target = if target.is_some() && !discard_indices.is_empty() {
+            Some(usize::MAX)
+        } else {
+            target
+        };
+        self.reveal_active_tab();
 
         // Second pass: persist dirty tabs.
-        for tab in &mut self.tabs {
-            if !tab.dirty {
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if !tab.dirty || target.is_some_and(|target| target != index) {
                 continue;
             }
             let mut meta = tab.original.clone();
@@ -445,7 +525,12 @@ impl NodeEditorPanel {
             }
             meta.properties = serde_json::Value::Object(props);
 
-            if self.graph.update_object(meta.clone()).is_ok() {
+            let persist_result = if tab.is_new {
+                self.graph.add_object(meta.clone()).map(|_| ())
+            } else {
+                self.graph.update_object(meta.clone())
+            };
+            if persist_result.is_ok() {
                 // ── Save edge changes ─────────────────────────────────────
                 skipped_edges += Self::save_edges_for_tab(&self.graph, tab);
 
@@ -521,9 +606,35 @@ impl NodeEditorPanel {
     }
 
     /// Return true if any tab has unsaved changes.
-    #[allow(dead_code)]
     pub(crate) fn has_dirty_tabs(&self) -> bool {
         self.tabs.iter().any(|t| t.dirty)
+    }
+
+    pub(crate) fn incomplete_relationship_count(&self) -> usize {
+        self.incomplete_relationship_count_for(None)
+    }
+
+    pub(crate) fn active_incomplete_relationship_count(&self) -> usize {
+        self.active_tab.map_or(0, |active| {
+            self.incomplete_relationship_count_for(Some(active))
+        })
+    }
+
+    pub(crate) fn incomplete_relationship_count_at(&self, index: usize) -> usize {
+        self.incomplete_relationship_count_for(Some(index))
+    }
+
+    fn incomplete_relationship_count_for(&self, target: Option<usize>) -> usize {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(index, _tab)| target.is_none_or(|target| target == *index))
+            .filter(|(_index, tab)| tab.dirty)
+            .flat_map(|(_index, tab)| &tab.edited_edges)
+            .filter(|edge| {
+                edge.from.is_none() || edge.to.is_none() || edge.edge_type.trim().is_empty()
+            })
+            .count()
     }
 
     // ── Array inline add ──────────────────────────────────────────────────
@@ -563,7 +674,7 @@ impl NodeEditorPanel {
             edge.from = Some(node_id);
             edge.from_name = node_name;
             tab.edited_edges.push(edge);
-            let entity = cx.new(|cx| TextFieldView::new(false, "edge type", cx));
+            let entity = cx.new(|cx| TextFieldView::new(false, "relationship type", cx));
             tab.edge_type_entities.push(entity);
             tab.recompute_dirty();
         }
@@ -775,5 +886,60 @@ impl NodeEditorPanel {
     fn build_node_name_map(&self) -> HashMap<ObjectId, String> {
         let snap = self.snapshot.read();
         snap.nodes.iter().map(|n| (n.id, n.name.clone())).collect()
+    }
+}
+
+impl Focusable for NodeEditorPanel {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+fn relative_tab_index(active: usize, len: usize, previous: bool) -> Option<usize> {
+    if len == 0 || active >= len {
+        return None;
+    }
+    Some(if previous {
+        active.checked_sub(1).unwrap_or(len - 1)
+    } else {
+        (active + 1) % len
+    })
+}
+
+fn remap_index_after_move(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{relative_tab_index, remap_index_after_move};
+
+    #[test]
+    fn relative_tab_navigation_wraps_and_rejects_stale_state() {
+        assert_eq!(relative_tab_index(0, 3, false), Some(1));
+        assert_eq!(relative_tab_index(2, 3, false), Some(0));
+        assert_eq!(relative_tab_index(0, 3, true), Some(2));
+        assert_eq!(relative_tab_index(2, 3, true), Some(1));
+        assert_eq!(relative_tab_index(0, 0, false), None);
+        assert_eq!(relative_tab_index(3, 3, false), None);
+    }
+
+    #[test]
+    fn tab_reordering_preserves_the_active_item() {
+        assert_eq!(remap_index_after_move(1, 1, 3), 3);
+        assert_eq!(remap_index_after_move(2, 1, 3), 1);
+        assert_eq!(remap_index_after_move(3, 1, 3), 2);
+        assert_eq!(remap_index_after_move(3, 3, 0), 0);
+        assert_eq!(remap_index_after_move(0, 3, 0), 1);
+        assert_eq!(remap_index_after_move(1, 3, 0), 2);
+        assert_eq!(remap_index_after_move(4, 1, 3), 4);
     }
 }

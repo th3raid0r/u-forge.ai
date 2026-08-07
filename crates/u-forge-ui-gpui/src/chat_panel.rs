@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, Pixels, Point, Window, anchored, deferred, div, linear_color_stop,
-    linear_gradient, list, prelude::*, px, relative, rems, rgb, rgba,
+    App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Window, anchored,
+    deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px, relative, rgb, rgba,
 };
 use u_forge_agent::{AgentParams, GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
@@ -19,11 +19,16 @@ use u_forge_core::{
 use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessage};
 use crate::chat_message::{ChatMessageRole, ChatMessageView};
 use crate::text_field::{TextFieldView, TextSubmit};
+use crate::ui::components::Tooltip;
+use crate::ui::icons::{Icon, IconName, IconSize};
+use crate::ui::theme::UiTheme;
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
 pub(crate) struct ConnectRequested;
 impl EventEmitter<ConnectRequested> for ChatPanel {}
+pub(crate) struct ToggleAssistantZoomRequested;
+impl EventEmitter<ToggleAssistantZoomRequested> for ChatPanel {}
 
 // ── ChatPanel ───────────────────────────────────────────────────────────────
 
@@ -32,7 +37,38 @@ struct ContextMenuState {
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum ProfileReloadState {
+    #[default]
+    Ready,
+    Reloading,
+    Failed(String),
+}
+
+impl ProfileReloadState {
+    fn is_reloading(&self) -> bool {
+        matches!(self, Self::Reloading)
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Failed(error) => Some(error),
+            Self::Ready | Self::Reloading => None,
+        }
+    }
+}
+
+fn assistant_controls_locked(
+    streaming: bool,
+    connecting: bool,
+    reload_state: &ProfileReloadState,
+) -> bool {
+    streaming || connecting || reload_state.is_reloading()
+}
+
 pub(crate) struct ChatPanel {
+    focus: FocusHandle,
+    zoomed: bool,
     /// The text input field for composing messages.
     input_field: Entity<TextFieldView>,
     /// When true, pressing Enter submits; Shift+Enter inserts a newline.
@@ -63,6 +99,8 @@ pub(crate) struct ChatPanel {
     selected_model_idx: usize,
     /// Whether the model selector dropdown is open.
     model_dropdown_open: bool,
+    /// Whether the compact Assistant toolbar overflow menu is open.
+    toolbar_menu_open: bool,
     /// The active chat provider for direct streaming (None until Lemonade is discovered).
     chat_provider: Option<LemonadeChatProvider>,
     /// Serializes model/reasoning profile reloads before inference.
@@ -70,6 +108,10 @@ pub(crate) struct ChatPanel {
     /// Lemonade applies this mode only after a full profile reload.
     reasoning_enabled: bool,
     reasoning_control: ReasoningControl,
+    /// User-visible lifecycle for explicit model/reasoning profile activation.
+    profile_reload_state: ProfileReloadState,
+    /// Retains the GPUI task so activation is not cancelled when the method returns.
+    profile_reload_task: Option<gpui::Task<()>>,
     /// True while a do_init_lemonade call is in flight (after ConnectRequested emitted).
     connecting: bool,
     /// Brief error string shown under the button when the last connect attempt failed.
@@ -186,6 +228,41 @@ impl AvailableModel {
         self.recipe == "llamacpp"
             && matches!(self.backend.as_deref(), Some("rocm" | "vulkan" | "metal"))
     }
+
+    /// Keep registry identifiers recognizable while removing packaging noise
+    /// that is not useful to a non-technical model picker.
+    fn display_name(&self) -> String {
+        let basename = self.model_id.rsplit('/').next().unwrap_or(&self.model_id);
+        let without_extension = basename
+            .strip_suffix(".gguf")
+            .or_else(|| basename.strip_suffix(".GGUF"))
+            .unwrap_or(basename);
+        let without_packaging = without_extension
+            .strip_suffix("-GGUF")
+            .unwrap_or(without_extension);
+        without_packaging.replace(['-', '_'], " ")
+    }
+
+    fn device_label(&self) -> &'static str {
+        match self.recipe.as_str() {
+            "flm" => "NPU",
+            "llamacpp" => match self.backend.as_deref() {
+                Some("rocm" | "vulkan" | "metal") => "GPU",
+                _ => "CPU",
+            },
+            _ => "",
+        }
+    }
+
+    fn picker_label(&self) -> String {
+        let name = self.display_name();
+        let device = self.device_label();
+        if device.is_empty() {
+            name
+        } else {
+            format!("{name} ({device})")
+        }
+    }
 }
 
 impl ChatPanel {
@@ -195,6 +272,7 @@ impl ChatPanel {
         response_reserve: usize,
         db_path: &Path,
         tokio_rt: Arc<tokio::runtime::Runtime>,
+        zoomed: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let input_field = cx.new(|cx| {
@@ -239,6 +317,8 @@ impl ChatPanel {
         let msg_count = messages.len();
 
         Self {
+            focus: cx.focus_handle(),
+            zoomed,
             input_field,
             enter_to_submit: true,
             messages,
@@ -250,10 +330,13 @@ impl ChatPanel {
             available_models: Vec::new(),
             selected_model_idx: 0,
             model_dropdown_open: false,
+            toolbar_menu_open: false,
             chat_provider: None,
             runtime: None,
             reasoning_enabled: true,
             reasoning_control: ReasoningControl::Request,
+            profile_reload_state: ProfileReloadState::Ready,
+            profile_reload_task: None,
             connecting: false,
             connect_error: None,
             agent: None,
@@ -274,6 +357,10 @@ impl ChatPanel {
         }
     }
 
+    pub(crate) fn set_zoomed(&mut self, zoomed: bool) {
+        self.zoomed = zoomed;
+    }
+
     /// Called from AppView after Lemonade init discovers LLM models.
     pub(crate) fn set_provider(
         &mut self,
@@ -290,6 +377,8 @@ impl ChatPanel {
         self.chat_provider = Some(provider);
         self.apply_selected_chat_profile();
         self.connecting = false;
+        self.profile_reload_state = ProfileReloadState::Ready;
+        self.profile_reload_task = None;
     }
 
     fn apply_selected_chat_profile(&mut self) {
@@ -355,6 +444,58 @@ impl ChatPanel {
                 .available_models
                 .get(self.selected_model_idx)
                 .is_some_and(|model| model.reasoning_capable)
+    }
+
+    fn controls_locked(&self) -> bool {
+        assistant_controls_locked(self.streaming, self.connecting, &self.profile_reload_state)
+    }
+
+    /// Activate the currently selected model/reasoning profile immediately.
+    /// This makes a selector change observable at the point of interaction,
+    /// rather than deferring an activation failure until the user sends text.
+    fn reload_selected_profile(&mut self, cx: &mut Context<Self>) {
+        if self.controls_locked() {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            self.profile_reload_state = ProfileReloadState::Failed(
+                "The Assistant runtime is not available. Reconnect and try again.".to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(profile) = self.selected_runtime_profile() else {
+            self.profile_reload_state = ProfileReloadState::Failed(
+                "No Assistant model is selected. Run Setup and choose a model.".to_string(),
+            );
+            cx.notify();
+            return;
+        };
+
+        self.model_dropdown_open = false;
+        self.toolbar_menu_open = false;
+        self.profile_reload_state = ProfileReloadState::Reloading;
+        let tokio_rt = self.tokio_rt.clone();
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { tokio_rt.block_on(runtime.activate(&profile)) })
+                .await;
+            this.update(cx, |view: &mut ChatPanel, cx| {
+                view.profile_reload_task = None;
+                view.profile_reload_state = match result {
+                    Ok(_) => ProfileReloadState::Ready,
+                    Err(error) => ProfileReloadState::Failed(format!(
+                        "Could not load the selected Assistant model: {error:#}"
+                    )),
+                };
+                cx.notify();
+            })
+            .ok();
+        });
+        self.profile_reload_task = Some(task);
     }
 
     /// Called from AppView once the graph, inference queue, and Lemonade URL
@@ -449,8 +590,8 @@ impl ChatPanel {
     /// If the clicked message is itself a User message, replays it directly.
     /// Otherwise walks backwards to find the nearest preceding User message.
     fn retry_message(&mut self, msg_entity_id: EntityId, cx: &mut Context<Self>) {
-        if self.streaming {
-            tracing::debug!("retry_message suppressed: stream in progress");
+        if self.controls_locked() {
+            tracing::debug!("retry_message suppressed: Assistant is busy");
             return;
         }
 
@@ -487,6 +628,9 @@ impl ChatPanel {
     /// Send the current input. Routes to the agent loop when an agent is
     /// available, otherwise falls back to direct LLM streaming.
     fn do_send(&mut self, cx: &mut Context<Self>) {
+        if self.profile_reload_state.is_reloading() {
+            return;
+        }
         if self.streaming {
             return;
         }
@@ -511,6 +655,9 @@ impl ChatPanel {
     /// spawns the agent or direct stream. Used by both `do_send` and
     /// `retry_message`.
     fn send_with_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.model_dropdown_open = false;
+        self.history_dropdown_open = false;
+        self.toolbar_menu_open = false;
         let Some(runtime) = self.runtime.clone() else {
             self.start_send_with_text(text, None, cx);
             return;
@@ -530,6 +677,9 @@ impl ChatPanel {
             this.update(cx, |view: &mut ChatPanel, cx| match lease {
                 Ok(lease) => view.start_send_with_text(text, Some(lease), cx),
                 Err(error) => {
+                    view.profile_reload_state = ProfileReloadState::Failed(format!(
+                        "Could not load the selected Assistant model: {error:#}"
+                    ));
                     view.push_text_message(ChatMessageRole::User, text, cx);
                     view.push_text_message(
                         ChatMessageRole::Assistant,
@@ -877,20 +1027,7 @@ impl ChatPanel {
         if self.available_models.is_empty() {
             return "No models".to_string();
         }
-        let m = &self.available_models[self.selected_model_idx];
-        let device = match m.recipe.as_str() {
-            "flm" => "NPU",
-            "llamacpp" => match m.backend.as_deref() {
-                Some("rocm") | Some("vulkan") | Some("metal") => "GPU",
-                _ => "CPU",
-            },
-            _ => "",
-        };
-        if device.is_empty() {
-            m.model_id.clone()
-        } else {
-            format!("{} ({})", m.model_id, device)
-        }
+        self.available_models[self.selected_model_idx].picker_label()
     }
 
     // ── Chat history methods ────────────────────────────────────────────────
@@ -902,7 +1039,7 @@ impl ChatPanel {
                 .iter()
                 .find(|s| s.id == *sid)
                 .map(|s| s.title.clone())
-                .unwrap_or_else(|| "Chat".to_string())
+                .unwrap_or_else(|| "Assistant".to_string())
         } else {
             "New Chat".to_string()
         }
@@ -973,8 +1110,8 @@ impl ChatPanel {
     /// session and `finalize_stream` to save the polluted list under the
     /// wrong session_id. The Send button is already gated on `streaming`.
     fn new_session(&mut self, cx: &mut Context<Self>) {
-        if self.streaming {
-            tracing::debug!("new_session suppressed: stream in progress");
+        if self.controls_locked() {
+            tracing::debug!("new_session suppressed: Assistant is busy");
             return;
         }
         // Save current session before switching.
@@ -985,6 +1122,7 @@ impl ChatPanel {
         self.messages.clear();
         self.current_session_id = None;
         self.history_dropdown_open = false;
+        self.toolbar_menu_open = false;
         self.reset_list_state();
         cx.notify();
     }
@@ -993,8 +1131,8 @@ impl ChatPanel {
     ///
     /// No-op while streaming — see `new_session` for the race it prevents.
     fn load_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
-        if self.streaming {
-            tracing::debug!(%session_id, "load_session suppressed: stream in progress");
+        if self.controls_locked() {
+            tracing::debug!(%session_id, "load_session suppressed: Assistant is busy");
             return;
         }
         // Save current session before switching.
@@ -1077,14 +1215,26 @@ impl ChatPanel {
     }
 }
 
+impl Focusable for ChatPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl Render for ChatPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_start = Instant::now();
+        let theme = *UiTheme::get(cx);
+        let panel_focused = self.focus.contains_focused(window, cx);
         let enter_to_submit = self.enter_to_submit;
         let streaming = self.streaming;
         let connecting = self.connecting;
+        let profile_reloading = self.profile_reload_state.is_reloading();
+        let controls_locked = self.controls_locked();
+        let profile_reload_error = self.profile_reload_state.error().map(ToString::to_string);
         let connect_error = self.connect_error.clone();
         let model_dropdown_open = self.model_dropdown_open;
+        let toolbar_menu_open = self.toolbar_menu_open;
         let reasoning_capable = self
             .available_models
             .get(self.selected_model_idx)
@@ -1215,7 +1365,12 @@ impl Render for ChatPanel {
                                     });
                                 },
                             )
-                            .child("✕"),
+                            .tooltip(Tooltip::text("Delete conversation"))
+                            .child(Icon::new(
+                                IconName::Trash,
+                                IconSize::Small,
+                                rgba(0xf38ba8ff),
+                            )),
                     )
                     .into_any_element()
             },
@@ -1234,9 +1389,10 @@ impl Render for ChatPanel {
             };
             let is_last = ix + 1 == panel.messages.len();
             let is_streaming = panel.streaming;
+            let controls_locked = panel.controls_locked();
             let role = msg.read(cx).role;
-            let can_retry =
-                !is_streaming && matches!(role, ChatMessageRole::User | ChatMessageRole::Assistant);
+            let can_retry = !controls_locked
+                && matches!(role, ChatMessageRole::User | ChatMessageRole::Assistant);
             let show_delete = is_last && !is_streaming;
 
             let mut row = div()
@@ -1298,8 +1454,7 @@ impl Render for ChatPanel {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(rems(1.0))
-                            .h(rems(1.0))
+                            .size(theme.metrics.control_height_small)
                             .text_base()
                             .text_color(rgba(0x6c708688))
                             .cursor_pointer()
@@ -1309,7 +1464,12 @@ impl Render for ChatPanel {
                                     this.retry_message(msg_entity_id, cx);
                                 });
                             })
-                            .child("⟳"),
+                            .tooltip(Tooltip::text("Try this response again"))
+                            .child(Icon::new(
+                                IconName::Refresh,
+                                IconSize::Small,
+                                rgba(0xa6adc8ff),
+                            )),
                     );
                 }
 
@@ -1320,8 +1480,7 @@ impl Render for ChatPanel {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .w(rems(1.0))
-                        .h(rems(1.0))
+                        .size(theme.metrics.control_height_small)
                         .text_base()
                         .text_color(rgba(0x6c708688))
                         .cursor_pointer()
@@ -1334,7 +1493,8 @@ impl Render for ChatPanel {
                                 cx.notify();
                             });
                         })
-                        .child("⎘"),
+                        .tooltip(Tooltip::text("Copy message"))
+                        .child(Icon::new(IconName::Copy, IconSize::Small, rgba(0xa6adc8ff))),
                 );
 
                 if show_delete {
@@ -1344,8 +1504,7 @@ impl Render for ChatPanel {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(rems(1.0))
-                            .h(rems(1.0))
+                            .size(theme.metrics.control_height_small)
                             .rounded(px(2.0))
                             .text_base()
                             .text_color(rgba(0xf38ba8aa))
@@ -1357,7 +1516,12 @@ impl Render for ChatPanel {
                                     this.delete_message_at(last, cx);
                                 });
                             })
-                            .child("x"),
+                            .tooltip(Tooltip::text("Delete message"))
+                            .child(Icon::new(
+                                IconName::Trash,
+                                IconSize::Small,
+                                rgba(0xf38ba8ff),
+                            )),
                     );
                 }
 
@@ -1373,20 +1537,12 @@ impl Render for ChatPanel {
                 .enumerate()
                 .map(|(idx, m)| {
                     let is_selected = idx == self.selected_model_idx;
-                    let device = match m.recipe.as_str() {
-                        "flm" => " (NPU)",
-                        "llamacpp" => match m.backend.as_deref() {
-                            Some("rocm") | Some("vulkan") | Some("metal") => " (GPU)",
-                            _ => " (CPU)",
-                        },
-                        _ => "",
-                    };
-                    let label = format!("{}{}", m.model_id, device);
+                    let label = m.picker_label();
                     div()
                         .id(("model", idx))
                         .flex()
                         .items_center()
-                        .h(px(24.0))
+                        .h(theme.metrics.control_height)
                         .px_2()
                         .text_sm()
                         .text_color(if is_selected {
@@ -1400,12 +1556,18 @@ impl Render for ChatPanel {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                if !this.streaming {
+                                let changed =
+                                    !this.controls_locked() && this.selected_model_idx != idx;
+                                if changed {
                                     this.selected_model_idx = idx;
                                     this.apply_selected_chat_profile();
                                 }
                                 this.model_dropdown_open = false;
-                                cx.notify();
+                                if changed {
+                                    this.reload_selected_profile(cx);
+                                } else {
+                                    cx.notify();
+                                }
                             }),
                         )
                         .child(label)
@@ -1442,6 +1604,8 @@ impl Render for ChatPanel {
 
         let root = div()
             .id("chat-panel")
+            .key_context("AssistantPanel")
+            .track_focus(&self.focus)
             .flex()
             .flex_col()
             .w_full()
@@ -1450,6 +1614,9 @@ impl Render for ChatPanel {
             .bg(rgb(0x181825))
             .border_l_1()
             .border_color(rgb(0x313244))
+            .when(panel_focused, |panel| {
+                panel.border_1().border_color(rgba(0xb4befeff))
+            })
             // ── Header: chat history selector ────────────────────────────────
             .child(
                 div()
@@ -1460,38 +1627,46 @@ impl Render for ChatPanel {
                     .w_full()
                     .border_b_1()
                     .border_color(rgb(0x313244))
-                    .px_2()
-                    .py_1()
                     .child(
                         div()
                             .id("history-selector-row")
                             .flex()
                             .flex_row()
+                            .flex_none()
                             .items_center()
-                            .gap(px(4.0))
+                            .h(theme.metrics.panel_header_height)
+                            .px_3()
+                            .gap(px(theme.metrics.space_2))
                             .child(
                                 div()
                                     .id("history-selector-btn")
                                     .flex()
                                     .items_center()
                                     .px_2()
-                                    .h(px(22.0))
+                                    .h(theme.metrics.control_height_small)
                                     .bg(rgb(0x313244))
                                     .border_1()
                                     .border_color(rgb(0x45475a))
                                     .rounded(px(3.0))
                                     .text_sm()
-                                    .text_color(rgba(0xcdd6f4ff))
-                                    .cursor_pointer()
+                                    .text_color(if controls_locked {
+                                        rgba(0x6c7086ff)
+                                    } else {
+                                        rgba(0xcdd6f4ff)
+                                    })
                                     .overflow_x_hidden()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.history_dropdown_open =
-                                                !this.history_dropdown_open;
-                                            cx.notify();
-                                        }),
-                                    )
+                                    .when(!controls_locked, |button| {
+                                        button.cursor_pointer().on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.history_dropdown_open =
+                                                    !this.history_dropdown_open;
+                                                this.model_dropdown_open = false;
+                                                this.toolbar_menu_open = false;
+                                                cx.notify();
+                                            }),
+                                        )
+                                    })
                                     .child(history_label),
                             )
                             .child({
@@ -1501,25 +1676,99 @@ impl Render for ChatPanel {
                             })
                             .child(
                                 div()
+                                    .id("assistant-zoom-btn")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .px_2()
+                                    .h(theme.metrics.control_height_small)
+                                    .rounded(px(3.0))
+                                    .text_sm()
+                                    .text_color(rgba(0xa6adc8ff))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text(if self.zoomed {
+                                        "Restore Assistant panel"
+                                    } else {
+                                        "Maximize Assistant panel"
+                                    }))
+                                    .hover(|style| style.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
+                                            cx.emit(ToggleAssistantZoomRequested);
+                                        }),
+                                    )
+                                    .child(Icon::new(
+                                        IconName::Maximize,
+                                        IconSize::Medium,
+                                        rgba(0xa6adc8ff),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("assistant-options-btn")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .px_2()
+                                    .h(theme.metrics.control_height_small)
+                                    .rounded(px(3.0))
+                                    .text_color(rgba(0xa6adc8ff))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text("More Assistant actions"))
+                                    .hover(|style| style.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.toolbar_menu_open = !this.toolbar_menu_open;
+                                            this.history_dropdown_open = false;
+                                            this.model_dropdown_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(Icon::new(
+                                        IconName::MoreHorizontal,
+                                        IconSize::Medium,
+                                        rgba(0xa6adc8ff),
+                                    )),
+                            )
+                            .child(
+                                div()
                                     .id("new-chat-btn")
                                     .flex()
                                     .flex_none()
                                     .items_center()
                                     .justify_center()
                                     .px_2()
-                                    .h(px(22.0))
+                                    .h(theme.metrics.control_height_small)
                                     .bg(rgb(0xa6e3a1))
                                     .rounded(px(3.0))
                                     .text_sm()
-                                    .text_color(rgba(0x1e1e2eff))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.new_session(cx);
-                                        }),
-                                    )
-                                    .child("New"),
+                                    .text_color(if controls_locked {
+                                        rgba(0x6c7086ff)
+                                    } else {
+                                        rgba(0x1e1e2eff)
+                                    })
+                                    .tooltip(Tooltip::text("Start a new conversation"))
+                                    .when(!controls_locked, |button| {
+                                        button.cursor_pointer().on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.new_session(cx);
+                                            }),
+                                        )
+                                    })
+                                    .child(Icon::new(
+                                        IconName::Plus,
+                                        IconSize::Medium,
+                                        if controls_locked {
+                                            rgba(0x6c7086ff)
+                                        } else {
+                                            rgba(0x1e1e2eff)
+                                        },
+                                    )),
                             ),
                     )
                     .when(history_dropdown_open, |header| {
@@ -1545,6 +1794,92 @@ impl Render for ChatPanel {
                                     el
                                 }),
                         )
+                    })
+                    .when(toolbar_menu_open, |header| {
+                        header.child(
+                            div()
+                                .id("assistant-options-menu")
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .bg(rgb(0x313244))
+                                .border_1()
+                                .border_color(rgb(0x45475a))
+                                .rounded(px(3.0))
+                                .mt_1()
+                                .child(
+                                    div()
+                                        .id("assistant-reload-model")
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .h(theme.metrics.control_height)
+                                        .px_2()
+                                        .text_sm()
+                                        .text_color(if controls_locked || !has_provider {
+                                            rgba(0x6c7086ff)
+                                        } else {
+                                            rgba(0xcdd6f4ff)
+                                        })
+                                        .when(!controls_locked && has_provider, |item| {
+                                            item.cursor_pointer()
+                                                .hover(|style| style.bg(rgba(0x45475a88)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |this, _: &MouseDownEvent, _window, cx| {
+                                                            this.reload_selected_profile(cx);
+                                                        },
+                                                    ),
+                                                )
+                                        })
+                                        .child(Icon::new(
+                                            IconName::Refresh,
+                                            IconSize::Medium,
+                                            if controls_locked || !has_provider {
+                                                rgba(0x6c7086ff)
+                                            } else {
+                                                rgba(0xa6adc8ff)
+                                            },
+                                        ))
+                                        .child(if profile_reloading {
+                                            "Reloading model…"
+                                        } else {
+                                            "Reload selected model"
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("assistant-options-zoom")
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .h(theme.metrics.control_height)
+                                        .px_2()
+                                        .text_sm()
+                                        .text_color(rgba(0xcdd6f4ff))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgba(0x45475a88)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.toolbar_menu_open = false;
+                                                cx.emit(ToggleAssistantZoomRequested);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(Icon::new(
+                                            IconName::Maximize,
+                                            IconSize::Medium,
+                                            rgba(0xa6adc8ff),
+                                        ))
+                                        .child(if self.zoomed {
+                                            "Restore Assistant"
+                                        } else {
+                                            "Maximize Assistant"
+                                        }),
+                                ),
+                        )
                     }),
             )
             // ── Message area (virtualized list) ──────────────────────────────
@@ -1558,9 +1893,13 @@ impl Render for ChatPanel {
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                             let mut changed = false;
-                            if this.history_dropdown_open || this.model_dropdown_open {
+                            if this.history_dropdown_open
+                                || this.model_dropdown_open
+                                || this.toolbar_menu_open
+                            {
                                 this.history_dropdown_open = false;
                                 this.model_dropdown_open = false;
+                                this.toolbar_menu_open = false;
                                 changed = true;
                             }
                             if this.context_menu.is_some() {
@@ -1609,8 +1948,13 @@ impl Render for ChatPanel {
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                             let mut changed = false;
-                            if this.history_dropdown_open {
+                            if this.history_dropdown_open
+                                || this.model_dropdown_open
+                                || this.toolbar_menu_open
+                            {
                                 this.history_dropdown_open = false;
+                                this.model_dropdown_open = false;
+                                this.toolbar_menu_open = false;
                                 changed = true;
                             }
                             if this.context_menu.is_some() {
@@ -1707,11 +2051,14 @@ impl Render for ChatPanel {
                                 enum BtnState {
                                     Connect,
                                     Connecting,
+                                    Reloading,
                                     Send,
                                     Stop,
                                 }
                                 let btn_state = if streaming {
                                     BtnState::Stop
+                                } else if profile_reloading {
+                                    BtnState::Reloading
                                 } else if connecting {
                                     BtnState::Connecting
                                 } else if !has_provider {
@@ -1726,12 +2073,22 @@ impl Render for ChatPanel {
                                     BtnState::Connecting => {
                                         ("Connecting…", rgb(0x45475a_u32), rgba(0x6c7086ff_u32))
                                     }
+                                    BtnState::Reloading => {
+                                        ("Loading…", rgb(0x45475a_u32), rgba(0x6c7086ff_u32))
+                                    }
                                     BtnState::Send => {
                                         ("Send", rgb(0x89b4fa_u32), rgba(0x1e1e2eff_u32))
                                     }
                                     BtnState::Stop => {
                                         ("Stop", rgb(0xf38ba8_u32), rgba(0x1e1e2eff_u32))
                                     }
+                                };
+                                let button_child = if matches!(btn_state, BtnState::Send) {
+                                    Icon::new(IconName::Send, IconSize::Large, fg)
+                                        .rotate_degrees(90.0)
+                                        .into_any_element()
+                                } else {
+                                    div().child(label).into_any_element()
                                 };
                                 div()
                                     .id("send-btn")
@@ -1740,26 +2097,33 @@ impl Render for ChatPanel {
                                     .items_center()
                                     .justify_center()
                                     .w(px(88.0))
-                                    .h(px(28.0))
+                                    .h(theme.metrics.control_height)
                                     .bg(bg)
                                     .rounded(px(3.0))
                                     .text_base()
                                     .text_color(fg)
                                     .cursor_pointer()
+                                    .tooltip(Tooltip::text(match btn_state {
+                                        BtnState::Connect => "Connect the Assistant",
+                                        BtnState::Connecting => "Connecting the Assistant",
+                                        BtnState::Reloading => "Loading the selected model",
+                                        BtnState::Send => "Send message",
+                                        BtnState::Stop => "Stop response",
+                                    }))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
                                             move |this, _: &MouseDownEvent, _window, cx| {
                                                 match btn_state {
                                                     BtnState::Connect => cx.emit(ConnectRequested),
-                                                    BtnState::Connecting => {}
+                                                    BtnState::Connecting | BtnState::Reloading => {}
                                                     BtnState::Send => this.do_send(cx),
                                                     BtnState::Stop => this.stop_stream(cx),
                                                 }
                                             },
                                         ),
                                     )
-                                    .child(label)
+                                    .child(button_child)
                             }),
                     )
                     .when_some(connect_error, |el, err| {
@@ -1767,6 +2131,24 @@ impl Render for ChatPanel {
                             div()
                                 .id("connect-error")
                                 .text_base()
+                                .text_color(rgba(0xf38ba8ff))
+                                .child(err),
+                        )
+                    })
+                    .when(profile_reloading, |el| {
+                        el.child(
+                            div()
+                                .id("profile-reloading")
+                                .text_sm()
+                                .text_color(rgba(0xf9e2afff))
+                                .child("Loading the selected Assistant model…"),
+                        )
+                    })
+                    .when_some(profile_reload_error, |el, err| {
+                        el.child(
+                            div()
+                                .id("profile-reload-error")
+                                .text_sm()
                                 .text_color(rgba(0xf38ba8ff))
                                 .child(err),
                         )
@@ -1792,34 +2174,41 @@ impl Render for ChatPanel {
                                     .child(
                                         div()
                                             .id("model-selector-btn")
+                                            .debug_selector(|| "model-selector-btn".to_string())
                                             .flex()
                                             .items_center()
                                             .px_2()
-                                            .h(px(22.0))
+                                            .h(theme.metrics.control_height)
                                             .bg(rgb(0x313244))
                                             .border_1()
                                             .border_color(rgb(0x45475a))
                                             .rounded(px(3.0))
                                             .text_sm()
-                                            .text_color(if has_provider {
+                                            .text_color(if has_provider && !controls_locked {
                                                 rgba(0xcdd6f4ff)
                                             } else {
                                                 rgba(0x6c7086ff)
                                             })
-                                            .when(reasoning_capable, |toggle| {
-                                                toggle.cursor_pointer()
+                                            .when(!controls_locked && has_provider, |toggle| {
+                                                toggle.cursor_pointer().on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |this, _: &MouseDownEvent, _window, cx| {
+                                                            // This control lives inside the input
+                                                            // area's general menu-dismissal handler.
+                                                            // Keep the opening press from bubbling
+                                                            // up and immediately closing the menu.
+                                                            cx.stop_propagation();
+                                                            this.model_dropdown_open =
+                                                                !this.model_dropdown_open;
+                                                            this.history_dropdown_open = false;
+                                                            this.toolbar_menu_open = false;
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                )
                                             })
                                             .overflow_x_hidden()
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, _window, cx| {
-                                                        this.model_dropdown_open =
-                                                            !this.model_dropdown_open;
-                                                        cx.notify();
-                                                    },
-                                                ),
-                                            )
                                             .child(model_label),
                                     )
                                     .child(
@@ -1827,8 +2216,8 @@ impl Render for ChatPanel {
                                             .id("reasoning-toggle")
                                             .flex()
                                             .items_center()
-                                            .px_2()
-                                            .h(px(22.0))
+                                            .justify_center()
+                                            .size(theme.metrics.control_height)
                                             .bg(if reasoning_enabled {
                                                 rgb(0x45475a)
                                             } else {
@@ -1843,39 +2232,51 @@ impl Render for ChatPanel {
                                             } else {
                                                 rgba(0x6c7086ff)
                                             })
-                                            .cursor_pointer()
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, _window, cx| {
-                                                        if !this.streaming
-                                                            && this
-                                                                .available_models
-                                                                .get(this.selected_model_idx)
-                                                                .is_some_and(|model| {
-                                                                    model.reasoning_capable
-                                                                })
-                                                        {
+                                            .tooltip(Tooltip::text(if !reasoning_capable {
+                                                "Thinking follows this model's default"
+                                            } else if reasoning_enabled {
+                                                "Disable thinking"
+                                            } else {
+                                                "Enable thinking"
+                                            }))
+                                            .when(!controls_locked && reasoning_capable, |toggle| {
+                                                toggle.cursor_pointer().on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |this, _: &MouseDownEvent, _window, cx| {
                                                             this.reasoning_enabled =
                                                                 !this.reasoning_enabled;
-                                                            cx.notify();
-                                                        }
-                                                    },
-                                                ),
-                                            )
-                                            .child(if !reasoning_capable {
-                                                "Thinking unavailable"
-                                            } else if reasoning_enabled {
-                                                "Thinking on"
-                                            } else {
-                                                "Thinking off"
-                                            }),
+                                                            if this.reasoning_control
+                                                                == ReasoningControl::Reload
+                                                            {
+                                                                this.reload_selected_profile(cx);
+                                                            } else {
+                                                                this.profile_reload_state =
+                                                                    ProfileReloadState::Ready;
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    ),
+                                                )
+                                            })
+                                            .child(Icon::new(
+                                                IconName::Thinking,
+                                                IconSize::Medium,
+                                                if !reasoning_capable {
+                                                    rgba(0xa6adc8ff)
+                                                } else if reasoning_enabled {
+                                                    rgba(0xa6e3a1ff)
+                                                } else {
+                                                    rgba(0xf38ba8ff)
+                                                },
+                                            )),
                                     ),
                             )
                             .when(model_dropdown_open, |container| {
                                 container.child(
                                     div()
                                         .id("model-dropdown")
+                                        .debug_selector(|| "model-dropdown".to_string())
                                         .flex()
                                         .flex_col()
                                         .w_full()
@@ -1942,7 +2343,59 @@ impl Render for ChatPanel {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{Modifiers, TestAppContext};
+
     use super::*;
+
+    fn picker_test_model(model_id: &str) -> AvailableModel {
+        AvailableModel {
+            model_id: model_id.into(),
+            checkpoint: "checkpoint".into(),
+            recipe: "llamacpp".into(),
+            backend: Some("vulkan".into()),
+            load_options: ModelLoadOptions::default(),
+            tool_capable: true,
+            reasoning_capable: true,
+            sampling: ChatDeviceConfig::default(),
+            effective_limits: None,
+            max_tool_turns: 5,
+        }
+    }
+
+    #[gpui::test]
+    fn model_selector_press_is_not_closed_by_the_input_area(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (panel, cx) = cx.add_window_view(move |_window, cx| {
+            let mut panel = ChatPanel::new(
+                "Test assistant".into(),
+                4096,
+                512,
+                &db_path,
+                runtime,
+                false,
+                cx,
+            );
+            panel.available_models = vec![picker_test_model("publisher/Gemma-4-E4B-it-GGUF")];
+            panel.chat_provider = Some(LemonadeChatProvider::new(
+                "http://127.0.0.1:1/v1",
+                "Gemma-4-E4B-it-GGUF",
+                None,
+            ));
+            panel
+        });
+        cx.update(|window, _app| window.refresh());
+        cx.run_until_parked();
+
+        let selector = cx.debug_bounds("model-selector-btn").unwrap();
+        cx.simulate_mouse_down(selector.center(), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(cx.update(|_window, app| panel.read(app).model_dropdown_open));
+        assert!(cx.debug_bounds("model-dropdown").is_some());
+    }
 
     #[test]
     fn available_model_maps_one_profile_to_rig_parameters() {
@@ -1979,5 +2432,42 @@ mod tests {
         assert!((params.repetition_penalty.unwrap() - 1.1).abs() < 1e-6);
         assert_eq!(params.max_tool_turns, 7);
         assert!(model.uses_gpu());
+    }
+
+    #[test]
+    fn assistant_controls_lock_during_connection_streaming_and_profile_reload() {
+        assert!(!assistant_controls_locked(
+            false,
+            false,
+            &ProfileReloadState::Ready
+        ));
+        assert!(assistant_controls_locked(
+            true,
+            false,
+            &ProfileReloadState::Ready
+        ));
+        assert!(assistant_controls_locked(
+            false,
+            true,
+            &ProfileReloadState::Ready
+        ));
+        assert!(assistant_controls_locked(
+            false,
+            false,
+            &ProfileReloadState::Reloading
+        ));
+        assert!(!assistant_controls_locked(
+            false,
+            false,
+            &ProfileReloadState::Failed("load failed".into())
+        ));
+    }
+
+    #[test]
+    fn model_picker_removes_registry_packaging_noise() {
+        assert_eq!(
+            picker_test_model("publisher/Gemma-4-26B-A4B-it-GGUF").picker_label(),
+            "Gemma 4 26B A4B it (GPU)"
+        );
     }
 }

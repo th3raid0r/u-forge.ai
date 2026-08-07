@@ -1,13 +1,9 @@
 use std::sync::Arc;
 
-use gpui::{
-    App, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBounds, WindowOptions, prelude::*,
-    px, size,
-};
+use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 use u_forge_core::AppConfig;
 use u_forge_ui_gpui::{
-    AppView, ClearData, ClearSchema, ExportData, FitGraph, ImportData, ImportSchema, SaveLayout,
-    TogglePerfOverlay, ToggleRightPanel, ToggleSidebar,
+    ActionContext, AppView, Assets, UiTheme, action_key_bindings, native_menus,
     startup::{StartupTimeline, prepare_app},
 };
 
@@ -36,43 +32,17 @@ fn main() {
     let graph = prepared.graph;
     let schema_mgr = prepared.schema_manager;
 
-    Application::new().run(move |cx: &mut App| {
+    let application = Application::new().with_assets(Assets);
+    application.run(move |cx: &mut App| {
         let _phase = startup.phase("gpui_application_start");
-        // Register keybindings.
-        cx.bind_keys([
-            KeyBinding::new("ctrl-s", SaveLayout, None),
-            KeyBinding::new("ctrl-b", ToggleSidebar, None),
-            KeyBinding::new("ctrl-j", ToggleRightPanel, None),
-            KeyBinding::new("ctrl-shift-p", TogglePerfOverlay, None),
-            KeyBinding::new("ctrl-shift-0", FitGraph, None),
-        ]);
+        UiTheme::init(cx);
+        cx.bind_keys(action_key_bindings());
 
         // Register native application menu (macOS menu bar; no-op on Linux).
-        cx.set_menus(vec![
-            Menu {
-                name: "File".into(),
-                items: vec![
-                    MenuItem::action("Save", SaveLayout),
-                    MenuItem::separator(),
-                    MenuItem::action("Import Schema…", ImportSchema),
-                    MenuItem::action("Import Data…", ImportData),
-                    MenuItem::action("Export Data…", ExportData),
-                    MenuItem::separator(),
-                    MenuItem::action("Clear Schema", ClearSchema),
-                    MenuItem::action("Clear Data", ClearData),
-                ],
-            },
-            Menu {
-                name: "View".into(),
-                items: vec![
-                    MenuItem::action("Toggle Left Panel", ToggleSidebar),
-                    MenuItem::action("Toggle Right Panel", ToggleRightPanel),
-                    MenuItem::action("Fit Graph", FitGraph),
-                    MenuItem::separator(),
-                    MenuItem::action("Toggle Perf Overlay", TogglePerfOverlay),
-                ],
-            },
-        ]);
+        cx.set_menus(native_menus(&ActionContext {
+            show_advanced_controls: cfg.ui.show_advanced_controls,
+            ..ActionContext::default()
+        }));
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(

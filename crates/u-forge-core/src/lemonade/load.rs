@@ -461,13 +461,25 @@ mod tests {
     #[tokio::test]
     async fn test_load_embeddinggemma_default_ctx() {
         let url = crate::test_helpers::require_integration_url!();
+        let model_name = "ggml-org/embeddinggemma-300M-GGUF";
+        let catalog = crate::lemonade::LemonadeServerCatalog::discover(&url)
+            .await
+            .unwrap();
+        if !catalog
+            .models
+            .iter()
+            .any(|model| model.id == model_name && model.downloaded)
+        {
+            eprintln!("SKIP: {model_name} is not present in the XDG model cache");
+            return;
+        }
 
         let opts = ModelLoadOptions {
             ctx_size: Some(crate::DEFAULT_EMBEDDING_CONTEXT_TOKENS),
             ..Default::default()
         };
 
-        let result = load_model(&url, "ggml-org/embeddinggemma-300M-GGUF", &opts, &[]).await;
+        let result = load_model(&url, model_name, &opts, &[]).await;
         assert!(
             result.is_ok(),
             "load_model failed: {:?}",

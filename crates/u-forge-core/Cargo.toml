@@ -66,12 +66,19 @@ toml_edit = "0.25.11"
 # Temp directories (tests + examples)
 tempfile = "3.27.0"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.183"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 
 [[example]]
 name = "convert_memorymesh"
 path = "examples/convert_memorymesh.rs"
+
+[[example]]
+name = "with_embedded_lemonade"
+path = "examples/with_embedded_lemonade.rs"
 
 [features]
 default = []

@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use u_forge_core::{AppConfig, KnowledgeGraph, lemonade::LemonadeConnection};
 
 use crate::{
-    AppView,
+    AppView, UiTheme,
     chat_history::ChatHistoryStore,
     startup::{
         LEMONADE_METADATA_READY_MESSAGE, StartupMilestone, StartupScenario, StartupTimeline,
@@ -301,6 +301,7 @@ fn event_index(timeline: &StartupTimeline, phase: &str) -> usize {
 
 #[gpui::test]
 fn fresh_start_measures_until_setup_is_painted(cx: &mut TestAppContext) {
+    cx.update(UiTheme::init);
     let temp = TempDir::new().unwrap();
     let server = FakeLemonade::fresh();
     let timeline = StartupTimeline::new(StartupScenario::Fresh);
@@ -344,6 +345,7 @@ fn fresh_start_measures_until_setup_is_painted(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn configured_start_measures_metadata_before_activation(cx: &mut TestAppContext) {
+    cx.update(UiTheme::init);
     let temp = TempDir::new().unwrap();
     let server = FakeLemonade::configured();
 

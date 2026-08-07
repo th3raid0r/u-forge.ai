@@ -19,7 +19,7 @@ export UFORGE_SCHEMA_DIR="./defaults/schemas"        # Override schema directory
 export UFORGE_DATA_FILE="./defaults/data/memory.jsonl" # Override data file
 export RUST_LOG=info                                 # Log verbosity
 
-# Integration test control (default: auto-skip when no server found)
+# Direct `cargo test` integration control (canonical `make test` overrides this)
 export UFORGE_INTEGRATION_TESTS=require  # Panic instead of skip when server unreachable
 export UFORGE_INTEGRATION_TESTS=skip     # Force-skip even when a server is present
 export UFORGE_SKIP_EMBEDDED_LEMONADE=1   # Skip automatic runtime provisioning
@@ -42,8 +42,10 @@ export RUST_LOG=info,u_forge_core::lemonade::management=debug,u_forge_core::lemo
 ```
 
 `RUST_LOG` controls u-forge's tracing filter. Embeddable Lemonade has its own
-`log_level` setting in `$XDG_DATA_HOME/u-forge/lemonade/config.json`, or
-`~/.local/share/u-forge/lemonade/config.json` when `XDG_DATA_HOME` is unset.
+`log_level` setting in `$XDG_CACHE_HOME/u-forge/lemonade/config.json`, or
+`~/.cache/u-forge/lemonade/config.json` when `XDG_CACHE_HOME` is unset. Models
+and downloaded backends live under that same cache root; model paths never
+fall back to the global Hugging Face cache.
 Set that JSON field to `"debug"` when Lemonade's default informational child
 events are insufficient; u-forge forwards those lines only when the dedicated
 `lemond` tracing target above is enabled and redacts both runtime credentials.
@@ -106,12 +108,23 @@ curl http://localhost:13305/api/v1/health
 Cross-platform Lemonade install: Linux → `snap`; macOS → `.pkg` from GitHub
 releases; Windows → `.exe` installer.
 
+### Canonical test ownership
+
+`make test` requires and launches the checksum-pinned Embeddable Lemonade
+artifact once, exports its private URL and credentials to every test binary,
+then unloads models and terminates the server's complete process group. It
+ignores `LEMONADE_URL`, `UFORGE_LEMOND_PATH`, and
+`UFORGE_SKIP_EMBEDDED_LEMONADE` so a developer's external server cannot change
+the tested version. The application and test runner reuse the same XDG-scoped
+model/backend cache, so tests do not create a second download tree. Direct
+`cargo test` retains the auto-skip controls below for narrow local iteration.
+
 ### URL Resolution Order
 
 `lemonade::resolve_lemonade_url()`:
-1. `GET http://localhost:13305/api/v1/health` — probed with 2 s timeout
-2. `GET http://127.0.0.1:13305/api/v1/health` — explicit IPv4 loopback
-3. `LEMONADE_URL` env var — accepted as-is, no liveness check
+1. `LEMONADE_URL` env var — normalized and accepted as-is
+2. `GET http://localhost:13305/v1/health` — probed with 2 s timeout
+3. `GET http://127.0.0.1:13305/v1/health` — explicit IPv4 loopback
 
 Returns `None` when no server is found. Setting `LEMONADE_URL` is optional when
 Lemonade runs on its default port.

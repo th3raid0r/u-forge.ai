@@ -7,32 +7,17 @@ use crate::text_field::TextFieldView;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Height of the tab bar inside the editor panel.
-pub(crate) const DETAIL_TAB_H: f32 = 28.0;
-
 /// Target column width for the multi-column form layout.
 pub(crate) const COLUMN_W: f32 = 300.0;
 
-/// Height of a single-line form field (label + input + gap).
-pub(crate) const FIELD_H_SINGLE: f32 = 52.0;
+/// Non-control height of a single-line form field (label + gap).
+const FIELD_CHROME_H: f32 = 24.0;
 
-/// Height of a multiline form field (label + textarea + gap).
-pub(crate) const FIELD_H_MULTI: f32 = 104.0;
-
-/// Space reserved for page navigation buttons.
-pub(crate) const PAGE_NAV_H: f32 = 32.0;
-
-/// Height of a single edge row in the edge editing section.
-pub(crate) const EDGE_ROW_H: f32 = 34.0;
+/// Baseline height of a multiline form field at the legacy 28 px control size.
+const FIELD_H_MULTI_BASE: f32 = 104.0;
 
 /// Height of the "EDGES" section header.
 pub(crate) const EDGE_SECTION_HEADER_H: f32 = 28.0;
-
-/// Height of the "Add Edge" button row.
-pub(crate) const EDGE_ADD_BTN_H: f32 = 28.0;
-
-/// Height of the Properties / Edges sub-tab bar inside each node editor tab.
-pub(crate) const SUBTAB_BAR_H: f32 = 24.0;
 
 /// Which sub-tab is active inside a node editor tab.
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -54,15 +39,17 @@ pub(crate) struct FieldSpec {
 }
 
 impl FieldSpec {
-    pub(crate) fn height(&self) -> f32 {
+    pub(crate) fn height(&self, control_height: f32) -> f32 {
+        let single = FIELD_CHROME_H + control_height;
+        let multiline = FIELD_H_MULTI_BASE + (control_height - 28.0).max(0.0);
         match &self.field_kind {
-            PropertyType::Boolean => FIELD_H_SINGLE,
-            PropertyType::Array(_) => FIELD_H_MULTI,
+            PropertyType::Boolean => single,
+            PropertyType::Array(_) => multiline,
             _ => {
                 if self.multiline {
-                    FIELD_H_MULTI
+                    multiline
                 } else {
-                    FIELD_H_SINGLE
+                    single
                 }
             }
         }
@@ -385,46 +372,63 @@ impl EditorTab {
             || props_changed
             || tags_changed
             || edges_changed;
+        if self.dirty {
+            self.pinned = true;
+        }
     }
 
     /// Compare `edited_edges` against `original_edges` to decide if edges
     /// have been modified.
     ///
-    /// Only *complete* edited edges (both endpoints + non-empty type) are
-    /// considered — incomplete placeholder rows are ignored for the purpose
-    /// of dirty tracking because they will be discarded on save anyway.
     fn are_edges_dirty(&self) -> bool {
-        // Collect the set of complete edited edges as (from, to, type) tuples.
-        let edited_set: Vec<(ObjectId, ObjectId, &str)> = self
-            .edited_edges
-            .iter()
-            .filter(|e| e.is_complete())
-            .map(|e| (e.from.unwrap(), e.to.unwrap(), e.edge_type.trim()))
-            .collect();
+        relationships_are_dirty(&self.edited_edges, &self.original_edges)
+    }
+}
 
-        let orig_set: Vec<(ObjectId, ObjectId, &str)> = self
-            .original_edges
-            .iter()
-            .map(|e| (e.from, e.to, e.edge_type.as_str()))
-            .collect();
+fn relationships_are_dirty(edited_edges: &[EditableEdge], original_edges: &[Edge]) -> bool {
+    // An unfinished row is user work, not a disposable placeholder. Marking it
+    // dirty pins a preview tab and lets the save path explain what is missing.
+    if edited_edges.iter().any(|edge| !edge.is_complete()) {
+        return true;
+    }
 
-        if edited_set.len() != orig_set.len() {
+    // Collect the set of complete edited edges as (from, to, type) tuples.
+    let edited_set: Vec<(ObjectId, ObjectId, &str)> = edited_edges
+        .iter()
+        .map(|e| (e.from.unwrap(), e.to.unwrap(), e.edge_type.trim()))
+        .collect();
+
+    let orig_set: Vec<(ObjectId, ObjectId, &str)> = original_edges
+        .iter()
+        .map(|e| (e.from, e.to, e.edge_type.as_str()))
+        .collect();
+
+    if edited_set.len() != orig_set.len() {
+        return true;
+    }
+
+    // Order-independent comparison: every original edge must appear in
+    // edited and vice-versa.
+    for triple in &orig_set {
+        if !edited_set.contains(triple) {
             return true;
         }
-
-        // Order-independent comparison: every original edge must appear in
-        // edited and vice-versa.
-        for triple in &orig_set {
-            if !edited_set.contains(triple) {
-                return true;
-            }
+    }
+    for triple in &edited_set {
+        if !orig_set.contains(triple) {
+            return true;
         }
-        for triple in &edited_set {
-            if !orig_set.contains(triple) {
-                return true;
-            }
-        }
+    }
 
-        false
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EditableEdge, relationships_are_dirty};
+
+    #[test]
+    fn unfinished_relationships_are_dirty_even_before_other_edits() {
+        assert!(relationships_are_dirty(&[EditableEdge::empty()], &[]));
     }
 }

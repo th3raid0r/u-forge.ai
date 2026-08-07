@@ -1,23 +1,33 @@
 use gpui::{
-    Context, MouseButton, MouseDownEvent, Render, SharedString, Window, canvas, div, prelude::*,
-    px, relative, rgb, rgba,
+    Context, Corner, MouseButton, MouseDownEvent, Render, SharedString, Window, anchored, canvas,
+    deferred, div, prelude::*, px, relative, rgb, rgba,
 };
 
+use crate::actions::{
+    ActionId, ActionTone, ContextActionId, ContextActionState, ContextScope, context_descriptors,
+    descriptor,
+};
 use crate::text_field::{TextFieldView, TextSubmit};
+use crate::ui::components::{ContextMenu, IconButton, LabelTone, MenuItem, Tooltip};
+use crate::ui::icons::{Icon, IconName, IconSize};
+use crate::ui::theme::UiTheme;
 
 use u_forge_core::PropertyType;
 
 use super::field_spec::SubTab;
 use super::{
-    NodeEditorPanel,
-    field_spec::{
-        COLUMN_W, DETAIL_TAB_H, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H, PAGE_NAV_H,
-        SUBTAB_BAR_H,
-    },
+    CloseDirtyTabRequested, NodeEditorPanel, TabContextMenuState,
+    field_spec::{COLUMN_W, EDGE_SECTION_HEADER_H},
 };
 
 impl Render for NodeEditorPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
+        let panel_focused = self.focus.contains_focused(window, cx);
+        let detail_tab_height = f32::from(theme.metrics.panel_header_height);
+        let subtab_bar_height = f32::from(theme.metrics.control_height_small);
+        let page_nav_height = f32::from(theme.metrics.control_height);
+        let tab_context_menu = self.tab_context_menu.clone();
         // Measure panel size each frame so column layout adapts to window resizes.
         let entity_for_measure = cx.entity().clone();
         let measure_canvas = canvas(
@@ -46,10 +56,23 @@ impl Render for NodeEditorPanel {
             .w_full()
             .h_full()
             .min_h_0()
+            .key_context("DetailsPanel")
+            .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    if this.tab_context_menu.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .overflow_hidden()
             .bg(rgb(0x1e1e2e))
             .border_b_1()
-            .border_color(rgb(0x313244));
+            .border_color(rgb(0x313244))
+            .when(panel_focused, |panel| {
+                panel.border_1().border_color(rgba(0xb4befeff))
+            });
 
         if self.tabs.is_empty() {
             return outer
@@ -60,7 +83,7 @@ impl Render for NodeEditorPanel {
                     div()
                         .text_base()
                         .text_color(rgba(0x6c7086ff))
-                        .child("Select a node to view details"),
+                        .child("Select a world item to view details"),
                 );
         }
 
@@ -72,17 +95,44 @@ impl Render for NodeEditorPanel {
             .flex()
             .flex_row()
             .flex_none()
-            .h(px(DETAIL_TAB_H))
-            .overflow_x_scroll()
+            .h(theme.metrics.panel_header_height)
             .bg(rgb(0x181825))
             .border_b_1()
             .border_color(rgb(0x313244));
+        let mut tab_strip = div()
+            .id("editor-tab-strip")
+            .flex()
+            .flex_row()
+            .min_w_0()
+            .h_full()
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_bar_scroll);
+        tab_strip.style().flex_grow = Some(1.0);
+        tab_strip.style().flex_shrink = Some(1.0);
+        tab_strip.style().flex_basis = Some(relative(0.0).into());
 
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == active_idx;
             let is_dirty = tab.dirty;
             let is_pinned = tab.pinned;
-            let tab_name: SharedString = tab.name.clone().into();
+            let display_name = if tab.name.trim().is_empty() {
+                format!("New {}", tab.object_type)
+            } else {
+                tab.name.clone()
+            };
+            let tab_name: SharedString = display_name.clone().into();
+            let tab_tooltip: SharedString = format!(
+                "{} — {}",
+                display_name,
+                if is_dirty {
+                    "unsaved changes"
+                } else if is_pinned {
+                    "kept open"
+                } else {
+                    "preview; may be replaced"
+                }
+            )
+            .into();
 
             let accent_color = if is_dirty {
                 rgb(0xfab387) // Catppuccin peach (orange) for dirty
@@ -110,33 +160,60 @@ impl Render for NodeEditorPanel {
                     rgb(0x1e1e2e)
                 } else {
                     rgb(0x181825)
-                });
+                })
+                .tooltip(Tooltip::text(tab_tooltip))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let focus = cx.focus_handle();
+                        focus.focus(window);
+                        this.tab_context_menu = Some(TabContextMenuState {
+                            position: event.position,
+                            index: i,
+                            focus,
+                        });
+                        cx.notify();
+                    }),
+                );
 
             if is_active {
                 tab_el = tab_el.border_b_2().border_color(accent_color);
             }
 
-            // Pin indicator
-            let pin_label: SharedString = if is_pinned { "P".into() } else { "o".into() };
-            let pin_btn = div()
-                .id(("tab-pin", i))
-                .text_base()
-                .text_color(if is_pinned {
-                    rgba(0xf9e2afff)
+            // Pinned and preview tabs use distinct glyphs. The tooltip explains
+            // the replacement behavior without spending tab width on labels.
+            let pin_panel = cx.weak_entity();
+            let pin_btn = IconButton::new(
+                ("tab-pin", i),
+                if is_pinned {
+                    IconName::TabPinFilled
                 } else {
-                    rgba(0x6c7086ff)
-                })
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    IconName::TabPinOutline
+                },
+                if is_pinned {
+                    if is_dirty {
+                        "Kept open while it has unsaved changes"
+                    } else {
+                        "Kept open — click to allow preview replacement"
+                    }
+                } else {
+                    "Preview tab — click to keep it open"
+                },
+            )
+            .disabled(is_dirty)
+            .selected(is_pinned)
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                pin_panel
+                    .update(cx, |this, cx| {
                         if let Some(tab) = this.tabs.get_mut(i) {
                             tab.pinned = !tab.pinned;
                         }
                         cx.notify();
-                    }),
-                )
-                .child(pin_label);
+                    })
+                    .ok();
+            });
 
             // Tab name — click to activate
             let name_el = div()
@@ -145,29 +222,40 @@ impl Render for NodeEditorPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        this.active_tab = Some(i);
-                        this.rebuild_field_subscriptions(cx);
-                        cx.notify();
+                        this.activate_tab(i, cx);
                     }),
                 )
+                .max_w(px(180.0))
+                .truncate()
                 .child(tab_name);
 
             // Close button
-            let close_btn = div()
-                .id(("tab-close", i))
-                .text_base()
-                .text_color(rgba(0x6c7086ff))
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        this.close_tab(i, cx);
-                        cx.notify();
-                    }),
-                )
-                .child("x");
+            let close_panel = cx.weak_entity();
+            let close_btn = IconButton::new(
+                ("tab-close", i),
+                IconName::TabClose,
+                if is_dirty {
+                    "Close tab — unsaved changes will require confirmation".to_string()
+                } else {
+                    descriptor(ActionId::DetailsCloseTab).display_tooltip()
+                },
+            )
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                close_panel
+                    .update(cx, |this, cx| {
+                        if is_dirty {
+                            cx.emit(CloseDirtyTabRequested(i));
+                        } else {
+                            this.close_tab(i, cx);
+                            cx.notify();
+                        }
+                        this.focus.focus(window);
+                    })
+                    .ok();
+            });
 
-            tab_el = tab_el.child(pin_btn).child(name_el).child(close_btn);
+            tab_el = tab_el.child(pin_btn).child(name_el);
 
             // Dirty indicator dot
             if is_dirty {
@@ -180,8 +268,33 @@ impl Render for NodeEditorPanel {
                 );
             }
 
-            tab_bar = tab_bar.child(tab_el);
+            tab_el = tab_el.child(close_btn);
+
+            tab_strip = tab_strip.child(tab_el);
         }
+        let dirty = self.has_dirty_tabs();
+        let active_dirty = self.tabs.get(active_idx).is_some_and(|tab| tab.dirty);
+        let save_active_descriptor = descriptor(ActionId::SaveActiveItem);
+        let save_active = IconButton::new(
+            "details-save-active",
+            IconName::FloppyDisc,
+            save_active_descriptor.display_tooltip(),
+        )
+        .disabled(!active_dirty)
+        .color(rgba(0xa6e3a1ff))
+        .boxed_action(save_active_descriptor.action());
+        let save_all_descriptor = descriptor(ActionId::SaveAllItems);
+        let save_all = IconButton::new(
+            "details-save-all",
+            IconName::SaveAll,
+            save_all_descriptor.display_tooltip(),
+        )
+        .disabled(!dirty)
+        .color(rgba(0xa6e3a1ff))
+        .boxed_action(save_all_descriptor.action());
+        tab_bar = tab_bar.child(tab_strip);
+        tab_bar = tab_bar.child(save_active);
+        tab_bar = tab_bar.child(save_all);
 
         // ── Form content for active tab ──────────────────────────────────────
         if active_idx >= self.tabs.len() {
@@ -260,14 +373,14 @@ impl Render for NodeEditorPanel {
                         cx.notify();
                     }),
                 )
-                .child("Edges");
+                .child("Relationships");
 
             div()
                 .id("subtab-bar")
                 .flex()
                 .flex_row()
                 .flex_none()
-                .h(px(SUBTAB_BAR_H))
+                .h(theme.metrics.control_height_small)
                 .bg(rgb(0x181825))
                 .border_b_1()
                 .border_color(rgb(0x313244))
@@ -278,7 +391,8 @@ impl Render for NodeEditorPanel {
         // Compute column/page layout using measured panel dimensions.
         let panel_w = f32::from(self.panel_size.width);
         let panel_h = f32::from(self.panel_size.height);
-        let available_h = (panel_h - DETAIL_TAB_H - SUBTAB_BAR_H - PAGE_NAV_H).max(100.0);
+        let available_h =
+            (panel_h - detail_tab_height - subtab_bar_height - page_nav_height).max(100.0);
         let max_cols = ((panel_w / COLUMN_W) as usize).max(1);
 
         // Greedy column fill to determine how many fields fit per page.
@@ -287,7 +401,7 @@ impl Render for NodeEditorPanel {
         let mut col_h = 0.0_f32;
 
         for (fi, spec) in specs.iter().enumerate() {
-            let fh = spec.height();
+            let fh = spec.height(f32::from(theme.metrics.control_height));
             if col_h + fh > available_h && !current_page.last().unwrap().is_empty() {
                 // Start a new column.
                 if current_page.len() < max_cols {
@@ -362,7 +476,7 @@ impl Render for NodeEditorPanel {
                             .flex_row()
                             .items_center()
                             .gap(px(6.0))
-                            .h(px(28.0))
+                            .h(theme.metrics.control_height)
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -431,7 +545,7 @@ impl Render for NodeEditorPanel {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .h(px(28.0))
+                            .h(theme.metrics.control_height)
                             .px(px(6.0))
                             .bg(rgb(0x313244))
                             .rounded(px(4.0))
@@ -464,7 +578,7 @@ impl Render for NodeEditorPanel {
                             let mut dropdown = div()
                                 .id(SharedString::from(format!("enum-drop-{}", spec.key)))
                                 .absolute()
-                                .top(px(30.0))
+                                .top(theme.metrics.control_height + px(2.0))
                                 .left_0()
                                 .w_full()
                                 .bg(rgb(0x313244))
@@ -547,7 +661,7 @@ impl Render for NodeEditorPanel {
                             .flex_row()
                             .flex_wrap()
                             .gap(px(4.0))
-                            .min_h(px(28.0));
+                            .min_h(theme.metrics.control_height);
 
                         for (item_idx, item) in items.iter().enumerate() {
                             let item_label: SharedString = item.clone().into();
@@ -578,6 +692,7 @@ impl Render for NodeEditorPanel {
                                             .text_base()
                                             .text_color(rgba(0xf38ba8ff))
                                             .cursor_pointer()
+                                            .tooltip(Tooltip::text("Remove this list item"))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
@@ -600,7 +715,11 @@ impl Render for NodeEditorPanel {
                                                     },
                                                 ),
                                             )
-                                            .child("x"),
+                                            .child(Icon::new(
+                                                IconName::MinusCircle,
+                                                IconSize::Small,
+                                                rgba(0xf38ba8ff),
+                                            )),
                                     ),
                             );
                         }
@@ -659,7 +778,11 @@ impl Render for NodeEditorPanel {
                                             cx.notify();
                                         }),
                                     )
-                                    .child("+"),
+                                    .child(Icon::new(
+                                        IconName::Plus,
+                                        IconSize::Small,
+                                        rgba(0x89b4faff),
+                                    )),
                             );
                         }
 
@@ -679,7 +802,7 @@ impl Render for NodeEditorPanel {
                                 .unwrap_or_default()
                                 .into();
                             div()
-                                .h(px(28.0))
+                                .h(theme.metrics.control_height)
                                 .px(px(6.0))
                                 .bg(rgb(0x313244))
                                 .rounded(px(4.0))
@@ -709,7 +832,7 @@ impl Render for NodeEditorPanel {
 
         let base = outer.child(measure_canvas).child(tab_bar).child(subtab_bar);
 
-        if active_subtab == SubTab::Properties {
+        let root = if active_subtab == SubTab::Properties {
             // ── Properties sub-tab: scrollable form columns + page nav ────────
             let has_prev = current_page_idx > 0;
             let has_next = current_page_idx + 1 < total_pages;
@@ -754,7 +877,13 @@ impl Render for NodeEditorPanel {
                                 cx.notify();
                             }),
                         )
-                        .child("< Prev"),
+                        .gap(px(4.0))
+                        .child(Icon::new(
+                            IconName::ChevronLeft,
+                            IconSize::Small,
+                            rgba(0xcdd6f4ff),
+                        ))
+                        .child("Previous"),
                 );
             }
 
@@ -785,7 +914,13 @@ impl Render for NodeEditorPanel {
                                 cx.notify();
                             }),
                         )
-                        .child("Next >"),
+                        .gap(px(4.0))
+                        .child("Next")
+                        .child(Icon::new(
+                            IconName::ChevronRight,
+                            IconSize::Small,
+                            rgba(0xcdd6f4ff),
+                        )),
                 );
             }
 
@@ -794,7 +929,101 @@ impl Render for NodeEditorPanel {
             // ── Edges sub-tab: edge editor fills remaining height ─────────────
             let edges_section = self.render_edges_section(active_idx, true, cx);
             base.child(edges_section)
-        }
+        };
+
+        root.when_some(tab_context_menu, |root, menu| {
+            let index = menu.index;
+            let Some(tab) = self.tabs.get(index) else {
+                return root;
+            };
+            let dirty = tab.dirty;
+            let pinned = tab.pinned;
+            let can_move_left = index > 0;
+            let can_move_right = index + 1 < self.tabs.len();
+            let action_state = ContextActionState {
+                tab_dirty: dirty,
+                can_move_tab_left: can_move_left,
+                can_move_tab_right: can_move_right,
+            };
+            let mut menu_body = div().w(px(220.0));
+            let mut previous_section = None;
+            for action_descriptor in context_descriptors(ContextScope::DetailsTab) {
+                if previous_section.is_some_and(|section| section != action_descriptor.section) {
+                    menu_body = menu_body.child(div().h(px(1.0)).bg(rgb(0x45475a)));
+                }
+                let label = if action_descriptor.id == ContextActionId::ToggleTabPinned && pinned {
+                    action_descriptor
+                        .alternate_label
+                        .unwrap_or(action_descriptor.label)
+                } else {
+                    action_descriptor.label
+                };
+                let action_id = action_descriptor.id;
+                let action_entity = cx.entity().clone();
+                let enabled = action_descriptor.is_enabled(&action_state);
+                let mut item = MenuItem::new(action_descriptor.element_id, label)
+                    .disabled(!enabled)
+                    .tooltip(action_descriptor.tooltip)
+                    .tone(match action_descriptor.tone {
+                        ActionTone::Normal => LabelTone::Primary,
+                        ActionTone::Danger => LabelTone::Danger,
+                    });
+                if enabled {
+                    item = item.on_click(move |_event, window, cx| {
+                        cx.stop_propagation();
+                        action_entity.update(cx, |panel, cx| {
+                            match action_id {
+                                ContextActionId::ToggleTabPinned => {
+                                    if let Some(tab) = panel.tabs.get_mut(index) {
+                                        tab.pinned = !tab.pinned;
+                                    }
+                                    panel.tab_context_menu = None;
+                                    cx.notify();
+                                }
+                                ContextActionId::MoveTabLeft => {
+                                    panel.move_tab(index, index.saturating_sub(1), cx);
+                                }
+                                ContextActionId::MoveTabRight => {
+                                    panel.move_tab(index, index + 1, cx);
+                                }
+                                ContextActionId::CloseTab => {
+                                    panel.tab_context_menu = None;
+                                    if dirty {
+                                        cx.emit(CloseDirtyTabRequested(index));
+                                    } else {
+                                        panel.close_tab(index, cx);
+                                        cx.notify();
+                                    }
+                                }
+                                _ => unreachable!("Details menu contains only Details actions"),
+                            }
+                            panel.focus.focus(window);
+                        });
+                    });
+                }
+                menu_body = menu_body.child(item);
+                previous_section = Some(action_descriptor.section);
+            }
+            root.child(deferred(
+                anchored()
+                    .position(menu.position)
+                    .anchor(Corner::TopLeft)
+                    .child(
+                        ContextMenu::new("details-tab-context-menu", menu_body)
+                            .focus_handle(menu.focus)
+                            .return_focus(self.focus.clone())
+                            .on_dismiss({
+                                let entity = cx.entity().clone();
+                                move |_window, cx| {
+                                    entity.update(cx, |panel, cx| {
+                                        panel.tab_context_menu = None;
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    ),
+            ))
+        })
     }
 }
 
@@ -811,6 +1040,8 @@ impl NodeEditorPanel {
         primary: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let theme = *UiTheme::get(cx);
+        let edge_row_height = f32::from(theme.metrics.control_height);
         let tab = match self.tabs.get(active_idx) {
             Some(t) => t,
             None => return div().into_any_element(),
@@ -894,26 +1125,25 @@ impl NodeEditorPanel {
                         .id(SharedString::from(format!("edge-type-{}", ei)))
                         .min_w(px(80.0))
                         .max_w(px(140.0))
-                        .h(px(26.0))
+                        .h(theme.metrics.control_height)
                         .bg(rgb(0x313244))
                         .rounded(px(4.0))
                 }
             };
 
             // Arrow to target
-            let arrow = div()
-                .flex()
-                .items_center()
-                .text_base()
-                .text_color(rgba(0x6c7086ff))
-                .child("\u{2192}"); // →
+            let arrow = div().flex().items_center().child(Icon::new(
+                IconName::ArrowRight,
+                IconSize::Small,
+                rgba(0x6c7086ff),
+            ));
 
             // "To" node selector button
             let to_btn = div()
                 .id(SharedString::from(format!("edge-to-btn-{}", ei)))
                 .flex()
                 .items_center()
-                .h(px(26.0))
+                .h(theme.metrics.control_height)
                 .px(px(6.0))
                 .bg(rgb(0x313244))
                 .rounded(px(4.0))
@@ -953,6 +1183,7 @@ impl NodeEditorPanel {
                 .cursor_pointer()
                 .text_base()
                 .text_color(rgba(0xf38ba8aa))
+                .tooltip(Tooltip::text("Remove this relationship"))
                 .hover(|style| style.bg(rgba(0xf38ba822)).text_color(rgba(0xf38ba8ff)))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -960,7 +1191,11 @@ impl NodeEditorPanel {
                         this.remove_edge_row(ei, cx);
                     }),
                 )
-                .child("\u{2715}"); // ✕
+                .child(Icon::new(
+                    IconName::MinusCircle,
+                    IconSize::Medium,
+                    rgba(0xf38ba8ff),
+                ));
 
             // Assemble the edge row — no dropdown inline; overlay is rendered
             // after the add button so it paints on top.
@@ -970,7 +1205,7 @@ impl NodeEditorPanel {
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
-                .h(px(EDGE_ROW_H))
+                .h(theme.metrics.control_height)
                 .child(type_field)
                 .child(arrow)
                 .child(to_btn)
@@ -979,12 +1214,13 @@ impl NodeEditorPanel {
             section = section.child(row);
         }
 
-        // ── "+ Add Edge" button ───────────────────────────────────────────
+        // ── "+ Add Relationship" button ──────────────────────────────────
         let mut add_btn = div()
             .id("edge-add-btn")
             .flex()
             .items_center()
-            .h(px(EDGE_ADD_BTN_H))
+            .gap(px(4.0))
+            .h(theme.metrics.control_height)
             .px(px(8.0))
             .bg(rgba(0x89b4fa1a))
             .rounded(px(4.0))
@@ -998,7 +1234,12 @@ impl NodeEditorPanel {
                     this.add_edge_row(cx);
                 }),
             )
-            .child("+ Add Edge");
+            .child(Icon::new(
+                IconName::Plus,
+                IconSize::Medium,
+                rgba(0x89b4faff),
+            ))
+            .child("Add Relationship");
         // Shrink to content width instead of stretching to fill the column.
         add_btn.style().align_self = Some(gpui::AlignItems::Start);
         section = section.child(add_btn);
@@ -1008,7 +1249,7 @@ impl NodeEditorPanel {
         // Positioned absolute within this section (which is `relative`).
         //
         // Y: bottom of row[ei] = header_h + (ei+1) * (row_h + gap)
-        //    = EDGE_SECTION_HEADER_H + gap(4) + ei*(EDGE_ROW_H+4) + EDGE_ROW_H
+        //    = header height + gap + ei*(row height+gap) + row height
         // X: align with section content edge (section has px_3 = 12px h-padding).
         if let Some(ref dd) = self.edge_node_dropdown {
             let ei = dd.edge_idx;
@@ -1017,7 +1258,7 @@ impl NodeEditorPanel {
             let highlighted = dd.highlighted_idx;
 
             let anchor_y =
-                EDGE_SECTION_HEADER_H + 4.0 + ei as f32 * (EDGE_ROW_H + 4.0) + EDGE_ROW_H;
+                EDGE_SECTION_HEADER_H + 4.0 + ei as f32 * (edge_row_height + 4.0) + edge_row_height;
 
             // Build filtered node list from snapshot.
             let snap = self.snapshot.read();
@@ -1056,7 +1297,7 @@ impl NodeEditorPanel {
                     .id(SharedString::from(format!("edge-dd-filter-overlay-{}", ei)))
                     .flex()
                     .flex_none()
-                    .h(px(28.0))
+                    .h(theme.metrics.control_height)
                     .px(px(4.0))
                     .border_b_1()
                     .border_color(rgb(0x313244))

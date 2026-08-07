@@ -192,6 +192,12 @@ impl LemonadeConnection {
         self.api_key()
     }
 
+    /// Administrative credential for owned-process bridges such as the test
+    /// suite runner. Callers must never log or persist the returned value.
+    pub fn admin_api_credential(&self) -> Option<&str> {
+        self.admin_api_key()
+    }
+
     /// Completion-class HTTP client shared with SDK adapters.
     pub fn completion_http_client(&self) -> reqwest::Client {
         self.clients.completion.clone()

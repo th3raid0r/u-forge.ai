@@ -6,9 +6,11 @@ description: Testing and debugging patterns
 
 ## Test Environment
 
-All tests use `TempDir` for isolation. `KnowledgeGraph::new(temp_dir.path())`
-creates `<temp_dir>/knowledge.db` automatically. No `env.sh`, no model downloads,
-no server needed.
+All storage tests use `TempDir` for isolation.
+`KnowledgeGraph::new(temp_dir.path())` creates `<temp_dir>/knowledge.db`
+automatically. No `env.sh` is needed. The canonical target provisions and owns
+the pinned embedded inference server, reuses the XDG-scoped model/backend
+cache, and skips optional live capabilities whose models are not cached.
 
 Bind the `TempDir` to a named variable (`_tmp`), not `_` — `TempDir` deletes its
 directory on drop. Discarding to `_` can drop before the test body runs.
@@ -18,7 +20,8 @@ directory on drop. Discarding to `_` can drop before the test body runs.
 ## Running Tests
 
 ```bash
-make test                                                              # All tests — always single-threaded
+make test                                                              # All tests, one embedded server, always single-threaded
+make test-ci                                                           # Offline suite; exclude Lemonade-backed tests
 cargo test --workspace storage -- --test-threads=1                     # Module-specific
 cargo test --workspace -- --test-threads=1 --nocapture                 # With stdout
 RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture  # With debug logging
@@ -26,9 +29,17 @@ cargo test --workspace test_name -- --exact --test-threads=1           # Single 
 ```
 
 **Always pass `--test-threads=1`.** Integration tests share GPU/NPU hardware on
-a live Lemonade Server and fail intermittently when run in parallel. Unit tests
-pass with no external service; integration tests skip automatically when no
-server is reachable.
+the suite-owned Lemonade Server and fail intermittently when run in parallel.
+`make test` prebuilds the test binaries, launches the pinned runtime once, runs
+both workspace and standalone `cosmic-text` suites, and then unloads models and
+terminates the runtime process group. Direct `cargo test` retains automatic
+integration-test skipping for narrow iteration.
+
+`make test-ci` sets `UFORGE_SKIP_EMBEDDED_LEMONADE=1`, excludes the Lemonade
+test namespace and the cross-module startup/provider tests backed by Lemonade,
+forces `UFORGE_INTEGRATION_TESTS=skip`, and removes Lemonade URLs and credentials
+from the workspace test process. The target cannot provision, discover, or
+contact a live Lemonade server.
 
 ---
 
@@ -69,13 +80,14 @@ speech audio. For smoke tests of the transcribe path, only check `result.is_ok()
 
 ## Lemonade integration tests — skip guard
 
-Use the `require_integration_url!()` macro from `crate::test_helpers`. It probes
-the live server and skips the test silently when none is reachable. Resolution
-order:
+Use the `require_integration_url!()` macro from `crate::test_helpers`.
+`make test` exports the owned runtime URL and forces `require` mode. Under a
+direct `cargo test`, it probes a live server and skips silently when none is
+reachable. Resolution order:
 
-1. `http://localhost:13305/api/v1` — probed via `GET /api/v1/health` (2 s timeout)
-2. `http://127.0.0.1:13305/api/v1` — explicit IPv4 loopback
-3. `LEMONADE_URL` env var — accepted as-is, no liveness check
+1. `LEMONADE_URL` env var — normalized and accepted as-is
+2. `http://localhost:13305/v1` — probed via `GET /v1/health` (2 s timeout)
+3. `http://127.0.0.1:13305/v1` — explicit IPv4 loopback
 
 Control variable:
 - `UFORGE_INTEGRATION_TESTS=require` — panic instead of skip (CI enforcement)
@@ -138,10 +150,12 @@ RUST_LOG=u_forge_core::ingest=warn                   # Suppress noisy modules
 ```bash
 make fmt-check
 make clippy
-make test
+make test-ci
 cargo doc --no-deps --workspace
 ```
 
-No `source env.sh` required. No model downloads. All commands work offline.
-Integration tests auto-skip when no Lemonade Server is reachable — set
-`UFORGE_INTEGRATION_TESTS=require` in CI to enforce them.
+No `source env.sh`, embedded-runtime download, model download, or live Lemonade
+server is allowed in CI. The CI job also exports the skip controls for its
+check and Clippy steps so the UI build script cannot provision Lemonade before
+the test step. Local `make test` remains the full embedded-runtime suite.
+Direct Cargo invocations retain `UFORGE_INTEGRATION_TESTS` for focused work.

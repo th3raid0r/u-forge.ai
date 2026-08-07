@@ -13,9 +13,18 @@ These are active failure modes observed in this codebase. Violating them produce
 
 `cargo run -p u-forge-ui-gpui` must work with **zero environment variables set**, degrading gracefully when no Lemonade Server is present. `LEMONADE_URL` exists only to override a non-standard location or port.
 
-- Always try the sensible default first (`http://localhost:13305/api/v1`). `lemonade::resolve_lemonade_url()` implements this — follow it, never bypass it.
+- Always honor `LEMONADE_URL` first, then try the sensible loopback defaults.
+  `lemonade::resolve_lemonade_url()` implements this — follow it, never bypass
+  it.
 - Never call `env::var(...).unwrap()` or `.expect("set LEMONADE_URL")` at the top level. An unset env var must never be a hard error for core functionality.
-- Tests: `make test` must pass with zero env vars. Use `crate::test_helpers::lemonade_url().await` and silently skip — never fail — when no server is reachable.
+- Tests: `make test` provisions the checksum-pinned embedded runtime, starts it
+  once for the complete suite, and tears down its process tree afterward. It
+  must work with zero env vars and must never adopt `LEMONADE_URL` or a server
+  already using a default port. Direct `cargo test` remains a narrow developer
+  path: use `crate::test_helpers::integration_test_url().await` and silently
+  skip when no server is reachable. CI uses `make test-ci`, which disables
+  embedded provisioning, excludes the Lemonade test namespace, and forces
+  cross-module live Lemonade tests to skip.
 
 ### 2. Fetch live state before making capability decisions
 
@@ -45,7 +54,10 @@ Every `.rs` file is thoroughly commented. `.md` and `.mdc` files tell you **wher
 → **`.rulesdir/environment-config.mdc`**
 → **`.rulesdir/development-workflow.mdc`**
 
-`env.sh` is optional — no longer required for compilation. `make build` and `make test` work with no env vars.
+`env.sh` is optional — no longer required for compilation. `make build` and
+`make test` work with no env vars; the latter requires a supported embedded
+runtime platform and either a cached pinned artifact or network access to
+provision it.
 
 ### 6. Imported data must conform to loaded schemas
 

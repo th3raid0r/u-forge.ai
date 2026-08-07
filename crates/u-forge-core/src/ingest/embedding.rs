@@ -110,13 +110,20 @@ impl EmbeddingPlan {
     /// The executor still performs its own checks because storage can change
     /// between scheduling and execution; this is only a cheap preflight to avoid
     /// flashing an embedding status when everything is already indexed.
-    pub fn has_pending_work(&self, graph: &KnowledgeGraph, hq_enabled: bool) -> Result<bool> {
+    pub fn has_pending_work(
+        &self,
+        graph: &KnowledgeGraph,
+        standard_enabled: bool,
+        hq_enabled: bool,
+    ) -> Result<bool> {
         match &self.task {
             EmbeddingTask::Rechunk(ids) => Ok(!ids.is_empty()),
             EmbeddingTask::EmbedAll => {
                 let stats = graph.get_stats()?;
-                Ok(stats.chunk_count > stats.embedded_count
-                    || (hq_enabled && stats.chunk_count > stats.embedded_hq_count))
+                Ok(
+                    (standard_enabled && stats.chunk_count > stats.embedded_count)
+                        || (hq_enabled && stats.chunk_count > stats.embedded_hq_count),
+                )
             }
         }
     }
@@ -229,7 +236,8 @@ impl EmbeddingPlan {
 ///
 /// # Errors
 /// - Node not found.
-/// - Embedding queue has no workers.
+/// - Neither the standard nor high-quality queue has an embedding worker.
+/// - An active embedding lane has no stable model fingerprint.
 /// - Any individual embed or upsert call fails.
 pub async fn rechunk_and_embed(
     graph: &KnowledgeGraph,
@@ -239,13 +247,19 @@ pub async fn rechunk_and_embed(
 ) -> Result<usize> {
     use crate::types::ChunkType;
 
-    let standard_fingerprint = queue
-        .embedding_space_fingerprint()
-        .ok_or_else(|| anyhow::anyhow!("Embedding queue has no model fingerprint"))?;
-    graph.ensure_embedding_space(EmbeddingTarget::Standard, standard_fingerprint)?;
-    if let Some(hq) = hq_queue
-        && hq.has_embedding()
-    {
+    let has_standard = queue.has_embedding();
+    let hq_queue = hq_queue.filter(|queue| queue.has_embedding());
+    if !has_standard && hq_queue.is_none() {
+        anyhow::bail!("No embedding-capable provider is available");
+    }
+
+    if has_standard {
+        let standard_fingerprint = queue
+            .embedding_space_fingerprint()
+            .ok_or_else(|| anyhow::anyhow!("Embedding queue has no model fingerprint"))?;
+        graph.ensure_embedding_space(EmbeddingTarget::Standard, standard_fingerprint)?;
+    }
+    if let Some(hq) = hq_queue {
         let hq_fingerprint = hq
             .embedding_space_fingerprint()
             .ok_or_else(|| anyhow::anyhow!("HQ embedding queue has no model fingerprint"))?;
@@ -274,16 +288,16 @@ pub async fn rechunk_and_embed(
     // Retrieve the newly created chunks so we have their content for embedding.
     let chunks = graph.get_text_chunks(object_id)?;
 
-    let mut embeddings = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
-        embeddings.push((chunk.id, queue.embed(&chunk.content).await?));
+    if has_standard {
+        let mut embeddings = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            embeddings.push((chunk.id, queue.embed(&chunk.content).await?));
+        }
+        graph.upsert_chunk_embeddings(embeddings)?;
     }
-    graph.upsert_chunk_embeddings(embeddings)?;
 
     // Embed with the HQ queue if available.
-    if let Some(hq) = hq_queue
-        && hq.has_embedding()
-    {
+    if let Some(hq) = hq_queue {
         let mut hq_embeddings = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
             hq_embeddings.push((chunk.id, hq.embed(&chunk.content).await?));
@@ -295,7 +309,8 @@ pub async fn rechunk_and_embed(
         object_id = %object_id,
         name = %meta.name,
         chunks = chunks.len(),
-        hq = hq_queue.is_some_and(|q| q.has_embedding()),
+        standard = has_standard,
+        hq = hq_queue.is_some(),
         "Rechunked and embedded node"
     );
 
@@ -495,13 +510,15 @@ mod tests {
 
     // ── Mock embedding provider ───────────────────────────────────────────────
 
-    struct MockEmbeddingProvider;
+    struct MockEmbeddingProvider {
+        dimensions: usize,
+    }
 
     #[async_trait]
     impl EmbeddingProvider for MockEmbeddingProvider {
         async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
             let seed = text.len() as f32 + text.chars().next().unwrap_or('a') as u32 as f32;
-            Ok((0..768)
+            Ok((0..self.dimensions)
                 .map(|i| ((seed + i as f32) % 1000.0) / 1000.0)
                 .collect())
         }
@@ -515,7 +532,7 @@ mod tests {
         }
 
         fn dimensions(&self) -> anyhow::Result<usize> {
-            Ok(768)
+            Ok(self.dimensions)
         }
         fn max_tokens(&self) -> anyhow::Result<usize> {
             Ok(512)
@@ -528,14 +545,18 @@ mod tests {
         }
     }
 
-    fn make_embed_queue() -> crate::queue::InferenceQueue {
+    fn make_embed_queue_with_dimensions(dimensions: usize) -> crate::queue::InferenceQueue {
         let built = BuiltProvider {
             name: "mock-embed".to_string(),
             capability: Capability::Embedding,
-            provider: ProviderSlot::Embedding(Arc::new(MockEmbeddingProvider)),
+            provider: ProviderSlot::Embedding(Arc::new(MockEmbeddingProvider { dimensions })),
             weight: 100,
         };
         InferenceQueueBuilder::new().with_provider(built).build()
+    }
+
+    fn make_embed_queue() -> crate::queue::InferenceQueue {
+        make_embed_queue_with_dimensions(crate::EMBEDDING_DIMENSIONS)
     }
 
     fn make_graph() -> (KnowledgeGraph, TempDir) {
@@ -624,6 +645,38 @@ mod tests {
         assert_eq!(
             stats.embedded_count, 12,
             "All 12 chunks should now be embedded"
+        );
+    }
+
+    #[tokio::test]
+    async fn rechunk_accepts_an_hq_only_embedding_lane() {
+        let (graph, _tmp) = make_graph();
+        let standard_queue = InferenceQueueBuilder::new().build();
+        let hq_queue = make_embed_queue_with_dimensions(HIGH_QUALITY_EMBEDDING_DIMENSIONS);
+        let object_id = ObjectBuilder::character("HQ-only character".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+
+        let chunks = rechunk_and_embed(&graph, &standard_queue, Some(&hq_queue), object_id)
+            .await
+            .unwrap();
+
+        assert_eq!(chunks, 1);
+        let stats = graph.get_stats().unwrap();
+        assert_eq!(stats.chunk_count, 1);
+        assert_eq!(stats.embedded_count, 0);
+        assert_eq!(stats.embedded_hq_count, 1);
+        assert!(
+            !EmbeddingPlan::embed_all()
+                .has_pending_work(&graph, false, true)
+                .unwrap(),
+            "a disabled standard lane must not keep an HQ-only sweep pending"
+        );
+        assert!(
+            EmbeddingPlan::embed_all()
+                .has_pending_work(&graph, true, true)
+                .unwrap(),
+            "the same graph still needs work when a standard lane is active"
         );
     }
 }

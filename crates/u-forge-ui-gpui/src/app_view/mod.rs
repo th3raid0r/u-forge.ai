@@ -4,7 +4,7 @@ mod state;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use gpui::{Context, Empty, Entity, Subscription, prelude::*};
+use gpui::{App, Context, Empty, Entity, FocusHandle, Focusable, Subscription, Window, prelude::*};
 use parking_lot::RwLock;
 use tracing::Instrument;
 use u_forge_agent::{AgentParams, GraphAgent};
@@ -26,11 +26,18 @@ use u_forge_graph_view::GraphSnapshot;
 
 use state::AppState;
 
-use crate::chat_panel::{AvailableModel, ChatPanel, ConnectRequested};
-use crate::confirmation_modal::{ConfirmationAccepted, ConfirmationCancelled, ConfirmationModal};
+use crate::actions::{ActionContext, native_menus};
+use crate::chat_panel::{
+    AvailableModel, ChatPanel, ConnectRequested, ToggleAssistantZoomRequested,
+};
+use crate::confirmation_modal::{
+    ConfirmationAccepted, ConfirmationAlternative, ConfirmationCancelled, ConfirmationModal,
+};
+use crate::dock_state::{DockFocusIntent, DockState};
 use crate::graph_canvas::GraphCanvas;
-use crate::node_editor::NodeEditorPanel;
+use crate::node_editor::{CloseDirtyTabRequested, NodeEditorPanel};
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
+use crate::panel_contracts::PanelId;
 use crate::path_picker::{
     PathCancelled, PathConfirmed, PathPickerKind, PathPickerModal, PickerMode,
 };
@@ -41,38 +48,9 @@ use crate::setup_panel::{
     SetupPanel, SetupRefreshRequested, SetupRequested,
 };
 use crate::startup::{LEMONADE_METADATA_READY_MESSAGE, StartupMilestone, StartupTimeline};
+use crate::ui::theme::UiTheme;
 
 // ── Root app view ─────────────────────────────────────────────────────────────
-
-/// Menu bar height in pixels.
-pub(crate) const MENU_BAR_H: f32 = 28.0;
-
-/// Status bar height in pixels.
-pub(crate) const STATUS_BAR_H: f32 = 24.0;
-
-/// Default sidebar (left panel) width in pixels.
-pub(crate) const DEFAULT_SIDEBAR_W: f32 = 220.0;
-
-/// Default fraction of workspace height allocated to the editor pane.
-pub(crate) const DEFAULT_EDITOR_RATIO: f32 = 0.3;
-
-/// Default right panel width in pixels.
-pub(crate) const DEFAULT_RIGHT_PANEL_W: f32 = 280.0;
-
-/// Minimum width for any side panel.
-pub(crate) const MIN_PANEL_W: f32 = 120.0;
-
-/// Minimum width for the central workspace.
-pub(crate) const MIN_WORKSPACE_W: f32 = 200.0;
-
-/// Minimum fraction for the editor/canvas vertical split.
-pub(crate) const MIN_PANE_RATIO: f32 = 0.1;
-
-/// Maximum fraction for the editor/canvas vertical split.
-pub(crate) const MAX_PANE_RATIO: f32 = 0.9;
-
-/// Width/height of resize drag handles in pixels.
-pub(crate) const RESIZE_HANDLE_SIZE: f32 = 6.0;
 
 // ── Drag marker types ─────────────────────────────────────────────────────────
 
@@ -98,13 +76,6 @@ impl Render for ResizeRightPanel {
     fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
-}
-
-/// Which panel is currently shown in the left sidebar.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum SidebarTab {
-    Nodes,
-    Search,
 }
 
 /// Number of frame-cost samples retained for the rolling perf-overlay average.
@@ -174,16 +145,26 @@ pub struct AppView {
     // ── UI layout state ───────────────────────────────────────────────────────
     pub(crate) file_menu_open: bool,
     pub(crate) view_menu_open: bool,
+    pub(crate) file_menu_button_focus: FocusHandle,
+    pub(crate) view_menu_button_focus: FocusHandle,
+    pub(crate) file_menu_focus: FocusHandle,
+    pub(crate) view_menu_focus: FocusHandle,
     pub(crate) setup_open: bool,
-    pub(crate) sidebar_open: bool,
-    pub(crate) sidebar_tab: SidebarTab,
-    pub(crate) right_panel_open: bool,
-    /// Current sidebar width in pixels (user-resizable).
-    pub(crate) sidebar_width: f32,
-    /// Fraction of workspace height for the editor pane (0.0..1.0).
-    pub(crate) editor_ratio: f32,
-    /// Current right panel width in pixels (user-resizable).
-    pub(crate) right_panel_width: f32,
+    pub(crate) settings_open: bool,
+    pub(crate) settings_focus: FocusHandle,
+    pub(crate) settings_return_focus: Option<FocusHandle>,
+    pub(crate) ui_font_size: f32,
+    pub(crate) ui_interface_size: f32,
+    pub(crate) show_advanced_controls: bool,
+    pub(crate) settings_draft_font_size: f32,
+    pub(crate) settings_draft_interface_size: f32,
+    pub(crate) settings_draft_advanced: bool,
+    pub(crate) dock_state: DockState,
+    /// Last focused descendant per workspace region, used when a dock is
+    /// revisited after F6 traversal or a close/reopen cycle.
+    last_region_focus: HashMap<FocusRegion, FocusHandle>,
+    workspace_state_path: std::path::PathBuf,
+    workspace_persist_task: Option<gpui::Task<()>>,
     // ── Path picker modal ─────────────────────────────────────────────────────
     /// Active path-picker dialog and which field it's editing, or None.
     pub(crate) path_picker: Option<(PathPickerKind, Entity<PathPickerModal>)>,
@@ -196,6 +177,10 @@ pub struct AppView {
     // ── GPUI bookkeeping ──────────────────────────────────────────────────────
     /// Subscriptions kept alive so handlers fire (node events, chat connect).
     _node_subs: Vec<Subscription>,
+    /// Ensures owned Lemonade cleanup is awaited on an ordinary application quit.
+    _app_quit_sub: Subscription,
+    /// Waits for Ctrl-C on the Tokio runtime once an embedded server is active.
+    _lemonade_signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Coalesces core mutation events into incremental graph refreshes.
     _graph_change_task: Option<gpui::Task<()>>,
     // ── Perf overlay ──────────────────────────────────────────────────────────
@@ -216,6 +201,24 @@ enum DestructiveAction {
     DeleteNode(ObjectId),
     ClearData,
     ClearSchema,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FocusRegion {
+    Panel(PanelId),
+    WorldCanvas,
+}
+
+fn next_focus_index(current: Option<usize>, len: usize, reverse: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (current, reverse) {
+        (Some(0), true) | (None, true) => len - 1,
+        (Some(index), true) => index - 1,
+        (Some(index), false) => (index + 1) % len,
+        (None, false) => 0,
+    })
 }
 
 #[derive(Clone)]
@@ -439,6 +442,309 @@ async fn activate_lemonade_capabilities(
 }
 
 impl AppView {
+    pub(crate) fn toggle_dock_panel(
+        &mut self,
+        panel: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if panel == PanelId::Assistant && self.dock_state.is_panel_active(panel) {
+            self.chat_panel
+                .update(cx, |chat, _cx| chat.last_render_us = 0);
+        }
+        let focus = self.dock_state.toggle_panel(panel);
+        self.sync_dock_presentational_state(cx);
+        self.apply_dock_focus_intent(focus, window, cx);
+        self.schedule_workspace_persist(cx);
+        cx.notify();
+    }
+
+    fn apply_dock_focus_intent(&mut self, intent: DockFocusIntent, window: &mut Window, cx: &App) {
+        match intent {
+            DockFocusIntent::Panel(panel) => {
+                self.focus_region(FocusRegion::Panel(panel), window, cx)
+            }
+            DockFocusIntent::WorldCanvas => self.focus_region(FocusRegion::WorldCanvas, window, cx),
+        }
+    }
+
+    pub(crate) fn cycle_workspace_focus(
+        &mut self,
+        reverse: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let regions = if let Some(zoomed) = self.dock_state.zoomed_panel() {
+            vec![FocusRegion::Panel(zoomed)]
+        } else {
+            let mut regions = Vec::with_capacity(4);
+            if self
+                .dock_state
+                .is_open(crate::panel_contracts::DockPosition::Left)
+            {
+                regions.push(FocusRegion::Panel(
+                    self.dock_state
+                        .active_panel(crate::panel_contracts::DockPosition::Left),
+                ));
+            }
+            regions.push(FocusRegion::WorldCanvas);
+            if self
+                .dock_state
+                .is_open(crate::panel_contracts::DockPosition::Bottom)
+            {
+                regions.push(FocusRegion::Panel(PanelId::Details));
+            }
+            if self
+                .dock_state
+                .is_open(crate::panel_contracts::DockPosition::Right)
+            {
+                regions.push(FocusRegion::Panel(PanelId::Assistant));
+            }
+            regions
+        };
+        if regions.is_empty() {
+            return;
+        }
+        let current = regions
+            .iter()
+            .position(|region| self.region_contains_focus(*region, window, cx));
+        let Some(next) = next_focus_index(current, regions.len(), reverse) else {
+            return;
+        };
+        self.focus_region(regions[next], window, cx);
+    }
+
+    fn region_contains_focus(&self, region: FocusRegion, window: &Window, cx: &App) -> bool {
+        match region {
+            FocusRegion::Panel(PanelId::World) => self
+                .node_panel
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx),
+            FocusRegion::Panel(PanelId::Search) => self
+                .search_panel
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx),
+            FocusRegion::Panel(PanelId::Assistant) => self
+                .chat_panel
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx),
+            FocusRegion::Panel(PanelId::Details) => self
+                .node_editor
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx),
+            FocusRegion::WorldCanvas => self
+                .graph_canvas
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx),
+        }
+    }
+
+    fn region_focus_handle(&self, region: FocusRegion, cx: &App) -> FocusHandle {
+        match region {
+            FocusRegion::Panel(PanelId::World) => self.node_panel.read(cx).focus_handle(cx),
+            FocusRegion::Panel(PanelId::Search) => self.search_panel.read(cx).focus_handle(cx),
+            FocusRegion::Panel(PanelId::Assistant) => self.chat_panel.read(cx).focus_handle(cx),
+            FocusRegion::Panel(PanelId::Details) => self.node_editor.read(cx).focus_handle(cx),
+            FocusRegion::WorldCanvas => self.graph_canvas.read(cx).focus_handle(cx),
+        }
+    }
+
+    fn remember_current_region_focus(&mut self, window: &Window, cx: &App) {
+        let Some(focused) = window.focused(cx) else {
+            return;
+        };
+        for region in [
+            FocusRegion::Panel(PanelId::World),
+            FocusRegion::Panel(PanelId::Search),
+            FocusRegion::WorldCanvas,
+            FocusRegion::Panel(PanelId::Details),
+            FocusRegion::Panel(PanelId::Assistant),
+        ] {
+            if self
+                .region_focus_handle(region, cx)
+                .contains(&focused, window)
+            {
+                self.last_region_focus.insert(region, focused);
+                return;
+            }
+        }
+    }
+
+    fn focus_region(&mut self, region: FocusRegion, window: &mut Window, cx: &App) {
+        self.remember_current_region_focus(window, cx);
+        let root_focus = self.region_focus_handle(region, cx);
+        if let Some(previous) = self.last_region_focus.get(&region)
+            && root_focus.contains(previous, window)
+        {
+            previous.focus(window);
+        } else {
+            root_focus.focus(window);
+        }
+    }
+
+    pub(crate) fn toggle_focused_panel_zoom(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = if self
+            .node_panel
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+        {
+            Some(PanelId::World)
+        } else if self
+            .search_panel
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+        {
+            Some(PanelId::Search)
+        } else if self
+            .chat_panel
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+        {
+            Some(PanelId::Assistant)
+        } else if self
+            .node_editor
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+        {
+            Some(PanelId::Details)
+        } else {
+            None
+        };
+        if let Some(panel) = panel {
+            self.dock_state.toggle_zoom(panel);
+            self.sync_dock_presentational_state(cx);
+            self.schedule_workspace_persist(cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_draft_font_size = self.ui_font_size;
+        self.settings_draft_interface_size = self.ui_interface_size;
+        self.settings_draft_advanced = self.show_advanced_controls;
+        self.settings_return_focus = window.focused(cx);
+        self.settings_open = true;
+        let focus = self.settings_focus.clone();
+        window.defer(cx, move |window, _cx| focus.focus(window));
+        cx.notify();
+    }
+
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        if let Some(return_focus) = self.settings_return_focus.take() {
+            return_focus.focus(window);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let font_size = self.settings_draft_font_size.clamp(10.0, 28.0);
+        let interface_size = self.settings_draft_interface_size.clamp(14.0, 32.0);
+        match self.state.app_config.persist_ui_settings(
+            font_size,
+            interface_size,
+            self.settings_draft_advanced,
+        ) {
+            Ok(path) => {
+                self.ui_font_size = font_size;
+                self.ui_interface_size = interface_size;
+                UiTheme::set_interface_size(cx, interface_size);
+                self.node_panel.update(cx, |_panel, cx| cx.notify());
+                self.search_panel.update(cx, |_panel, cx| cx.notify());
+                self.node_editor.update(cx, |_panel, cx| cx.notify());
+                self.chat_panel.update(cx, |_panel, cx| cx.notify());
+                self.setup_panel.update(cx, |_panel, cx| cx.notify());
+                self.show_advanced_controls = self.settings_draft_advanced;
+                self.refresh_native_menus(cx);
+                self.settings_open = false;
+                if let Some(return_focus) = self.settings_return_focus.take() {
+                    return_focus.focus(window);
+                }
+                self.state.data_status = Some(format!("Settings saved to {}", path.display()));
+            }
+            Err(error) => {
+                self.state.data_status = Some(format!("Could not save settings: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn action_context(&self, cx: &App) -> ActionContext {
+        let editor = self.node_editor.read(cx);
+        let active_details_dirty = editor
+            .active_tab
+            .and_then(|active| editor.tabs.get(active))
+            .is_some_and(|tab| tab.dirty);
+        let any_details_dirty = editor.has_dirty_tabs();
+        let has_active_details_tab = editor.active_tab.is_some();
+        let details_tab_count = editor.tabs.len();
+
+        let snapshot = self.state.snapshot.read();
+        let has_data = !snapshot.nodes.is_empty();
+        drop(snapshot);
+
+        let left_open = self
+            .dock_state
+            .is_open(crate::panel_contracts::DockPosition::Left);
+        let active_left = self
+            .dock_state
+            .active_panel(crate::panel_contracts::DockPosition::Left);
+        ActionContext {
+            show_advanced_controls: self.show_advanced_controls,
+            has_schema: self.state.schema_loaded,
+            has_data,
+            active_details_dirty,
+            any_details_dirty,
+            has_active_details_tab,
+            details_tab_count,
+            world_open: left_open && active_left == PanelId::World,
+            search_open: left_open && active_left == PanelId::Search,
+            assistant_open: self
+                .dock_state
+                .is_open(crate::panel_contracts::DockPosition::Right),
+            details_open: self
+                .dock_state
+                .is_open(crate::panel_contracts::DockPosition::Bottom),
+            performance_visible: self.perf_enabled,
+        }
+    }
+
+    pub(crate) fn refresh_native_menus(&self, cx: &mut App) {
+        cx.set_menus(native_menus(&self.action_context(cx)));
+    }
+
+    pub(crate) fn sync_dock_presentational_state(&mut self, cx: &mut Context<Self>) {
+        let assistant_zoomed = self.dock_state.zoomed_panel() == Some(PanelId::Assistant);
+        self.chat_panel
+            .update(cx, |panel, _cx| panel.set_zoomed(assistant_zoomed));
+    }
+
+    pub(crate) fn schedule_workspace_persist(&mut self, cx: &mut Context<Self>) {
+        let state = self.dock_state.clone();
+        let path = self.workspace_state_path.clone();
+        self.workspace_persist_task = Some(cx.spawn(async move |_this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            if let Err(error) = state.save(&path) {
+                tracing::warn!(path = %path.display(), %error, "Workspace UI state was not saved");
+            }
+        }));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: GraphSnapshot,
@@ -482,6 +788,12 @@ impl AppView {
     ) -> Self {
         let _phase = startup.phase("app_view_construct");
         let snapshot_arc = Arc::new(RwLock::new(snapshot));
+        let workspace_state_path = DockState::state_path(&app_config.storage.db_path);
+        let dock_state = DockState::load(&workspace_state_path);
+        let ui_font_size = app_config.ui.font_size;
+        let ui_interface_size = app_config.ui.interface_size;
+        UiTheme::set_interface_size(cx, ui_interface_size);
+        let show_advanced_controls = app_config.ui.show_advanced_controls;
 
         // Build child entities — clone Arc handles before they move into AppState.
         let selection = {
@@ -496,7 +808,7 @@ impl AppView {
         };
         let node_panel = {
             let _phase = startup.phase("node_panel_construct");
-            cx.new(|_cx| NodePanel::new(snapshot_arc.clone(), selection.clone()))
+            cx.new(|cx| NodePanel::new(snapshot_arc.clone(), selection.clone(), cx))
         };
 
         // Subscribe to node panel create/delete events.
@@ -512,6 +824,13 @@ impl AppView {
                 this.request_delete_node(event.0, cx);
             },
         );
+        let selection_sub = cx.observe(&selection, |this: &mut Self, selection, cx| {
+            if selection.read(cx).selected_node_id.is_some() {
+                this.dock_state.activate_panel(PanelId::Details);
+                this.schedule_workspace_persist(cx);
+                cx.notify();
+            }
+        });
         let search_panel = {
             let _phase = startup.phase("search_panel_construct");
             cx.new(|cx| {
@@ -536,7 +855,14 @@ impl AppView {
                 )
             })
         };
+        let close_dirty_tab_sub = cx.subscribe(
+            &node_editor,
+            |this: &mut Self, _editor, event: &CloseDirtyTabRequested, cx| {
+                this.open_dirty_tab_confirmation(event.0, cx);
+            },
+        );
         let db_path = app_config.storage.db_path.clone();
+        let assistant_zoomed = dock_state.zoomed_panel() == Some(PanelId::Assistant);
         let chat_panel = {
             let _phase = startup.phase("chat_panel_construct");
             cx.new(|cx| {
@@ -546,6 +872,7 @@ impl AppView {
                     app_config.chat.response_reserve,
                     &db_path,
                     tokio_rt.clone(),
+                    assistant_zoomed,
                     cx,
                 )
             })
@@ -557,6 +884,15 @@ impl AppView {
                     panel.set_connecting(true);
                 });
                 this.do_init_lemonade(cx);
+            },
+        );
+        let assistant_zoom_sub = cx.subscribe(
+            &chat_panel,
+            |this: &mut Self, _panel, _event: &ToggleAssistantZoomRequested, cx| {
+                this.dock_state.toggle_zoom(PanelId::Assistant);
+                this.sync_dock_presentational_state(cx);
+                this.schedule_workspace_persist(cx);
+                cx.notify();
             },
         );
 
@@ -624,6 +960,16 @@ impl AppView {
         );
         state.lemonade_connection = initial_lemonade_connection;
 
+        // GPUI only polls asynchronous quit observers for 100 ms. Perform the
+        // owned-process shutdown synchronously in the observer callback so the
+        // model unload and child reap are allowed to complete.
+        let app_quit_sub = cx.on_app_quit(|this, _cx| {
+            if let Some(embedded) = this.state.embedded_lemonade.clone() {
+                this.state.tokio_rt.block_on(embedded.shutdown());
+            }
+            async {}
+        });
+
         let mut view = Self {
             state,
             graph_canvas,
@@ -636,13 +982,24 @@ impl AppView {
             selection,
             file_menu_open: false,
             view_menu_open: false,
+            file_menu_button_focus: cx.focus_handle().tab_stop(true),
+            view_menu_button_focus: cx.focus_handle().tab_stop(true),
+            file_menu_focus: cx.focus_handle(),
+            view_menu_focus: cx.focus_handle(),
             setup_open: false,
-            sidebar_open: false,
-            sidebar_tab: SidebarTab::Nodes,
-            right_panel_open: false,
-            sidebar_width: DEFAULT_SIDEBAR_W,
-            editor_ratio: DEFAULT_EDITOR_RATIO,
-            right_panel_width: DEFAULT_RIGHT_PANEL_W,
+            settings_open: false,
+            settings_focus: cx.focus_handle(),
+            settings_return_focus: None,
+            ui_font_size,
+            ui_interface_size,
+            show_advanced_controls,
+            settings_draft_font_size: ui_font_size,
+            settings_draft_interface_size: ui_interface_size,
+            settings_draft_advanced: show_advanced_controls,
+            dock_state,
+            last_region_focus: HashMap::new(),
+            workspace_state_path,
+            workspace_persist_task: None,
             path_picker: None,
             _path_picker_subs: vec![],
             confirmation: None,
@@ -651,13 +1008,18 @@ impl AppView {
             _node_subs: vec![
                 node_sub_create,
                 node_sub_delete,
+                selection_sub,
+                close_dirty_tab_sub,
                 connect_sub,
+                assistant_zoom_sub,
                 setup_requested,
                 setup_refresh,
                 setup_backend_install,
                 setup_download,
                 setup_closed,
             ],
+            _app_quit_sub: app_quit_sub,
+            _lemonade_signal_task: None,
             _graph_change_task: None,
             perf_enabled: false,
             last_frame_cost_us: 0,
@@ -695,6 +1057,7 @@ impl AppView {
             }
         }));
 
+        view.refresh_native_menus(cx);
         view.do_init_lemonade(cx);
         view
     }
@@ -773,22 +1136,30 @@ impl AppView {
         }
     }
 
-    pub(crate) fn request_clear_data(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn request_clear_data(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.graph_canvas.read(cx).focus_handle(cx));
         self.open_confirmation(
             DestructiveAction::ClearData,
             "Clear all data",
-            "Delete every node, edge, chunk, and saved layout position? This cannot be undone.",
+            "Delete every world item, relationship, text chunk, and saved canvas position? This cannot be undone.",
             "Clear Data",
+            return_focus,
             cx,
         );
     }
 
-    pub(crate) fn request_clear_schema(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn request_clear_schema(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.graph_canvas.read(cx).focus_handle(cx));
         self.open_confirmation(
             DestructiveAction::ClearSchema,
             "Clear schemas",
             "Remove all imported schemas? Existing graph data is not changed, but schema validation will be unavailable.",
             "Clear Schema",
+            return_focus,
             cx,
         );
     }
@@ -807,9 +1178,10 @@ impl AppView {
             DestructiveAction::DeleteNode(node_id),
             "Delete node",
             &format!(
-                "Delete “{node_name}” and its connected edges and text chunks? This cannot be undone."
+                "Delete “{node_name}” and its connected relationships and text chunks? This cannot be undone."
             ),
             "Delete Node",
+            self.node_panel.read(cx).focus_handle(cx),
             cx,
         );
     }
@@ -820,13 +1192,16 @@ impl AppView {
         title: &str,
         message: &str,
         confirm_label: &str,
+        return_focus: FocusHandle,
         cx: &mut Context<Self>,
     ) {
-        let modal = cx.new(|_cx| {
+        let modal = cx.new(|cx| {
             ConfirmationModal::new(
                 title.to_string(),
                 message.to_string(),
                 confirm_label.to_string(),
+                return_focus,
+                cx,
             )
         });
         let accepted = cx.subscribe(&modal, |this, _modal, _event: &ConfirmationAccepted, cx| {
@@ -852,6 +1227,70 @@ impl AppView {
         self.confirmation = Some(modal);
         self._confirmation_subs = vec![accepted, cancelled];
         cx.notify();
+    }
+
+    fn open_dirty_tab_confirmation(&mut self, index: usize, cx: &mut Context<Self>) {
+        let return_focus = self.node_editor.read(cx).focus_handle(cx);
+        let modal = cx.new(|cx| {
+            ConfirmationModal::new(
+                "Save changes before closing?".to_string(),
+                "This Details tab has unsaved changes.".to_string(),
+                "Save Changes".to_string(),
+                return_focus,
+                cx,
+            )
+            .with_alternative("Don't Save")
+            .non_destructive()
+        });
+        let accepted = cx.subscribe(
+            &modal,
+            move |this, _modal, _event: &ConfirmationAccepted, cx| {
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                this.save_and_close_editor_tab(index, cx);
+            },
+        );
+        let discarded = cx.subscribe(
+            &modal,
+            move |this, _modal, _event: &ConfirmationAlternative, cx| {
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                this.node_editor
+                    .update(cx, |editor, cx| editor.close_tab(index, cx));
+                cx.notify();
+            },
+        );
+        let cancelled = cx.subscribe(
+            &modal,
+            |this, _modal, _event: &ConfirmationCancelled, cx| {
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                cx.notify();
+            },
+        );
+        self.pending_destructive_action = None;
+        self.confirmation = Some(modal);
+        self._confirmation_subs = vec![accepted, discarded, cancelled];
+        cx.notify();
+    }
+
+    fn request_close_active_editor_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.node_editor.read(cx).active_tab else {
+            return;
+        };
+        if self
+            .node_editor
+            .read(cx)
+            .tabs
+            .get(index)
+            .is_some_and(|tab| tab.dirty)
+        {
+            self.open_dirty_tab_confirmation(index, cx);
+        } else {
+            self.node_editor
+                .update(cx, |editor, cx| editor.close_tab(index, cx));
+            self.node_editor.read(cx).focus_handle(cx).focus(window);
+        }
     }
 
     fn execute_destructive_action(&mut self, action: DestructiveAction, cx: &mut Context<Self>) {
@@ -917,7 +1356,7 @@ impl AppView {
                             String::new()
                         };
                         let skipped_edges = if stats.edge_records_skipped > 0 {
-                            format!(", {} edges skipped", stats.edge_records_skipped)
+                            format!(", {} relationships skipped", stats.edge_records_skipped)
                         } else {
                             String::new()
                         };
@@ -927,7 +1366,7 @@ impl AppView {
                             .map(|path| format!(", diagnostics: {}", path.display()))
                             .unwrap_or_default();
                         view.state.data_status = Some(format!(
-                            "Import done — {} nodes, {} edges{}{}{}{}{}",
+                            "Import done — {} world items, {} relationships{}{}{}{}{}",
                             stats.objects_created,
                             stats.relationships_created,
                             reused,
@@ -999,7 +1438,11 @@ impl AppView {
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        let modal = cx.new(|cx| PathPickerModal::new(mode, title, title, initial_path, cx));
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.graph_canvas.read(cx).focus_handle(cx));
+        let modal =
+            cx.new(|cx| PathPickerModal::new(mode, title, title, initial_path, return_focus, cx));
 
         let confirm_sub = cx.subscribe(&modal, |this, _modal, event: &PathConfirmed, cx| {
             let path = event.0.clone();
@@ -1132,18 +1575,102 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn do_save(&mut self, cx: &mut Context<Self>) {
-        // 1. Save layout positions.
-        self.graph_canvas.read(cx).save_layout();
+    pub(crate) fn do_save_active(&mut self, cx: &mut Context<Self>) {
+        self.do_save_editor(false, cx);
+    }
 
-        // 2. Save all dirty editor tabs (also discards empty new nodes).
-        let (saved, saved_ids, discarded_ids, skipped_edges) = self
+    pub(crate) fn do_save_all(&mut self, cx: &mut Context<Self>) {
+        self.do_save_editor(true, cx);
+    }
+
+    fn do_save_editor(&mut self, all: bool, cx: &mut Context<Self>) {
+        // Save All is also the explicit full workspace flush.
+        if all {
+            self.graph_canvas.read(cx).save_layout();
+        }
+
+        let incomplete_relationships = if all {
+            self.node_editor.read(cx).incomplete_relationship_count()
+        } else {
+            self.node_editor
+                .read(cx)
+                .active_incomplete_relationship_count()
+        };
+        if incomplete_relationships > 0 {
+            self.state.data_status = Some(format!(
+                "Cannot save: complete all {incomplete_relationships} unfinished relationship(s)."
+            ));
+            cx.notify();
+            return;
+        }
+
+        let (saved, saved_ids, discarded_ids, skipped_edges) =
+            self.node_editor.update(cx, |editor, cx| {
+                if all {
+                    editor.save_dirty_tabs(cx)
+                } else {
+                    editor.save_active_tab(cx)
+                }
+            });
+        self.finish_editor_save((saved, saved_ids, discarded_ids, skipped_edges), cx);
+    }
+
+    fn save_and_close_editor_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let incomplete = self
             .node_editor
-            .update(cx, |editor, cx| editor.save_dirty_tabs(cx));
+            .read(cx)
+            .incomplete_relationship_count_at(index);
+        if incomplete > 0 {
+            self.state.data_status = Some(format!(
+                "Cannot save: complete all {incomplete} unfinished relationship(s)."
+            ));
+            cx.notify();
+            return;
+        }
+        let node_id = self
+            .node_editor
+            .read(cx)
+            .tabs
+            .get(index)
+            .map(|tab| tab.node_id);
+        let result = self
+            .node_editor
+            .update(cx, |editor, cx| editor.save_tab(index, cx));
+        self.finish_editor_save(result, cx);
+
+        if let Some(node_id) = node_id {
+            let still_dirty = self
+                .node_editor
+                .read(cx)
+                .tabs
+                .iter()
+                .any(|tab| tab.node_id == node_id && tab.dirty);
+            if still_dirty {
+                self.state.data_status = Some(
+                    "Could not close the tab because its changes did not pass validation."
+                        .to_string(),
+                );
+            } else {
+                self.node_editor.update(cx, |editor, cx| {
+                    if let Some(index) = editor.tabs.iter().position(|tab| tab.node_id == node_id) {
+                        editor.close_tab(index, cx);
+                    }
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_editor_save(
+        &mut self,
+        result: (usize, Vec<ObjectId>, Vec<ObjectId>, usize),
+        cx: &mut Context<Self>,
+    ) {
+        let (saved, saved_ids, discarded_ids, skipped_edges) = result;
 
         if skipped_edges > 0 {
             self.state.data_status = Some(format!(
-                "{skipped_edges} incomplete edge(s) skipped — fill both endpoints before saving."
+                "{skipped_edges} incomplete relationship(s) skipped — fill both endpoints before saving."
             ));
         }
 
@@ -1170,36 +1697,14 @@ impl AppView {
 
     // ── Node create / delete (driven by node panel events) ────────────────
 
-    /// Create a new empty node of the given type, persist it, refresh the
-    /// snapshot, and navigate to it in the editor (marked as `is_new`).
+    /// Create an in-memory Details draft. Storage is not touched until Save.
     fn create_node(&mut self, object_type: &str, cx: &mut Context<Self>) {
         let meta = ObjectMetadata::new(object_type.to_string(), String::new());
-        let node_id = meta.id;
-
-        match self.state.graph.add_object(meta) {
-            Ok(_id) => {
-                // Refresh snapshot so the node panel and canvas see the new node.
-                self.refresh_snapshot(cx);
-
-                // Select the new node — this triggers the editor's observer,
-                // but we use `open_new_node_tab` directly so the `is_new` flag
-                // is set correctly.
-                self.selection.update(cx, |sel, cx| {
-                    sel.select_by_id(Some(node_id), cx);
-                });
-                self.node_editor.update(cx, |editor, cx| {
-                    editor.open_new_node_tab(node_id, cx);
-                });
-
-                // Ensure the sidebar is open on the nodes tab so the user sees
-                // the newly created node.
-                self.sidebar_open = true;
-                self.sidebar_tab = SidebarTab::Nodes;
-            }
-            Err(e) => {
-                self.state.data_status = Some(format!("Failed to create node: {e}"));
-            }
-        }
+        self.node_editor
+            .update(cx, |editor, cx| editor.open_new_draft(meta, cx));
+        self.dock_state.activate_panel(PanelId::World);
+        self.dock_state.activate_panel(PanelId::Details);
+        self.schedule_workspace_persist(cx);
         cx.notify();
     }
 
@@ -1284,7 +1789,11 @@ impl AppView {
         let tokio_rt = self.state.tokio_rt.clone();
 
         let plan_kind = plan.kind();
-        match plan.has_pending_work(&graph, hq_queue.as_ref().is_some_and(|q| q.has_embedding())) {
+        match plan.has_pending_work(
+            &graph,
+            queue.has_embedding(),
+            hq_queue.as_ref().is_some_and(|q| q.has_embedding()),
+        ) {
             Ok(true) => {}
             Ok(false) => {
                 self.state.embedding_status = None;
@@ -1825,6 +2334,22 @@ impl AppView {
     fn apply_lemonade_metadata(&mut self, metadata: LemonadeMetadata, cx: &mut Context<Self>) {
         let _phase = self.startup.phase("lemonade_metadata_ui_apply");
         self.state.embedded_lemonade = metadata.embedded;
+        if self._lemonade_signal_task.is_none()
+            && let Some(embedded) = self.state.embedded_lemonade.clone()
+        {
+            self._lemonade_signal_task = Some(self.state.tokio_rt.spawn(async move {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        tracing::info!("Ctrl-C received; shutting down embedded Lemonade");
+                        embedded.shutdown().await;
+                        std::process::exit(130);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not install the Ctrl-C shutdown handler");
+                    }
+                }
+            }));
+        }
         self.state.lemonade_connection = Some(metadata.connection.clone());
         self.state.lemonade_catalog = Some(metadata.catalog.clone());
         let setup_hq_default = if self
@@ -2079,7 +2604,7 @@ impl AppView {
                             .to_string_lossy()
                             .into_owned();
                         view.state.data_status = Some(format!(
-                            "Exported {node_count} nodes, {edge_count} edges → {filename}"
+                            "Exported {node_count} world items, {edge_count} relationships → {filename}"
                         ));
                     }
                     Err(e) => {
@@ -2289,6 +2814,15 @@ async fn provision_lemonade(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_focus_cycle_wraps_in_both_directions() {
+        assert_eq!(next_focus_index(None, 4, false), Some(0));
+        assert_eq!(next_focus_index(Some(3), 4, false), Some(0));
+        assert_eq!(next_focus_index(None, 4, true), Some(3));
+        assert_eq!(next_focus_index(Some(0), 4, true), Some(3));
+        assert_eq!(next_focus_index(None, 0, false), None);
+    }
 
     fn selected(
         id: &str,
