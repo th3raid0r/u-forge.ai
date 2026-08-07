@@ -117,8 +117,9 @@ Primary Zed references:
   with incomplete relationships rather than silently dropping them.
 - [x] **UI-19 — Assistant toolbar.** Match Zed's toolbar semantics for title,
   new conversation, maximize/restore, overflow, tooltips, friendly model
-  selection, Think Longer, and explicit reload/busy/failure states. Conflicting
-  actions are disabled during streaming or reload rather than silently ignored.
+  selection, a thinking enable/disable toggle, and explicit
+  reload/busy/failure states. Conflicting actions are disabled during streaming
+  or reload rather than silently ignored.
 - [x] **UI-20 — Conversation boundary.** Retain storage, latest-session resume,
   and the current lightweight new/switch/delete selector. Do not add Zed's
   archive presentation. Preserve per-message entities, virtualization,

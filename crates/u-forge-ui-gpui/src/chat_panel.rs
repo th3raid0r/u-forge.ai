@@ -2233,11 +2233,11 @@ impl Render for ChatPanel {
                                                 rgba(0x6c7086ff)
                                             })
                                             .tooltip(Tooltip::text(if !reasoning_capable {
-                                                "Think Longer follows this model's default"
+                                                "Thinking follows this model's default"
                                             } else if reasoning_enabled {
-                                                "Think Longer is on — click to turn it off"
+                                                "Disable thinking"
                                             } else {
-                                                "Think Longer is off — click to turn it on"
+                                                "Enable thinking"
                                             }))
                                             .when(!controls_locked && reasoning_capable, |toggle| {
                                                 toggle.cursor_pointer().on_mouse_down(
