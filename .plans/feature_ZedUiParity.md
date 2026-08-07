@@ -78,7 +78,7 @@ Primary Zed references:
 
 ## Focus, actions, menus, and status
 
-- [ ] **UI-11 — Focus contracts.** Make panels focusable, attach key contexts,
+- [x] **UI-11 — Focus contracts.** Make panels focusable, attach key contexts,
   preserve last descendant focus, expose focus-visible state, and restore focus
   predictably after closing panels, menus, dialogs, and tabs.
 - [x] **UI-12 — Keyboard navigation.** Support dock activation, F6 region

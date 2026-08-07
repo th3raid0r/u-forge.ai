@@ -558,6 +558,8 @@ impl Render for Tooltip {
 pub struct Popover {
     id: ElementId,
     child: AnyElement,
+    focus_handle: Option<FocusHandle>,
+    return_focus: Option<FocusHandle>,
     on_dismiss: Option<DismissHandler>,
 }
 
@@ -566,8 +568,20 @@ impl Popover {
         Self {
             id: id.into(),
             child: child.into_any_element(),
+            focus_handle: None,
+            return_focus: None,
             on_dismiss: None,
         }
+    }
+
+    pub fn focus_handle(mut self, focus_handle: FocusHandle) -> Self {
+        self.focus_handle = Some(focus_handle);
+        self
+    }
+
+    pub fn return_focus(mut self, return_focus: FocusHandle) -> Self {
+        self.return_focus = Some(return_focus);
+        self
     }
 
     pub fn on_dismiss(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
@@ -581,7 +595,7 @@ impl RenderOnce for Popover {
         let theme = *UiTheme::get(cx);
         let mut popover = div()
             .id(self.id)
-            .focusable()
+            .key_context("Menu")
             // Deferred overlays must block workspace hitboxes beneath them.
             // Otherwise a body's mouse-down dismissal removes the menu before
             // an item can receive mouse-up and complete its click.
@@ -594,14 +608,27 @@ impl RenderOnce for Popover {
             .focus_visible(move |style| style.border_color(theme.colors.focus))
             .child(self.child);
 
+        popover = match self.focus_handle {
+            Some(focus_handle) => popover.track_focus(&focus_handle),
+            None => popover.focusable(),
+        };
+
         if let Some(on_dismiss) = self.on_dismiss {
+            let return_focus = self.return_focus;
             let dismiss_on_click_out = on_dismiss.clone();
+            let return_on_click_out = return_focus.clone();
             popover = popover
                 .on_mouse_down_out(move |_: &MouseDownEvent, window, cx| {
+                    if let Some(return_focus) = &return_on_click_out {
+                        return_focus.focus(window);
+                    }
                     dismiss_on_click_out(window, cx);
                 })
                 .on_key_down(move |event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
+                        if let Some(return_focus) = &return_focus {
+                            return_focus.focus(window);
+                        }
                         on_dismiss(window, cx);
                         cx.stop_propagation();
                     }
@@ -628,6 +655,16 @@ impl Menu {
         self.popover = self.popover.on_dismiss(handler);
         self
     }
+
+    pub fn focus_handle(mut self, focus_handle: FocusHandle) -> Self {
+        self.popover = self.popover.focus_handle(focus_handle);
+        self
+    }
+
+    pub fn return_focus(mut self, return_focus: FocusHandle) -> Self {
+        self.popover = self.popover.return_focus(return_focus);
+        self
+    }
 }
 
 impl RenderOnce for Menu {
@@ -650,6 +687,16 @@ impl ContextMenu {
 
     pub fn on_dismiss(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.menu = self.menu.on_dismiss(handler);
+        self
+    }
+
+    pub fn focus_handle(mut self, focus_handle: FocusHandle) -> Self {
+        self.menu = self.menu.focus_handle(focus_handle);
+        self
+    }
+
+    pub fn return_focus(mut self, return_focus: FocusHandle) -> Self {
+        self.menu = self.menu.return_focus(return_focus);
         self
     }
 }
@@ -791,6 +838,8 @@ pub struct Dialog {
     title: SharedString,
     body: AnyElement,
     actions: Vec<AnyElement>,
+    focus_handle: Option<FocusHandle>,
+    return_focus: Option<FocusHandle>,
     on_dismiss: Option<DismissHandler>,
 }
 
@@ -801,6 +850,8 @@ impl Dialog {
             title: title.into(),
             body: body.into_any_element(),
             actions: Vec::new(),
+            focus_handle: None,
+            return_focus: None,
             on_dismiss: None,
         }
     }
@@ -815,6 +866,16 @@ impl Dialog {
         self
     }
 
+    pub fn focus_handle(mut self, focus_handle: FocusHandle) -> Self {
+        self.focus_handle = Some(focus_handle);
+        self
+    }
+
+    pub fn return_focus(mut self, return_focus: FocusHandle) -> Self {
+        self.return_focus = Some(return_focus);
+        self
+    }
+
     pub fn on_dismiss(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_dismiss = Some(Rc::new(handler));
         self
@@ -826,7 +887,7 @@ impl RenderOnce for Dialog {
         let theme = *UiTheme::get(cx);
         let mut dialog = div()
             .id(self.id)
-            .focusable()
+            .key_context("Dialog")
             .flex()
             .flex_col()
             .w(px(440.0))
@@ -855,9 +916,18 @@ impl RenderOnce for Dialog {
                     .children(self.actions),
             );
 
+        dialog = match self.focus_handle {
+            Some(focus_handle) => dialog.track_focus(&focus_handle),
+            None => dialog.focusable(),
+        };
+
         if let Some(on_dismiss) = self.on_dismiss {
+            let return_focus = self.return_focus;
             dialog = dialog.on_key_down(move |event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
+                    if let Some(return_focus) = &return_focus {
+                        return_focus.focus(window);
+                    }
                     on_dismiss(window, cx);
                     cx.stop_propagation();
                 }
@@ -901,7 +971,9 @@ mod tests {
     struct PrimitiveHarness {
         focus: FocusHandle,
         action_focus: FocusHandle,
+        menu_scope_focus: FocusHandle,
         menu_focus: FocusHandle,
+        dialog_scope_focus: FocusHandle,
         dialog_focus: FocusHandle,
         activations: Rc<Cell<usize>>,
         menu_dismissals: Rc<Cell<usize>>,
@@ -978,10 +1050,14 @@ mod tests {
                             .focus_handle(self.menu_focus.clone())
                             .on_click(|_, _, _| {}),
                     )
+                    .focus_handle(self.menu_scope_focus.clone())
+                    .return_focus(self.action_focus.clone())
                     .on_dismiss(move |_, _| menu_dismissals.set(menu_dismissals.get() + 1)),
                 )
                 .child(
                     Dialog::new("Test dialog", div().child("Body"))
+                        .focus_handle(self.dialog_scope_focus.clone())
+                        .return_focus(self.action_focus.clone())
                         .action(
                             Button::new("dialog-action", "Dialog action")
                                 .focus_handle(self.dialog_focus.clone())
@@ -1004,7 +1080,9 @@ mod tests {
         let (harness, cx) = cx.add_window_view(|_window, cx| PrimitiveHarness {
             focus: cx.focus_handle(),
             action_focus: cx.focus_handle().tab_index(0).tab_stop(true),
+            menu_scope_focus: cx.focus_handle(),
             menu_focus: cx.focus_handle().tab_index(1).tab_stop(true),
+            dialog_scope_focus: cx.focus_handle(),
             dialog_focus: cx.focus_handle().tab_index(2).tab_stop(true),
             activations: harness_activations,
             menu_dismissals: harness_menu_dismissals,
@@ -1039,6 +1117,9 @@ mod tests {
         cx.simulate_keystrokes("escape");
         assert_eq!(menu_dismissals.get(), 1);
         assert_eq!(dialog_dismissals.get(), 0);
+        cx.update(|window, app| {
+            assert!(harness.read(app).action_focus.is_focused(window));
+        });
 
         // Dialogs use the same Escape contract but do not dismiss on outside
         // presses, leaving modal backdrop policy to their owner.
@@ -1049,6 +1130,9 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_keystrokes("escape");
         assert_eq!(dialog_dismissals.get(), 1);
+        cx.update(|window, app| {
+            assert!(harness.read(app).action_focus.is_focused(window));
+        });
 
         // Pointer presses outside the popover use the same dismissal path.
         cx.simulate_mouse_down(

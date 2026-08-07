@@ -123,8 +123,8 @@ impl Render for AppView {
                 this.do_save_all(cx);
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
-                this.open_settings(cx);
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleFocusedPanelZoom, window, cx| {
                 this.toggle_focused_panel_zoom(window, cx);
@@ -143,8 +143,8 @@ impl Render for AppView {
                 this.node_editor
                     .update(cx, |editor, cx| editor.activate_relative_tab(true, cx));
             }))
-            .on_action(cx.listener(|this, _: &DetailsCloseTab, _window, cx| {
-                this.request_close_active_editor_tab(cx);
+            .on_action(cx.listener(|this, _: &DetailsCloseTab, window, cx| {
+                this.request_close_active_editor_tab(window, cx);
             }))
             .on_action(cx.listener(|this, _: &FitGraph, _window, cx| {
                 this.graph_canvas
@@ -162,11 +162,11 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ToggleDetailsPanel, window, cx| {
                 this.toggle_dock_panel(PanelId::Details, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ClearData, _window, cx| {
-                this.request_clear_data(cx);
+            .on_action(cx.listener(|this, _: &ClearData, window, cx| {
+                this.request_clear_data(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ClearSchema, _window, cx| {
-                this.request_clear_schema(cx);
+            .on_action(cx.listener(|this, _: &ClearSchema, window, cx| {
+                this.request_clear_schema(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ImportData, window, cx| {
                 this.do_import_data_picker(window, cx);
@@ -200,6 +200,9 @@ impl Render for AppView {
                         // "File" menu button
                         div()
                             .id("file-btn")
+                            .key_context("MenuBar")
+                            .track_focus(&self.file_menu_button_focus)
+                            .tab_index(0)
                             .flex()
                             .items_center()
                             .h_full()
@@ -207,11 +210,19 @@ impl Render for AppView {
                             .text_color(theme.colors.text)
                             .text_size(theme.typography.chrome)
                             .cursor_pointer()
+                            .focus_visible(move |style| {
+                                style.border_1().border_color(theme.colors.focus)
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    this.file_menu_button_focus.focus(window);
                                     this.file_menu_open = !this.file_menu_open;
                                     this.view_menu_open = false;
+                                    if this.file_menu_open {
+                                        let focus = this.file_menu_focus.clone();
+                                        window.defer(cx, move |window, _cx| focus.focus(window));
+                                    }
                                     cx.notify();
                                 }),
                             )
@@ -221,6 +232,9 @@ impl Render for AppView {
                         // "View" menu button
                         div()
                             .id("view-btn")
+                            .key_context("MenuBar")
+                            .track_focus(&self.view_menu_button_focus)
+                            .tab_index(0)
                             .flex()
                             .items_center()
                             .h_full()
@@ -228,11 +242,19 @@ impl Render for AppView {
                             .text_color(theme.colors.text)
                             .text_size(theme.typography.chrome)
                             .cursor_pointer()
+                            .focus_visible(move |style| {
+                                style.border_1().border_color(theme.colors.focus)
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    this.view_menu_button_focus.focus(window);
                                     this.view_menu_open = !this.view_menu_open;
                                     this.file_menu_open = false;
+                                    if this.view_menu_open {
+                                        let focus = this.view_menu_focus.clone();
+                                        window.defer(cx, move |window, _cx| focus.focus(window));
+                                    }
                                     cx.notify();
                                 }),
                             )
@@ -838,18 +860,20 @@ impl Render for AppView {
                                     .child(
                                         MenuItem::new("save-item", "Save Changes")
                                             .shortcut("Ctrl+S")
-                                            .on_click(cx.listener(|this, _, _window, cx| {
+                                            .on_click(cx.listener(|this, _, window, cx| {
                                                 this.do_save_active(cx);
                                                 this.file_menu_open = false;
+                                                this.file_menu_button_focus.focus(window);
                                                 cx.notify();
                                             })),
                                     )
                                     .child(
                                         MenuItem::new("save-all-item", "Save All")
                                             .shortcut("Ctrl+Shift+S")
-                                            .on_click(cx.listener(|this, _, _window, cx| {
+                                            .on_click(cx.listener(|this, _, window, cx| {
                                                 this.do_save_all(cx);
                                                 this.file_menu_open = false;
+                                                this.file_menu_button_focus.focus(window);
                                                 cx.notify();
                                             })),
                                     )
@@ -858,8 +882,9 @@ impl Render for AppView {
                                 .child(
                                     MenuItem::new("lemonade-setup-item", "Lemonade AI Setup…")
                                         .on_click(
-                                            cx.listener(|this, _, _window, cx| {
+                                            cx.listener(|this, _, window, cx| {
                                                 this.file_menu_open = false;
+                                                this.file_menu_button_focus.focus(window);
                                                 this.setup_open = true;
                                                 this.do_refresh_lemonade_setup(cx);
                                                 cx.notify();
@@ -874,6 +899,7 @@ impl Render for AppView {
                                         .on_click(
                                             cx.listener(|this, _, window, cx| {
                                                 this.file_menu_open = false;
+                                                this.file_menu_button_focus.focus(window);
                                                 this.do_import_schema_picker(window, cx);
                                             }),
                                         ),
@@ -885,6 +911,7 @@ impl Render for AppView {
                                             .disabled(!has_schema)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.file_menu_open = false;
+                                                this.file_menu_button_focus.focus(window);
                                                 this.do_import_data_picker(window, cx);
                                             }));
                                     if has_schema {
@@ -901,6 +928,7 @@ impl Render for AppView {
                                         .disabled(!has_data)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.file_menu_open = false;
+                                            this.file_menu_button_focus.focus(window);
                                             this.do_export_data_picker(window, cx);
                                         })),
                                 )
@@ -911,9 +939,10 @@ impl Render for AppView {
                                     MenuItem::new("clear-schema-item", "Clear Schema")
                                         .disabled(!has_schema)
                                         .tone(LabelTone::Danger)
-                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.file_menu_open = false;
-                                            this.request_clear_schema(cx);
+                                            this.file_menu_button_focus.focus(window);
+                                            this.request_clear_schema(window, cx);
                                         })),
                                 )
                                 // Clear Data — greyed when no data
@@ -921,12 +950,15 @@ impl Render for AppView {
                                     MenuItem::new("clear-data-item", "Clear Data")
                                         .disabled(!has_data)
                                         .tone(LabelTone::Danger)
-                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.file_menu_open = false;
-                                            this.request_clear_data(cx);
+                                            this.file_menu_button_focus.focus(window);
+                                            this.request_clear_data(window, cx);
                                         })),
                                 ),
                             )
+                            .focus_handle(self.file_menu_focus.clone())
+                            .return_focus(self.file_menu_button_focus.clone())
                             .on_dismiss({
                                 let handle = handle.clone();
                                 move |_window, cx| {
@@ -1007,13 +1039,16 @@ impl Render for AppView {
                                     MenuItem::new("open-settings-item", "Settings…")
                                         .shortcut("Ctrl+,")
                                         .on_click(
-                                            cx.listener(|this, _, _window, cx| {
+                                            cx.listener(|this, _, window, cx| {
                                                 this.view_menu_open = false;
-                                                this.open_settings(cx);
+                                                this.view_menu_button_focus.focus(window);
+                                                this.open_settings(window, cx);
                                             }),
                                         ),
                                 ),
                             )
+                            .focus_handle(self.view_menu_focus.clone())
+                            .return_focus(self.view_menu_button_focus.clone())
                             .on_dismiss({
                                 let handle = handle.clone();
                                 move |_window, cx| {
@@ -1167,33 +1202,32 @@ impl Render for AppView {
                             "Everyday worldbuilding features remain visible."
                         },
                     ));
-                let dialog = Dialog::new("Settings", body)
+                let mut dialog = Dialog::new("Settings", body)
                     .id("settings-dialog")
-                    .on_dismiss(move |_window, cx| {
+                    .focus_handle(self.settings_focus.clone())
+                    .on_dismiss(move |window, cx| {
                         dismiss
-                            .update(cx, |view, cx| {
-                                view.settings_open = false;
-                                cx.notify();
-                            })
+                            .update(cx, |view, cx| view.close_settings(window, cx))
                             .ok();
                     })
                     .action(
-                        Button::new("settings-cancel", "Cancel").on_click(move |_, _, cx| {
+                        Button::new("settings-cancel", "Cancel").on_click(move |_, window, cx| {
                             cancel
-                                .update(cx, |view, cx| {
-                                    view.settings_open = false;
-                                    cx.notify();
-                                })
+                                .update(cx, |view, cx| view.close_settings(window, cx))
                                 .ok();
                         }),
                     )
                     .action(
                         Button::new("settings-save", "Save Settings")
                             .style(ButtonStyle::Filled)
-                            .on_click(move |_, _, cx| {
-                                save.update(cx, |view, cx| view.save_settings(cx)).ok();
+                            .on_click(move |_, window, cx| {
+                                save.update(cx, |view, cx| view.save_settings(window, cx))
+                                    .ok();
                             }),
                     );
+                if let Some(return_focus) = self.settings_return_focus.clone() {
+                    dialog = dialog.return_focus(return_focus);
+                }
                 root.child(
                     div()
                         .id("settings-overlay")

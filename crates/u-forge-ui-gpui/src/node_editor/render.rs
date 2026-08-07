@@ -161,11 +161,14 @@ impl Render for NodeEditorPanel {
                 .tooltip(Tooltip::text(tab_tooltip))
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
+                        let focus = cx.focus_handle();
+                        focus.focus(window);
                         this.tab_context_menu = Some(TabContextMenuState {
                             position: event.position,
                             index: i,
+                            focus,
                         });
                         cx.notify();
                     }),
@@ -234,7 +237,7 @@ impl Render for NodeEditorPanel {
                     "Close tab (Ctrl+W)"
                 },
             )
-            .on_click(move |_, _, cx| {
+            .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 close_panel
                     .update(cx, |this, cx| {
@@ -244,6 +247,7 @@ impl Render for NodeEditorPanel {
                             this.close_tab(i, cx);
                             cx.notify();
                         }
+                        this.focus.focus(window);
                     })
                     .ok();
             });
@@ -954,13 +958,14 @@ impl Render for NodeEditorPanel {
                         "Keep Open"
                     },
                     !dirty,
-                    move |_event, _window, cx| {
+                    move |_event, window, cx| {
                         cx.stop_propagation();
                         pin_entity.update(cx, |panel, cx| {
                             if let Some(tab) = panel.tabs.get_mut(index) {
                                 tab.pinned = !tab.pinned;
                             }
                             panel.tab_context_menu = None;
+                            panel.focus.focus(window);
                             cx.notify();
                         });
                     },
@@ -968,20 +973,22 @@ impl Render for NodeEditorPanel {
                 .child(tab_context_menu_item(
                     "Move Left",
                     can_move_left,
-                    move |_event, _window, cx| {
+                    move |_event, window, cx| {
                         cx.stop_propagation();
                         move_left_entity.update(cx, |panel, cx| {
                             panel.move_tab(index, index.saturating_sub(1), cx);
+                            panel.focus.focus(window);
                         });
                     },
                 ))
                 .child(tab_context_menu_item(
                     "Move Right",
                     can_move_right,
-                    move |_event, _window, cx| {
+                    move |_event, window, cx| {
                         cx.stop_propagation();
                         move_right_entity.update(cx, |panel, cx| {
                             panel.move_tab(index, index + 1, cx);
+                            panel.focus.focus(window);
                         });
                     },
                 ))
@@ -989,7 +996,7 @@ impl Render for NodeEditorPanel {
                 .child(tab_context_menu_item(
                     "Close",
                     true,
-                    move |_event, _window, cx| {
+                    move |_event, window, cx| {
                         cx.stop_propagation();
                         close_entity.update(cx, |panel, cx| {
                             panel.tab_context_menu = None;
@@ -999,6 +1006,7 @@ impl Render for NodeEditorPanel {
                                 panel.close_tab(index, cx);
                                 cx.notify();
                             }
+                            panel.focus.focus(window);
                         });
                     },
                 ));
@@ -1007,15 +1015,18 @@ impl Render for NodeEditorPanel {
                     .position(menu.position)
                     .anchor(Corner::TopLeft)
                     .child(
-                        ContextMenu::new("details-tab-context-menu", menu_body).on_dismiss({
-                            let entity = cx.entity().clone();
-                            move |_window, cx| {
-                                entity.update(cx, |panel, cx| {
-                                    panel.tab_context_menu = None;
-                                    cx.notify();
-                                });
-                            }
-                        }),
+                        ContextMenu::new("details-tab-context-menu", menu_body)
+                            .focus_handle(menu.focus)
+                            .return_focus(self.focus.clone())
+                            .on_dismiss({
+                                let entity = cx.entity().clone();
+                                move |_window, cx| {
+                                    entity.update(cx, |panel, cx| {
+                                        panel.tab_context_menu = None;
+                                        cx.notify();
+                                    });
+                                }
+                            }),
                     ),
             ))
         })

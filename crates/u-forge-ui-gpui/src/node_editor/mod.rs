@@ -52,6 +52,7 @@ pub(crate) struct EdgeNodeDropdown {
 struct TabContextMenuState {
     position: Point<Pixels>,
     index: usize,
+    focus: FocusHandle,
 }
 
 // ── Node editor panel ─────────────────────────────────────────────────────────

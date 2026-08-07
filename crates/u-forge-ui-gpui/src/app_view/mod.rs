@@ -146,8 +146,14 @@ pub struct AppView {
     // ── UI layout state ───────────────────────────────────────────────────────
     pub(crate) file_menu_open: bool,
     pub(crate) view_menu_open: bool,
+    pub(crate) file_menu_button_focus: FocusHandle,
+    pub(crate) view_menu_button_focus: FocusHandle,
+    pub(crate) file_menu_focus: FocusHandle,
+    pub(crate) view_menu_focus: FocusHandle,
     pub(crate) setup_open: bool,
     pub(crate) settings_open: bool,
+    pub(crate) settings_focus: FocusHandle,
+    pub(crate) settings_return_focus: Option<FocusHandle>,
     pub(crate) ui_font_size: f32,
     pub(crate) ui_interface_size: f32,
     pub(crate) show_advanced_controls: bool,
@@ -626,15 +632,26 @@ impl AppView {
         }
     }
 
-    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_draft_font_size = self.ui_font_size;
         self.settings_draft_interface_size = self.ui_interface_size;
         self.settings_draft_advanced = self.show_advanced_controls;
+        self.settings_return_focus = window.focused(cx);
         self.settings_open = true;
+        let focus = self.settings_focus.clone();
+        window.defer(cx, move |window, _cx| focus.focus(window));
         cx.notify();
     }
 
-    pub(crate) fn save_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        if let Some(return_focus) = self.settings_return_focus.take() {
+            return_focus.focus(window);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let font_size = self.settings_draft_font_size.clamp(10.0, 28.0);
         let interface_size = self.settings_draft_interface_size.clamp(14.0, 32.0);
         match self.state.app_config.persist_ui_settings(
@@ -653,6 +670,9 @@ impl AppView {
                 self.setup_panel.update(cx, |_panel, cx| cx.notify());
                 self.show_advanced_controls = self.settings_draft_advanced;
                 self.settings_open = false;
+                if let Some(return_focus) = self.settings_return_focus.take() {
+                    return_focus.focus(window);
+                }
                 self.state.data_status = Some(format!("Settings saved to {}", path.display()));
             }
             Err(error) => {
@@ -930,8 +950,14 @@ impl AppView {
             selection,
             file_menu_open: false,
             view_menu_open: false,
+            file_menu_button_focus: cx.focus_handle().tab_stop(true),
+            view_menu_button_focus: cx.focus_handle().tab_stop(true),
+            file_menu_focus: cx.focus_handle(),
+            view_menu_focus: cx.focus_handle(),
             setup_open: false,
             settings_open: false,
+            settings_focus: cx.focus_handle(),
+            settings_return_focus: None,
             ui_font_size,
             ui_interface_size,
             show_advanced_controls,
@@ -1079,22 +1105,30 @@ impl AppView {
         }
     }
 
-    pub(crate) fn request_clear_data(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn request_clear_data(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.graph_canvas.read(cx).focus_handle(cx));
         self.open_confirmation(
             DestructiveAction::ClearData,
             "Clear all data",
             "Delete every world item, relationship, text chunk, and saved canvas position? This cannot be undone.",
             "Clear Data",
+            return_focus,
             cx,
         );
     }
 
-    pub(crate) fn request_clear_schema(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn request_clear_schema(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.graph_canvas.read(cx).focus_handle(cx));
         self.open_confirmation(
             DestructiveAction::ClearSchema,
             "Clear schemas",
             "Remove all imported schemas? Existing graph data is not changed, but schema validation will be unavailable.",
             "Clear Schema",
+            return_focus,
             cx,
         );
     }
@@ -1116,6 +1150,7 @@ impl AppView {
                 "Delete “{node_name}” and its connected relationships and text chunks? This cannot be undone."
             ),
             "Delete Node",
+            self.node_panel.read(cx).focus_handle(cx),
             cx,
         );
     }
@@ -1126,13 +1161,16 @@ impl AppView {
         title: &str,
         message: &str,
         confirm_label: &str,
+        return_focus: FocusHandle,
         cx: &mut Context<Self>,
     ) {
-        let modal = cx.new(|_cx| {
+        let modal = cx.new(|cx| {
             ConfirmationModal::new(
                 title.to_string(),
                 message.to_string(),
                 confirm_label.to_string(),
+                return_focus,
+                cx,
             )
         });
         let accepted = cx.subscribe(&modal, |this, _modal, _event: &ConfirmationAccepted, cx| {
@@ -1161,11 +1199,14 @@ impl AppView {
     }
 
     fn open_dirty_tab_confirmation(&mut self, index: usize, cx: &mut Context<Self>) {
-        let modal = cx.new(|_cx| {
+        let return_focus = self.node_editor.read(cx).focus_handle(cx);
+        let modal = cx.new(|cx| {
             ConfirmationModal::new(
                 "Save changes before closing?".to_string(),
                 "This Details tab has unsaved changes.".to_string(),
                 "Save Changes".to_string(),
+                return_focus,
+                cx,
             )
             .with_alternative("Don't Save")
             .non_destructive()
@@ -1202,7 +1243,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn request_close_active_editor_tab(&mut self, cx: &mut Context<Self>) {
+    fn request_close_active_editor_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.node_editor.read(cx).active_tab else {
             return;
         };
@@ -1217,6 +1258,7 @@ impl AppView {
         } else {
             self.node_editor
                 .update(cx, |editor, cx| editor.close_tab(index, cx));
+            self.node_editor.read(cx).focus_handle(cx).focus(window);
         }
     }
 
@@ -1365,7 +1407,11 @@ impl AppView {
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        let modal = cx.new(|cx| PathPickerModal::new(mode, title, title, initial_path, cx));
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.graph_canvas.read(cx).focus_handle(cx));
+        let modal =
+            cx.new(|cx| PathPickerModal::new(mode, title, title, initial_path, return_focus, cx));
 
         let confirm_sub = cx.subscribe(&modal, |this, _modal, event: &PathConfirmed, cx| {
             let path = event.0.clone();

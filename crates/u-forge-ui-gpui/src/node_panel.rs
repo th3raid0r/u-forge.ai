@@ -50,6 +50,7 @@ enum WorldContextTarget {
 struct WorldContextMenuState {
     position: Point<Pixels>,
     target: WorldContextTarget,
+    focus: FocusHandle,
 }
 
 pub(crate) struct NodePanel {
@@ -199,7 +200,7 @@ impl NodePanel {
         }
     }
 
-    fn open_cursor_context_menu(&mut self, cx: &mut Context<Self>) {
+    fn open_cursor_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.cursor_index else {
             return;
         };
@@ -208,9 +209,12 @@ impl NodePanel {
             Some(WorldRow::Item { node_id, .. }) => WorldContextTarget::Item(*node_id),
             None => return,
         };
+        let focus = cx.focus_handle();
+        focus.focus(window);
         self.context_menu = Some(WorldContextMenuState {
             position: point(px(24.0), px(52.0)),
             target,
+            focus,
         });
         cx.notify();
     }
@@ -243,7 +247,7 @@ impl Render for NodePanel {
         let context_menu = self
             .context_menu
             .as_ref()
-            .map(|menu| (menu.position, menu.target.clone()));
+            .map(|menu| (menu.position, menu.target.clone(), menu.focus.clone()));
         let entity = cx.entity().clone();
         let list_entity = entity.clone();
         let mut rows = list(
@@ -359,9 +363,12 @@ impl Render for NodePanel {
                                     context_entity.update(cx, |panel, cx| {
                                         panel.cursor_index = Some(index);
                                         panel.focus.focus(window);
+                                        let focus = cx.focus_handle();
+                                        focus.focus(window);
                                         panel.context_menu = Some(WorldContextMenuState {
                                             position: event.position,
                                             target: WorldContextTarget::Group(context_name.clone()),
+                                            focus,
                                         });
                                         cx.notify();
                                     });
@@ -412,9 +419,12 @@ impl Render for NodePanel {
                                         panel.selection.update(cx, |selection, cx| {
                                             selection.select_by_id(Some(node_id), cx);
                                         });
+                                        let focus = cx.focus_handle();
+                                        focus.focus(window);
                                         panel.context_menu = Some(WorldContextMenuState {
                                             position: event.position,
                                             target: WorldContextTarget::Item(node_id),
+                                            focus,
                                         });
                                         cx.notify();
                                     });
@@ -492,8 +502,8 @@ impl Render for NodePanel {
             .on_action(cx.listener(|this, _: &WorldDeleteRow, _window, cx| {
                 this.delete_cursor(cx);
             }))
-            .on_action(cx.listener(|this, _: &WorldOpenContextMenu, _window, cx| {
-                this.open_cursor_context_menu(cx);
+            .on_action(cx.listener(|this, _: &WorldOpenContextMenu, window, cx| {
+                this.open_cursor_context_menu(window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -525,7 +535,7 @@ impl Render for NodePanel {
             )
             .child(list_container);
 
-        root.when_some(context_menu, |root, (position, target)| {
+        root.when_some(context_menu, |root, (position, target, menu_focus)| {
             let menu_body = match target {
                 WorldContextTarget::Group(type_name) => {
                     let toggle_entity = entity.clone();
@@ -535,23 +545,25 @@ impl Render for NodePanel {
                         .w(px(180.0))
                         .child(context_menu_item(
                             "Show / Hide Group",
-                            move |_event, _window, cx| {
+                            move |_event, window, cx| {
                                 cx.stop_propagation();
                                 toggle_entity.update(cx, |panel, cx| {
                                     panel.toggle_group(&toggle_name);
                                     panel.context_menu = None;
+                                    panel.focus.focus(window);
                                     cx.notify();
                                 });
                             },
                         ))
                         .child(context_menu_item(
                             "New World Item",
-                            move |_event, _window, cx| {
+                            move |_event, window, cx| {
                                 cx.stop_propagation();
                                 create_entity.update(cx, |panel, cx| {
                                     panel.context_menu = None;
                                     panel.collapsed.remove(&type_name);
                                     panel.rebuild_visible_rows();
+                                    panel.focus.focus(window);
                                     cx.emit(CreateNodeRequest(type_name.clone()));
                                     cx.notify();
                                 });
@@ -595,14 +607,15 @@ impl Render for NodePanel {
             let dismiss_entity = entity.clone();
             root.child(deferred(
                 anchored().position(position).anchor(Corner::TopLeft).child(
-                    ContextMenu::new("world-context-menu", menu_body).on_dismiss(
-                        move |_window, cx| {
+                    ContextMenu::new("world-context-menu", menu_body)
+                        .focus_handle(menu_focus)
+                        .return_focus(self.focus.clone())
+                        .on_dismiss(move |_window, cx| {
                             dismiss_entity.update(cx, |panel, cx| {
                                 panel.context_menu = None;
                                 cx.notify();
                             });
-                        },
-                    ),
+                        }),
                 ),
             ))
         })
