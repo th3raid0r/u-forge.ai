@@ -5,7 +5,7 @@ use gpui::{
 
 use crate::text_field::{TextFieldView, TextSubmit};
 use crate::ui::components::{ContextMenu, IconButton, Tooltip};
-use crate::ui::icons::{Icon, IconName};
+use crate::ui::icons::{Icon, IconName, IconSize};
 
 use u_forge_core::PropertyType;
 
@@ -715,7 +715,7 @@ impl Render for NodeEditorPanel {
                                             )
                                             .child(Icon::new(
                                                 IconName::MinusCircle,
-                                                12.0,
+                                                IconSize::Small,
                                                 rgba(0xf38ba8ff),
                                             )),
                                     ),
@@ -776,7 +776,11 @@ impl Render for NodeEditorPanel {
                                             cx.notify();
                                         }),
                                     )
-                                    .child(Icon::new(IconName::Plus, 12.0, rgba(0x89b4faff))),
+                                    .child(Icon::new(
+                                        IconName::Plus,
+                                        IconSize::Small,
+                                        rgba(0x89b4faff),
+                                    )),
                             );
                         }
 
@@ -1183,7 +1187,11 @@ impl NodeEditorPanel {
                         this.remove_edge_row(ei, cx);
                     }),
                 )
-                .child(Icon::new(IconName::MinusCircle, 13.0, rgba(0xf38ba8ff)));
+                .child(Icon::new(
+                    IconName::MinusCircle,
+                    IconSize::Medium,
+                    rgba(0xf38ba8ff),
+                ));
 
             // Assemble the edge row — no dropdown inline; overlay is rendered
             // after the add button so it paints on top.
@@ -1222,7 +1230,11 @@ impl NodeEditorPanel {
                     this.add_edge_row(cx);
                 }),
             )
-            .child(Icon::new(IconName::Plus, 13.0, rgba(0x89b4faff)))
+            .child(Icon::new(
+                IconName::Plus,
+                IconSize::Medium,
+                rgba(0x89b4faff),
+            ))
             .child("Add Relationship");
         // Shrink to content width instead of stretching to fill the column.
         add_btn.style().align_self = Some(gpui::AlignItems::Start);

@@ -52,12 +52,6 @@ use crate::startup::{LEMONADE_METADATA_READY_MESSAGE, StartupMilestone, StartupT
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
-/// Menu bar height in pixels.
-pub(crate) const MENU_BAR_H: f32 = 28.0;
-
-/// Status bar height in pixels.
-pub(crate) const STATUS_BAR_H: f32 = 24.0;
-
 // ── Drag marker types ─────────────────────────────────────────────────────────
 
 /// Drag marker for resizing the left sidebar edge.

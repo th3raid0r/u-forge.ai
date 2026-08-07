@@ -34,7 +34,7 @@ Primary Zed references:
 
 ## Foundation
 
-- [ ] **UI-01 — Semantic tokens.** Centralize application/panel/elevated/input
+- [x] **UI-01 — Semantic tokens.** Centralize application/panel/elevated/input
   surfaces; borders; primary/muted/disabled text; accent, selected, success,
   warning, danger, and focus colors; spacing, radii, control heights, and
   typography. Seed them with the current u-forge palette. Graph type colors

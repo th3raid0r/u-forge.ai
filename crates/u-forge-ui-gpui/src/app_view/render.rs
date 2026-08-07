@@ -2,8 +2,7 @@ use std::time::Instant;
 
 use gpui::{
     AnyView, App, ClickEvent, Context, Corner, MouseButton, MouseDownEvent, Render,
-    StyleRefinement, Window, anchored, canvas, deferred, div, point, prelude::*, px, relative, rgb,
-    rgba,
+    StyleRefinement, Window, anchored, canvas, deferred, div, point, prelude::*, px, relative,
 };
 
 use crate::{
@@ -13,9 +12,7 @@ use crate::{
     ToggleRightPanel, ToggleSearchPanel, ToggleSidebar,
 };
 
-use super::{
-    AppView, MENU_BAR_H, ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar, STATUS_BAR_H,
-};
+use super::{AppView, ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar};
 use crate::dock_state::RESIZE_HANDLE_SIZE;
 use crate::panel_contracts::{DockPosition, PanelId, WorkspaceItemId, WorldCanvasViewId};
 use crate::search_panel::SearchPanelStatus;
@@ -45,6 +42,7 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.ui_font_size));
         let theme = *UiTheme::get(cx);
+        let menu_bar_height = theme.metrics.menu_bar_height.to_pixels(window.rem_size());
 
         // Capture frame start time. The canvas element appended at the end of the
         // tree records elapsed time in its paint closure — after GPUI's full layout
@@ -190,7 +188,7 @@ impl Render for AppView {
                     .id("menu-bar")
                     .flex()
                     .flex_none()
-                    .h(px(MENU_BAR_H))
+                    .h(theme.metrics.menu_bar_height)
                     .w_full()
                     .bg(theme.colors.panel_surface)
                     .border_b_1()
@@ -205,7 +203,7 @@ impl Render for AppView {
                             .h_full()
                             .px_3()
                             .text_color(theme.colors.text)
-                            .text_xs()
+                            .text_size(theme.typography.chrome)
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -226,7 +224,7 @@ impl Render for AppView {
                             .h_full()
                             .px_3()
                             .text_color(theme.colors.text)
-                            .text_xs()
+                            .text_size(theme.typography.chrome)
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -391,7 +389,7 @@ impl Render for AppView {
                 if sidebar_open {
                     left_resize_handle = left_resize_handle
                         .cursor_col_resize()
-                        .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                        .hover(move |s: StyleRefinement| s.bg(theme.colors.selected))
                         .on_drag(ResizeSidebar, |_, _, _, cx: &mut App| {
                             cx.new(|_| ResizeSidebar)
                         })
@@ -459,7 +457,7 @@ impl Render for AppView {
                 if details_open && !details_zoomed {
                     editor_canvas_handle = editor_canvas_handle
                         .cursor_row_resize()
-                        .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                        .hover(move |s: StyleRefinement| s.bg(theme.colors.selected))
                         .on_drag(ResizeEditorCanvas, |_, _, _, cx: &mut App| {
                             cx.new(|_| ResizeEditorCanvas)
                         })
@@ -492,13 +490,13 @@ impl Render for AppView {
                             .flex()
                             .flex_none()
                             .items_center()
-                            .h(px(theme.metrics.panel_header_height))
+                            .h(theme.metrics.panel_header_height)
                             .px_3()
                             .gap(px(theme.metrics.space_4))
                             .bg(theme.colors.panel_surface)
                             .border_b_1()
                             .border_color(theme.colors.border_subtle)
-                            .text_sm()
+                            .text_size(theme.typography.label)
                             .text_color(theme.colors.text)
                             .child(WorkspaceItemId::WorldCanvas.title())
                             .child(
@@ -610,7 +608,7 @@ impl Render for AppView {
                 if right_panel_open {
                     resize_handle = resize_handle
                         .cursor_col_resize()
-                        .hover(|s: StyleRefinement| s.bg(rgba(0x45475a66)))
+                        .hover(move |s: StyleRefinement| s.bg(theme.colors.selected))
                         .on_drag(ResizeRightPanel, |_, _, _, cx: &mut App| {
                             cx.new(|_| ResizeRightPanel)
                         })
@@ -669,13 +667,13 @@ impl Render for AppView {
                     .flex()
                     .flex_none()
                     .flex_row()
-                    .h(px(STATUS_BAR_H))
+                    .h(theme.metrics.status_bar_height)
                     .w_full()
                     .bg(theme.colors.panel_surface)
                     .border_t_1()
                     .border_color(theme.colors.border_subtle)
                     .items_center()
-                    .text_sm()
+                    .text_size(theme.typography.chrome)
                     .child(
                         div()
                             .id("status-left")
@@ -838,26 +836,26 @@ impl Render for AppView {
             .when(file_menu_open, |root| {
                 root.child(deferred(
                     anchored()
-                        .position(point(px(0.0), px(MENU_BAR_H)))
+                        .position(point(px(0.0), menu_bar_height))
                         .anchor(Corner::TopLeft)
                         .child(
                             div()
                                 .id("file-dropdown")
                                 .w(px(200.0))
-                                .bg(rgb(0x313244))
+                                .bg(theme.colors.elevated_surface)
                                 .border_1()
-                                .border_color(rgb(0x45475a))
+                                .border_color(theme.colors.border)
                                 .child(
                                     div()
                                         .id("save-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_xs()
+                                        .text_color(theme.colors.text)
+                                        .text_size(theme.typography.chrome)
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .hover(move |s| s.bg(theme.colors.selected))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -873,12 +871,12 @@ impl Render for AppView {
                                         .id("save-all-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_xs()
+                                        .text_color(theme.colors.text)
+                                        .text_size(theme.typography.chrome)
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .hover(move |s| s.bg(theme.colors.selected))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -890,18 +888,18 @@ impl Render for AppView {
                                         .child("Save All       Ctrl+Shift+S"),
                                 )
                                 // ── separator ──
-                                .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                                .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
                                 .child(
                                     div()
                                         .id("lemonade-setup-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_xs()
+                                        .text_color(theme.colors.text)
+                                        .text_size(theme.typography.chrome)
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .hover(move |s| s.bg(theme.colors.selected))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -914,19 +912,19 @@ impl Render for AppView {
                                         .child("Lemonade AI Setup…"),
                                 )
                                 // ── separator ──
-                                .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                                .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
                                 // Import Schema… — always enabled
                                 .child(
                                     div()
                                         .id("import-schema-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_xs()
+                                        .text_color(theme.colors.text)
+                                        .text_size(theme.typography.chrome)
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(rgba(0x45475a88)))
+                                        .hover(move |s| s.bg(theme.colors.selected))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -942,13 +940,13 @@ impl Render for AppView {
                                         .id("import-data-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_xs();
+                                        .text_size(theme.typography.chrome);
                                     if has_schema {
-                                        el.text_color(rgba(0xcdd6f4ff))
+                                        el.text_color(theme.colors.text)
                                             .cursor_pointer()
-                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .hover(move |s| s.bg(theme.colors.selected))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
@@ -959,7 +957,7 @@ impl Render for AppView {
                                                 ),
                                             )
                                     } else {
-                                        el.text_color(rgba(0xcdd6f450))
+                                        el.text_color(theme.colors.text_disabled)
                                     }
                                     .child("Import Data…")
                                 })
@@ -969,13 +967,13 @@ impl Render for AppView {
                                         .id("export-data-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_xs();
+                                        .text_size(theme.typography.chrome);
                                     if has_data {
-                                        el.text_color(rgba(0xcdd6f4ff))
+                                        el.text_color(theme.colors.text)
                                             .cursor_pointer()
-                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .hover(move |s| s.bg(theme.colors.selected))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
@@ -986,25 +984,25 @@ impl Render for AppView {
                                                 ),
                                             )
                                     } else {
-                                        el.text_color(rgba(0xcdd6f450))
+                                        el.text_color(theme.colors.text_disabled)
                                     }
                                     .child("Export Data…")
                                 })
                                 // ── separator ──
-                                .child(div().h(px(1.0)).w_full().bg(rgb(0x45475a)))
+                                .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
                                 // Clear Schema — greyed when no schemas
                                 .child({
                                     let el = div()
                                         .id("clear-schema-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_xs();
+                                        .text_size(theme.typography.chrome);
                                     if has_schema {
-                                        el.text_color(rgba(0xf38ba8ff))
+                                        el.text_color(theme.colors.danger)
                                             .cursor_pointer()
-                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .hover(move |s| s.bg(theme.colors.selected))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
@@ -1015,7 +1013,7 @@ impl Render for AppView {
                                                 ),
                                             )
                                     } else {
-                                        el.text_color(rgba(0xf38ba850))
+                                        el.text_color(theme.colors.text_disabled)
                                     }
                                     .child("Clear Schema")
                                 })
@@ -1025,13 +1023,13 @@ impl Render for AppView {
                                         .id("clear-data-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_xs();
+                                        .text_size(theme.typography.chrome);
                                     if has_data {
-                                        el.text_color(rgba(0xf38ba8ff))
+                                        el.text_color(theme.colors.danger)
                                             .cursor_pointer()
-                                            .hover(|s| s.bg(rgba(0x45475a88)))
+                                            .hover(move |s| s.bg(theme.colors.selected))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
@@ -1042,7 +1040,7 @@ impl Render for AppView {
                                                 ),
                                             )
                                     } else {
-                                        el.text_color(rgba(0xf38ba850))
+                                        el.text_color(theme.colors.text_disabled)
                                     }
                                     .child("Clear Data")
                                 }),
@@ -1054,15 +1052,15 @@ impl Render for AppView {
                 // Position horizontally after the "File" button (~30px wide + padding).
                 root.child(deferred(
                     anchored()
-                        .position(point(px(32.0), px(MENU_BAR_H)))
+                        .position(point(px(32.0), menu_bar_height))
                         .anchor(Corner::TopLeft)
                         .child(
                             div()
                                 .id("view-dropdown")
                                 .w(px(200.0))
-                                .bg(rgb(0x313244))
+                                .bg(theme.colors.elevated_surface)
                                 .border_1()
-                                .border_color(rgb(0x45475a))
+                                .border_color(theme.colors.border)
                                 // Left Panel toggle
                                 .child(
                                     div()
@@ -1070,10 +1068,10 @@ impl Render for AppView {
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_xs()
+                                        .text_color(theme.colors.text)
+                                        .text_size(theme.typography.chrome)
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -1096,10 +1094,10 @@ impl Render for AppView {
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_xs()
+                                        .text_color(theme.colors.text)
+                                        .text_size(theme.typography.chrome)
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -1126,10 +1124,10 @@ impl Render for AppView {
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .text_xs()
+                                        .text_color(theme.colors.text)
+                                        .text_size(theme.typography.chrome)
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -1155,10 +1153,10 @@ impl Render for AppView {
                                         .id("open-settings-item")
                                         .flex()
                                         .items_center()
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
                                         .text_color(theme.colors.text)
-                                        .text_xs()
+                                        .text_size(theme.typography.chrome)
                                         .cursor_pointer()
                                         .hover(|style| style.bg(theme.colors.selected))
                                         .on_mouse_down(

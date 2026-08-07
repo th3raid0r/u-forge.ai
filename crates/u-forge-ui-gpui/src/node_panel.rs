@@ -13,7 +13,7 @@ use u_forge_ui_traits::node_color_for_type;
 
 use crate::selection_model::SelectionModel;
 use crate::ui::components::{ContextMenu, Tooltip};
-use crate::ui::icons::{Icon, IconName};
+use crate::ui::icons::{Icon, IconName, IconSize};
 use crate::{
     WorldActivateRow, WorldDeleteRow, WorldNextRow, WorldOpenContextMenu, WorldPreviousRow,
 };
@@ -308,7 +308,7 @@ impl Render for NodePanel {
                                         } else {
                                             IconName::ChevronDown
                                         },
-                                        12.0,
+                                        IconSize::Small,
                                         rgb(node_type_color(&type_name)),
                                     ))
                                     .child(format!("{type_name} ({count})")),
@@ -337,7 +337,11 @@ impl Render for NodePanel {
                                             });
                                         },
                                     )
-                                    .child(Icon::new(IconName::Plus, 12.0, rgba(0xa6e3a1ff))),
+                                    .child(Icon::new(
+                                        IconName::Plus,
+                                        IconSize::Small,
+                                        rgba(0xa6e3a1ff),
+                                    )),
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -439,7 +443,11 @@ impl Render for NodePanel {
                                             });
                                         },
                                     )
-                                    .child(Icon::new(IconName::Trash, 12.0, rgba(0xf38ba8ff))),
+                                    .child(Icon::new(
+                                        IconName::Trash,
+                                        IconSize::Small,
+                                        rgba(0xf38ba8ff),
+                                    )),
                             )
                             .into_any_element()
                     }

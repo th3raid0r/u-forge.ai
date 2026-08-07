@@ -21,7 +21,7 @@ use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessag
 use crate::chat_message::{ChatMessageRole, ChatMessageView};
 use crate::text_field::{TextFieldView, TextSubmit};
 use crate::ui::components::Tooltip;
-use crate::ui::icons::{Icon, IconName};
+use crate::ui::icons::{Icon, IconName, IconSize};
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
@@ -1365,7 +1365,11 @@ impl Render for ChatPanel {
                                 },
                             )
                             .tooltip(Tooltip::text("Delete conversation"))
-                            .child(Icon::new(IconName::Trash, 12.0, rgba(0xf38ba8ff))),
+                            .child(Icon::new(
+                                IconName::Trash,
+                                IconSize::Small,
+                                rgba(0xf38ba8ff),
+                            )),
                     )
                     .into_any_element()
             },
@@ -1461,7 +1465,11 @@ impl Render for ChatPanel {
                                 });
                             })
                             .tooltip(Tooltip::text("Try this response again"))
-                            .child(Icon::new(IconName::Refresh, 12.0, rgba(0xa6adc8ff))),
+                            .child(Icon::new(
+                                IconName::Refresh,
+                                IconSize::Small,
+                                rgba(0xa6adc8ff),
+                            )),
                     );
                 }
 
@@ -1487,7 +1495,7 @@ impl Render for ChatPanel {
                             });
                         })
                         .tooltip(Tooltip::text("Copy message"))
-                        .child(Icon::new(IconName::Copy, 12.0, rgba(0xa6adc8ff))),
+                        .child(Icon::new(IconName::Copy, IconSize::Small, rgba(0xa6adc8ff))),
                 );
 
                 if show_delete {
@@ -1511,7 +1519,11 @@ impl Render for ChatPanel {
                                 });
                             })
                             .tooltip(Tooltip::text("Delete message"))
-                            .child(Icon::new(IconName::Trash, 12.0, rgba(0xf38ba8ff))),
+                            .child(Icon::new(
+                                IconName::Trash,
+                                IconSize::Small,
+                                rgba(0xf38ba8ff),
+                            )),
                     );
                 }
 
@@ -1688,7 +1700,11 @@ impl Render for ChatPanel {
                                             cx.emit(ToggleAssistantZoomRequested);
                                         }),
                                     )
-                                    .child(Icon::new(IconName::Maximize, 13.0, rgba(0xa6adc8ff))),
+                                    .child(Icon::new(
+                                        IconName::Maximize,
+                                        IconSize::Medium,
+                                        rgba(0xa6adc8ff),
+                                    )),
                             )
                             .child(
                                 div()
@@ -1715,7 +1731,7 @@ impl Render for ChatPanel {
                                     )
                                     .child(Icon::new(
                                         IconName::MoreHorizontal,
-                                        13.0,
+                                        IconSize::Medium,
                                         rgba(0xa6adc8ff),
                                     )),
                             )
@@ -1747,7 +1763,7 @@ impl Render for ChatPanel {
                                     })
                                     .child(Icon::new(
                                         IconName::Plus,
-                                        13.0,
+                                        IconSize::Medium,
                                         if controls_locked {
                                             rgba(0x6c7086ff)
                                         } else {
@@ -1820,7 +1836,7 @@ impl Render for ChatPanel {
                                         })
                                         .child(Icon::new(
                                             IconName::Refresh,
-                                            13.0,
+                                            IconSize::Medium,
                                             if controls_locked || !has_provider {
                                                 rgba(0x6c7086ff)
                                             } else {
@@ -1855,7 +1871,7 @@ impl Render for ChatPanel {
                                         )
                                         .child(Icon::new(
                                             IconName::Maximize,
-                                            13.0,
+                                            IconSize::Medium,
                                             rgba(0xa6adc8ff),
                                         ))
                                         .child(if self.zoomed {
@@ -2069,7 +2085,7 @@ impl Render for ChatPanel {
                                     }
                                 };
                                 let button_child = if matches!(btn_state, BtnState::Send) {
-                                    Icon::new(IconName::Send, 16.0, fg)
+                                    Icon::new(IconName::Send, IconSize::Large, fg)
                                         .rotate_degrees(90.0)
                                         .into_any_element()
                                 } else {
@@ -2241,7 +2257,7 @@ impl Render for ChatPanel {
                                             })
                                             .child(Icon::new(
                                                 IconName::Thinking,
-                                                14.0,
+                                                IconSize::Medium,
                                                 if !reasoning_capable {
                                                     rgba(0xa6adc8ff)
                                                 } else if reasoning_enabled {

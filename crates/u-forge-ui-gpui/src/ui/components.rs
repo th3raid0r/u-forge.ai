@@ -11,7 +11,7 @@ use gpui::{
     RenderOnce, SharedString, Window, div, prelude::*, px,
 };
 
-use super::icons::{Icon, IconName};
+use super::icons::{Icon, IconName, IconSize};
 use super::theme::UiTheme;
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -61,19 +61,19 @@ impl Label {
 
 impl RenderOnce for Label {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let colors = UiTheme::get(cx).colors;
+        let theme = *UiTheme::get(cx);
         div()
             .text_color(match self.tone {
-                LabelTone::Primary => colors.text,
-                LabelTone::Muted => colors.text_muted,
-                LabelTone::Disabled => colors.text_disabled,
-                LabelTone::Success => colors.success,
-                LabelTone::Warning => colors.warning,
-                LabelTone::Danger => colors.danger,
+                LabelTone::Primary => theme.colors.text,
+                LabelTone::Muted => theme.colors.text_muted,
+                LabelTone::Disabled => theme.colors.text_disabled,
+                LabelTone::Success => theme.colors.success,
+                LabelTone::Warning => theme.colors.warning,
+                LabelTone::Danger => theme.colors.danger,
             })
             .map(|label| match self.size {
-                LabelSize::Small => label.text_xs(),
-                LabelSize::Normal => label.text_sm(),
+                LabelSize::Small => label.text_size(theme.typography.caption),
+                LabelSize::Normal => label.text_size(theme.typography.label),
             })
             .child(self.text)
     }
@@ -147,10 +147,10 @@ impl RenderOnce for Button {
             .flex()
             .items_center()
             .justify_center()
-            .h(px(theme.metrics.control_height))
+            .h(theme.metrics.control_height)
             .px(px(theme.metrics.space_4))
             .rounded(px(theme.metrics.radius_small))
-            .text_sm()
+            .text_size(theme.typography.label)
             .text_color(if self.disabled {
                 theme.colors.text_disabled
             } else if self.style == ButtonStyle::Filled {
@@ -259,10 +259,12 @@ impl RenderOnce for IconButton {
             .flex_none()
             .items_center()
             .justify_center()
-            .size(px(theme.metrics.control_height_small))
+            .size(theme.metrics.control_height_small)
             .rounded(px(theme.metrics.radius_small))
             .when(self.selected, |button| button.bg(theme.colors.selected))
-            .child(Icon::new(self.icon, 13.0, color).rotate_degrees(self.rotation_degrees))
+            .child(
+                Icon::new(self.icon, IconSize::Medium, color).rotate_degrees(self.rotation_degrees),
+            )
             .tooltip(Tooltip::text(self.accessible_label));
         if !self.disabled {
             button = button
@@ -408,15 +410,18 @@ impl RenderOnce for StatusItem {
             .flex()
             .items_center()
             .gap(px(theme.metrics.space_2))
-            .h(px(theme.metrics.control_height_small))
+            .h(theme.metrics.control_height_small)
             .max_w(px(360.0))
             .px(px(theme.metrics.space_2))
             .rounded(px(theme.metrics.radius_small))
             .truncate()
-            .text_xs()
+            .text_size(theme.typography.chrome)
             .text_color(color)
             .when(self.active, |item| item.bg(theme.colors.selected))
-            .children(self.icon.map(|icon| Icon::new(icon, 12.0, color)))
+            .children(
+                self.icon
+                    .map(|icon| Icon::new(icon, IconSize::Small, color)),
+            )
             .when(self.show_label, |item| item.child(self.label));
         if let Some(handler) = self.on_click {
             item = item
@@ -454,7 +459,7 @@ impl Render for Tooltip {
                 .bg(theme.colors.elevated_surface)
                 .border_1()
                 .border_color(theme.colors.border)
-                .text_xs()
+                .text_size(theme.typography.caption)
                 .text_color(theme.colors.text)
                 .child(self.text.clone()),
         )
@@ -525,7 +530,7 @@ impl RenderOnce for Dialog {
             .rounded(px(theme.metrics.radius_medium))
             .child(
                 div()
-                    .h(px(theme.metrics.panel_header_height))
+                    .h(theme.metrics.panel_header_height)
                     .px_3()
                     .flex()
                     .items_center()

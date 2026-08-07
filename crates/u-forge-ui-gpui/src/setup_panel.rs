@@ -16,7 +16,7 @@ use u_forge_core::{
 
 use crate::startup::{StartupMilestone, StartupTimeline};
 use crate::ui::components::Tooltip;
-use crate::ui::icons::{Icon, IconName};
+use crate::ui::icons::{Icon, IconName, IconSize};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SetupRequested {
@@ -953,10 +953,12 @@ impl Render for SetupPanel {
             let primary_model_name = model_name.clone();
             let operation_content = match operation {
                 SetupDownloadOperation::Retry => {
-                    Icon::new(IconName::Refresh, 13.0, rgba(0xcdd6f4ff)).into_any_element()
+                    Icon::new(IconName::Refresh, IconSize::Medium, rgba(0xcdd6f4ff))
+                        .into_any_element()
                 }
                 SetupDownloadOperation::Control(DownloadAction::Remove) => {
-                    Icon::new(IconName::MinusCircle, 13.0, rgba(0xf38ba8ff)).into_any_element()
+                    Icon::new(IconName::MinusCircle, IconSize::Medium, rgba(0xf38ba8ff))
+                        .into_any_element()
                 }
                 _ => div().child(format!("{operation:?}")).into_any_element(),
             };

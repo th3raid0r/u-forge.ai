@@ -1,8 +1,8 @@
 //! Monochrome application icons rendered through GPUI's SVG mask pipeline.
 
-use gpui::{
-    App, IntoElement, RenderOnce, Rgba, Transformation, Window, prelude::*, px, radians, svg,
-};
+use gpui::{App, IntoElement, RenderOnce, Rgba, Transformation, Window, prelude::*, radians, svg};
+
+use super::theme::UiTheme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconName {
@@ -34,6 +34,14 @@ pub enum IconName {
     World,
     ZoomIn,
     ZoomOut,
+}
+
+/// Semantic icon sizes tied to the root font size by [`UiTheme`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconSize {
+    Small,
+    Medium,
+    Large,
 }
 
 impl IconName {
@@ -74,13 +82,13 @@ impl IconName {
 #[derive(IntoElement)]
 pub struct Icon {
     name: IconName,
-    size: f32,
+    size: IconSize,
     color: Rgba,
     rotation_degrees: f32,
 }
 
 impl Icon {
-    pub fn new(name: IconName, size: f32, color: Rgba) -> Self {
+    pub fn new(name: IconName, size: IconSize, color: Rgba) -> Self {
         Self {
             name,
             size,
@@ -96,13 +104,19 @@ impl Icon {
 }
 
 impl RenderOnce for Icon {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let typography = UiTheme::get(cx).typography;
+        let size = match self.size {
+            IconSize::Small => typography.icon_small,
+            IconSize::Medium => typography.icon_medium,
+            IconSize::Large => typography.icon_large,
+        };
         svg()
             .path(self.name.path())
             .with_transformation(Transformation::rotate(radians(
                 self.rotation_degrees.to_radians(),
             )))
-            .size(px(self.size))
+            .size(size)
             .flex_none()
             .text_color(self.color)
     }
