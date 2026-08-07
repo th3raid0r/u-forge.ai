@@ -8,8 +8,8 @@ use gpui::{
     point, prelude::*, px, rgb, rgba, size,
 };
 
-/// Single-line text field height (px).
-pub(crate) const TEXT_FIELD_MIN_H: f32 = 28.0;
+use crate::ui::theme::UiTheme;
+
 /// Maximum text field height before scrolling kicks in (px).
 pub(crate) const TEXT_FIELD_MAX_H: f32 = 120.0;
 /// Vertical padding inside text fields (px).
@@ -51,6 +51,14 @@ struct PreparedTextFieldPaint {
 
 fn should_install_blink(read_only: bool, focused: bool) -> bool {
     !read_only && focused
+}
+
+fn editable_field_height(multiline: bool, content_height: f32, control_height: f32) -> f32 {
+    if multiline {
+        content_height.clamp(control_height, TEXT_FIELD_MAX_H)
+    } else {
+        control_height
+    }
 }
 
 /// A minimal editable text field built on GPUI's `EntityInputHandler`.
@@ -614,6 +622,7 @@ impl EntityInputHandler for TextFieldView {
 
 impl Render for TextFieldView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
         let focused = self.focus.is_focused(window);
         let input_entity = cx.entity().clone();
         let prepare_entity = cx.entity().clone();
@@ -889,11 +898,12 @@ impl Render for TextFieldView {
         // Single-line: fixed height. Multiline: grow with content, capped at max.
         let dynamic_h = if self.read_only {
             self.content_height.max(0.0)
-        } else if self.multiline {
-            self.content_height
-                .clamp(TEXT_FIELD_MIN_H, TEXT_FIELD_MAX_H)
         } else {
-            TEXT_FIELD_MIN_H
+            editable_field_height(
+                self.multiline,
+                self.content_height,
+                f32::from(theme.metrics.control_height),
+            )
         };
 
         let mut field = div()
@@ -1255,8 +1265,10 @@ impl Render for TextFieldView {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextFieldView, should_install_blink};
+    use super::{TextFieldView, editable_field_height, should_install_blink};
     use gpui::TestAppContext;
+
+    use crate::ui::theme::UiTheme;
 
     #[test]
     fn cursor_blink_tasks_are_only_installed_for_focused_editable_fields() {
@@ -1266,8 +1278,16 @@ mod tests {
         assert!(!should_install_blink(true, false));
     }
 
+    #[test]
+    fn single_line_fields_use_the_standard_control_height() {
+        assert_eq!(editable_field_height(false, 28.0, 35.0), 35.0);
+        assert_eq!(editable_field_height(true, 28.0, 35.0), 35.0);
+        assert_eq!(editable_field_height(true, 64.0, 35.0), 64.0);
+    }
+
     #[gpui::test]
     fn editable_text_field_window_launches_paints_and_closes(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
         let (_field, cx) = cx.add_window_view(|window, cx| {
             window.on_window_should_close(cx, |_window, _cx| true);
             TextFieldView::new(false, "Search", cx)

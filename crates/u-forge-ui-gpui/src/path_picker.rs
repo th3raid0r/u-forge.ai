@@ -6,6 +6,7 @@ use gpui::{
 };
 
 use crate::text_field::TextFieldView;
+use crate::ui::theme::UiTheme;
 
 // ── Picker mode & kind ────────────────────────────────────────────────────────
 
@@ -128,6 +129,7 @@ impl PathPickerModal {
 
 impl Render for PathPickerModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
         let title = self.title.clone();
         let confirm_label = self.confirm_label.clone();
         let path_field = self.path_field.clone();
@@ -189,7 +191,7 @@ impl Render for PathPickerModal {
                                 .child(
                                     div()
                                         .id("path-picker-browse")
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .w(px(36.0))
                                         .flex()
                                         .items_center()
@@ -226,7 +228,7 @@ impl Render for PathPickerModal {
                                 .child(
                                     div()
                                         .id("path-picker-cancel")
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
                                         .flex()
                                         .items_center()
@@ -249,7 +251,7 @@ impl Render for PathPickerModal {
                                 .child(
                                     div()
                                         .id("path-picker-confirm")
-                                        .h(px(28.0))
+                                        .h(theme.metrics.control_height)
                                         .px_3()
                                         .flex()
                                         .items_center()

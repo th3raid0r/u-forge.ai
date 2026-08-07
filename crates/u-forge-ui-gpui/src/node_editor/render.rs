@@ -14,7 +14,7 @@ use super::field_spec::SubTab;
 use super::{
     CloseDirtyTabRequested, NodeEditorPanel, SaveActiveRequested, SaveAllRequested,
     TabContextMenuState,
-    field_spec::{COLUMN_W, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H},
+    field_spec::{COLUMN_W, EDGE_SECTION_HEADER_H},
 };
 
 impl Render for NodeEditorPanel {
@@ -402,7 +402,7 @@ impl Render for NodeEditorPanel {
         let mut col_h = 0.0_f32;
 
         for (fi, spec) in specs.iter().enumerate() {
-            let fh = spec.height();
+            let fh = spec.height(f32::from(theme.metrics.control_height));
             if col_h + fh > available_h && !current_page.last().unwrap().is_empty() {
                 // Start a new column.
                 if current_page.len() < max_cols {
@@ -477,7 +477,7 @@ impl Render for NodeEditorPanel {
                             .flex_row()
                             .items_center()
                             .gap(px(6.0))
-                            .h(px(28.0))
+                            .h(theme.metrics.control_height)
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -546,7 +546,7 @@ impl Render for NodeEditorPanel {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .h(px(28.0))
+                            .h(theme.metrics.control_height)
                             .px(px(6.0))
                             .bg(rgb(0x313244))
                             .rounded(px(4.0))
@@ -579,7 +579,7 @@ impl Render for NodeEditorPanel {
                             let mut dropdown = div()
                                 .id(SharedString::from(format!("enum-drop-{}", spec.key)))
                                 .absolute()
-                                .top(px(30.0))
+                                .top(theme.metrics.control_height + px(2.0))
                                 .left_0()
                                 .w_full()
                                 .bg(rgb(0x313244))
@@ -662,7 +662,7 @@ impl Render for NodeEditorPanel {
                             .flex_row()
                             .flex_wrap()
                             .gap(px(4.0))
-                            .min_h(px(28.0));
+                            .min_h(theme.metrics.control_height);
 
                         for (item_idx, item) in items.iter().enumerate() {
                             let item_label: SharedString = item.clone().into();
@@ -803,7 +803,7 @@ impl Render for NodeEditorPanel {
                                 .unwrap_or_default()
                                 .into();
                             div()
-                                .h(px(28.0))
+                                .h(theme.metrics.control_height)
                                 .px(px(6.0))
                                 .bg(rgb(0x313244))
                                 .rounded(px(4.0))
@@ -1040,6 +1040,8 @@ impl NodeEditorPanel {
         primary: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let theme = *UiTheme::get(cx);
+        let edge_row_height = f32::from(theme.metrics.control_height);
         let tab = match self.tabs.get(active_idx) {
             Some(t) => t,
             None => return div().into_any_element(),
@@ -1123,7 +1125,7 @@ impl NodeEditorPanel {
                         .id(SharedString::from(format!("edge-type-{}", ei)))
                         .min_w(px(80.0))
                         .max_w(px(140.0))
-                        .h(px(26.0))
+                        .h(theme.metrics.control_height)
                         .bg(rgb(0x313244))
                         .rounded(px(4.0))
                 }
@@ -1142,7 +1144,7 @@ impl NodeEditorPanel {
                 .id(SharedString::from(format!("edge-to-btn-{}", ei)))
                 .flex()
                 .items_center()
-                .h(px(26.0))
+                .h(theme.metrics.control_height)
                 .px(px(6.0))
                 .bg(rgb(0x313244))
                 .rounded(px(4.0))
@@ -1204,7 +1206,7 @@ impl NodeEditorPanel {
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
-                .h(px(EDGE_ROW_H))
+                .h(theme.metrics.control_height)
                 .child(type_field)
                 .child(arrow)
                 .child(to_btn)
@@ -1219,7 +1221,7 @@ impl NodeEditorPanel {
             .flex()
             .items_center()
             .gap(px(4.0))
-            .h(px(EDGE_ADD_BTN_H))
+            .h(theme.metrics.control_height)
             .px(px(8.0))
             .bg(rgba(0x89b4fa1a))
             .rounded(px(4.0))
@@ -1248,7 +1250,7 @@ impl NodeEditorPanel {
         // Positioned absolute within this section (which is `relative`).
         //
         // Y: bottom of row[ei] = header_h + (ei+1) * (row_h + gap)
-        //    = EDGE_SECTION_HEADER_H + gap(4) + ei*(EDGE_ROW_H+4) + EDGE_ROW_H
+        //    = header height + gap + ei*(row height+gap) + row height
         // X: align with section content edge (section has px_3 = 12px h-padding).
         if let Some(ref dd) = self.edge_node_dropdown {
             let ei = dd.edge_idx;
@@ -1257,7 +1259,7 @@ impl NodeEditorPanel {
             let highlighted = dd.highlighted_idx;
 
             let anchor_y =
-                EDGE_SECTION_HEADER_H + 4.0 + ei as f32 * (EDGE_ROW_H + 4.0) + EDGE_ROW_H;
+                EDGE_SECTION_HEADER_H + 4.0 + ei as f32 * (edge_row_height + 4.0) + edge_row_height;
 
             // Build filtered node list from snapshot.
             let snap = self.snapshot.read();
@@ -1296,7 +1298,7 @@ impl NodeEditorPanel {
                     .id(SharedString::from(format!("edge-dd-filter-overlay-{}", ei)))
                     .flex()
                     .flex_none()
-                    .h(px(28.0))
+                    .h(theme.metrics.control_height)
                     .px(px(4.0))
                     .border_b_1()
                     .border_color(rgb(0x313244))

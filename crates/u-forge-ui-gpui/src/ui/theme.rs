@@ -42,6 +42,8 @@ pub struct UiMetrics {
     pub radius_small: f32,
     pub radius_medium: f32,
     pub control_height_small: Pixels,
+    /// Standard height shared by editable fields, dropdown triggers, and
+    /// full-size buttons so adjacent controls align exactly.
     pub control_height: Pixels,
     pub menu_bar_height: Pixels,
     pub panel_header_height: Pixels,

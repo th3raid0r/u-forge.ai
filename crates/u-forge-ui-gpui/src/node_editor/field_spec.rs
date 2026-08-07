@@ -10,20 +10,14 @@ use crate::text_field::TextFieldView;
 /// Target column width for the multi-column form layout.
 pub(crate) const COLUMN_W: f32 = 300.0;
 
-/// Height of a single-line form field (label + input + gap).
-pub(crate) const FIELD_H_SINGLE: f32 = 52.0;
+/// Non-control height of a single-line form field (label + gap).
+const FIELD_CHROME_H: f32 = 24.0;
 
-/// Height of a multiline form field (label + textarea + gap).
-pub(crate) const FIELD_H_MULTI: f32 = 104.0;
-
-/// Height of a single edge row in the edge editing section.
-pub(crate) const EDGE_ROW_H: f32 = 34.0;
+/// Baseline height of a multiline form field at the legacy 28 px control size.
+const FIELD_H_MULTI_BASE: f32 = 104.0;
 
 /// Height of the "EDGES" section header.
 pub(crate) const EDGE_SECTION_HEADER_H: f32 = 28.0;
-
-/// Height of the "Add Edge" button row.
-pub(crate) const EDGE_ADD_BTN_H: f32 = 28.0;
 
 /// Which sub-tab is active inside a node editor tab.
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -45,15 +39,17 @@ pub(crate) struct FieldSpec {
 }
 
 impl FieldSpec {
-    pub(crate) fn height(&self) -> f32 {
+    pub(crate) fn height(&self, control_height: f32) -> f32 {
+        let single = FIELD_CHROME_H + control_height;
+        let multiline = FIELD_H_MULTI_BASE + (control_height - 28.0).max(0.0);
         match &self.field_kind {
-            PropertyType::Boolean => FIELD_H_SINGLE,
-            PropertyType::Array(_) => FIELD_H_MULTI,
+            PropertyType::Boolean => single,
+            PropertyType::Array(_) => multiline,
             _ => {
                 if self.multiline {
-                    FIELD_H_MULTI
+                    multiline
                 } else {
-                    FIELD_H_SINGLE
+                    single
                 }
             }
         }
