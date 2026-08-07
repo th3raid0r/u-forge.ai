@@ -11,8 +11,11 @@ use u_forge_core::ObjectId;
 use u_forge_graph_view::GraphSnapshot;
 use u_forge_ui_traits::node_color_for_type;
 
+use crate::actions::{
+    ActionTone, ContextActionId, ContextActionState, ContextScope, context_descriptors,
+};
 use crate::selection_model::SelectionModel;
-use crate::ui::components::{ContextMenu, MenuItem, Tooltip};
+use crate::ui::components::{ContextMenu, LabelTone, MenuItem, Tooltip};
 use crate::ui::icons::{Icon, IconName, IconSize};
 use crate::ui::theme::UiTheme;
 use crate::{
@@ -538,70 +541,83 @@ impl Render for NodePanel {
         root.when_some(context_menu, |root, (position, target, menu_focus)| {
             let menu_body = match target {
                 WorldContextTarget::Group(type_name) => {
-                    let toggle_entity = entity.clone();
-                    let toggle_name = type_name.clone();
-                    let create_entity = entity.clone();
-                    div()
-                        .w(px(180.0))
-                        .child(context_menu_item(
-                            "Show / Hide Group",
-                            move |_event, window, cx| {
-                                cx.stop_propagation();
-                                toggle_entity.update(cx, |panel, cx| {
-                                    panel.toggle_group(&toggle_name);
-                                    panel.context_menu = None;
-                                    panel.focus.focus(window);
-                                    cx.notify();
-                                });
-                            },
-                        ))
-                        .child(context_menu_item(
-                            "New World Item",
-                            move |_event, window, cx| {
-                                cx.stop_propagation();
-                                create_entity.update(cx, |panel, cx| {
-                                    panel.context_menu = None;
-                                    panel.collapsed.remove(&type_name);
-                                    panel.rebuild_visible_rows();
-                                    panel.focus.focus(window);
-                                    cx.emit(CreateNodeRequest(type_name.clone()));
-                                    cx.notify();
-                                });
-                            },
-                        ))
-                        .into_any_element()
+                    let mut body = div().w(px(180.0));
+                    for action_descriptor in context_descriptors(ContextScope::WorldGroup) {
+                        let action_id = action_descriptor.id;
+                        let action_entity = entity.clone();
+                        let action_type_name = type_name.clone();
+                        body = body.child(
+                            MenuItem::new(action_descriptor.element_id, action_descriptor.label)
+                                .tooltip(action_descriptor.tooltip)
+                                .tone(match action_descriptor.tone {
+                                    ActionTone::Normal => LabelTone::Primary,
+                                    ActionTone::Danger => LabelTone::Danger,
+                                })
+                                .on_click(move |_event, window, cx| {
+                                    cx.stop_propagation();
+                                    action_entity.update(cx, |panel, cx| {
+                                        match action_id {
+                                            ContextActionId::ToggleWorldGroup => {
+                                                panel.toggle_group(&action_type_name);
+                                            }
+                                            ContextActionId::NewWorldItem => {
+                                                panel.collapsed.remove(&action_type_name);
+                                                panel.rebuild_visible_rows();
+                                                cx.emit(CreateNodeRequest(
+                                                    action_type_name.clone(),
+                                                ));
+                                            }
+                                            _ => unreachable!(
+                                                "World group menu contains only group actions"
+                                            ),
+                                        }
+                                        panel.context_menu = None;
+                                        panel.focus.focus(window);
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    body.into_any_element()
                 }
                 WorldContextTarget::Item(node_id) => {
-                    let open_entity = entity.clone();
-                    let delete_entity = entity.clone();
-                    div()
-                        .w(px(180.0))
-                        .child(context_menu_item(
-                            "Open Details",
-                            move |_event, window, cx| {
-                                cx.stop_propagation();
-                                open_entity.update(cx, |panel, cx| {
-                                    panel.context_menu = None;
-                                    panel.focus.focus(window);
-                                    panel.selection.update(cx, |selection, cx| {
-                                        selection.select_by_id(Some(node_id), cx);
+                    let state = ContextActionState::default();
+                    let mut body = div().w(px(180.0));
+                    for action_descriptor in context_descriptors(ContextScope::WorldItem) {
+                        let action_id = action_descriptor.id;
+                        let action_entity = entity.clone();
+                        body = body.child(
+                            MenuItem::new(action_descriptor.element_id, action_descriptor.label)
+                                .disabled(!action_descriptor.is_enabled(&state))
+                                .tooltip(action_descriptor.tooltip)
+                                .tone(match action_descriptor.tone {
+                                    ActionTone::Normal => LabelTone::Primary,
+                                    ActionTone::Danger => LabelTone::Danger,
+                                })
+                                .on_click(move |_event, window, cx| {
+                                    cx.stop_propagation();
+                                    action_entity.update(cx, |panel, cx| {
+                                        panel.context_menu = None;
+                                        match action_id {
+                                            ContextActionId::OpenDetails => {
+                                                panel.selection.update(cx, |selection, cx| {
+                                                    selection.select_by_id(Some(node_id), cx);
+                                                });
+                                                panel.focus.focus(window);
+                                            }
+                                            ContextActionId::DeleteWorldItem => {
+                                                cx.emit(DeleteNodeRequest(node_id));
+                                            }
+                                            _ => unreachable!(
+                                                "World item menu contains only item actions"
+                                            ),
+                                        }
+                                        cx.notify();
                                     });
-                                    cx.notify();
-                                });
-                            },
-                        ))
-                        .child(context_menu_item(
-                            "Delete…",
-                            move |_event, _window, cx| {
-                                cx.stop_propagation();
-                                delete_entity.update(cx, |panel, cx| {
-                                    panel.context_menu = None;
-                                    cx.emit(DeleteNodeRequest(node_id));
-                                    cx.notify();
-                                });
-                            },
-                        ))
-                        .into_any_element()
+                                }),
+                        );
+                    }
+                    body.into_any_element()
                 }
             };
             let dismiss_entity = entity.clone();
@@ -620,13 +636,6 @@ impl Render for NodePanel {
             ))
         })
     }
-}
-
-fn context_menu_item(
-    label: &'static str,
-    listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    MenuItem::new(label, label).on_click(listener)
 }
 
 #[cfg(test)]

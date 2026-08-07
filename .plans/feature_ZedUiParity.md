@@ -84,7 +84,7 @@ Primary Zed references:
 - [x] **UI-12 — Keyboard navigation.** Support dock activation, F6 region
   traversal, list/tree navigation, expand/collapse, Details tab switching and
   closing, and Shift+F10 context-menu invocation through typed actions.
-- [ ] **UI-13 — One action source.** Generate native menus, in-app menus,
+- [x] **UI-13 — One action source.** Generate native menus, in-app menus,
   shortcuts, enabled state, advanced visibility, tooltips, context entries,
   and status toggles from shared action descriptors. `Ctrl+S` saves the active
   Details item; `Ctrl+Shift+S` saves all dirty items.
@@ -100,10 +100,10 @@ Primary Zed references:
   confirmed deletion. Delete controls stop row-selection propagation. New
   world items start as in-memory pinned Details drafts and reach storage only
   through explicit Save.
-- [ ] **UI-16 — Guided import/setup.** Make Import World the normal data flow
+- [!!!] **DEFERRED -- UI-16 — Guided import/setup.** Make Import World the normal data flow
   against authoritative loaded schemas, with plain-language validation and a
   structured completion summary. Keep raw schema maintenance advanced. Make
-  recommended Lemonade setup the normal path and backend matrices advanced.
+  recommended Lemonade setup the normal path and backend matrices advanced. (DEFERRED)
 - [x] **UI-17 — Search panel.** Use shared fields/buttons/status components,
   retain owned search tasks, virtualize results, and present structured
   degradation outcomes from `bug_AlphaCorrectness.md` with concise hints and

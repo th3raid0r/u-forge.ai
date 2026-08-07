@@ -18,10 +18,6 @@ use crate::text_field::{TextArrowKey, TextChanged, TextFieldView, TextSubmit};
 
 pub(crate) use field_spec::{EditableEdge, EditorTab};
 
-pub(crate) struct SaveActiveRequested;
-impl gpui::EventEmitter<SaveActiveRequested> for NodeEditorPanel {}
-pub(crate) struct SaveAllRequested;
-impl gpui::EventEmitter<SaveAllRequested> for NodeEditorPanel {}
 pub(crate) struct CloseDirtyTabRequested(pub usize);
 impl gpui::EventEmitter<CloseDirtyTabRequested> for NodeEditorPanel {}
 
@@ -610,7 +606,6 @@ impl NodeEditorPanel {
     }
 
     /// Return true if any tab has unsaved changes.
-    #[allow(dead_code)]
     pub(crate) fn has_dirty_tabs(&self) -> bool {
         self.tabs.iter().any(|t| t.dirty)
     }

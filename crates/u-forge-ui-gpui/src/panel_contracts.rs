@@ -16,15 +16,6 @@ pub enum PanelId {
 }
 
 impl PanelId {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::World => "World",
-            Self::Search => "Search",
-            Self::Assistant => "Assistant",
-            Self::Details => "Details",
-        }
-    }
-
     pub const fn position(self) -> DockPosition {
         match self {
             Self::World | Self::Search => DockPosition::Left,

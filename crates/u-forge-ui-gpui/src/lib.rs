@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod app_view;
 mod assets;
 pub mod chat_history;
@@ -20,35 +21,7 @@ pub mod ui;
 #[cfg(test)]
 mod startup_tests;
 
+pub use actions::*;
 pub use app_view::AppView;
 pub use assets::Assets;
 pub use ui::theme::UiTheme;
-
-use gpui::actions;
-actions!([
-    SaveActiveItem,
-    SaveAllItems,
-    OpenSettings,
-    ToggleSidebar,
-    ToggleSearchPanel,
-    ToggleRightPanel,
-    ToggleDetailsPanel,
-    ToggleFocusedPanelZoom,
-    FocusNextRegion,
-    FocusPreviousRegion,
-    WorldNextRow,
-    WorldPreviousRow,
-    WorldActivateRow,
-    WorldDeleteRow,
-    WorldOpenContextMenu,
-    DetailsNextTab,
-    DetailsPreviousTab,
-    DetailsCloseTab,
-    ClearData,
-    ClearSchema,
-    ImportData,
-    ImportSchema,
-    ExportData,
-    TogglePerfOverlay,
-    FitGraph
-]);

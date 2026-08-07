@@ -26,6 +26,7 @@ use u_forge_graph_view::GraphSnapshot;
 
 use state::AppState;
 
+use crate::actions::{ActionContext, native_menus};
 use crate::chat_panel::{
     AvailableModel, ChatPanel, ConnectRequested, ToggleAssistantZoomRequested,
 };
@@ -34,9 +35,7 @@ use crate::confirmation_modal::{
 };
 use crate::dock_state::{DockFocusIntent, DockState};
 use crate::graph_canvas::GraphCanvas;
-use crate::node_editor::{
-    CloseDirtyTabRequested, NodeEditorPanel, SaveActiveRequested, SaveAllRequested,
-};
+use crate::node_editor::{CloseDirtyTabRequested, NodeEditorPanel};
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
 use crate::panel_contracts::PanelId;
 use crate::path_picker::{
@@ -669,6 +668,7 @@ impl AppView {
                 self.chat_panel.update(cx, |_panel, cx| cx.notify());
                 self.setup_panel.update(cx, |_panel, cx| cx.notify());
                 self.show_advanced_controls = self.settings_draft_advanced;
+                self.refresh_native_menus(cx);
                 self.settings_open = false;
                 if let Some(return_focus) = self.settings_return_focus.take() {
                     return_focus.focus(window);
@@ -680,6 +680,50 @@ impl AppView {
             }
         }
         cx.notify();
+    }
+
+    pub(crate) fn action_context(&self, cx: &App) -> ActionContext {
+        let editor = self.node_editor.read(cx);
+        let active_details_dirty = editor
+            .active_tab
+            .and_then(|active| editor.tabs.get(active))
+            .is_some_and(|tab| tab.dirty);
+        let any_details_dirty = editor.has_dirty_tabs();
+        let has_active_details_tab = editor.active_tab.is_some();
+        let details_tab_count = editor.tabs.len();
+
+        let snapshot = self.state.snapshot.read();
+        let has_data = !snapshot.nodes.is_empty();
+        drop(snapshot);
+
+        let left_open = self
+            .dock_state
+            .is_open(crate::panel_contracts::DockPosition::Left);
+        let active_left = self
+            .dock_state
+            .active_panel(crate::panel_contracts::DockPosition::Left);
+        ActionContext {
+            show_advanced_controls: self.show_advanced_controls,
+            has_schema: self.state.schema_loaded,
+            has_data,
+            active_details_dirty,
+            any_details_dirty,
+            has_active_details_tab,
+            details_tab_count,
+            world_open: left_open && active_left == PanelId::World,
+            search_open: left_open && active_left == PanelId::Search,
+            assistant_open: self
+                .dock_state
+                .is_open(crate::panel_contracts::DockPosition::Right),
+            details_open: self
+                .dock_state
+                .is_open(crate::panel_contracts::DockPosition::Bottom),
+            performance_visible: self.perf_enabled,
+        }
+    }
+
+    pub(crate) fn refresh_native_menus(&self, cx: &mut App) {
+        cx.set_menus(native_menus(&self.action_context(cx)));
     }
 
     pub(crate) fn sync_dock_presentational_state(&mut self, cx: &mut Context<Self>) {
@@ -811,18 +855,6 @@ impl AppView {
                 )
             })
         };
-        let save_all_sub = cx.subscribe(
-            &node_editor,
-            |this: &mut Self, _editor, _event: &SaveAllRequested, cx| {
-                this.do_save_all(cx);
-            },
-        );
-        let save_active_sub = cx.subscribe(
-            &node_editor,
-            |this: &mut Self, _editor, _event: &SaveActiveRequested, cx| {
-                this.do_save_active(cx);
-            },
-        );
         let close_dirty_tab_sub = cx.subscribe(
             &node_editor,
             |this: &mut Self, _editor, event: &CloseDirtyTabRequested, cx| {
@@ -977,8 +1009,6 @@ impl AppView {
                 node_sub_create,
                 node_sub_delete,
                 selection_sub,
-                save_all_sub,
-                save_active_sub,
                 close_dirty_tab_sub,
                 connect_sub,
                 assistant_zoom_sub,
@@ -1027,6 +1057,7 @@ impl AppView {
             }
         }));
 
+        view.refresh_native_menus(cx);
         view.do_init_lemonade(cx);
         view
     }

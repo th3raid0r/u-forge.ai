@@ -1,10 +1,14 @@
 use gpui::{
-    App, Context, Corner, MouseButton, MouseDownEvent, Render, SharedString, Window, anchored,
-    canvas, deferred, div, prelude::*, px, relative, rgb, rgba,
+    Context, Corner, MouseButton, MouseDownEvent, Render, SharedString, Window, anchored, canvas,
+    deferred, div, prelude::*, px, relative, rgb, rgba,
 };
 
+use crate::actions::{
+    ActionId, ActionTone, ContextActionId, ContextActionState, ContextScope, context_descriptors,
+    descriptor,
+};
 use crate::text_field::{TextFieldView, TextSubmit};
-use crate::ui::components::{ContextMenu, IconButton, MenuItem, Tooltip};
+use crate::ui::components::{ContextMenu, IconButton, LabelTone, MenuItem, Tooltip};
 use crate::ui::icons::{Icon, IconName, IconSize};
 use crate::ui::theme::UiTheme;
 
@@ -12,8 +16,7 @@ use u_forge_core::PropertyType;
 
 use super::field_spec::SubTab;
 use super::{
-    CloseDirtyTabRequested, NodeEditorPanel, SaveActiveRequested, SaveAllRequested,
-    TabContextMenuState,
+    CloseDirtyTabRequested, NodeEditorPanel, TabContextMenuState,
     field_spec::{COLUMN_W, EDGE_SECTION_HEADER_H},
 };
 
@@ -232,9 +235,9 @@ impl Render for NodeEditorPanel {
                 ("tab-close", i),
                 IconName::TabClose,
                 if is_dirty {
-                    "Close tab — unsaved changes will require confirmation"
+                    "Close tab — unsaved changes will require confirmation".to_string()
                 } else {
-                    "Close tab (Ctrl+W)"
+                    descriptor(ActionId::DetailsCloseTab).display_tooltip()
                 },
             )
             .on_click(move |_, window, cx| {
@@ -271,32 +274,24 @@ impl Render for NodeEditorPanel {
         }
         let dirty = self.has_dirty_tabs();
         let active_dirty = self.tabs.get(active_idx).is_some_and(|tab| tab.dirty);
-        let save_active_panel = cx.weak_entity();
+        let save_active_descriptor = descriptor(ActionId::SaveActiveItem);
         let save_active = IconButton::new(
             "details-save-active",
             IconName::FloppyDisc,
-            "Save changes (Ctrl+S)",
+            save_active_descriptor.display_tooltip(),
         )
         .disabled(!active_dirty)
         .color(rgba(0xa6e3a1ff))
-        .on_click(move |_, _, cx| {
-            save_active_panel
-                .update(cx, |_this, cx| cx.emit(SaveActiveRequested))
-                .ok();
-        });
-        let save_all_panel = cx.weak_entity();
+        .boxed_action(save_active_descriptor.action());
+        let save_all_descriptor = descriptor(ActionId::SaveAllItems);
         let save_all = IconButton::new(
             "details-save-all",
             IconName::SaveAll,
-            "Save all changed tabs (Ctrl+Shift+S)",
+            save_all_descriptor.display_tooltip(),
         )
         .disabled(!dirty)
         .color(rgba(0xa6e3a1ff))
-        .on_click(move |_, _, cx| {
-            save_all_panel
-                .update(cx, |_this, cx| cx.emit(SaveAllRequested))
-                .ok();
-        });
+        .boxed_action(save_all_descriptor.action());
         tab_bar = tab_bar.child(tab_strip);
         tab_bar = tab_bar.child(save_active);
         tab_bar = tab_bar.child(save_all);
@@ -945,71 +940,70 @@ impl Render for NodeEditorPanel {
             let pinned = tab.pinned;
             let can_move_left = index > 0;
             let can_move_right = index + 1 < self.tabs.len();
-            let pin_entity = cx.entity().clone();
-            let move_left_entity = cx.entity().clone();
-            let move_right_entity = cx.entity().clone();
-            let close_entity = cx.entity().clone();
-            let menu_body = div()
-                .w(px(220.0))
-                .child(tab_context_menu_item(
-                    if pinned {
-                        "Allow Preview Replacement"
-                    } else {
-                        "Keep Open"
-                    },
-                    !dirty,
-                    move |_event, window, cx| {
+            let action_state = ContextActionState {
+                tab_dirty: dirty,
+                can_move_tab_left: can_move_left,
+                can_move_tab_right: can_move_right,
+            };
+            let mut menu_body = div().w(px(220.0));
+            let mut previous_section = None;
+            for action_descriptor in context_descriptors(ContextScope::DetailsTab) {
+                if previous_section.is_some_and(|section| section != action_descriptor.section) {
+                    menu_body = menu_body.child(div().h(px(1.0)).bg(rgb(0x45475a)));
+                }
+                let label = if action_descriptor.id == ContextActionId::ToggleTabPinned && pinned {
+                    action_descriptor
+                        .alternate_label
+                        .unwrap_or(action_descriptor.label)
+                } else {
+                    action_descriptor.label
+                };
+                let action_id = action_descriptor.id;
+                let action_entity = cx.entity().clone();
+                let enabled = action_descriptor.is_enabled(&action_state);
+                let mut item = MenuItem::new(action_descriptor.element_id, label)
+                    .disabled(!enabled)
+                    .tooltip(action_descriptor.tooltip)
+                    .tone(match action_descriptor.tone {
+                        ActionTone::Normal => LabelTone::Primary,
+                        ActionTone::Danger => LabelTone::Danger,
+                    });
+                if enabled {
+                    item = item.on_click(move |_event, window, cx| {
                         cx.stop_propagation();
-                        pin_entity.update(cx, |panel, cx| {
-                            if let Some(tab) = panel.tabs.get_mut(index) {
-                                tab.pinned = !tab.pinned;
-                            }
-                            panel.tab_context_menu = None;
-                            panel.focus.focus(window);
-                            cx.notify();
-                        });
-                    },
-                ))
-                .child(tab_context_menu_item(
-                    "Move Left",
-                    can_move_left,
-                    move |_event, window, cx| {
-                        cx.stop_propagation();
-                        move_left_entity.update(cx, |panel, cx| {
-                            panel.move_tab(index, index.saturating_sub(1), cx);
-                            panel.focus.focus(window);
-                        });
-                    },
-                ))
-                .child(tab_context_menu_item(
-                    "Move Right",
-                    can_move_right,
-                    move |_event, window, cx| {
-                        cx.stop_propagation();
-                        move_right_entity.update(cx, |panel, cx| {
-                            panel.move_tab(index, index + 1, cx);
-                            panel.focus.focus(window);
-                        });
-                    },
-                ))
-                .child(div().h(px(1.0)).bg(rgb(0x45475a)))
-                .child(tab_context_menu_item(
-                    "Close",
-                    true,
-                    move |_event, window, cx| {
-                        cx.stop_propagation();
-                        close_entity.update(cx, |panel, cx| {
-                            panel.tab_context_menu = None;
-                            if dirty {
-                                cx.emit(CloseDirtyTabRequested(index));
-                            } else {
-                                panel.close_tab(index, cx);
-                                cx.notify();
+                        action_entity.update(cx, |panel, cx| {
+                            match action_id {
+                                ContextActionId::ToggleTabPinned => {
+                                    if let Some(tab) = panel.tabs.get_mut(index) {
+                                        tab.pinned = !tab.pinned;
+                                    }
+                                    panel.tab_context_menu = None;
+                                    cx.notify();
+                                }
+                                ContextActionId::MoveTabLeft => {
+                                    panel.move_tab(index, index.saturating_sub(1), cx);
+                                }
+                                ContextActionId::MoveTabRight => {
+                                    panel.move_tab(index, index + 1, cx);
+                                }
+                                ContextActionId::CloseTab => {
+                                    panel.tab_context_menu = None;
+                                    if dirty {
+                                        cx.emit(CloseDirtyTabRequested(index));
+                                    } else {
+                                        panel.close_tab(index, cx);
+                                        cx.notify();
+                                    }
+                                }
+                                _ => unreachable!("Details menu contains only Details actions"),
                             }
                             panel.focus.focus(window);
                         });
-                    },
-                ));
+                    });
+                }
+                menu_body = menu_body.child(item);
+                previous_section = Some(action_descriptor.section);
+            }
             root.child(deferred(
                 anchored()
                     .position(menu.position)
@@ -1031,16 +1025,6 @@ impl Render for NodeEditorPanel {
             ))
         })
     }
-}
-
-fn tab_context_menu_item(
-    label: &'static str,
-    enabled: bool,
-    listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    MenuItem::new(label, label)
-        .disabled(!enabled)
-        .on_click(listener)
 }
 
 // ── Edge section rendering (split out for readability) ───────────────────────

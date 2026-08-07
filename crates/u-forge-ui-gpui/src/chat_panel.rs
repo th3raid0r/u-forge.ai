@@ -2174,6 +2174,7 @@ impl Render for ChatPanel {
                                     .child(
                                         div()
                                             .id("model-selector-btn")
+                                            .debug_selector(|| "model-selector-btn".to_string())
                                             .flex()
                                             .items_center()
                                             .px_2()
@@ -2193,6 +2194,11 @@ impl Render for ChatPanel {
                                                     MouseButton::Left,
                                                     cx.listener(
                                                         |this, _: &MouseDownEvent, _window, cx| {
+                                                            // This control lives inside the input
+                                                            // area's general menu-dismissal handler.
+                                                            // Keep the opening press from bubbling
+                                                            // up and immediately closing the menu.
+                                                            cx.stop_propagation();
                                                             this.model_dropdown_open =
                                                                 !this.model_dropdown_open;
                                                             this.history_dropdown_open = false;
@@ -2270,6 +2276,7 @@ impl Render for ChatPanel {
                                 container.child(
                                     div()
                                         .id("model-dropdown")
+                                        .debug_selector(|| "model-dropdown".to_string())
                                         .flex()
                                         .flex_col()
                                         .w_full()
@@ -2336,7 +2343,59 @@ impl Render for ChatPanel {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{Modifiers, TestAppContext};
+
     use super::*;
+
+    fn picker_test_model(model_id: &str) -> AvailableModel {
+        AvailableModel {
+            model_id: model_id.into(),
+            checkpoint: "checkpoint".into(),
+            recipe: "llamacpp".into(),
+            backend: Some("vulkan".into()),
+            load_options: ModelLoadOptions::default(),
+            tool_capable: true,
+            reasoning_capable: true,
+            sampling: ChatDeviceConfig::default(),
+            effective_limits: None,
+            max_tool_turns: 5,
+        }
+    }
+
+    #[gpui::test]
+    fn model_selector_press_is_not_closed_by_the_input_area(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (panel, cx) = cx.add_window_view(move |_window, cx| {
+            let mut panel = ChatPanel::new(
+                "Test assistant".into(),
+                4096,
+                512,
+                &db_path,
+                runtime,
+                false,
+                cx,
+            );
+            panel.available_models = vec![picker_test_model("publisher/Gemma-4-E4B-it-GGUF")];
+            panel.chat_provider = Some(LemonadeChatProvider::new(
+                "http://127.0.0.1:1/v1",
+                "Gemma-4-E4B-it-GGUF",
+                None,
+            ));
+            panel
+        });
+        cx.update(|window, _app| window.refresh());
+        cx.run_until_parked();
+
+        let selector = cx.debug_bounds("model-selector-btn").unwrap();
+        cx.simulate_mouse_down(selector.center(), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(cx.update(|_window, app| panel.read(app).model_dropdown_open));
+        assert!(cx.debug_bounds("model-dropdown").is_some());
+    }
 
     #[test]
     fn available_model_maps_one_profile_to_rig_parameters() {
@@ -2406,18 +2465,9 @@ mod tests {
 
     #[test]
     fn model_picker_removes_registry_packaging_noise() {
-        let model = AvailableModel {
-            model_id: "publisher/Gemma-4-26B-A4B-it-GGUF".into(),
-            checkpoint: "checkpoint".into(),
-            recipe: "llamacpp".into(),
-            backend: Some("vulkan".into()),
-            load_options: ModelLoadOptions::default(),
-            tool_capable: true,
-            reasoning_capable: true,
-            sampling: ChatDeviceConfig::default(),
-            effective_limits: None,
-            max_tool_turns: 5,
-        };
-        assert_eq!(model.picker_label(), "Gemma 4 26B A4B it (GPU)");
+        assert_eq!(
+            picker_test_model("publisher/Gemma-4-26B-A4B-it-GGUF").picker_label(),
+            "Gemma 4 26B A4B it (GPU)"
+        );
     }
 }

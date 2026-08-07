@@ -3,10 +3,10 @@
 #   text_xs (labels, timestamps) = 0.75 × font_size
 #   text_sm (body, menus)        = 0.875 × font_size
 # Default: 16.0. Adjust text without resizing interface chrome or icons.
-font_size = 14.0
+font_size = 16.0
 # Independent baseline for controls, panel chrome, spacing, and icons.
 # Default: 22.0. This does not alter content text size.
-interface_size = 22.0
+interface_size = 20.0
 # Reveal low-level runtime diagnostics and maintenance controls in the app.
 # Ordinary worldbuilding and AI choices remain visible when this is false.
 show_advanced_controls = true
@@ -45,17 +45,18 @@ cpu_weight = 10
 "Gemma-4-26B-A4B-it-GGUF"          = { ctx_size = 262144, batch_size = 2048, ubatch_size = 2048 }
 
 [chat]
-preferred_device = "gpu"       # "auto" | "gpu" | "npu" | "cpu"
+preferred_device = "gpu"
 system_prompt = "You are a knowledgeable assistant for a TTRPG worldbuilding tool. Answer questions accurately based on the provided knowledge graph context. Be concise and informative."
 max_history_turns = 10
 alpha = 0.5                     # 0.0 = FTS5-only, 1.0 = semantic-only
 search_limit = 3
 hq_semantic_boost = 3           # RRF weight multiplier for the 4096-dim HQ semantic path (vs 1.0 for 768-dim)
 max_tool_turns = 5              # max tool-call round-trips per user message
+reasoning_control = "request"
 
 [chat.gpu]
 #model = "Qwen3.5-27B-GGUF"
-model = "Gemma-4-26B-A4B-it-GGUF"
+model = "Gemma-4-E4B-it-GGUF"
 # model = "Gemma-4-E4B-it-GGUF"
 # model = "Qwen3.5-122B-A10B-GGUF"
 max_tokens = 262144

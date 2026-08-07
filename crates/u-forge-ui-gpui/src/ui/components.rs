@@ -23,6 +23,10 @@ fn action_handler(action: impl Action) -> ClickHandler {
     Rc::new(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
 }
 
+fn boxed_action_handler(action: Box<dyn Action>) -> ClickHandler {
+    Rc::new(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LabelTone {
     Primary,
@@ -168,6 +172,11 @@ impl Button {
         self.on_click = Some(action_handler(action));
         self
     }
+
+    pub fn boxed_action(mut self, action: Box<dyn Action>) -> Self {
+        self.on_click = Some(boxed_action_handler(action));
+        self
+    }
 }
 
 impl RenderOnce for Button {
@@ -287,6 +296,11 @@ impl IconButton {
 
     pub fn action(mut self, action: impl Action) -> Self {
         self.on_click = Some(action_handler(action));
+        self
+    }
+
+    pub fn boxed_action(mut self, action: Box<dyn Action>) -> Self {
+        self.on_click = Some(boxed_action_handler(action));
         self
     }
 }
@@ -474,6 +488,11 @@ impl StatusItem {
 
     pub fn action(mut self, action: impl Action) -> Self {
         self.on_click = Some(action_handler(action));
+        self
+    }
+
+    pub fn boxed_action(mut self, action: Box<dyn Action>) -> Self {
+        self.on_click = Some(boxed_action_handler(action));
         self
     }
 }
@@ -775,6 +794,11 @@ impl MenuItem {
 
     pub fn action(mut self, action: impl Action) -> Self {
         self.on_click = Some(action_handler(action));
+        self
+    }
+
+    pub fn boxed_action(mut self, action: Box<dyn Action>) -> Self {
+        self.on_click = Some(boxed_action_handler(action));
         self
     }
 }

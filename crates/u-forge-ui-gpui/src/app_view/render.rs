@@ -1,15 +1,20 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyView, App, ClickEvent, Context, Corner, MouseButton, MouseDownEvent, Render,
-    StyleRefinement, Window, anchored, canvas, deferred, div, point, prelude::*, px, relative,
+    AnyElement, AnyView, App, ClickEvent, Context, Corner, FocusHandle, MouseButton,
+    MouseDownEvent, Render, StyleRefinement, Window, anchored, canvas, deferred, div, point,
+    prelude::*, px, relative,
 };
 
+use crate::actions::{
+    ActionContext, ActionDescriptor, ActionId, ActionMenu, ActionTone, StatusSide,
+    menu_descriptors, status_descriptors,
+};
 use crate::{
     ClearData, ClearSchema, DetailsCloseTab, DetailsNextTab, DetailsPreviousTab, ExportData,
-    FitGraph, FocusNextRegion, FocusPreviousRegion, ImportData, ImportSchema, OpenSettings,
-    SaveActiveItem, SaveAllItems, ToggleDetailsPanel, ToggleFocusedPanelZoom, TogglePerfOverlay,
-    ToggleRightPanel, ToggleSearchPanel, ToggleSidebar,
+    FitGraph, FocusNextRegion, FocusPreviousRegion, ImportData, ImportSchema, OpenLemonadeSetup,
+    OpenSettings, SaveActiveItem, SaveAllItems, ToggleDetailsPanel, ToggleFocusedPanelZoom,
+    TogglePerfOverlay, ToggleRightPanel, ToggleSearchPanel, ToggleSidebar,
 };
 
 use super::{AppView, ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar};
@@ -20,7 +25,6 @@ use crate::startup::StartupMilestone;
 use crate::ui::components::{
     Button, ButtonStyle, Dialog, LabelTone, Menu, MenuItem, StatusItem, StatusTone, Tab as UiTab,
 };
-use crate::ui::icons::IconName;
 use crate::ui::theme::UiTheme;
 
 fn operation_status_tone(message: &str) -> StatusTone {
@@ -38,6 +42,90 @@ fn operation_status_tone(message: &str) -> StatusTone {
     } else {
         StatusTone::Success
     }
+}
+
+fn action_menu_entries(
+    menu: ActionMenu,
+    context: &ActionContext,
+    return_focus: FocusHandle,
+    handle: gpui::WeakEntity<AppView>,
+    theme: UiTheme,
+) -> Vec<AnyElement> {
+    let mut entries = Vec::new();
+    let mut previous_section = None;
+    for action_descriptor in menu_descriptors(menu, context) {
+        let placement = action_descriptor
+            .menu
+            .expect("menu descriptors must have a menu placement");
+        if previous_section.is_some_and(|section| section != placement.section) {
+            entries.push(
+                div()
+                    .h(px(1.0))
+                    .w_full()
+                    .bg(theme.colors.border)
+                    .into_any_element(),
+            );
+        }
+
+        let enabled = action_descriptor.is_enabled(context);
+        let action = action_descriptor.action();
+        let action_handle = handle.clone();
+        let action_focus = return_focus.clone();
+        let mut item = MenuItem::new(action_descriptor.element_id, action_descriptor.label)
+            .disabled(!enabled)
+            .selected(action_descriptor.is_selected(context))
+            .tooltip(action_descriptor.display_tooltip())
+            .tone(match action_descriptor.tone {
+                ActionTone::Normal => LabelTone::Primary,
+                ActionTone::Danger => LabelTone::Danger,
+            });
+        if let Some(shortcut) = action_descriptor.shortcut {
+            item = item.shortcut(shortcut.display);
+        }
+        if enabled {
+            item = item.on_click(move |_, window, cx| {
+                action_handle
+                    .update(cx, |view, cx| {
+                        match menu {
+                            ActionMenu::File => view.file_menu_open = false,
+                            ActionMenu::View => view.view_menu_open = false,
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                action_focus.focus(window);
+                window.dispatch_action(action.boxed_clone(), cx);
+            });
+        }
+        entries.push(item.into_any_element());
+        previous_section = Some(placement.section);
+    }
+    entries
+}
+
+fn status_action_item(action_descriptor: &ActionDescriptor, context: &ActionContext) -> StatusItem {
+    let placement = action_descriptor
+        .status
+        .expect("status descriptors must have a status placement");
+    let selected = action_descriptor.is_selected(context);
+    let mut item = StatusItem::new(placement.element_id, placement.label)
+        .active(selected)
+        .tooltip(action_descriptor.display_tooltip())
+        .boxed_action(action_descriptor.action());
+    if let Some(icon) = placement.icon {
+        item = item.icon(icon);
+    }
+    if placement.icon_only {
+        item = item.icon_only();
+    }
+    if action_descriptor.id == ActionId::TogglePerfOverlay {
+        item = item.tone(if selected {
+            StatusTone::Success
+        } else {
+            StatusTone::Muted
+        });
+    }
+    item
 }
 
 impl Render for AppView {
@@ -101,9 +189,8 @@ impl Render for AppView {
         let snap = self.state.snapshot.read();
         let node_count = snap.nodes.len();
         let edge_count = snap.edges.len();
-        let has_data = node_count > 0;
-        let has_schema = self.state.schema_loaded;
         drop(snap);
+        let action_context = self.action_context(cx);
 
         // Weak handle used by drag-move closures to update panel sizes.
         let handle = cx.weak_entity();
@@ -115,12 +202,28 @@ impl Render for AppView {
             .size_full()
             .bg(theme.colors.app_surface)
             // Handle actions dispatched from native menu or keybindings.
-            .on_action(cx.listener(|this, _: &SaveActiveItem, _window, cx| {
-                this.do_save_active(cx);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &SaveAllItems, _window, cx| {
-                this.do_save_all(cx);
+            .when(
+                crate::actions::descriptor(ActionId::SaveActiveItem)
+                    .is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &SaveActiveItem, _window, cx| {
+                        this.do_save_active(cx);
+                        cx.notify();
+                    }))
+                },
+            )
+            .when(
+                crate::actions::descriptor(ActionId::SaveAllItems).is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &SaveAllItems, _window, cx| {
+                        this.do_save_all(cx);
+                        cx.notify();
+                    }))
+                },
+            )
+            .on_action(cx.listener(|this, _: &OpenLemonadeSetup, _window, cx| {
+                this.setup_open = true;
+                this.do_refresh_lemonade_setup(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
@@ -128,6 +231,7 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ToggleFocusedPanelZoom, window, cx| {
                 this.toggle_focused_panel_zoom(window, cx);
+                this.refresh_native_menus(cx);
             }))
             .on_action(cx.listener(|this, _: &FocusNextRegion, window, cx| {
                 this.cycle_workspace_focus(false, window, cx);
@@ -135,55 +239,109 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &FocusPreviousRegion, window, cx| {
                 this.cycle_workspace_focus(true, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &DetailsNextTab, _window, cx| {
-                this.node_editor
-                    .update(cx, |editor, cx| editor.activate_relative_tab(false, cx));
-            }))
-            .on_action(cx.listener(|this, _: &DetailsPreviousTab, _window, cx| {
-                this.node_editor
-                    .update(cx, |editor, cx| editor.activate_relative_tab(true, cx));
-            }))
-            .on_action(cx.listener(|this, _: &DetailsCloseTab, window, cx| {
-                this.request_close_active_editor_tab(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &FitGraph, _window, cx| {
-                this.graph_canvas
-                    .update(cx, |canvas, cx| canvas.fit_graph(cx));
-            }))
+            .when(
+                crate::actions::descriptor(ActionId::DetailsNextTab)
+                    .is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &DetailsNextTab, _window, cx| {
+                        this.node_editor
+                            .update(cx, |editor, cx| editor.activate_relative_tab(false, cx));
+                    }))
+                },
+            )
+            .when(
+                crate::actions::descriptor(ActionId::DetailsPreviousTab)
+                    .is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &DetailsPreviousTab, _window, cx| {
+                        this.node_editor
+                            .update(cx, |editor, cx| editor.activate_relative_tab(true, cx));
+                    }))
+                },
+            )
+            .when(
+                crate::actions::descriptor(ActionId::DetailsCloseTab)
+                    .is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &DetailsCloseTab, window, cx| {
+                        this.request_close_active_editor_tab(window, cx);
+                    }))
+                },
+            )
+            .when(
+                crate::actions::descriptor(ActionId::FitGraph).is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &FitGraph, _window, cx| {
+                        this.graph_canvas
+                            .update(cx, |canvas, cx| canvas.fit_graph(cx));
+                    }))
+                },
+            )
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.toggle_dock_panel(PanelId::World, window, cx);
+                this.refresh_native_menus(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSearchPanel, window, cx| {
                 this.toggle_dock_panel(PanelId::Search, window, cx);
+                this.refresh_native_menus(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| {
                 this.toggle_dock_panel(PanelId::Assistant, window, cx);
+                this.refresh_native_menus(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleDetailsPanel, window, cx| {
                 this.toggle_dock_panel(PanelId::Details, window, cx);
+                this.refresh_native_menus(cx);
             }))
-            .on_action(cx.listener(|this, _: &ClearData, window, cx| {
-                this.request_clear_data(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ClearSchema, window, cx| {
-                this.request_clear_schema(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ImportData, window, cx| {
-                this.do_import_data_picker(window, cx);
-            }))
+            .when(
+                crate::actions::descriptor(ActionId::ClearData).is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &ClearData, window, cx| {
+                        this.request_clear_data(window, cx);
+                    }))
+                },
+            )
+            .when(
+                crate::actions::descriptor(ActionId::ClearSchema).is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &ClearSchema, window, cx| {
+                        this.request_clear_schema(window, cx);
+                    }))
+                },
+            )
+            .when(
+                crate::actions::descriptor(ActionId::ImportData).is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &ImportData, window, cx| {
+                        this.do_import_data_picker(window, cx);
+                    }))
+                },
+            )
             .on_action(cx.listener(|this, _: &ImportSchema, window, cx| {
                 this.do_import_schema_picker(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ExportData, window, cx| {
-                this.do_export_data_picker(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &TogglePerfOverlay, _window, cx| {
-                this.perf_enabled = !this.perf_enabled;
-                if !this.perf_enabled {
-                    this.frame_times_us.clear();
-                }
-                cx.notify();
-            }))
+            .when(
+                crate::actions::descriptor(ActionId::ExportData).is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &ExportData, window, cx| {
+                        this.do_export_data_picker(window, cx);
+                    }))
+                },
+            )
+            .when(
+                crate::actions::descriptor(ActionId::TogglePerfOverlay)
+                    .is_enabled(&action_context),
+                |root| {
+                    root.on_action(cx.listener(|this, _: &TogglePerfOverlay, _window, cx| {
+                        this.perf_enabled = !this.perf_enabled;
+                        if !this.perf_enabled {
+                            this.frame_times_us.clear();
+                        }
+                        this.refresh_native_menus(cx);
+                        cx.notify();
+                    }))
+                },
+            )
             // ── Menu bar ──────────────────────────────────────────────────────
             .child(
                 div()
@@ -707,21 +865,11 @@ impl Render for AppView {
                             .flex_none()
                             .gap(px(2.0))
                             .px_1()
-                            .child(
-                                StatusItem::new("status-world", PanelId::World.title())
-                                    .icon(IconName::World)
-                                    .icon_only()
-                                    .active(sidebar_open && sidebar_tab == PanelId::World)
-                                    .tooltip("Show or hide the World panel (Ctrl+B)")
-                                    .action(ToggleSidebar),
-                            )
-                            .child(
-                                StatusItem::new("status-search", PanelId::Search.title())
-                                    .icon(IconName::Search)
-                                    .icon_only()
-                                    .active(sidebar_open && sidebar_tab == PanelId::Search)
-                                    .tooltip("Show or hide Search (Ctrl+Shift+F)")
-                                    .action(ToggleSearchPanel),
+                            .children(
+                                status_descriptors(StatusSide::Left, &action_context)
+                                    .map(|descriptor| {
+                                        status_action_item(descriptor, &action_context)
+                                    }),
                             ),
                     )
                     .child({
@@ -815,35 +963,12 @@ impl Render for AppView {
                             .flex_none()
                             .gap(px(2.0))
                             .px_1()
-                            .child(
-                                StatusItem::new("status-details", PanelId::Details.title())
-                                    .icon(IconName::Edit)
-                                    .icon_only()
-                                    .active(details_open)
-                                    .tooltip("Show or hide Details (Ctrl+Shift+J)")
-                                    .action(ToggleDetailsPanel),
-                            )
-                            .child(
-                                StatusItem::new("status-assistant", PanelId::Assistant.title())
-                                    .icon(IconName::Bot)
-                                    .icon_only()
-                                    .active(right_panel_open)
-                                    .tooltip("Show or hide Assistant (Ctrl+J)")
-                                    .action(ToggleRightPanel),
-                            )
-                            .when(show_advanced_controls, |status| {
-                                status.child(
-                                    StatusItem::new("status-perf", "Perf")
-                                        .active(perf_enabled)
-                                        .tone(if perf_enabled {
-                                            StatusTone::Success
-                                        } else {
-                                            StatusTone::Muted
-                                        })
-                                        .tooltip("Toggle performance diagnostics (Ctrl+Shift+P)")
-                                        .action(TogglePerfOverlay),
-                                )
-                            }),
+                            .children(
+                                status_descriptors(StatusSide::Right, &action_context)
+                                    .map(|descriptor| {
+                                        status_action_item(descriptor, &action_context)
+                                    }),
+                            ),
                     ),
             )
             // ── File dropdown overlay ─────────────────────────────────────────
@@ -857,105 +982,13 @@ impl Render for AppView {
                                 "file-dropdown",
                                 div()
                                     .w(px(220.0))
-                                    .child(
-                                        MenuItem::new("save-item", "Save Changes")
-                                            .shortcut("Ctrl+S")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.do_save_active(cx);
-                                                this.file_menu_open = false;
-                                                this.file_menu_button_focus.focus(window);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        MenuItem::new("save-all-item", "Save All")
-                                            .shortcut("Ctrl+Shift+S")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.do_save_all(cx);
-                                                this.file_menu_open = false;
-                                                this.file_menu_button_focus.focus(window);
-                                                cx.notify();
-                                            })),
-                                    )
-                                // ── separator ──
-                                .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
-                                .child(
-                                    MenuItem::new("lemonade-setup-item", "Lemonade AI Setup…")
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.file_menu_open = false;
-                                                this.file_menu_button_focus.focus(window);
-                                                this.setup_open = true;
-                                                this.do_refresh_lemonade_setup(cx);
-                                                cx.notify();
-                                            }),
-                                        ),
-                                )
-                                // ── separator ──
-                                .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
-                                // Import Schema… — always enabled
-                                .child(
-                                    MenuItem::new("import-schema-item", "Import Schema…")
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.file_menu_open = false;
-                                                this.file_menu_button_focus.focus(window);
-                                                this.do_import_schema_picker(window, cx);
-                                            }),
-                                        ),
-                                )
-                                // Import Data… — greyed when no schema loaded
-                                .child({
-                                    let item =
-                                        MenuItem::new("import-data-item", "Import Data…")
-                                            .disabled(!has_schema)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.file_menu_open = false;
-                                                this.file_menu_button_focus.focus(window);
-                                                this.do_import_data_picker(window, cx);
-                                            }));
-                                    if has_schema {
-                                        item
-                                    } else {
-                                        item.tooltip(
-                                            "Import a schema before importing world data",
-                                        )
-                                    }
-                                })
-                                // Export Data… — greyed when no data
-                                .child(
-                                    MenuItem::new("export-data-item", "Export Data…")
-                                        .disabled(!has_data)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.file_menu_open = false;
-                                            this.file_menu_button_focus.focus(window);
-                                            this.do_export_data_picker(window, cx);
-                                        })),
-                                )
-                                // ── separator ──
-                                .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
-                                // Clear Schema — greyed when no schemas
-                                .child(
-                                    MenuItem::new("clear-schema-item", "Clear Schema")
-                                        .disabled(!has_schema)
-                                        .tone(LabelTone::Danger)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.file_menu_open = false;
-                                            this.file_menu_button_focus.focus(window);
-                                            this.request_clear_schema(window, cx);
-                                        })),
-                                )
-                                // Clear Data — greyed when no data
-                                .child(
-                                    MenuItem::new("clear-data-item", "Clear Data")
-                                        .disabled(!has_data)
-                                        .tone(LabelTone::Danger)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.file_menu_open = false;
-                                            this.file_menu_button_focus.focus(window);
-                                            this.request_clear_data(window, cx);
-                                        })),
-                                ),
+                                    .children(action_menu_entries(
+                                        ActionMenu::File,
+                                        &action_context,
+                                        self.file_menu_button_focus.clone(),
+                                        handle.clone(),
+                                        theme,
+                                    )),
                             )
                             .focus_handle(self.file_menu_focus.clone())
                             .return_focus(self.file_menu_button_focus.clone())
@@ -984,68 +1017,14 @@ impl Render for AppView {
                             Menu::new(
                                 "view-dropdown",
                                 div()
-                                .w(px(220.0))
-                                // Left Panel toggle
-                                .child(
-                                    MenuItem::new("toggle-left-item", "World")
-                                        .shortcut("Ctrl+B")
-                                        .selected(
-                                            sidebar_open && sidebar_tab == PanelId::World,
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.toggle_dock_panel(PanelId::World, window, cx);
-                                                this.view_menu_open = false;
-                                                cx.notify();
-                                            }),
-                                        ),
-                                )
-                                // Right Panel toggle
-                                .child(
-                                    MenuItem::new("toggle-right-item", "Assistant")
-                                        .shortcut("Ctrl+J")
-                                        .selected(right_panel_open)
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.toggle_dock_panel(
-                                                    PanelId::Assistant,
-                                                    window,
-                                                    cx,
-                                                );
-                                                this.view_menu_open = false;
-                                                cx.notify();
-                                            }),
-                                        ),
-                                )
-                                // Bottom Details toggle
-                                .child(
-                                    MenuItem::new("toggle-details-item", "Details")
-                                        .shortcut("Ctrl+Shift+J")
-                                        .selected(details_open)
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.toggle_dock_panel(
-                                                    PanelId::Details,
-                                                    window,
-                                                    cx,
-                                                );
-                                                this.view_menu_open = false;
-                                                cx.notify();
-                                            }),
-                                        ),
-                                )
-                                .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
-                                .child(
-                                    MenuItem::new("open-settings-item", "Settings…")
-                                        .shortcut("Ctrl+,")
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.view_menu_open = false;
-                                                this.view_menu_button_focus.focus(window);
-                                                this.open_settings(window, cx);
-                                            }),
-                                        ),
-                                ),
+                                    .w(px(250.0))
+                                    .children(action_menu_entries(
+                                        ActionMenu::View,
+                                        &action_context,
+                                        self.view_menu_button_focus.clone(),
+                                        handle.clone(),
+                                        theme,
+                                    )),
                             )
                             .focus_handle(self.view_menu_focus.clone())
                             .return_focus(self.view_menu_button_focus.clone())
