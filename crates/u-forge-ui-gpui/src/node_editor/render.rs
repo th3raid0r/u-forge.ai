@@ -878,7 +878,13 @@ impl Render for NodeEditorPanel {
                                 cx.notify();
                             }),
                         )
-                        .child("< Prev"),
+                        .gap(px(4.0))
+                        .child(Icon::new(
+                            IconName::ChevronLeft,
+                            IconSize::Small,
+                            rgba(0xcdd6f4ff),
+                        ))
+                        .child("Previous"),
                 );
             }
 
@@ -909,7 +915,13 @@ impl Render for NodeEditorPanel {
                                 cx.notify();
                             }),
                         )
-                        .child("Next >"),
+                        .gap(px(4.0))
+                        .child("Next")
+                        .child(Icon::new(
+                            IconName::ChevronRight,
+                            IconSize::Small,
+                            rgba(0xcdd6f4ff),
+                        )),
                 );
             }
 
@@ -1132,12 +1144,11 @@ impl NodeEditorPanel {
             };
 
             // Arrow to target
-            let arrow = div()
-                .flex()
-                .items_center()
-                .text_base()
-                .text_color(rgba(0x6c7086ff))
-                .child("\u{2192}"); // →
+            let arrow = div().flex().items_center().child(Icon::new(
+                IconName::ArrowRight,
+                IconSize::Small,
+                rgba(0x6c7086ff),
+            ));
 
             // "To" node selector button
             let to_btn = div()

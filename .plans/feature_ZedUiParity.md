@@ -43,7 +43,7 @@ Primary Zed references:
   IconButton, Tab, Tooltip, Menu/ContextMenu, Popover, Dialog, and StatusItem
   components with consistent hover, pressed, disabled, selected, focus,
   keyboard, action, and dismissal behavior.
-- [ ] **UI-03 — Icon policy.** Bundle a coherent original monochrome SVG set
+- [x] **UI-03 — Icon policy.** Bundle a coherent original monochrome SVG set
   through GPUI's asset source. Replace character stand-ins and give every
   icon-only control an accessible label and tooltip.
 - [x] **UI-04 — GPUI-local panel contracts.** Remove generic panel metadata

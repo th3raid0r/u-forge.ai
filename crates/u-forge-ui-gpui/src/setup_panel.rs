@@ -1091,7 +1091,13 @@ impl Render for SetupPanel {
                                 rgb(0x313244)
                             })
                             .text_color(rgba(0x1e1e2eff))
-                            .child(if self.show_all_backends { "✓" } else { "" }),
+                            .when(self.show_all_backends, |checkbox| {
+                                checkbox.child(Icon::new(
+                                    IconName::Check,
+                                    IconSize::Small,
+                                    rgba(0x1e1e2eff),
+                                ))
+                            }),
                     )
                     .child(
                         div()
@@ -1153,25 +1159,43 @@ impl Render for SetupPanel {
                             .child(
                                 div()
                                     .id("setup-chat-prev")
-                                    .px_2()
+                                    .size(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .cursor_pointer()
+                                    .tooltip(Tooltip::text("Previous chat model"))
+                                    .hover(|style| style.bg(rgba(0x45475aaa)))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| this.cycle_chat(-1, cx)),
                                     )
-                                    .child("‹"),
+                                    .child(Icon::new(
+                                        IconName::ChevronLeft,
+                                        IconSize::Medium,
+                                        rgba(0xcdd6f4ff),
+                                    )),
                             )
                             .child(chat_label)
                             .child(
                                 div()
                                     .id("setup-chat-next")
-                                    .px_2()
+                                    .size(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .cursor_pointer()
+                                    .tooltip(Tooltip::text("Next chat model"))
+                                    .hover(|style| style.bg(rgba(0x45475aaa)))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| this.cycle_chat(1, cx)),
                                     )
-                                    .child("›"),
+                                    .child(Icon::new(
+                                        IconName::ChevronRight,
+                                        IconSize::Medium,
+                                        rgba(0xcdd6f4ff),
+                                    )),
                             ),
                     ),
             )

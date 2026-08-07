@@ -8,8 +8,24 @@ pub struct Assets;
 
 const ASSETS: &[(&str, &[u8])] = &[
     (
+        "icons/arrow-right.svg",
+        include_bytes!("../../../assets/icons/arrow-right.svg"),
+    ),
+    (
+        "icons/bot.svg",
+        include_bytes!("../../../assets/icons/bot.svg"),
+    ),
+    (
+        "icons/check.svg",
+        include_bytes!("../../../assets/icons/check.svg"),
+    ),
+    (
         "icons/chevron-down.svg",
         include_bytes!("../../../assets/icons/chevron-down.svg"),
+    ),
+    (
+        "icons/chevron-left.svg",
+        include_bytes!("../../../assets/icons/chevron-left.svg"),
     ),
     (
         "icons/chevron-right.svg",
@@ -28,16 +44,16 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../../../assets/icons/copy.svg"),
     ),
     (
-        "icons/bot.svg",
-        include_bytes!("../../../assets/icons/bot.svg"),
-    ),
-    (
         "icons/edit.svg",
         include_bytes!("../../../assets/icons/edit.svg"),
     ),
     (
         "icons/floppy-disc.svg",
         include_bytes!("../../../assets/icons/floppy-disc.svg"),
+    ),
+    (
+        "icons/folder-open.svg",
+        include_bytes!("../../../assets/icons/folder-open.svg"),
     ),
     (
         "icons/maximize.svg",
@@ -96,6 +112,10 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../../../assets/icons/thinking.svg"),
     ),
     (
+        "icons/tool.svg",
+        include_bytes!("../../../assets/icons/tool.svg"),
+    ),
+    (
         "icons/trash.svg",
         include_bytes!("../../../assets/icons/trash.svg"),
     ),
@@ -143,15 +163,26 @@ mod tests {
     use gpui::AssetSource;
 
     use super::Assets;
+    use crate::ui::icons::IconName;
 
     #[test]
     fn application_icons_are_embedded_and_discoverable() {
         let assets = Assets;
         let listed = assets.list("icons/").unwrap();
 
-        assert_eq!(listed.len(), 28);
-        for path in listed {
-            assert!(assets.load(path.as_ref()).unwrap().is_some());
+        assert_eq!(listed.len(), IconName::ALL.len());
+        for icon in IconName::ALL {
+            let path = icon.path();
+            assert!(
+                listed
+                    .iter()
+                    .any(|listed_path| listed_path.as_ref() == path)
+            );
+
+            let svg = assets.load(path).unwrap().expect("icon should be embedded");
+            let svg = std::str::from_utf8(svg.as_ref()).expect("icon should be UTF-8 SVG");
+            assert!(svg.contains("viewBox=\"0 0 24 24\""), "{path}");
+            assert!(svg.contains("currentColor"), "{path}");
         }
     }
 }

@@ -12,6 +12,8 @@ use tracing::trace_span;
 
 use crate::chat_history::{StoredChatMessage, StoredRole, StoredToolCall};
 use crate::text_field::TextFieldView;
+use crate::ui::components::Tooltip;
+use crate::ui::icons::{Icon, IconName, IconSize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatMessageRole {
@@ -268,8 +270,11 @@ impl ChatMessageView {
         )
         .entered();
         let collapsed = self.collapsed;
-        let chevron = if collapsed { "▶" } else { "▼" };
-        let header = SharedString::from(format!("{chevron} Thinking"));
+        let chevron = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
 
         let mut el = div()
             .flex()
@@ -284,14 +289,26 @@ impl ChatMessageView {
                     .flex()
                     .flex_row()
                     .items_center()
+                    .gap(px(4.0))
                     .cursor_pointer()
+                    .tooltip(Tooltip::text(if collapsed {
+                        "Expand thinking"
+                    } else {
+                        "Collapse thinking"
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                             this.toggle_collapsed(cx);
                         }),
                     )
-                    .child(div().text_base().text_color(rgba(0xf9e2afff)).child(header)),
+                    .child(Icon::new(chevron, IconSize::Small, rgba(0xf9e2afff)))
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgba(0xf9e2afff))
+                            .child("Thinking"),
+                    ),
             );
 
         if !collapsed {
@@ -316,8 +333,11 @@ impl ChatMessageView {
     fn render_tool_call(&self, cx: &mut Context<Self>) -> gpui::Div {
         let collapsed = self.collapsed;
         let has_result = self.tool_result.is_some();
-        let chevron = if collapsed { "▶" } else { "▼" };
-        let header_label = format!("{chevron} ⚙ {}", self.text);
+        let chevron = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
 
         let mut el = div()
             .flex()
@@ -336,20 +356,31 @@ impl ChatMessageView {
                     .items_center()
                     .gap(px(4.0))
                     .cursor_pointer()
+                    .tooltip(Tooltip::text(if collapsed {
+                        "Expand tool details"
+                    } else {
+                        "Collapse tool details"
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                             this.toggle_collapsed(cx);
                         }),
                     )
+                    .child(Icon::new(chevron, IconSize::Small, rgba(0xcba6f7ff)))
+                    .child(Icon::new(IconName::Tool, IconSize::Small, rgba(0xcba6f7ff)))
                     .child(
                         div()
                             .text_base()
                             .text_color(rgba(0xcba6f7ff))
-                            .child(SharedString::from(header_label)),
+                            .child(self.text.clone()),
                     )
                     .when(has_result, |row| {
-                        row.child(div().text_base().text_color(rgba(0xa6e3a188)).child("✓"))
+                        row.child(Icon::new(
+                            IconName::Check,
+                            IconSize::Small,
+                            rgba(0xa6e3a188),
+                        ))
                     }),
             );
 

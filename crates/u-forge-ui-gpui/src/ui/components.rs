@@ -317,12 +317,20 @@ impl Tab {
 }
 
 impl RenderOnce for Tab {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
         div()
             .flex()
             .items_center()
             .child(self.button)
-            .when(self.dirty, |tab| tab.child("•"))
+            .when(self.dirty, |tab| {
+                tab.child(
+                    div()
+                        .size(px(theme.metrics.space_2))
+                        .rounded_full()
+                        .bg(theme.colors.accent),
+                )
+            })
     }
 }
 

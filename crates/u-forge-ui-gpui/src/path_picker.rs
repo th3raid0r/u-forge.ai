@@ -6,6 +6,8 @@ use gpui::{
 };
 
 use crate::text_field::TextFieldView;
+use crate::ui::components::Tooltip;
+use crate::ui::icons::{Icon, IconName, IconSize};
 use crate::ui::theme::UiTheme;
 
 // ── Picker mode & kind ────────────────────────────────────────────────────────
@@ -204,13 +206,18 @@ impl Render for PathPickerModal {
                                         .text_sm()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgb(0x585b70)))
+                                        .tooltip(Tooltip::text("Browse for a path"))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                                 this.browse(cx);
                                             }),
                                         )
-                                        .child("…"),
+                                        .child(Icon::new(
+                                            IconName::FolderOpen,
+                                            IconSize::Medium,
+                                            rgba(0xcdd6f4ff),
+                                        )),
                                 ),
                         )
                         // ── footer ────────────────────────────────────────────
