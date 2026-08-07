@@ -8,7 +8,7 @@ description: Development workflow and setup guide
 
 ```bash
 make build                                                     # Build all crates
-make test                                                      # Run all tests
+make test                                                      # Run all tests with one pinned embedded server
 cargo run -p u-forge-ui-gpui                                   # Run the desktop app
 ```
 
@@ -30,8 +30,9 @@ cargo run -p u-forge-ui-gpui                                   # Run the desktop
 3. Optionally install a standalone
    [Lemonade Server](https://github.com/lemonade-sdk/lemonade) when developing
    against an externally managed service.
-4. `make test` — tests pass with no
-   server required.
+4. `make test` — provisions and owns one checksum-pinned embedded server for
+   the complete suite, then tears down its process tree. No external server or
+   environment configuration is required.
 5. `cargo run -p u-forge-ui-gpui` — launch the desktop app.
 
 ---
@@ -52,7 +53,8 @@ schema, inference design, design decisions.
 2. There is no `EmbeddingManager`. Construct directly, wrap in a
    `BuiltProvider`, and register with `InferenceQueueBuilder::with_provider`.
 3. Gate live-server tests with `require_integration_url!()`
-   (`crate::test_helpers`) — tests skip silently when no server is reachable.
+   (`crate::test_helpers`). Canonical `make test` supplies its owned server;
+   direct `cargo test` skips silently when no server is reachable.
 4. **Never add `Mutex<T>` around synchronous work in an async embedding path**
    (the BUG-5 pattern). Use `tokio::task::spawn_blocking` if CPU-bound work is
    unavoidable, or keep the provider fully async via HTTP.

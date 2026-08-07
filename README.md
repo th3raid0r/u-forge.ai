@@ -84,7 +84,7 @@ Current implementation briefs and their status live in
 audit material.
 
 ```bash
-# Run the test suite (no server required)
+# Run the test suite with one checksum-pinned embedded server
 make test
 ```
 

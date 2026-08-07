@@ -425,3 +425,16 @@ the 0.14 line, so the local backport remains active.
 Standard Rust stable toolchain + a C compiler (`gcc`, `clang`, or MSVC) for bundled SQLite compilation. No system SQLite, no ONNX Runtime, no RocksDB. `source env.sh` is not required.
 
 `cargo run -p u-forge-ui-gpui` works with zero environment variables set. On Ubuntu x64, the UI crate's build step downloads the checksum-pinned Embeddable Lemonade artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, and places `lemonade/lemond` beside the application executable. With no `LEMONADE_URL`, the application launches that private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
+
+Mutable embedded state follows the XDG cache contract at
+`${XDG_CACHE_HOME:-~/.cache}/u-forge/lemonade`. Models, backend executables,
+and generated Lemonade configuration share that application-scoped cache;
+model resolution does not use the global Hugging Face cache. Older u-forge
+cache entries under XDG data storage or a build profile's `lemonade/models`
+directory are moved into this location on the next owned launch.
+
+The canonical `make test` target prebuilds against that same pinned artifact,
+launches one owned instance for all test binaries, and exports its private
+connection rather than probing or adopting an external server. Shutdown first
+unloads models and requests `lemond` exit, then terminates the private Unix
+process group so backend grandchildren cannot survive the suite.

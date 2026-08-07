@@ -41,13 +41,13 @@ fi
 endef
 endif
 
-.PHONY: help build check test fmt fmt-check clippy startup-profile-fresh startup-profile-configured
+.PHONY: help build check test _test-with-embedded-lemonade fmt fmt-check clippy startup-profile-fresh startup-profile-configured
 
 help:
 	@printf '%s\n' 'u-forge.ai development targets'
 	@printf '%s\n' '  make build      Build the workspace'
 	@printf '%s\n' '  make check      Check required targets and run workspace clippy'
-	@printf '%s\n' '  make test       Test the workspace serially by default'
+	@printf '%s\n' '  make test       Test serially with one pinned embedded Lemonade server'
 	@printf '%s\n' '  make fmt        Format the workspace'
 	@printf '%s\n' '  make fmt-check  Verify workspace formatting'
 	@printf '%s\n' '  make clippy     Run strict workspace clippy'
@@ -65,6 +65,12 @@ check:
 	$(call run_silent,$(CARGO) clippy $(CARGO_CLIPPY_FLAGS))
 
 test:
+	$(call run_silent,env -u UFORGE_SKIP_EMBEDDED_LEMONADE -u UFORGE_LEMOND_PATH UFORGE_REQUIRE_EMBEDDED_LEMONADE=1 $(CARGO) test --workspace --no-run)
+	$(call run_silent,$(CARGO) test --manifest-path $(COSMIC_TEXT_MANIFEST) --no-run)
+	@env -u UFORGE_LEMOND_PATH $(CARGO) run --quiet -p u-forge-core --example with_embedded_lemonade -- $(MAKE) --no-print-directory _test-with-embedded-lemonade
+
+_test-with-embedded-lemonade:
+	@test "$${UFORGE_INTEGRATION_TESTS:-}" = require || { printf '%s\n' 'internal test target requires the embedded Lemonade runner' >&2; exit 2; }
 	$(call run_tests,workspace,$(CARGO) test --workspace -- --test-threads=$(TEST_THREADS))
 	$(call run_tests,cosmic-text,$(CARGO) test --manifest-path $(COSMIC_TEXT_MANIFEST) -- --test-threads=$(TEST_THREADS))
 

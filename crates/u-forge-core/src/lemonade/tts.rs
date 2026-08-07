@@ -173,9 +173,10 @@ mod tests {
             .unwrap();
         let cfg = crate::config::AppConfig::default();
         let selector = crate::lemonade::ModelSelector::new(&catalog, &cfg.models, &cfg.embedding);
-        let tts_sel = selector
-            .select_tts()
-            .expect("No TTS model found in catalog");
+        let Some(tts_sel) = selector.select_tts() else {
+            eprintln!("SKIP: no TTS model is present in the XDG model cache");
+            return;
+        };
         let tts = LemonadeTtsProvider::new(&url, &tts_sel.model_id);
 
         let audio = tts.synthesize_default("Hello, adventurer!").await.unwrap();
