@@ -175,6 +175,10 @@ pub struct AppView {
     // ── GPUI bookkeeping ──────────────────────────────────────────────────────
     /// Subscriptions kept alive so handlers fire (node events, chat connect).
     _node_subs: Vec<Subscription>,
+    /// Ensures owned Lemonade cleanup is awaited on an ordinary application quit.
+    _app_quit_sub: Subscription,
+    /// Waits for Ctrl-C on the Tokio runtime once an embedded server is active.
+    _lemonade_signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Coalesces core mutation events into incremental graph refreshes.
     _graph_change_task: Option<gpui::Task<()>>,
     // ── Perf overlay ──────────────────────────────────────────────────────────
@@ -896,6 +900,16 @@ impl AppView {
         );
         state.lemonade_connection = initial_lemonade_connection;
 
+        // GPUI only polls asynchronous quit observers for 100 ms. Perform the
+        // owned-process shutdown synchronously in the observer callback so the
+        // model unload and child reap are allowed to complete.
+        let app_quit_sub = cx.on_app_quit(|this, _cx| {
+            if let Some(embedded) = this.state.embedded_lemonade.clone() {
+                this.state.tokio_rt.block_on(embedded.shutdown());
+            }
+            async {}
+        });
+
         let mut view = Self {
             state,
             graph_canvas,
@@ -938,6 +952,8 @@ impl AppView {
                 setup_download,
                 setup_closed,
             ],
+            _app_quit_sub: app_quit_sub,
+            _lemonade_signal_task: None,
             _graph_change_task: None,
             perf_enabled: false,
             last_frame_cost_us: 0,
@@ -2231,6 +2247,22 @@ impl AppView {
     fn apply_lemonade_metadata(&mut self, metadata: LemonadeMetadata, cx: &mut Context<Self>) {
         let _phase = self.startup.phase("lemonade_metadata_ui_apply");
         self.state.embedded_lemonade = metadata.embedded;
+        if self._lemonade_signal_task.is_none()
+            && let Some(embedded) = self.state.embedded_lemonade.clone()
+        {
+            self._lemonade_signal_task = Some(self.state.tokio_rt.spawn(async move {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        tracing::info!("Ctrl-C received; shutting down embedded Lemonade");
+                        embedded.shutdown().await;
+                        std::process::exit(130);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not install the Ctrl-C shutdown handler");
+                    }
+                }
+            }));
+        }
         self.state.lemonade_connection = Some(metadata.connection.clone());
         self.state.lemonade_catalog = Some(metadata.catalog.clone());
         let setup_hq_default = if self

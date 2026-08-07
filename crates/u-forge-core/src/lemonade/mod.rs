@@ -42,6 +42,7 @@ pub mod stt;
 pub mod system_info;
 pub mod transcription;
 pub mod tts;
+pub mod unload;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
@@ -82,6 +83,10 @@ pub use stt::{LemonadeSttProvider, TranscriptionResult};
 pub use system_info::{RecipeBackendInfo, SystemDeviceInfo, SystemInfo};
 pub use transcription::LemonadeTranscriptionProvider;
 pub use tts::{KokoroVoice, LemonadeTtsProvider};
+pub use unload::{
+    unload_all_models, unload_all_models_with_connection, unload_model,
+    unload_model_with_connection,
+};
 
 // ── URL resolution utilities ──────────────────────────────────────────────────
 

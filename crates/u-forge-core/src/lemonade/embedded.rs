@@ -21,7 +21,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{LemonadeConnection, LemonadeHttpClient, LemonadeOwnership, LemonadeTimeouts};
+use super::{
+    LemonadeConnection, LemonadeHttpClient, LemonadeOwnership, LemonadeTimeouts,
+    unload_all_models_with_connection,
+};
 
 const PORT_START: u16 = 13305;
 const PORT_END: u16 = 13315;
@@ -44,6 +47,8 @@ pub struct EmbeddedLemonade {
     diagnostics: Arc<Mutex<VecDeque<String>>>,
     data_root: PathBuf,
     shutting_down: Arc<AtomicBool>,
+    shutdown_complete: AtomicBool,
+    shutdown_lock: tokio::sync::Mutex<()>,
 }
 
 impl EmbeddedLemonade {
@@ -150,6 +155,8 @@ impl EmbeddedLemonade {
                         diagnostics,
                         data_root,
                         shutting_down,
+                        shutdown_complete: AtomicBool::new(false),
+                        shutdown_lock: tokio::sync::Mutex::new(()),
                     }));
                 }
                 Err(error) => {
@@ -186,8 +193,13 @@ impl EmbeddedLemonade {
     }
 
     pub async fn shutdown(&self) {
+        let _shutdown = self.shutdown_lock.lock().await;
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            return;
+        }
         self.shutting_down.store(true, Ordering::Release);
         shutdown_parts(self.connection.clone(), self.child.clone()).await;
+        self.shutdown_complete.store(true, Ordering::Release);
     }
 }
 
@@ -217,6 +229,9 @@ fn embedded_command(
 impl Drop for EmbeddedLemonade {
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            return;
+        }
         let connection = self.connection.clone();
         let child = self.child.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -321,12 +336,28 @@ async fn shutdown_parts_with_timeouts(
     graceful_timeout: Duration,
     kill_timeout: Duration,
 ) {
+    if let Err(error) = tokio::time::timeout(
+        admin_timeout,
+        unload_all_models_with_connection(connection.clone()),
+    )
+    .await
+    .context("timed out unloading embedded Lemonade models")
+    .and_then(|result| result)
+    {
+        tracing::warn!(%error, "Could not unload all embedded Lemonade models before shutdown");
+    }
+
     let client = LemonadeHttpClient::from_connection(connection);
-    let _ = tokio::time::timeout(
+    if let Err(error) = tokio::time::timeout(
         admin_timeout,
         client.post_admin_empty("/shutdown", &serde_json::json!({})),
     )
-    .await;
+    .await
+    .context("timed out requesting embedded Lemonade shutdown")
+    .and_then(|result| result)
+    {
+        tracing::warn!(%error, "Embedded Lemonade did not accept graceful shutdown");
+    }
     let mut guard = child.lock().await;
     let Some(mut process) = guard.take() else {
         return;
@@ -469,7 +500,7 @@ mod tests {
     use std::io::{Read, Write};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn fake_lemond_process() {
@@ -699,6 +730,64 @@ mod tests {
 
         let external = LemonadeConnection::external("http://127.0.0.1:1/v1").unwrap();
         assert_eq!(external.ownership(), LemonadeOwnership::External);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_unloads_all_models_before_requesting_server_exit() {
+        let Some((port, _)) = two_available_ports() else {
+            eprintln!("SKIP: embedded test port is not available");
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request_lines = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0_u8; 4096];
+                let read = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..read]);
+                request_lines.push(request.lines().next().unwrap_or_default().to_string());
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            }
+            request_lines
+        });
+        let connection = Arc::new(
+            LemonadeConnection::with_credentials(
+                &format!("http://{address}/v1"),
+                LemonadeOwnership::Embedded,
+                None,
+                None,
+                LemonadeTimeouts::default(),
+            )
+            .unwrap(),
+        );
+        let child = Arc::new(tokio::sync::Mutex::new(None));
+
+        shutdown_parts_with_timeouts(
+            connection,
+            child,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                "POST /v1/unload HTTP/1.1",
+                "POST /internal/shutdown HTTP/1.1",
+            ]
+        );
     }
 
     #[cfg(unix)]
