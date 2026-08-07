@@ -22,7 +22,9 @@ These are active failure modes observed in this codebase. Violating them produce
   must work with zero env vars and must never adopt `LEMONADE_URL` or a server
   already using a default port. Direct `cargo test` remains a narrow developer
   path: use `crate::test_helpers::integration_test_url().await` and silently
-  skip when no server is reachable.
+  skip when no server is reachable. CI uses `make test-ci`, which disables
+  embedded provisioning, excludes the Lemonade test namespace, and forces
+  cross-module live Lemonade tests to skip.
 
 ### 2. Fetch live state before making capability decisions
 

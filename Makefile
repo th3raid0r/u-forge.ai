@@ -4,6 +4,20 @@ CARGO ?= cargo
 TEST_THREADS ?= 1
 CARGO_CLIPPY_FLAGS := --workspace --no-deps
 COSMIC_TEXT_MANIFEST := crates/cosmic-text-patched/Cargo.toml
+CI_LEMONADE_TEST_FILTERS := \
+	--skip lemonade \
+	--skip startup_tests::fresh_start_measures_until_setup_is_painted \
+	--skip startup_tests::configured_start_measures_metadata_before_activation \
+	--skip via_provider_factory \
+	--skip two_transcription_workers_compete
+CI_OFFLINE_ENV := env \
+	-u LEMONADE_URL \
+	-u LEMONADE_API_KEY \
+	-u LEMONADE_ADMIN_API_KEY \
+	-u UFORGE_LEMOND_PATH \
+	-u UFORGE_REQUIRE_EMBEDDED_LEMONADE \
+	UFORGE_SKIP_EMBEDDED_LEMONADE=1 \
+	UFORGE_INTEGRATION_TESTS=skip
 
 ifeq ($(V),1)
 define run_silent
@@ -41,13 +55,14 @@ fi
 endef
 endif
 
-.PHONY: help build check test _test-with-embedded-lemonade fmt fmt-check clippy startup-profile-fresh startup-profile-configured
+.PHONY: help build check test test-ci _test-with-embedded-lemonade fmt fmt-check clippy startup-profile-fresh startup-profile-configured
 
 help:
 	@printf '%s\n' 'u-forge.ai development targets'
 	@printf '%s\n' '  make build      Build the workspace'
 	@printf '%s\n' '  make check      Check required targets and run workspace clippy'
 	@printf '%s\n' '  make test       Test serially with one pinned embedded Lemonade server'
+	@printf '%s\n' '  make test-ci    Test serially without provisioning or Lemonade tests'
 	@printf '%s\n' '  make fmt        Format the workspace'
 	@printf '%s\n' '  make fmt-check  Verify workspace formatting'
 	@printf '%s\n' '  make clippy     Run strict workspace clippy'
@@ -68,6 +83,10 @@ test:
 	$(call run_silent,env -u UFORGE_SKIP_EMBEDDED_LEMONADE -u UFORGE_LEMOND_PATH UFORGE_REQUIRE_EMBEDDED_LEMONADE=1 $(CARGO) test --workspace --no-run)
 	$(call run_silent,$(CARGO) test --manifest-path $(COSMIC_TEXT_MANIFEST) --no-run)
 	@env -u UFORGE_LEMOND_PATH $(CARGO) run --quiet -p u-forge-core --example with_embedded_lemonade -- $(MAKE) --no-print-directory _test-with-embedded-lemonade
+
+test-ci:
+	$(call run_tests,workspace,$(CI_OFFLINE_ENV) $(CARGO) test --workspace -- --test-threads=$(TEST_THREADS) $(CI_LEMONADE_TEST_FILTERS))
+	$(call run_tests,cosmic-text,$(CARGO) test --manifest-path $(COSMIC_TEXT_MANIFEST) -- --test-threads=$(TEST_THREADS))
 
 _test-with-embedded-lemonade:
 	@test "$${UFORGE_INTEGRATION_TESTS:-}" = require || { printf '%s\n' 'internal test target requires the embedded Lemonade runner' >&2; exit 2; }

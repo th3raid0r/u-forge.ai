@@ -110,9 +110,13 @@ control variable.
 ```bash
 make fmt-check
 make clippy
-make test
+make test-ci
 cargo doc --no-deps --workspace
 ```
+
+CI exports `UFORGE_SKIP_EMBEDDED_LEMONADE=1` for every Cargo step and uses
+`make test-ci` to force live Lemonade integration tests off. Local full
+verification continues to use `make test` with the owned embedded runtime.
 
 ---
 

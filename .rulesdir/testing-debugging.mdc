@@ -21,6 +21,7 @@ directory on drop. Discarding to `_` can drop before the test body runs.
 
 ```bash
 make test                                                              # All tests, one embedded server, always single-threaded
+make test-ci                                                           # Offline suite; exclude Lemonade-backed tests
 cargo test --workspace storage -- --test-threads=1                     # Module-specific
 cargo test --workspace -- --test-threads=1 --nocapture                 # With stdout
 RUST_LOG=debug cargo test --workspace -- --test-threads=1 --nocapture  # With debug logging
@@ -33,6 +34,12 @@ the suite-owned Lemonade Server and fail intermittently when run in parallel.
 both workspace and standalone `cosmic-text` suites, and then unloads models and
 terminates the runtime process group. Direct `cargo test` retains automatic
 integration-test skipping for narrow iteration.
+
+`make test-ci` sets `UFORGE_SKIP_EMBEDDED_LEMONADE=1`, excludes the Lemonade
+test namespace and the cross-module startup/provider tests backed by Lemonade,
+forces `UFORGE_INTEGRATION_TESTS=skip`, and removes Lemonade URLs and credentials
+from the workspace test process. The target cannot provision, discover, or
+contact a live Lemonade server.
 
 ---
 
@@ -143,12 +150,12 @@ RUST_LOG=u_forge_core::ingest=warn                   # Suppress noisy modules
 ```bash
 make fmt-check
 make clippy
-make test
+make test-ci
 cargo doc --no-deps --workspace
 ```
 
-No `source env.sh` or model download is required; uncached optional model
-capabilities skip. `make test` downloads the checksum-pinned runtime only when
-its build cache is absent, requires that owned server to become ready, and
-never uses an external Lemonade instance. Direct Cargo invocations retain
-`UFORGE_INTEGRATION_TESTS` for focused work.
+No `source env.sh`, embedded-runtime download, model download, or live Lemonade
+server is allowed in CI. The CI job also exports the skip controls for its
+check and Clippy steps so the UI build script cannot provision Lemonade before
+the test step. Local `make test` remains the full embedded-runtime suite.
+Direct Cargo invocations retain `UFORGE_INTEGRATION_TESTS` for focused work.
