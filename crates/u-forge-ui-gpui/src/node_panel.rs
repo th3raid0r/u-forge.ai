@@ -12,7 +12,7 @@ use u_forge_graph_view::GraphSnapshot;
 use u_forge_ui_traits::node_color_for_type;
 
 use crate::selection_model::SelectionModel;
-use crate::ui::components::{ContextMenu, Tooltip};
+use crate::ui::components::{ContextMenu, MenuItem, Tooltip};
 use crate::ui::icons::{Icon, IconName, IconSize};
 use crate::ui::theme::UiTheme;
 use crate::{
@@ -535,7 +535,7 @@ impl Render for NodePanel {
                         .w(px(180.0))
                         .child(context_menu_item(
                             "Show / Hide Group",
-                            move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                            move |_event, _window, cx| {
                                 cx.stop_propagation();
                                 toggle_entity.update(cx, |panel, cx| {
                                     panel.toggle_group(&toggle_name);
@@ -546,7 +546,7 @@ impl Render for NodePanel {
                         ))
                         .child(context_menu_item(
                             "New World Item",
-                            move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                            move |_event, _window, cx| {
                                 cx.stop_propagation();
                                 create_entity.update(cx, |panel, cx| {
                                     panel.context_menu = None;
@@ -566,7 +566,7 @@ impl Render for NodePanel {
                         .w(px(180.0))
                         .child(context_menu_item(
                             "Open Details",
-                            move |_event: &MouseDownEvent, window, cx: &mut App| {
+                            move |_event, window, cx| {
                                 cx.stop_propagation();
                                 open_entity.update(cx, |panel, cx| {
                                     panel.context_menu = None;
@@ -580,7 +580,7 @@ impl Render for NodePanel {
                         ))
                         .child(context_menu_item(
                             "Delete…",
-                            move |_event: &MouseDownEvent, _window, cx: &mut App| {
+                            move |_event, _window, cx| {
                                 cx.stop_propagation();
                                 delete_entity.update(cx, |panel, cx| {
                                     panel.context_menu = None;
@@ -592,11 +592,18 @@ impl Render for NodePanel {
                         .into_any_element()
                 }
             };
+            let dismiss_entity = entity.clone();
             root.child(deferred(
-                anchored()
-                    .position(position)
-                    .anchor(Corner::TopLeft)
-                    .child(ContextMenu::new("world-context-menu", menu_body)),
+                anchored().position(position).anchor(Corner::TopLeft).child(
+                    ContextMenu::new("world-context-menu", menu_body).on_dismiss(
+                        move |_window, cx| {
+                            dismiss_entity.update(cx, |panel, cx| {
+                                panel.context_menu = None;
+                                cx.notify();
+                            });
+                        },
+                    ),
+                ),
             ))
         })
     }
@@ -604,20 +611,9 @@ impl Render for NodePanel {
 
 fn context_menu_item(
     label: &'static str,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .id(label)
-        .flex()
-        .items_center()
-        .h(px(26.0))
-        .px_3()
-        .text_sm()
-        .text_color(rgba(0xcdd6f4ff))
-        .cursor_pointer()
-        .hover(|style| style.bg(rgba(0x45475a88)))
-        .on_mouse_down(MouseButton::Left, listener)
-        .child(label)
+    MenuItem::new(label, label).on_click(listener)
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use gpui::{
 };
 
 use crate::text_field::{TextFieldView, TextSubmit};
-use crate::ui::components::{ContextMenu, IconButton, Tooltip};
+use crate::ui::components::{ContextMenu, IconButton, MenuItem, Tooltip};
 use crate::ui::icons::{Icon, IconName, IconSize};
 use crate::ui::theme::UiTheme;
 
@@ -1006,7 +1006,17 @@ impl Render for NodeEditorPanel {
                 anchored()
                     .position(menu.position)
                     .anchor(Corner::TopLeft)
-                    .child(ContextMenu::new("details-tab-context-menu", menu_body)),
+                    .child(
+                        ContextMenu::new("details-tab-context-menu", menu_body).on_dismiss({
+                            let entity = cx.entity().clone();
+                            move |_window, cx| {
+                                entity.update(cx, |panel, cx| {
+                                    panel.tab_context_menu = None;
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                    ),
             ))
         })
     }
@@ -1015,28 +1025,11 @@ impl Render for NodeEditorPanel {
 fn tab_context_menu_item(
     label: &'static str,
     enabled: bool,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let item = div()
-        .id(label)
-        .flex()
-        .items_center()
-        .h(px(26.0))
-        .px_3()
-        .text_sm()
-        .text_color(if enabled {
-            rgba(0xcdd6f4ff)
-        } else {
-            rgba(0x6c7086ff)
-        })
-        .child(label);
-    if enabled {
-        item.cursor_pointer()
-            .hover(|style| style.bg(rgba(0x45475a88)))
-            .on_mouse_down(MouseButton::Left, listener)
-    } else {
-        item
-    }
+    MenuItem::new(label, label)
+        .disabled(!enabled)
+        .on_click(listener)
 }
 
 // ── Edge section rendering (split out for readability) ───────────────────────

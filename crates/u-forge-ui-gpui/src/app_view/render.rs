@@ -17,7 +17,9 @@ use crate::dock_state::RESIZE_HANDLE_SIZE;
 use crate::panel_contracts::{DockPosition, PanelId, WorkspaceItemId, WorldCanvasViewId};
 use crate::search_panel::SearchPanelStatus;
 use crate::startup::StartupMilestone;
-use crate::ui::components::{Button, ButtonStyle, Dialog, StatusItem, StatusTone, Tab as UiTab};
+use crate::ui::components::{
+    Button, ButtonStyle, Dialog, LabelTone, Menu, MenuItem, StatusItem, StatusTone, Tab as UiTab,
+};
 use crate::ui::icons::IconName;
 use crate::ui::theme::UiTheme;
 
@@ -689,9 +691,7 @@ impl Render for AppView {
                                     .icon_only()
                                     .active(sidebar_open && sidebar_tab == PanelId::World)
                                     .tooltip("Show or hide the World panel (Ctrl+B)")
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(ToggleSidebar), cx);
-                                    }),
+                                    .action(ToggleSidebar),
                             )
                             .child(
                                 StatusItem::new("status-search", PanelId::Search.title())
@@ -699,9 +699,7 @@ impl Render for AppView {
                                     .icon_only()
                                     .active(sidebar_open && sidebar_tab == PanelId::Search)
                                     .tooltip("Show or hide Search (Ctrl+Shift+F)")
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(ToggleSearchPanel), cx);
-                                    }),
+                                    .action(ToggleSearchPanel),
                             ),
                     )
                     .child({
@@ -801,9 +799,7 @@ impl Render for AppView {
                                     .icon_only()
                                     .active(details_open)
                                     .tooltip("Show or hide Details (Ctrl+Shift+J)")
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(ToggleDetailsPanel), cx);
-                                    }),
+                                    .action(ToggleDetailsPanel),
                             )
                             .child(
                                 StatusItem::new("status-assistant", PanelId::Assistant.title())
@@ -811,9 +807,7 @@ impl Render for AppView {
                                     .icon_only()
                                     .active(right_panel_open)
                                     .tooltip("Show or hide Assistant (Ctrl+J)")
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(ToggleRightPanel), cx);
-                                    }),
+                                    .action(ToggleRightPanel),
                             )
                             .when(show_advanced_controls, |status| {
                                 status.child(
@@ -825,9 +819,7 @@ impl Render for AppView {
                                             StatusTone::Muted
                                         })
                                         .tooltip("Toggle performance diagnostics (Ctrl+Shift+P)")
-                                        .on_click(|_, window, cx| {
-                                            window.dispatch_action(Box::new(TogglePerfOverlay), cx);
-                                        }),
+                                        .action(TogglePerfOverlay),
                                 )
                             }),
                     ),
@@ -839,211 +831,113 @@ impl Render for AppView {
                         .position(point(px(0.0), menu_bar_height))
                         .anchor(Corner::TopLeft)
                         .child(
-                            div()
-                                .id("file-dropdown")
-                                .w(px(200.0))
-                                .bg(theme.colors.elevated_surface)
-                                .border_1()
-                                .border_color(theme.colors.border)
-                                .child(
-                                    div()
-                                        .id("save-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_color(theme.colors.text)
-                                        .text_size(theme.typography.chrome)
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(theme.colors.selected))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            Menu::new(
+                                "file-dropdown",
+                                div()
+                                    .w(px(220.0))
+                                    .child(
+                                        MenuItem::new("save-item", "Save Changes")
+                                            .shortcut("Ctrl+S")
+                                            .on_click(cx.listener(|this, _, _window, cx| {
                                                 this.do_save_active(cx);
                                                 this.file_menu_open = false;
                                                 cx.notify();
-                                            }),
-                                        )
-                                        .child("Save Changes        Ctrl+S"),
-                                )
-                                .child(
-                                    div()
-                                        .id("save-all-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_color(theme.colors.text)
-                                        .text_size(theme.typography.chrome)
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(theme.colors.selected))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            })),
+                                    )
+                                    .child(
+                                        MenuItem::new("save-all-item", "Save All")
+                                            .shortcut("Ctrl+Shift+S")
+                                            .on_click(cx.listener(|this, _, _window, cx| {
                                                 this.do_save_all(cx);
                                                 this.file_menu_open = false;
                                                 cx.notify();
-                                            }),
-                                        )
-                                        .child("Save All       Ctrl+Shift+S"),
-                                )
+                                            })),
+                                    )
                                 // ── separator ──
                                 .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
                                 .child(
-                                    div()
-                                        .id("lemonade-setup-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_color(theme.colors.text)
-                                        .text_size(theme.typography.chrome)
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(theme.colors.selected))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    MenuItem::new("lemonade-setup-item", "Lemonade AI Setup…")
+                                        .on_click(
+                                            cx.listener(|this, _, _window, cx| {
                                                 this.file_menu_open = false;
                                                 this.setup_open = true;
                                                 this.do_refresh_lemonade_setup(cx);
                                                 cx.notify();
                                             }),
-                                        )
-                                        .child("Lemonade AI Setup…"),
+                                        ),
                                 )
                                 // ── separator ──
                                 .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
                                 // Import Schema… — always enabled
                                 .child(
-                                    div()
-                                        .id("import-schema-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_color(theme.colors.text)
-                                        .text_size(theme.typography.chrome)
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(theme.colors.selected))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    MenuItem::new("import-schema-item", "Import Schema…")
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
                                                 this.file_menu_open = false;
                                                 this.do_import_schema_picker(window, cx);
                                             }),
-                                        )
-                                        .child("Import Schema…"),
+                                        ),
                                 )
                                 // Import Data… — greyed when no schema loaded
                                 .child({
-                                    let el = div()
-                                        .id("import-data-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_size(theme.typography.chrome);
+                                    let item =
+                                        MenuItem::new("import-data-item", "Import Data…")
+                                            .disabled(!has_schema)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.file_menu_open = false;
+                                                this.do_import_data_picker(window, cx);
+                                            }));
                                     if has_schema {
-                                        el.text_color(theme.colors.text)
-                                            .cursor_pointer()
-                                            .hover(move |s| s.bg(theme.colors.selected))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, window, cx| {
-                                                        this.file_menu_open = false;
-                                                        this.do_import_data_picker(window, cx);
-                                                    },
-                                                ),
-                                            )
+                                        item
                                     } else {
-                                        el.text_color(theme.colors.text_disabled)
+                                        item.tooltip(
+                                            "Import a schema before importing world data",
+                                        )
                                     }
-                                    .child("Import Data…")
                                 })
                                 // Export Data… — greyed when no data
-                                .child({
-                                    let el = div()
-                                        .id("export-data-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_size(theme.typography.chrome);
-                                    if has_data {
-                                        el.text_color(theme.colors.text)
-                                            .cursor_pointer()
-                                            .hover(move |s| s.bg(theme.colors.selected))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, window, cx| {
-                                                        this.file_menu_open = false;
-                                                        this.do_export_data_picker(window, cx);
-                                                    },
-                                                ),
-                                            )
-                                    } else {
-                                        el.text_color(theme.colors.text_disabled)
-                                    }
-                                    .child("Export Data…")
-                                })
+                                .child(
+                                    MenuItem::new("export-data-item", "Export Data…")
+                                        .disabled(!has_data)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.file_menu_open = false;
+                                            this.do_export_data_picker(window, cx);
+                                        })),
+                                )
                                 // ── separator ──
                                 .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
                                 // Clear Schema — greyed when no schemas
-                                .child({
-                                    let el = div()
-                                        .id("clear-schema-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_size(theme.typography.chrome);
-                                    if has_schema {
-                                        el.text_color(theme.colors.danger)
-                                            .cursor_pointer()
-                                            .hover(move |s| s.bg(theme.colors.selected))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, _window, cx| {
-                                                        this.file_menu_open = false;
-                                                        this.request_clear_schema(cx);
-                                                    },
-                                                ),
-                                            )
-                                    } else {
-                                        el.text_color(theme.colors.text_disabled)
-                                    }
-                                    .child("Clear Schema")
-                                })
+                                .child(
+                                    MenuItem::new("clear-schema-item", "Clear Schema")
+                                        .disabled(!has_schema)
+                                        .tone(LabelTone::Danger)
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.file_menu_open = false;
+                                            this.request_clear_schema(cx);
+                                        })),
+                                )
                                 // Clear Data — greyed when no data
-                                .child({
-                                    let el = div()
-                                        .id("clear-data-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_size(theme.typography.chrome);
-                                    if has_data {
-                                        el.text_color(theme.colors.danger)
-                                            .cursor_pointer()
-                                            .hover(move |s| s.bg(theme.colors.selected))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, _window, cx| {
-                                                        this.file_menu_open = false;
-                                                        this.request_clear_data(cx);
-                                                    },
-                                                ),
-                                            )
-                                    } else {
-                                        el.text_color(theme.colors.text_disabled)
-                                    }
-                                    .child("Clear Data")
-                                }),
+                                .child(
+                                    MenuItem::new("clear-data-item", "Clear Data")
+                                        .disabled(!has_data)
+                                        .tone(LabelTone::Danger)
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.file_menu_open = false;
+                                            this.request_clear_data(cx);
+                                        })),
+                                ),
+                            )
+                            .on_dismiss({
+                                let handle = handle.clone();
+                                move |_window, cx| {
+                                    handle
+                                        .update(cx, |view, cx| {
+                                            view.file_menu_open = false;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }
+                            }),
                         ),
                 ))
             })
@@ -1055,53 +949,32 @@ impl Render for AppView {
                         .position(point(px(32.0), menu_bar_height))
                         .anchor(Corner::TopLeft)
                         .child(
-                            div()
-                                .id("view-dropdown")
-                                .w(px(200.0))
-                                .bg(theme.colors.elevated_surface)
-                                .border_1()
-                                .border_color(theme.colors.border)
+                            Menu::new(
+                                "view-dropdown",
+                                div()
+                                .w(px(220.0))
                                 // Left Panel toggle
                                 .child(
-                                    div()
-                                        .id("toggle-left-item")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_color(theme.colors.text)
-                                        .text_size(theme.typography.chrome)
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    MenuItem::new("toggle-left-item", "World")
+                                        .shortcut("Ctrl+B")
+                                        .selected(
+                                            sidebar_open && sidebar_tab == PanelId::World,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
                                                 this.toggle_dock_panel(PanelId::World, window, cx);
                                                 this.view_menu_open = false;
                                                 cx.notify();
                                             }),
-                                        )
-                                        .child(if sidebar_open && sidebar_tab == PanelId::World {
-                                            "  World            Ctrl+B"
-                                        } else {
-                                            "    World            Ctrl+B"
-                                        }),
+                                        ),
                                 )
                                 // Right Panel toggle
                                 .child(
-                                    div()
-                                        .id("toggle-right-item")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_color(theme.colors.text)
-                                        .text_size(theme.typography.chrome)
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    MenuItem::new("toggle-right-item", "Assistant")
+                                        .shortcut("Ctrl+J")
+                                        .selected(right_panel_open)
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
                                                 this.toggle_dock_panel(
                                                     PanelId::Assistant,
                                                     window,
@@ -1110,28 +983,15 @@ impl Render for AppView {
                                                 this.view_menu_open = false;
                                                 cx.notify();
                                             }),
-                                        )
-                                        .child(if right_panel_open {
-                                            "  Assistant        Ctrl+J"
-                                        } else {
-                                            "    Assistant        Ctrl+J"
-                                        }),
+                                        ),
                                 )
                                 // Bottom Details toggle
                                 .child(
-                                    div()
-                                        .id("toggle-details-item")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_color(theme.colors.text)
-                                        .text_size(theme.typography.chrome)
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    MenuItem::new("toggle-details-item", "Details")
+                                        .shortcut("Ctrl+Shift+J")
+                                        .selected(details_open)
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
                                                 this.toggle_dock_panel(
                                                     PanelId::Details,
                                                     window,
@@ -1140,34 +1000,31 @@ impl Render for AppView {
                                                 this.view_menu_open = false;
                                                 cx.notify();
                                             }),
-                                        )
-                                        .child(if details_open {
-                                            "  Details      Ctrl+Shift+J"
-                                        } else {
-                                            "    Details      Ctrl+Shift+J"
-                                        }),
+                                        ),
                                 )
                                 .child(div().h(px(1.0)).w_full().bg(theme.colors.border))
                                 .child(
-                                    div()
-                                        .id("open-settings-item")
-                                        .flex()
-                                        .items_center()
-                                        .h(theme.metrics.control_height)
-                                        .px_3()
-                                        .text_color(theme.colors.text)
-                                        .text_size(theme.typography.chrome)
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(theme.colors.selected))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    MenuItem::new("open-settings-item", "Settings…")
+                                        .shortcut("Ctrl+,")
+                                        .on_click(
+                                            cx.listener(|this, _, _window, cx| {
                                                 this.view_menu_open = false;
                                                 this.open_settings(cx);
                                             }),
-                                        )
-                                        .child("Settings…               Ctrl+,"),
+                                        ),
                                 ),
+                            )
+                            .on_dismiss({
+                                let handle = handle.clone();
+                                move |_window, cx| {
+                                    handle
+                                        .update(cx, |view, cx| {
+                                            view.view_menu_open = false;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }
+                            }),
                         ),
                 ))
             })
@@ -1187,6 +1044,7 @@ impl Render for AppView {
                 let increase_interface = handle.clone();
                 let toggle_advanced = handle.clone();
                 let cancel = handle.clone();
+                let dismiss = handle.clone();
                 let save = handle.clone();
                 let body = div()
                     .flex()
@@ -1310,6 +1168,15 @@ impl Render for AppView {
                         },
                     ));
                 let dialog = Dialog::new("Settings", body)
+                    .id("settings-dialog")
+                    .on_dismiss(move |_window, cx| {
+                        dismiss
+                            .update(cx, |view, cx| {
+                                view.settings_open = false;
+                                cx.notify();
+                            })
+                            .ok();
+                    })
                     .action(
                         Button::new("settings-cancel", "Cancel").on_click(move |_, _, cx| {
                             cancel
@@ -1332,6 +1199,7 @@ impl Render for AppView {
                         .id("settings-overlay")
                         .absolute()
                         .size_full()
+                        .occlude()
                         .flex()
                         .items_center()
                         .justify_center()

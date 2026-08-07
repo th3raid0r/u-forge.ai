@@ -39,7 +39,7 @@ Primary Zed references:
   warning, danger, and focus colors; spacing, radii, control heights, and
   typography. Seed them with the current u-forge palette. Graph type colors
   remain graph-specific.
-- [ ] **UI-02 — Component primitives.** Add reusable Label, Button,
+- [x] **UI-02 — Component primitives.** Add reusable Label, Button,
   IconButton, Tab, Tooltip, Menu/ContextMenu, Popover, Dialog, and StatusItem
   components with consistent hover, pressed, disabled, selected, focus,
   keyboard, action, and dismissal behavior.
