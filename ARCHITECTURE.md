@@ -11,7 +11,7 @@ High-level architecture, data model, storage schema, inference design, and desig
 | `u-forge-core` | lib | Complete | Storage, AI traits, Lemonade integration, queue, search, schema, ingest |
 | `u-forge-graph-view` | lib | Complete | Graph view model + force-directed layout + R-tree spatial index |
 | `u-forge-ui-traits` | lib | Complete | Framework-agnostic rendering contracts (`DrawCommands`, `Viewport`, `generate_draw_commands`) |
-| `u-forge-ui-gpui` | lib + bin | Alpha | GPUI native desktop app — graph canvas, node editor, search, chat |
+| `u-forge-ui-gpui` | lib + bin | Alpha | GPUI native desktop app — DM workspace, World Canvas, Details editing, search, chat, and managed setup |
 | `u-forge-agent` | lib | Complete | Rig-based LLM agent with five graph tools and streaming event loop |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox — not started |
 
@@ -245,7 +245,7 @@ Tool arguments emitted by the LLM are validated against each tool's JSON Schema 
 
 **Strict two-pass JSONL import** (`data.rs`): validate and collect nodes → create accepted objects with a name→ID map → validate and resolve edges → create accepted edges. Existing objects are preloaded for cross-session references. Unknown types, missing required fields, undeclared properties, invalid endpoint pairs, and unresolved endpoints are counted and written to a `.u-forge-import-diagnostics` JSONL sidecar rather than silently widening the graph shape.
 
-**Two ingestion entry points:**
+**Three ingestion entry points:**
 - `setup_and_index(graph, schema_dir, data_file)` — loads schemas AND imports data. Used for a full fresh setup only.
 - `import_data_only(graph, data_file)` — strict data import against schemas already loaded in the graph, with **no schema side-effects**.
 - `import_schemas_and_data(graph, schema_files, data_files)` — explicit schema import followed by strict data import; used by the UI's combined import workflow.
@@ -260,6 +260,27 @@ Tool arguments emitted by the LLM are validated against each tool's JSON Schema 
 `EmbeddingPlan` is the declarative UI entry point: `EmbeddingPlan::rechunk(ids)` for per-node re-chunk + embed, `EmbeddingPlan::embed_all()` for bulk unembedded sweep. `AppView::run_embedding_plan(plan, cx)` is the single UI call site — owns status formatting, epoch-based poller cancellation, and the background tokio task. The spawned future is attached to an `info_span!("embedding_plan", plan_kind)` before detaching; `do_init_lemonade` uses the same `.instrument(info_span!(...))` pattern.
 
 ---
+
+## Desktop Workspace (`u-forge-ui-gpui`)
+
+`AppView` composes a permanent World Canvas with four behavioral dock panels:
+World and Search on the left, Assistant on the right, and Details at the
+bottom. `DockState` owns open/active state, sizes, zoom, focus intent, and the
+canonical placement contract; versioned state is persisted beside the graph at
+`<db_path>/workspace-ui.json`. See `app_view/`, `dock_state.rs`, and
+`panel_contracts.rs` for the composition boundaries.
+
+The World panel is a grouped virtual list over the current graph snapshot.
+Selection opens a preview Details tab; editing pins it, and new objects remain
+in-memory drafts until explicit save. Details owns pinned tabs, dirty state,
+relationship validation, reorder/close behavior, and Save Changes/Save All.
+`actions.rs` is the single descriptor source for menus, shortcuts, tooltips,
+context actions, enabled state, and status toggles.
+
+The permanent World Canvas currently hosts Connections. `GraphCanvas` retains
+the force-directed layout, culling, local-coordinate paint path, spatial index,
+selection, saved node positions, and Fit Connections behavior without making
+Connections the only possible future center item.
 
 ## Chat UI Component Model (`u-forge-ui-gpui`)
 
@@ -289,7 +310,9 @@ AppView
 
 ### File menu and path picker
 
-The File menu exposes six operations in order: Save → Import Schema… → Import Data… → Export Data… → Clear Schema → Clear Data.
+The File menu exposes Save Changes, Save All, Lemonade AI Setup…, Import
+Schema…, Import Data…, Export Data…, Clear Schema, and Clear Data. Availability
+comes from the shared action descriptors rather than menu-local conditions.
 
 "Import Schema…", "Import Data…", and "Export Data…" each open `PathPickerModal` (`src/path_picker.rs`) — a custom in-app dialog (see `.rulesdir/gpui-patterns.mdc` — "Modal overlay") pre-populated from `AppConfig`. On confirm, the chosen path is used directly; there is no separate "Choose…" step.
 
@@ -302,9 +325,13 @@ The graph starts empty on a fresh install; there is no startup auto-import. User
 
 **Send button is four-state, width-pinned.** States: Connect (yellow) / Connecting… (grey) / Send (blue) / Stop (red). Width is pinned to 88 px so the input row doesn't reflow on state change.
 
-### UI text size hierarchy
+### UI scaling and text hierarchy
 
-All font sizes are relative to a single rem base configured via `[ui] font_size` in `u-forge.toml` (default 18 px). `AppView::render` calls `window.set_rem_size(px(font_size))` on every frame, so every GPUI semantic size method and every `window.rem_size()` call in canvas painters reflects the user's choice.
+Content text and interface geometry are independent settings. `[ui].font_size`
+sets the window rem base used by body text and canvas labels;
+`[ui].interface_size` scales panel headers, controls, spacing, radii, and
+semantic icons through `UiTheme`. The Settings dialog updates both while
+keeping low-level model and queue controls behind advanced disclosure.
 
 | GPUI size | Rem multiplier | Used for |
 |-----------|---------------|----------|
@@ -330,18 +357,26 @@ All font sizes are relative to a single rem base configured via `[ui] font_size`
   flattened additional parameters. Embeddings, TTS, and STT use
   `async-openai`; Lemonade management and reranking remain custom HTTP.
 - **LLM runtime profiles are server-global** — `LemonadeRuntime` compares model,
-  load options, and thinking mode as one local identity. Changing any part
-  triggers `/load` before the next direct or agent request. The current runtime
-  lock covers profile activation, not the full subsequent response stream, and
-  thinking mode is also sent as the request-level `enable_thinking` hint.
+  load options, and the configured reasoning strategy as one effective
+  identity. A runtime execution lease covers live comparison, any required
+  load/reload, and the complete direct stream or Rig tool loop. Request-scoped
+  reasoning remains the default; the reload strategy is an explicit fallback.
 - **`properties` as JSON text** — stored as an opaque string. Filtering inside the blob requires deserializing at the Rust layer, or using `json_set`/`json_extract` for targeted mutations. Acceptable for now; revisit if query patterns demand indexed property access.
 - **Schema naming `add_npc` vs `npc`** — `.schema.json` files are named after MCP tool actions. `SchemaIngestion` strips the `add_` prefix, but the file names leak an external convention.
-- **`save_schema` is `async` but has no `.await`** — called with `.await` by several callers; making it sync would require updating all of them. Minor but misleading.
 - **`embedding_manager` not in `KnowledgeGraph`** — embedding is now a caller concern. Simplifies the core struct but means callers must manage the embedding lifecycle separately from storage.
-- **Panel metadata is descriptive only** — `u-forge-ui-traits::Panel` currently
-  exposes static metadata, while `AppView` owns actual placement, resizing,
-  activation, and open state. The graph drawing contracts remain the reusable
-  part of `u-forge-ui-traits`.
+- **Panel behavior is GPUI-local** — `DockState` and GPUI panel contracts own
+  placement, resizing, activation, and focus. `u-forge-ui-traits` remains
+  limited to framework-agnostic graph drawing contracts.
+- **Queue cancellation is not yet a job contract** — GPUI task ownership and
+  dropped streaming receivers stop UI work cooperatively, but pending/retrying
+  inference jobs do not yet expose parent cancellation tokens or explicit
+  cancellation outcomes.
+- **Agent context has fixed ceilings but no cumulative request ledger** — chat
+  history windowing, tool JSON-schema validation, and a max-turn limit exist;
+  schema-summary, cumulative token/tool-output, and repeat-call budgets do not.
+- **Linux client decorations are not drawn by the app** — server-decorated
+  sessions are usable, but compositors such as GNOME Wayland can negotiate
+  client-side decorations that the current root view does not render.
 - **The TypeScript runtime is a stub** — `u-forge-ts-runtime` has no V8 or
   `deno_core` implementation and participates in the workspace only as a
   placeholder crate.

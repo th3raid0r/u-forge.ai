@@ -1,94 +1,122 @@
 # u-forge.ai (Universe Forge)
 
-> **Your worlds, your data, your way.** A local-first TTRPG worldbuilding tool powered by AI.
+> **Build a world you can see, search, and talk to.** A local-first desktop
+> workspace for game masters.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)
 ![Status](https://img.shields.io/badge/status-Alpha-yellow.svg)
+![Distribution](https://img.shields.io/badge/distribution-source%20builds-lightgrey.svg)
 
-![u-forge.ai screenshot](assets/images/u-forge-ai.png)
+![u-forge.ai showing World Canvas, Details, and Assistant](assets/images/u-forge-ai.png)
 
----
+## Your campaign notes, connected
 
-## What is u-forge.ai?
+Worldbuilding rarely fits into a folder tree. Characters belong to factions,
+quests cross locations, artifacts change hands, and old events explain current
+conflicts. u-forge brings those pieces together as a living knowledge graph so
+you can follow the connections instead of hunting through documents.
 
-u-forge.ai is a desktop app for game masters who want a smarter way to manage their worlds. It keeps track of your characters, locations, factions, quests, and the relationships between them — and it runs entirely on your own machine. No subscriptions, no cloud, no data leaving your computer.
+- **See the whole setting.** World Canvas turns people, places, factions,
+  quests, events, and anything else you define into an explorable relationship
+  map.
+- **Shape u-forge around your world.** Schemas act as templates for your lore,
+  defining the kinds of things in a setting, the details they carry, and how
+  they can relate. The editor adapts to those choices instead of forcing every
+  campaign into the same character-sheet format.
+- **Find lore the way you remember it.** Search exact words, search by meaning,
+  or combine both into a best match. When local AI is unavailable, word search
+  keeps working.
+- **Ask questions in context.** The Assistant answers from your own setting,
+  shows when it searches the graph, and keeps conversations alongside the world
+  they are about.
+- **Build with the Assistant.** Compatible models can search, create, and update
+  world items and relationships while respecting the structure you defined.
 
-When you connect an AI backend (optional), u-forge.ai can search your world by *meaning* rather than just keywords, answer questions about your lore in a chat panel, and eventually run AI agents that help you build out your world automatically.
+## Local-first by design
 
----
+Your world lives in local SQLite databases and does not require an account,
+subscription, or hosted service. Graph exploration, editing, import/export,
+and word search continue to work without any AI server.
 
-## Features
+Optional AI features run through
+[Lemonade Server](https://github.com/lemonade-sdk/lemonade). On Ubuntu x64,
+u-forge can provision and run its own private Lemonade runtime. Its guided setup
+discovers the available hardware and manages the models needed for search and
+chat. You can also connect to a separately managed server; world data leaves
+the machine only if you explicitly point u-forge at a non-local one.
 
-- **Visual knowledge graph** — See your world as a connected map of people, places, and things. Pan, zoom, and drag nodes around; the layout is saved automatically.
-- **Node editor** — Click any node to open a structured editor with fields appropriate for that type (character, location, faction, etc.).
-- **Smart search** — Search by keyword or by meaning. Ask "who rules the northern provinces?" and get relevant results even if those exact words don't appear in your notes.
-- **AI chat** — Ask your world questions in plain language and get answers grounded in your own lore.
-- **Works offline** — The core app — graph, editor, keyword search — works without any AI server running. AI features activate automatically when a server is available.
-- **Your data** — Everything is stored in a local SQLite database. No account required.
+## Made for a GM's desk
 
----
+World, Search, Details, Assistant, and the permanent World Canvas stay together
+in a focused native workspace rather than being split across tools. A cohesive
+dark theme and color-coded world types keep even dense settings readable, while
+the technical AI controls remain out of the way until you want them.
 
-## Quick Start
+Imports are checked against the world's templates, so malformed records and
+ambiguous relationships are reported rather than quietly reshaping the setting.
+The included Foundation sample is available as a starting point, or you can
+bring your own schemas and JSONL data.
+
+## Build and run from source
+
+u-forge.ai is currently available as an Alpha source build. Binary releases
+have not been published yet.
+
+Install the stable Rust toolchain and a C compiler first. Debian and Ubuntu
+also need the native GPUI development libraries used by CI:
 
 ```bash
-# Build and launch the app (~30 s on first build)
-cargo build
+sudo apt-get update
+sudo apt-get install --yes \
+  libasound2-dev libfontconfig1-dev libudev-dev libwayland-dev \
+  libx11-xcb-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev
+```
+
+Then build and launch from the repository root:
+
+```bash
+make build
 cargo run -p u-forge-ui-gpui
 ```
 
-The app opens with an empty local database. Import one or more schemas through
-**File → Import Schema…**, then import matching JSONL data through
-**File → Import Data…**. The sample Foundation data under `defaults/` is
-available for an explicit import; startup never modifies the graph implicitly.
+On Ubuntu x64, the first build downloads and verifies the pinned Embeddable
+Lemonade runtime. The app starts that private runtime automatically and opens
+Lemonade AI Setup when required components are missing. Models and backend
+executables are downloaded only when selected in that setup flow.
 
-### Enabling AI features (optional)
+To build without the embedded runtime, set
+`UFORGE_SKIP_EMBEDDED_LEMONADE=1`. On other platforms, or when using an
+independently managed server, run a compatible Lemonade Server and set
+`LEMONADE_URL` only when it is not available at the default loopback address.
 
-AI-powered search, chat, and future agentic features require [Lemonade Server](https://github.com/lemonade-sdk/lemonade) running locally.
+### Start a world
 
-```bash
-# Install Lemonade Server (Linux)
-sudo snap install lemonade-server
+The app opens with an empty local database:
 
-# Pull the models you want
-lemonade-server pull embed-gemma-300m-FLM   # semantic search
-lemonade-server pull GLM-4.7-Flash-GGUF     # chat
+1. Use **File → Import Schema…** and select `defaults/schemas` or your own
+   schema directory.
+2. Use **File → Import Data…** and select `defaults/data/memory.jsonl` or a
+   matching JSONL file.
+3. Select items in World or the canvas, edit them in Details, and save changes
+   explicitly.
 
-lemonade-server serve   # leave running in the background
-```
+## For developers
 
-u-forge.ai will detect the server automatically on startup. Semantic search and the chat panel become available; if the server isn't running, the app falls back to keyword-only search.
-
-> **CPU/GPU systems (no AMD NPU):** You'll need to manually add `ggml-org/embeddinggemma-300M-GGUF:Q8_0` via the Lemonade UI (Models → Add Custom Model, recipe: `llamacpp`, label: `embeddings`). See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
-
----
-
-## Current Status
-
-| Feature | Status |
-|---|---|
-| Desktop app (graph, editor, search, chat) | **Alpha** |
-| Keyword search | Working |
-| AI-powered semantic search | Working (requires Lemonade) |
-| AI chat grounded in your lore | Working (requires Lemonade) |
-| AI agents for automated world-building | Planned |
-| Web UI / server mode | Distant |
-
----
-
-## For Developers
-
-Technical details — crate layout, SQLite schema, inference pipeline, embedding architecture, design decisions — live in [ARCHITECTURE.md](ARCHITECTURE.md).
-Current implementation briefs and their status live in
-[the active plan ledger](.plans/README.md); archived phase plans are historical
-audit material.
+[ARCHITECTURE.md](ARCHITECTURE.md) covers the crate layout, SQLite and vector
+storage, inference pipeline, schema boundaries, and UI architecture. Current
+implementation briefs and their status live in
+[the active plan ledger](.plans/README.md); archived plans are historical audit
+material.
 
 ```bash
-# Run the test suite with one checksum-pinned embedded server
+make fmt-check
+make check
+make clippy
 make test
 ```
 
----
+`make test` provisions one checksum-pinned embedded Lemonade instance for the
+complete suite, then unloads models and tears down the owned process tree.
 
 ## License
 

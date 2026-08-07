@@ -1,6 +1,6 @@
 # Active Plan Ledger
 
-Last reconciled: 2026-08-04 against `main` after PR #33.
+Last reconciled: 2026-08-07 against `main` after PR #40.
 
 Source code is authoritative. Active implementation checklists are recorded in
 `bug_*.md` and `feature_*.md`. A decision-complete `plan_*.md` may accompany a
@@ -26,21 +26,30 @@ tracker should duplicate. Older phase plans remain under
   through complete inference.
 - Packaged Ubuntu x64 builds own a private pinned embeddable `lemond` by
   default. `LEMONADE_URL` explicitly selects an external instance.
+- The repository remains source-first with no published binary release. The
+  first binary distribution is gated on inference lifecycle, agent budgets,
+  and GNOME-compatible client-side window decorations being complete and
+  verified.
 
 ## Active plans
 
 | Plan | Priority | Purpose |
 |------|----------|---------|
-| [Alpha correctness](bug_AlphaCorrectness.md) | P0 | Import integrity, graph invariants, search outcomes, GPUI lifecycle fixes, and maintenance debt. |
-| [Lemonade runtime](feature_LemonadeRuntime.md) ([detailed plan](plan_LemonadeRuntime.md)) | P0 | Private embeddable runtime/release, managed setup, shared connection/auth, live effective profiles, and coordinated chat transports. |
-| [Zed UI parity](feature_ZedUiParity.md) | P0/P1 | Semantic components, behavioral docks, focus/actions, tabs, menus, status UI, and parity verification. |
 | [Inference lifecycle](feature_InferenceLifecycle.md) | P1 | Real cancellation and evidence-led queue observability/tuning. |
 | [Agent budgets](feature_AgentBudgets.md) | P1 | Schema prompt limits, cumulative budgets, and repeated-tool circuit breaking. |
+| [GNOME client-side decorations](feature_GnomeClientSideDecorations.md) | P1 | Complete Linux window chrome when the compositor delegates decorations to the client. |
 
-The active plans are independently reviewable, but their implementation order
-is: correctness foundations → Lemonade runtime → Zed UI foundation/adaptation →
-inference lifecycle → agent budgets. Small maintenance tasks may land alongside
-the first compatible change.
+Inference lifecycle must precede agent budgets where their cancellation and
+completion outcomes meet. Client-side decorations are independent and may land
+alongside either feature. All three are first-binary-release gates.
+
+## Completed Alpha foundations
+
+| Plan | Completed | Outcome |
+|------|-----------|---------|
+| [Alpha correctness](bug_AlphaCorrectness.md) | 2026-08-04 | Strict import integrity, finite graph invariants, structured search outcomes, GPUI lifecycle corrections, and maintenance closure. |
+| [Lemonade runtime](feature_LemonadeRuntime.md) ([detailed plan](plan_LemonadeRuntime.md)) | 2026-08-05 | Private pinned runtime, managed setup, shared connection/auth, live effective profiles, and coordinated chat transports. |
+| [Zed UI parity](feature_ZedUiParity.md) | 2026-08-07 | Semantic components, behavioral docks, focus/actions, Details tabs, menus, status UI, and the DM-oriented World Canvas workspace. Guided import remains separately deferred. |
 
 ## Parked decisions
 
@@ -59,25 +68,25 @@ usage trigger exists.
 
 ## Archived audit reconciliation
 
-The archived plans contain useful history but also stale or disproven claims:
+The archived plans contain useful history but predate the completed Alpha
+foundations:
 
-- Import ambiguity remains real in both the in-session name map and persisted
-  fallback. Strict schema import and atomic validated writes already exist.
-- The layout plan's original coincident-node and NaN-selection explanations do
-  not match current control flow. The retained work is saved/unsaved placement,
-  viewport invariants, measured convergence, and robust spatial rebuilds.
-- Lemonade's timeout and all-or-nothing catalog findings remain, but a blanket
-  five-second completion timeout is not acceptable for local models.
-- Search task ownership, list-state helpers, CI, dimension mismatch coverage,
-  and HQ backfill are already implemented.
-- Search runtime failures still do not reach the UI even though a structured
-  response shell exists.
+- Ambiguous import endpoints, required-property consistency, and agent
+  ambiguity diagnostics were resolved by the Alpha correctness work.
+- Saved/unsaved placement, finite viewport invariants, measured convergence,
+  and robust spatial rebuilding are implemented; the archived layout plan's
+  earlier coincident-node and NaN-selection explanations remain disproven.
+- Partial Lemonade discovery, bounded timeout classes, live profile authority,
+  and full-stream execution leases replaced the archived all-or-nothing and
+  blanket-timeout assumptions.
+- Search task ownership, stage-outcome propagation through the UI, list-state
+  helpers, CI, dimension mismatch coverage, and HQ backfill are implemented.
 - The vendored `cosmic-text` test profile is intentional and valid.
 - Provider generalization, multi-tenancy, and storage redesign were speculative
   future work, not Alpha defects.
 
 ## Verification baseline
 
-At reconciliation time `make fmt-check`, `make check`, and `make test` pass
-without a Lemonade server. Project crates have no clippy warnings; inherited
-warnings remain in the separately tested vendored `cosmic-text` crate.
+The completed feature briefs record their canonical verification. CI runs
+`make fmt-check`, `make check`, `make clippy`, and `make test-ci`; local full
+verification uses `make test` with one owned pinned Lemonade runtime.

@@ -2,7 +2,8 @@
 
 ## Status and target
 
-Approved and in implementation. Use Zed commit
+Implemented and verified on 2026-08-07, except for the explicitly deferred
+guided import/setup increment below. The completed pass used Zed commit
 `381953d44897c53c4d252ae30620bafaa7d060b7` for the entire parity pass.
 Reimplement its composition and behavior for GPUI CE; do not import Zed
 workspace crates or copy Zed implementation code or assets.
@@ -100,10 +101,11 @@ Primary Zed references:
   confirmed deletion. Delete controls stop row-selection propagation. New
   world items start as in-memory pinned Details drafts and reach storage only
   through explicit Save.
-- [!!!] **DEFERRED -- UI-16 — Guided import/setup.** Make Import World the normal data flow
-  against authoritative loaded schemas, with plain-language validation and a
-  structured completion summary. Keep raw schema maintenance advanced. Make
-  recommended Lemonade setup the normal path and backend matrices advanced. (DEFERRED)
+- [ ] **Deferred — UI-16 — Guided import/setup.** Make Import World the normal
+  data flow against authoritative loaded schemas, with plain-language
+  validation and a structured completion summary. Keep raw schema maintenance
+  advanced. Make recommended Lemonade setup the normal path and backend
+  matrices advanced.
 - [x] **UI-17 — Search panel.** Use shared fields/buttons/status components,
   retain owned search tasks, virtualize results, and present structured
   degradation outcomes from `bug_AlphaCorrectness.md` with concise hints and
