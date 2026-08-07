@@ -46,7 +46,7 @@ Primary Zed references:
 - [ ] **UI-03 — Icon policy.** Bundle a coherent original monochrome SVG set
   through GPUI's asset source. Replace character stand-ins and give every
   icon-only control an accessible label and tooltip.
-- [ ] **UI-04 — GPUI-local panel contracts.** Remove generic panel metadata
+- [x] **UI-04 — GPUI-local panel contracts.** Remove generic panel metadata
   from `u-forge-ui-traits`, leaving it focused on graph drawing. Add GPUI-local
   `PanelId`, `DockPosition`, descriptors, focus contracts, and erased handles.
 - [x] **UI-05 — Progressive settings.** Add `show_advanced_controls` to UI
@@ -115,11 +115,11 @@ Primary Zed references:
   Save/Don't Save/Cancel confirmation on dirty close, rather than as a standing
   destructive action. Rename visible Edges UI to Relationships and block saves
   with incomplete relationships rather than silently dropping them.
-- [ ] **UI-19 — Assistant toolbar.** Match Zed's toolbar semantics for title,
+- [x] **UI-19 — Assistant toolbar.** Match Zed's toolbar semantics for title,
   new conversation, maximize/restore, overflow, tooltips, friendly model
   selection, Think Longer, and explicit reload/busy/failure states. Conflicting
   actions are disabled during streaming or reload rather than silently ignored.
-- [ ] **UI-20 — Conversation boundary.** Retain storage, latest-session resume,
+- [x] **UI-20 — Conversation boundary.** Retain storage, latest-session resume,
   and the current lightweight new/switch/delete selector. Do not add Zed's
   archive presentation. Preserve per-message entities, virtualization,
   collapsed thinking/tool blocks, and targeted streaming invalidation; richer

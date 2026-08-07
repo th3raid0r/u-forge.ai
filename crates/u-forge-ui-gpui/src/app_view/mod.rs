@@ -4,7 +4,7 @@ mod state;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use gpui::{App, Context, Empty, Entity, Focusable, Subscription, Window, prelude::*};
+use gpui::{App, Context, Empty, Entity, FocusHandle, Focusable, Subscription, Window, prelude::*};
 use parking_lot::RwLock;
 use tracing::Instrument;
 use u_forge_agent::{AgentParams, GraphAgent};
@@ -158,6 +158,9 @@ pub struct AppView {
     pub(crate) settings_draft_font_size: f32,
     pub(crate) settings_draft_advanced: bool,
     pub(crate) dock_state: DockState,
+    /// Last focused descendant per workspace region, used when a dock is
+    /// revisited after F6 traversal or a close/reopen cycle.
+    last_region_focus: HashMap<FocusRegion, FocusHandle>,
     workspace_state_path: std::path::PathBuf,
     workspace_persist_task: Option<gpui::Task<()>>,
     // ── Path picker modal ─────────────────────────────────────────────────────
@@ -194,7 +197,7 @@ enum DestructiveAction {
     ClearSchema,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FocusRegion {
     Panel(PanelId),
     WorldCanvas,
@@ -450,7 +453,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn apply_dock_focus_intent(&self, intent: DockFocusIntent, window: &mut Window, cx: &App) {
+    fn apply_dock_focus_intent(&mut self, intent: DockFocusIntent, window: &mut Window, cx: &App) {
         match intent {
             DockFocusIntent::Panel(panel) => {
                 self.focus_region(FocusRegion::Panel(panel), window, cx)
@@ -535,21 +538,46 @@ impl AppView {
         }
     }
 
-    fn focus_region(&self, region: FocusRegion, window: &mut Window, cx: &App) {
+    fn region_focus_handle(&self, region: FocusRegion, cx: &App) -> FocusHandle {
         match region {
-            FocusRegion::Panel(PanelId::World) => {
-                self.node_panel.read(cx).focus_handle(cx).focus(window)
+            FocusRegion::Panel(PanelId::World) => self.node_panel.read(cx).focus_handle(cx),
+            FocusRegion::Panel(PanelId::Search) => self.search_panel.read(cx).focus_handle(cx),
+            FocusRegion::Panel(PanelId::Assistant) => self.chat_panel.read(cx).focus_handle(cx),
+            FocusRegion::Panel(PanelId::Details) => self.node_editor.read(cx).focus_handle(cx),
+            FocusRegion::WorldCanvas => self.graph_canvas.read(cx).focus_handle(cx),
+        }
+    }
+
+    fn remember_current_region_focus(&mut self, window: &Window, cx: &App) {
+        let Some(focused) = window.focused(cx) else {
+            return;
+        };
+        for region in [
+            FocusRegion::Panel(PanelId::World),
+            FocusRegion::Panel(PanelId::Search),
+            FocusRegion::WorldCanvas,
+            FocusRegion::Panel(PanelId::Details),
+            FocusRegion::Panel(PanelId::Assistant),
+        ] {
+            if self
+                .region_focus_handle(region, cx)
+                .contains(&focused, window)
+            {
+                self.last_region_focus.insert(region, focused);
+                return;
             }
-            FocusRegion::Panel(PanelId::Search) => {
-                self.search_panel.read(cx).focus_handle(cx).focus(window)
-            }
-            FocusRegion::Panel(PanelId::Assistant) => {
-                self.chat_panel.read(cx).focus_handle(cx).focus(window)
-            }
-            FocusRegion::Panel(PanelId::Details) => {
-                self.node_editor.read(cx).focus_handle(cx).focus(window)
-            }
-            FocusRegion::WorldCanvas => self.graph_canvas.read(cx).focus_handle(cx).focus(window),
+        }
+    }
+
+    fn focus_region(&mut self, region: FocusRegion, window: &mut Window, cx: &App) {
+        self.remember_current_region_focus(window, cx);
+        let root_focus = self.region_focus_handle(region, cx);
+        if let Some(previous) = self.last_region_focus.get(&region)
+            && root_focus.contains(previous, window)
+        {
+            previous.focus(window);
+        } else {
+            root_focus.focus(window);
         }
     }
 
@@ -887,6 +915,7 @@ impl AppView {
             settings_draft_font_size: ui_font_size,
             settings_draft_advanced: show_advanced_controls,
             dock_state,
+            last_region_focus: HashMap::new(),
             workspace_state_path,
             workspace_persist_task: None,
             path_picker: None,

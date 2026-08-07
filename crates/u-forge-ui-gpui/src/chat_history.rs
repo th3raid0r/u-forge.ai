@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 const CHAT_SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS chat_sessions (
     id         TEXT PRIMARY KEY,
@@ -42,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id, ord
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Summary of a chat session for the history list.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChatSessionSummary {
     pub id: String,
     pub title: String,
@@ -80,7 +81,7 @@ impl StoredRole {
 }
 
 /// Tool call metadata — present only when `StoredChatMessage.role == ToolCall`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredToolCall {
     /// Stable correlation ID matching the `ToolCallStart` event.
     pub internal_id: String,
@@ -96,7 +97,7 @@ pub(crate) struct StoredToolCall {
 ///
 /// The UI layer (`ChatMessageView`) converts to/from this type at the
 /// persistence boundary only (`from_stored` / `to_stored`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredChatMessage {
     pub role: StoredRole,
     pub text: String,
@@ -211,20 +212,21 @@ impl ChatHistoryStore {
         title: &str,
         messages: &[StoredChatMessage],
     ) -> Result<()> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
+        let transaction = conn.transaction()?;
 
-        conn.execute(
+        transaction.execute(
             "UPDATE chat_sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
             params![title, now, session_id],
         )?;
 
         // Replace all messages atomically.
-        conn.execute(
+        transaction.execute(
             "DELETE FROM chat_messages WHERE session_id = ?1",
             params![session_id],
         )?;
-        let mut insert = conn.prepare(
+        let mut insert = transaction.prepare(
             "INSERT INTO chat_messages \
              (session_id, ordering, role, text, tool_args, tool_result, tool_internal_id, collapsed) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -252,11 +254,12 @@ impl ChatHistoryStore {
                 if collapsed { 1i32 } else { 0i32 },
             ])?;
         }
+        drop(insert);
+        transaction.commit()?;
         Ok(())
     }
 
     /// Delete a session and all its messages.
-    #[allow(dead_code)]
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -264,5 +267,79 @@ impl ChatHistoryStore {
             params![session_id],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn session_round_trip_preserves_message_order_and_tool_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = ChatHistoryStore::open(temp_dir.path()).unwrap();
+        let session_id = store.create_session("First title").unwrap();
+        let messages = vec![
+            StoredChatMessage {
+                role: StoredRole::User,
+                text: "Tell me about the observatory.".into(),
+                tool_call: None,
+            },
+            StoredChatMessage {
+                role: StoredRole::Thinking,
+                text: "Find the location before answering.".into(),
+                tool_call: None,
+            },
+            StoredChatMessage {
+                role: StoredRole::ToolCall,
+                text: "search_world".into(),
+                tool_call: Some(StoredToolCall {
+                    internal_id: "tool-1".into(),
+                    args: r#"{"query":"observatory"}"#.into(),
+                    result: Some("The old observatory".into()),
+                    collapsed: false,
+                }),
+            },
+            StoredChatMessage {
+                role: StoredRole::Assistant,
+                text: "The old observatory overlooks the northern pass.".into(),
+                tool_call: None,
+            },
+        ];
+
+        store
+            .save_session(&session_id, "The old observatory", &messages)
+            .unwrap();
+
+        assert_eq!(store.load_messages(&session_id).unwrap(), messages);
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+        assert_eq!(sessions[0].title, "The old observatory");
+    }
+
+    #[test]
+    fn deleting_a_session_cascades_to_its_messages() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = ChatHistoryStore::open(temp_dir.path()).unwrap();
+        let session_id = store.create_session("Temporary").unwrap();
+        store
+            .save_session(
+                &session_id,
+                "Temporary",
+                &[StoredChatMessage {
+                    role: StoredRole::Assistant,
+                    text: "This will be removed.".into(),
+                    tool_call: None,
+                }],
+            )
+            .unwrap();
+
+        store.delete_session(&session_id).unwrap();
+
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert!(store.load_messages(&session_id).unwrap().is_empty());
     }
 }
