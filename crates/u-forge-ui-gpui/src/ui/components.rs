@@ -50,6 +50,14 @@ fn label_tone_color(tone: LabelTone, theme: UiTheme) -> gpui::Rgba {
     }
 }
 
+fn menu_item_hover_background(selected: bool, theme: UiTheme) -> gpui::Rgba {
+    if selected {
+        theme.colors.border
+    } else {
+        theme.colors.selected
+    }
+}
+
 #[derive(IntoElement)]
 pub struct Label {
     text: SharedString,
@@ -574,6 +582,10 @@ impl RenderOnce for Popover {
         let mut popover = div()
             .id(self.id)
             .focusable()
+            // Deferred overlays must block workspace hitboxes beneath them.
+            // Otherwise a body's mouse-down dismissal removes the menu before
+            // an item can receive mouse-up and complete its click.
+            .occlude()
             .bg(theme.colors.elevated_surface)
             .border_1()
             .border_color(theme.colors.border)
@@ -723,6 +735,7 @@ impl MenuItem {
 impl RenderOnce for MenuItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = *UiTheme::get(cx);
+        let hover_background = menu_item_hover_background(self.selected, theme);
         let mut item = div()
             .id(self.id)
             .flex()
@@ -760,8 +773,8 @@ impl RenderOnce for MenuItem {
                 None => item.tab_index(0),
             }
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.colors.selected))
-            .active(move |style| style.bg(theme.colors.border))
+            .hover(move |style| style.bg(hover_background))
+            .active(move |style| style.bg(theme.colors.input_surface))
             .focus_visible(move |style| style.border_1().border_color(theme.colors.focus))
             .on_click(move |event, window, cx| handler(event, window, cx));
         }
@@ -860,14 +873,30 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use gpui::{
-        Context, FocusHandle, KeyUpEvent, Keystroke, Modifiers, Render, TestAppContext, Window,
-        actions, div, point, prelude::*, px,
+        Context, Corner, FocusHandle, KeyUpEvent, Keystroke, Modifiers, MouseButton,
+        MouseDownEvent, Render, TestAppContext, Window, actions, anchored, deferred, div, point,
+        prelude::*, px,
     };
 
-    use super::{Button, Dialog, Menu, MenuItem};
+    use super::{Button, Dialog, Menu, MenuItem, menu_item_hover_background};
     use crate::ui::theme::UiTheme;
 
     actions!(component_tests, [Activate]);
+
+    #[test]
+    fn selected_menu_items_use_a_distinct_hover_surface() {
+        let theme = UiTheme::default();
+
+        assert_eq!(
+            menu_item_hover_background(false, theme),
+            theme.colors.selected
+        );
+        assert_eq!(menu_item_hover_background(true, theme), theme.colors.border);
+        assert_ne!(
+            menu_item_hover_background(true, theme),
+            theme.colors.selected
+        );
+    }
 
     struct PrimitiveHarness {
         focus: FocusHandle,
@@ -877,6 +906,49 @@ mod tests {
         activations: Rc<Cell<usize>>,
         menu_dismissals: Rc<Cell<usize>>,
         dialog_dismissals: Rc<Cell<usize>>,
+    }
+
+    struct PointerMenuHarness {
+        menu_open: bool,
+        activations: Rc<Cell<usize>>,
+    }
+
+    impl Render for PointerMenuHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            div()
+                .id("pointer-menu-harness")
+                .relative()
+                .w(px(320.0))
+                .h(px(240.0))
+                .child(div().absolute().size_full().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.menu_open = false;
+                        cx.notify();
+                    }),
+                ))
+                .when(self.menu_open, |root| {
+                    root.child(deferred(
+                        anchored()
+                            .position(point(px(0.0), px(0.0)))
+                            .anchor(Corner::TopLeft)
+                            .child(Menu::new(
+                                "pointer-test-menu",
+                                div()
+                                    .debug_selector(|| "pointer-menu-item".to_string())
+                                    .w(px(180.0))
+                                    .child(MenuItem::new("pointer-item", "Activate").on_click(
+                                        move |_, _, cx| {
+                                            entity.update(cx, |this, _cx| {
+                                                this.activations.set(this.activations.get() + 1);
+                                            });
+                                        },
+                                    )),
+                            )),
+                    ))
+                })
+        }
     }
 
     impl Render for PrimitiveHarness {
@@ -986,5 +1058,24 @@ mod tests {
         );
         assert_eq!(menu_dismissals.get(), 2);
         assert_eq!(dialog_dismissals.get(), 1);
+    }
+
+    #[gpui::test]
+    fn pointer_menu_occludes_underlying_mouse_down_dismissal(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let activations = Rc::new(Cell::new(0));
+        let harness_activations = activations.clone();
+        let (harness, cx) = cx.add_window_view(|_window, _cx| PointerMenuHarness {
+            menu_open: true,
+            activations: harness_activations,
+        });
+        cx.update(|window, _app| window.refresh());
+        cx.run_until_parked();
+
+        let bounds = cx.debug_bounds("pointer-menu-item").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::none());
+
+        assert_eq!(activations.get(), 1);
+        assert!(cx.update(|_window, app| harness.read(app).menu_open));
     }
 }
