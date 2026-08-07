@@ -6,8 +6,7 @@ use std::time::Instant;
 use gpui::{
     App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Window, anchored,
-    deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px, relative, rems, rgb,
-    rgba,
+    deferred, div, linear_color_stop, linear_gradient, list, prelude::*, px, relative, rgb, rgba,
 };
 use u_forge_agent::{AgentParams, GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
@@ -22,6 +21,7 @@ use crate::chat_message::{ChatMessageRole, ChatMessageView};
 use crate::text_field::{TextFieldView, TextSubmit};
 use crate::ui::components::Tooltip;
 use crate::ui::icons::{Icon, IconName, IconSize};
+use crate::ui::theme::UiTheme;
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
@@ -1224,6 +1224,7 @@ impl Focusable for ChatPanel {
 impl Render for ChatPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_start = Instant::now();
+        let theme = *UiTheme::get(cx);
         let panel_focused = self.focus.contains_focused(window, cx);
         let enter_to_submit = self.enter_to_submit;
         let streaming = self.streaming;
@@ -1453,8 +1454,7 @@ impl Render for ChatPanel {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(rems(1.0))
-                            .h(rems(1.0))
+                            .size(theme.metrics.control_height_small)
                             .text_base()
                             .text_color(rgba(0x6c708688))
                             .cursor_pointer()
@@ -1480,8 +1480,7 @@ impl Render for ChatPanel {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .w(rems(1.0))
-                        .h(rems(1.0))
+                        .size(theme.metrics.control_height_small)
                         .text_base()
                         .text_color(rgba(0x6c708688))
                         .cursor_pointer()
@@ -1505,8 +1504,7 @@ impl Render for ChatPanel {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(rems(1.0))
-                            .h(rems(1.0))
+                            .size(theme.metrics.control_height_small)
                             .rounded(px(2.0))
                             .text_base()
                             .text_color(rgba(0xf38ba8aa))
@@ -1644,7 +1642,7 @@ impl Render for ChatPanel {
                                     .flex()
                                     .items_center()
                                     .px_2()
-                                    .h(px(22.0))
+                                    .h(theme.metrics.control_height_small)
                                     .bg(rgb(0x313244))
                                     .border_1()
                                     .border_color(rgb(0x45475a))
@@ -1683,7 +1681,7 @@ impl Render for ChatPanel {
                                     .items_center()
                                     .justify_center()
                                     .px_2()
-                                    .h(px(22.0))
+                                    .h(theme.metrics.control_height_small)
                                     .rounded(px(3.0))
                                     .text_sm()
                                     .text_color(rgba(0xa6adc8ff))
@@ -1714,7 +1712,7 @@ impl Render for ChatPanel {
                                     .items_center()
                                     .justify_center()
                                     .px_2()
-                                    .h(px(22.0))
+                                    .h(theme.metrics.control_height_small)
                                     .rounded(px(3.0))
                                     .text_color(rgba(0xa6adc8ff))
                                     .cursor_pointer()
@@ -1743,7 +1741,7 @@ impl Render for ChatPanel {
                                     .items_center()
                                     .justify_center()
                                     .px_2()
-                                    .h(px(22.0))
+                                    .h(theme.metrics.control_height_small)
                                     .bg(rgb(0xa6e3a1))
                                     .rounded(px(3.0))
                                     .text_sm()

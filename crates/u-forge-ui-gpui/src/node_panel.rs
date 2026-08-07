@@ -14,6 +14,7 @@ use u_forge_ui_traits::node_color_for_type;
 use crate::selection_model::SelectionModel;
 use crate::ui::components::{ContextMenu, Tooltip};
 use crate::ui::icons::{Icon, IconName, IconSize};
+use crate::ui::theme::UiTheme;
 use crate::{
     WorldActivateRow, WorldDeleteRow, WorldNextRow, WorldOpenContextMenu, WorldPreviousRow,
 };
@@ -237,6 +238,7 @@ fn display_name(name: &str) -> String {
 
 impl Render for NodePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
         let panel_focused = self.focus.contains_focused(window, cx);
         let context_menu = self
             .context_menu
@@ -512,7 +514,7 @@ impl Render for NodePanel {
                     .id("node-header")
                     .flex()
                     .items_center()
-                    .h(px(28.0))
+                    .h(theme.metrics.panel_header_height)
                     .px_3()
                     .flex_none()
                     .border_b_1()

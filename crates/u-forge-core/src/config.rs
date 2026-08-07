@@ -565,23 +565,36 @@ impl Default for DataConfig {
 
 // ── UiConfig ──────────────────────────────────────────────────────────────────
 
+/// Default logical-pixel baseline for interface geometry and icons.
+pub const DEFAULT_UI_INTERFACE_SIZE: f32 = 22.0;
+
 /// UI / display settings.
 ///
 /// Corresponds to the `[ui]` section of `u-forge.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiConfig {
-    /// Base font size in pixels, used as the rem unit for all UI text.
+    /// Base content font size in pixels, used as the rem unit for application
+    /// text without also forcing controls and icons to the same scale.
     ///
     /// GPUI's semantic text sizes (`text_xs`, `text_sm`, etc.) scale relative
     /// to this value:
     /// - `text_xs` = 0.75 × font_size  (labels, timestamps, captions)
     /// - `text_sm` = 0.875 × font_size (body, menu items, panel headers)
     ///
-    /// Defaults to `16.0` (standard web/desktop baseline).  Increase for
-    /// high-DPI displays or accessibility; decrease for a more compact UI.
+    /// Defaults to `16.0` (standard web/desktop baseline). Increase for text
+    /// accessibility without changing the interface geometry.
     #[serde(default = "UiConfig::default_font_size")]
     pub font_size: f32,
+
+    /// Independent interface baseline in logical pixels. Controls, panel
+    /// chrome, spacing, and icons scale from this value while content text
+    /// continues to use `font_size`.
+    ///
+    /// Defaults to `22.0`, matching the comfortable Zed-scale workspace used
+    /// for the parity pass.
+    #[serde(default = "UiConfig::default_interface_size")]
+    pub interface_size: f32,
 
     /// Reveal diagnostics and low-level runtime controls intended for
     /// troubleshooting or expert configuration. Ordinary worldbuilding,
@@ -595,12 +608,17 @@ impl UiConfig {
     fn default_font_size() -> f32 {
         16.0
     }
+
+    fn default_interface_size() -> f32 {
+        DEFAULT_UI_INTERFACE_SIZE
+    }
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             font_size: Self::default_font_size(),
+            interface_size: Self::default_interface_size(),
             show_advanced_controls: false,
         }
     }
@@ -796,6 +814,7 @@ impl AppConfig {
     pub fn persist_ui_settings(
         &self,
         font_size: f32,
+        interface_size: f32,
         show_advanced_controls: bool,
     ) -> Result<PathBuf> {
         use toml_edit::{DocumentMut, Item, Table, value};
@@ -815,6 +834,7 @@ impl AppConfig {
             document["ui"] = Item::Table(Table::new());
         }
         document["ui"]["font_size"] = value(font_size as f64);
+        document["ui"]["interface_size"] = value(interface_size as f64);
         document["ui"]["show_advanced_controls"] = value(show_advanced_controls);
 
         if let Some(parent) = path.parent() {
@@ -920,6 +940,8 @@ mod tests {
     #[test]
     fn test_default_values() {
         let cfg = AppConfig::default();
+        assert_eq!(cfg.ui.font_size, 16.0);
+        assert_eq!(cfg.ui.interface_size, DEFAULT_UI_INTERFACE_SIZE);
         assert!(cfg.embedding.npu_enabled);
         assert!(cfg.embedding.gpu_enabled);
         assert!(cfg.embedding.cpu_enabled);
@@ -997,16 +1019,18 @@ mod tests {
             ..AppConfig::default()
         };
 
-        let written = config.persist_ui_settings(18.0, true).unwrap();
+        let written = config.persist_ui_settings(18.0, 24.0, true).unwrap();
         assert_eq!(written, path);
         let text = std::fs::read_to_string(written).unwrap();
         assert!(text.contains("# keep this comment"));
         assert!(text.contains("preferred_device = \"cpu\""));
         assert!(text.contains("font_size = 18.0"));
+        assert!(text.contains("interface_size = 24.0"));
         assert!(text.contains("show_advanced_controls = true"));
 
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.ui.font_size, 18.0);
+        assert_eq!(reloaded.ui.interface_size, 24.0);
         assert!(reloaded.ui.show_advanced_controls);
     }
 

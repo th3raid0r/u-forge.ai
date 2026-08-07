@@ -36,7 +36,7 @@ pub enum IconName {
     ZoomOut,
 }
 
-/// Semantic icon sizes tied to the root font size by [`UiTheme`].
+/// Semantic icon sizes tied to the independent interface scale in [`UiTheme`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconSize {
     Small,

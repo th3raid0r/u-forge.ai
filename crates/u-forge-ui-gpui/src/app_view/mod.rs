@@ -49,6 +49,7 @@ use crate::setup_panel::{
     SetupPanel, SetupRefreshRequested, SetupRequested,
 };
 use crate::startup::{LEMONADE_METADATA_READY_MESSAGE, StartupMilestone, StartupTimeline};
+use crate::ui::theme::UiTheme;
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -148,8 +149,10 @@ pub struct AppView {
     pub(crate) setup_open: bool,
     pub(crate) settings_open: bool,
     pub(crate) ui_font_size: f32,
+    pub(crate) ui_interface_size: f32,
     pub(crate) show_advanced_controls: bool,
     pub(crate) settings_draft_font_size: f32,
+    pub(crate) settings_draft_interface_size: f32,
     pub(crate) settings_draft_advanced: bool,
     pub(crate) dock_state: DockState,
     /// Last focused descendant per workspace region, used when a dock is
@@ -625,6 +628,7 @@ impl AppView {
 
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_draft_font_size = self.ui_font_size;
+        self.settings_draft_interface_size = self.ui_interface_size;
         self.settings_draft_advanced = self.show_advanced_controls;
         self.settings_open = true;
         cx.notify();
@@ -632,13 +636,21 @@ impl AppView {
 
     pub(crate) fn save_settings(&mut self, cx: &mut Context<Self>) {
         let font_size = self.settings_draft_font_size.clamp(10.0, 28.0);
-        match self
-            .state
-            .app_config
-            .persist_ui_settings(font_size, self.settings_draft_advanced)
-        {
+        let interface_size = self.settings_draft_interface_size.clamp(14.0, 32.0);
+        match self.state.app_config.persist_ui_settings(
+            font_size,
+            interface_size,
+            self.settings_draft_advanced,
+        ) {
             Ok(path) => {
                 self.ui_font_size = font_size;
+                self.ui_interface_size = interface_size;
+                UiTheme::set_interface_size(cx, interface_size);
+                self.node_panel.update(cx, |_panel, cx| cx.notify());
+                self.search_panel.update(cx, |_panel, cx| cx.notify());
+                self.node_editor.update(cx, |_panel, cx| cx.notify());
+                self.chat_panel.update(cx, |_panel, cx| cx.notify());
+                self.setup_panel.update(cx, |_panel, cx| cx.notify());
                 self.show_advanced_controls = self.settings_draft_advanced;
                 self.settings_open = false;
                 self.state.data_status = Some(format!("Settings saved to {}", path.display()));
@@ -715,6 +727,8 @@ impl AppView {
         let workspace_state_path = DockState::state_path(&app_config.storage.db_path);
         let dock_state = DockState::load(&workspace_state_path);
         let ui_font_size = app_config.ui.font_size;
+        let ui_interface_size = app_config.ui.interface_size;
+        UiTheme::set_interface_size(cx, ui_interface_size);
         let show_advanced_controls = app_config.ui.show_advanced_controls;
 
         // Build child entities — clone Arc handles before they move into AppState.
@@ -919,8 +933,10 @@ impl AppView {
             setup_open: false,
             settings_open: false,
             ui_font_size,
+            ui_interface_size,
             show_advanced_controls,
             settings_draft_font_size: ui_font_size,
+            settings_draft_interface_size: ui_interface_size,
             settings_draft_advanced: show_advanced_controls,
             dock_state,
             last_region_focus: HashMap::new(),

@@ -6,6 +6,7 @@ use gpui::{
 use crate::text_field::{TextFieldView, TextSubmit};
 use crate::ui::components::{ContextMenu, IconButton, Tooltip};
 use crate::ui::icons::{Icon, IconName, IconSize};
+use crate::ui::theme::UiTheme;
 
 use u_forge_core::PropertyType;
 
@@ -13,15 +14,16 @@ use super::field_spec::SubTab;
 use super::{
     CloseDirtyTabRequested, NodeEditorPanel, SaveActiveRequested, SaveAllRequested,
     TabContextMenuState,
-    field_spec::{
-        COLUMN_W, DETAIL_TAB_H, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H, PAGE_NAV_H,
-        SUBTAB_BAR_H,
-    },
+    field_spec::{COLUMN_W, EDGE_ADD_BTN_H, EDGE_ROW_H, EDGE_SECTION_HEADER_H},
 };
 
 impl Render for NodeEditorPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
         let panel_focused = self.focus.contains_focused(window, cx);
+        let detail_tab_height = f32::from(theme.metrics.panel_header_height);
+        let subtab_bar_height = f32::from(theme.metrics.control_height_small);
+        let page_nav_height = f32::from(theme.metrics.control_height);
         let tab_context_menu = self.tab_context_menu.clone();
         // Measure panel size each frame so column layout adapts to window resizes.
         let entity_for_measure = cx.entity().clone();
@@ -90,7 +92,7 @@ impl Render for NodeEditorPanel {
             .flex()
             .flex_row()
             .flex_none()
-            .h(px(DETAIL_TAB_H))
+            .h(theme.metrics.panel_header_height)
             .bg(rgb(0x181825))
             .border_b_1()
             .border_color(rgb(0x313244));
@@ -379,7 +381,7 @@ impl Render for NodeEditorPanel {
                 .flex()
                 .flex_row()
                 .flex_none()
-                .h(px(SUBTAB_BAR_H))
+                .h(theme.metrics.control_height_small)
                 .bg(rgb(0x181825))
                 .border_b_1()
                 .border_color(rgb(0x313244))
@@ -390,7 +392,8 @@ impl Render for NodeEditorPanel {
         // Compute column/page layout using measured panel dimensions.
         let panel_w = f32::from(self.panel_size.width);
         let panel_h = f32::from(self.panel_size.height);
-        let available_h = (panel_h - DETAIL_TAB_H - SUBTAB_BAR_H - PAGE_NAV_H).max(100.0);
+        let available_h =
+            (panel_h - detail_tab_height - subtab_bar_height - page_nav_height).max(100.0);
         let max_cols = ((panel_w / COLUMN_W) as usize).max(1);
 
         // Greedy column fill to determine how many fields fit per page.

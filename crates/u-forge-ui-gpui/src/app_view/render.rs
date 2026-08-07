@@ -42,7 +42,7 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.ui_font_size));
         let theme = *UiTheme::get(cx);
-        let menu_bar_height = theme.metrics.menu_bar_height.to_pixels(window.rem_size());
+        let menu_bar_height = theme.metrics.menu_bar_height;
 
         // Capture frame start time. The canvas element appended at the end of the
         // tree records elapsed time in its paint closure — after GPUI's full layout
@@ -1183,6 +1183,8 @@ impl Render for AppView {
             .when(settings_open, |root| {
                 let decrease = handle.clone();
                 let increase = handle.clone();
+                let decrease_interface = handle.clone();
+                let increase_interface = handle.clone();
                 let toggle_advanced = handle.clone();
                 let cancel = handle.clone();
                 let save = handle.clone();
@@ -1215,7 +1217,7 @@ impl Render for AppView {
                                             },
                                         ),
                                     )
-                                    .child(format!("{:.0} pt", self.settings_draft_font_size))
+                                    .child(format!("{:.0} px", self.settings_draft_font_size))
                                     .child(Button::new("settings-font-larger", "Larger").on_click(
                                         move |_, _, cx| {
                                             increase
@@ -1228,6 +1230,56 @@ impl Render for AppView {
                                                 .ok();
                                         },
                                     )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child("Interface size")
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme.metrics.space_2))
+                                    .child(
+                                        Button::new("settings-interface-smaller", "Smaller")
+                                            .on_click(move |_, _, cx| {
+                                                decrease_interface
+                                                    .update(cx, |view, cx| {
+                                                        view.settings_draft_interface_size = (view
+                                                            .settings_draft_interface_size
+                                                            - 1.0)
+                                                            .max(14.0);
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            }),
+                                    )
+                                    .child(format!("{:.0} px", self.settings_draft_interface_size))
+                                    .child(
+                                        Button::new("settings-interface-larger", "Larger")
+                                            .on_click(move |_, _, cx| {
+                                                increase_interface
+                                                    .update(cx, |view, cx| {
+                                                        view.settings_draft_interface_size = (view
+                                                            .settings_draft_interface_size
+                                                            + 1.0)
+                                                            .min(32.0);
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.typography.caption)
+                            .text_color(theme.colors.text_muted)
+                            .child(
+                                "Text size affects readable content; interface size affects panels, controls, spacing, and icons.",
                             ),
                     )
                     .child(
