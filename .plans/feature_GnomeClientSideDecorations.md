@@ -2,8 +2,9 @@
 
 ## Status and target
 
-Implemented, pending user validation. This is a first-binary-release requirement alongside
-`feature_InferenceLifecycle.md` and `feature_AgentBudgets.md`.
+Implemented and user-validated on the available Linux sessions. GNOME X11 was
+not available for this cycle. This is a first-binary-release requirement
+alongside `feature_InferenceLifecycle.md` and `feature_AgentBudgets.md`.
 
 Provide complete native-window behavior on Linux compositors that delegate
 window chrome to the application, especially GNOME on Wayland. Preserve native
@@ -48,22 +49,23 @@ guessing from desktop-name environment variables.
 - Final verification is `make fmt-check`, `make check`, `make clippy`, and the
   unfiltered `make test`.
 
-## User validation gate
+## User validation
 
-Do not mark this feature complete until a user has completed and reported the
-following cycle. Record the compositor/session and any defects below.
+Completed by the user on 2026-08-09. The unavailable X11 session is recorded
+explicitly rather than treated as a supported-session failure.
 
-- [ ] GNOME Wayland, floating: one title bar only; centered `u-forge.ai`;
+- [X] GNOME Wayland, floating: one title bar only; centered `u-forge.ai`;
   controls work; empty title-bar space drags; double-click toggles maximize;
   right-click opens the native menu; every free edge/corner resizes.
-- [ ] GNOME Wayland, maximized, fullscreen, and left/right tiled: chrome and
+- [X] GNOME Wayland, maximized, fullscreen, and left/right tiled: chrome and
   resize regions follow the state; application menus, workspace, and status bar
   remain fully usable.
-- [ ] Settings: left/right placement applies after Save Settings, survives a
+- [X] Settings: left/right placement applies after Save Settings, survives a
   restart, and remains usable at interface sizes 14, 22, and 32.
-- [ ] GNOME X11 where available: move, resize, controls, and native menu work;
-  unsupported CSD falls back without losing native decorations.
-- [ ] At least one server-decorated Linux session: no duplicate application
+- [!!!] GNOME X11 where available: move, resize, controls, and native menu work;
+  unsupported CSD falls back without losing native decorations. (UNSUPPORTED CONFIG - NO TEST)
+- [X] At least one server-decorated Linux session: no duplicate application
   title bar and no change to workspace bounds.
 
-Validation result: pending.
+Validation result: complete on GNOME Wayland and a server-decorated Linux
+session; GNOME X11 was unavailable and remains untested.
