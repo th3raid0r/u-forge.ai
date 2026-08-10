@@ -406,6 +406,43 @@ async fn activate_lemonade_capabilities(
                 )
                 .map_err(|error| tracing::warn!(%error, "chat context is unusable"))
                 .ok();
+            let agent_budget = effective_limits
+                .as_ref()
+                .and_then(|limits| {
+                    app_config
+                        .chat
+                        .agent
+                        .reconcile(
+                            limits.context,
+                            limits.response_reserve,
+                            app_config.chat.max_tool_turns,
+                        )
+                        .map_err(|error| {
+                            tracing::warn!(%error, "agent budget configuration is unusable");
+                            error
+                        })
+                        .ok()
+                })
+                .unwrap_or_else(|| {
+                    let context = effective_limits
+                        .as_ref()
+                        .map_or(app_config.chat.max_context_tokens, |limits| limits.context);
+                    let reserve = effective_limits.as_ref().map_or_else(
+                        || {
+                            app_config
+                                .chat
+                                .response_reserve
+                                .min(context.saturating_sub(1))
+                        },
+                        |limits| limits.response_reserve,
+                    );
+                    u_forge_core::AgentBudgetConfig::default()
+                        .reconcile(context.max(2), reserve, app_config.chat.max_tool_turns)
+                        .expect("safe fallback agent budget reconciles")
+                });
+            if let Some(limits) = &mut effective_limits {
+                limits.diagnostics.extend(agent_budget.diagnostics.clone());
+            }
             if index == preferred_idx
                 && let (Some(limits), Some(diagnostic)) =
                     (&mut effective_limits, &selection_diagnostic)
@@ -416,6 +453,7 @@ async fn activate_lemonade_capabilities(
                 device_config,
                 effective_limits,
                 app_config.chat.max_tool_turns,
+                agent_budget,
             )
         })
         .collect::<Vec<_>>();
@@ -2548,6 +2586,10 @@ impl AppView {
             seed: developer.seed,
             stop: developer.stop.clone(),
             max_tool_turns: self.state.app_config.chat.max_tool_turns,
+            budget: llm_models
+                .get(preferred_idx)
+                .map(|model| model.agent_budget.clone())
+                .unwrap_or_default(),
         };
         if has_chat {
             match GraphAgent::new_with_connection_and_gpu(

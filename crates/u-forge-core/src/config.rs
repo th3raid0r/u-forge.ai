@@ -316,6 +316,144 @@ pub struct ChatDeviceConfig {
     pub stop: Option<Vec<String>>,
 }
 
+/// Limits applied to one multi-turn graph-agent request.
+///
+/// These values live below `[chat.agent]` so provider sampling and agent-loop
+/// safety remain independently configurable. Model-specific context limits are
+/// reconciled at activation time by [`AgentBudgetConfig::reconcile`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBudgetConfig {
+    /// Maximum tokens used by the schema summary injected into the preamble.
+    #[serde(default = "AgentBudgetConfig::default_schema_summary_tokens")]
+    pub schema_summary_tokens: usize,
+
+    /// Cumulative model input plus response reservations across the request.
+    #[serde(default = "AgentBudgetConfig::default_cumulative_request_tokens")]
+    pub cumulative_request_tokens: usize,
+
+    /// Cumulative model-visible output returned by tools.
+    #[serde(default = "AgentBudgetConfig::default_cumulative_tool_output_tokens")]
+    pub cumulative_tool_output_tokens: usize,
+
+    /// Number of unchanged repeats allowed for one canonical tool call.
+    #[serde(default = "AgentBudgetConfig::default_repeated_call_limit")]
+    pub repeated_call_limit: usize,
+}
+
+impl AgentBudgetConfig {
+    fn default_schema_summary_tokens() -> usize {
+        768
+    }
+
+    fn default_cumulative_request_tokens() -> usize {
+        16_384
+    }
+
+    fn default_cumulative_tool_output_tokens() -> usize {
+        4_096
+    }
+
+    fn default_repeated_call_limit() -> usize {
+        1
+    }
+
+    /// Reconcile configured agent limits with the active model context.
+    pub fn reconcile(
+        &self,
+        context: usize,
+        response_reserve: usize,
+        max_tool_turns: usize,
+    ) -> anyhow::Result<EffectiveAgentBudget> {
+        if context < 2 || response_reserve >= context {
+            anyhow::bail!("effective context leaves no agent prompt allocation");
+        }
+        if self.schema_summary_tokens == 0 {
+            anyhow::bail!("chat.agent.schema_summary_tokens must be greater than zero");
+        }
+        if self.cumulative_request_tokens == 0 {
+            anyhow::bail!("chat.agent.cumulative_request_tokens must be greater than zero");
+        }
+        if self.cumulative_tool_output_tokens == 0 {
+            anyhow::bail!("chat.agent.cumulative_tool_output_tokens must be greater than zero");
+        }
+
+        let prompt_window = context - response_reserve;
+        let maximum_cumulative = context.saturating_mul(max_tool_turns.max(1));
+        let mut diagnostics = Vec::new();
+
+        let schema_summary_tokens = self.schema_summary_tokens.min(prompt_window);
+        if schema_summary_tokens != self.schema_summary_tokens {
+            diagnostics.push(format!(
+                "agent schema budget clamped from {} to {schema_summary_tokens}",
+                self.schema_summary_tokens
+            ));
+        }
+
+        let cumulative_request_tokens = self
+            .cumulative_request_tokens
+            .min(maximum_cumulative.max(context));
+        if cumulative_request_tokens != self.cumulative_request_tokens {
+            diagnostics.push(format!(
+                "agent cumulative request budget clamped from {} to {cumulative_request_tokens}",
+                self.cumulative_request_tokens
+            ));
+        }
+
+        let cumulative_tool_output_tokens = self
+            .cumulative_tool_output_tokens
+            .min(cumulative_request_tokens)
+            .min(prompt_window);
+        if cumulative_tool_output_tokens != self.cumulative_tool_output_tokens {
+            diagnostics.push(format!(
+                "agent tool-output budget clamped from {} to {cumulative_tool_output_tokens}",
+                self.cumulative_tool_output_tokens
+            ));
+        }
+
+        Ok(EffectiveAgentBudget {
+            context_tokens: context,
+            response_reserve_tokens: response_reserve,
+            schema_summary_tokens,
+            cumulative_request_tokens,
+            cumulative_tool_output_tokens,
+            repeated_call_limit: self.repeated_call_limit,
+            diagnostics,
+        })
+    }
+}
+
+impl Default for AgentBudgetConfig {
+    fn default() -> Self {
+        Self {
+            schema_summary_tokens: Self::default_schema_summary_tokens(),
+            cumulative_request_tokens: Self::default_cumulative_request_tokens(),
+            cumulative_tool_output_tokens: Self::default_cumulative_tool_output_tokens(),
+            repeated_call_limit: Self::default_repeated_call_limit(),
+        }
+    }
+}
+
+/// Active-model-safe limits consumed by `u-forge-agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveAgentBudget {
+    pub context_tokens: usize,
+    pub response_reserve_tokens: usize,
+    pub schema_summary_tokens: usize,
+    pub cumulative_request_tokens: usize,
+    pub cumulative_tool_output_tokens: usize,
+    pub repeated_call_limit: usize,
+    pub diagnostics: Vec<String>,
+}
+
+impl Default for EffectiveAgentBudget {
+    fn default() -> Self {
+        AgentBudgetConfig::default()
+            .reconcile(4_096, 1_024, 5)
+            .expect("default agent budget is valid")
+    }
+}
+
 /// Global chat / RAG settings.
 ///
 /// Corresponds to the `[chat]` section of `u-forge.toml`.
@@ -368,6 +506,10 @@ pub struct ChatConfig {
     /// Defaults to 1024.
     #[serde(default = "ChatConfig::default_response_reserve")]
     pub response_reserve: usize,
+
+    /// Multi-turn graph-agent safety limits.
+    #[serde(default)]
+    pub agent: AgentBudgetConfig,
 
     /// Hybrid-search balance: 0.0 = FTS5-only, 1.0 = semantic-only.
     #[serde(default = "ChatConfig::default_alpha")]
@@ -453,6 +595,7 @@ impl Default for ChatConfig {
             max_history_turns: Self::default_max_history_turns(),
             max_context_tokens: Self::default_max_context_tokens(),
             response_reserve: Self::default_response_reserve(),
+            agent: AgentBudgetConfig::default(),
             alpha: Self::default_alpha(),
             search_limit: Self::default_search_limit(),
             hq_semantic_boost: Self::default_hq_semantic_boost(),
@@ -960,6 +1103,48 @@ mod tests {
             cfg.data.import_file,
             PathBuf::from("./defaults/data/memory.jsonl")
         );
+        assert_eq!(cfg.chat.agent.schema_summary_tokens, 768);
+        assert_eq!(cfg.chat.agent.cumulative_request_tokens, 16_384);
+        assert_eq!(cfg.chat.agent.cumulative_tool_output_tokens, 4_096);
+        assert_eq!(cfg.chat.agent.repeated_call_limit, 1);
+    }
+
+    #[test]
+    fn agent_budgets_reconcile_with_the_active_context_and_turn_ceiling() {
+        let configured = AgentBudgetConfig {
+            schema_summary_tokens: 10_000,
+            cumulative_request_tokens: 100_000,
+            cumulative_tool_output_tokens: 50_000,
+            repeated_call_limit: 2,
+        };
+        let effective = configured.reconcile(4_096, 1_024, 3).unwrap();
+        assert_eq!(effective.schema_summary_tokens, 3_072);
+        assert_eq!(effective.cumulative_request_tokens, 12_288);
+        assert_eq!(effective.cumulative_tool_output_tokens, 3_072);
+        assert_eq!(effective.repeated_call_limit, 2);
+        assert_eq!(effective.diagnostics.len(), 3);
+
+        let invalid = AgentBudgetConfig {
+            schema_summary_tokens: 0,
+            ..AgentBudgetConfig::default()
+        };
+        assert!(invalid.reconcile(4_096, 1_024, 5).is_err());
+    }
+
+    #[test]
+    fn agent_budget_config_deserializes_below_chat() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "[chat.agent]\nschema_summary_tokens = 321\ncumulative_request_tokens = 4321\n\
+             cumulative_tool_output_tokens = 654\nrepeated_call_limit = 3\n"
+        )
+        .unwrap();
+        let config = AppConfig::load(file.path()).unwrap();
+        assert_eq!(config.chat.agent.schema_summary_tokens, 321);
+        assert_eq!(config.chat.agent.cumulative_request_tokens, 4_321);
+        assert_eq!(config.chat.agent.cumulative_tool_output_tokens, 654);
+        assert_eq!(config.chat.agent.repeated_call_limit, 3);
     }
 
     #[test]
@@ -1194,6 +1379,11 @@ cpu_enabled = false
                 "chat device",
                 "[chat.gpu]\ntemprature = 0.5\n",
                 "temprature",
+            ),
+            (
+                "chat agent",
+                "[chat.agent]\nrepeeted_call_limit = 2\n",
+                "repeeted_call_limit",
             ),
             (
                 "storage",

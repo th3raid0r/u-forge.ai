@@ -10,8 +10,8 @@ use gpui::{
 };
 use u_forge_agent::{AgentParams, GraphAgent, HistoryMessage, select_history_window};
 use u_forge_core::{
-    ChatDeviceConfig, ChatMessage, ChatRequest, LemonadeRuntime, LemonadeRuntimeLease,
-    LemonadeRuntimeProfile, ModelLoadOptions, ReasoningPolicy, StreamToken,
+    ChatDeviceConfig, ChatMessage, ChatRequest, EffectiveAgentBudget, LemonadeRuntime,
+    LemonadeRuntimeLease, LemonadeRuntimeProfile, ModelLoadOptions, ReasoningPolicy, StreamToken,
     config::ReasoningControl,
     lemonade::{EffectiveChatLimits, LemonadeChatProvider, SelectedModel},
     queue::CancellationToken,
@@ -168,6 +168,7 @@ pub(crate) struct AvailableModel {
     pub(crate) sampling: ChatDeviceConfig,
     pub(crate) effective_limits: Option<EffectiveChatLimits>,
     pub(crate) max_tool_turns: usize,
+    pub(crate) agent_budget: EffectiveAgentBudget,
 }
 
 impl From<&SelectedModel> for AvailableModel {
@@ -190,6 +191,7 @@ impl From<&SelectedModel> for AvailableModel {
             sampling: ChatDeviceConfig::default(),
             effective_limits: None,
             max_tool_turns: 5,
+            agent_budget: EffectiveAgentBudget::default(),
         }
     }
 }
@@ -200,10 +202,12 @@ impl AvailableModel {
         sampling: ChatDeviceConfig,
         effective_limits: Option<EffectiveChatLimits>,
         max_tool_turns: usize,
+        agent_budget: EffectiveAgentBudget,
     ) -> Self {
         self.sampling = sampling;
         self.effective_limits = effective_limits;
         self.max_tool_turns = max_tool_turns;
+        self.agent_budget = agent_budget;
         self
     }
 
@@ -224,6 +228,7 @@ impl AvailableModel {
             seed: self.sampling.seed,
             stop: self.sampling.stop.clone(),
             max_tool_turns: self.max_tool_turns,
+            budget: self.agent_budget.clone(),
         }
     }
 
@@ -880,7 +885,67 @@ impl ChatPanel {
                             })
                             .ok();
                         }
-                        Some(AgentStreamEvent::Usage(_)) => {}
+                        Some(AgentStreamEvent::Usage(_))
+                        | Some(AgentStreamEvent::AgentDiagnostics(_)) => {}
+                        Some(AgentStreamEvent::BudgetTerminated {
+                            reason,
+                            diagnostics,
+                        }) => {
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
+                                    let message = view.push_text_message(
+                                        ChatMessageRole::Assistant,
+                                        String::new(),
+                                        cx,
+                                    );
+                                    view.streaming_assistant = Some(message.clone());
+                                    message
+                                });
+                                msg.update(cx, |message, cx| {
+                                    message.append_text(
+                                        &format!(
+                                            "\n[Agent budget stop: {reason} Used {} model call(s), \
+                                             {} request tokens, and {} tool-output tokens.]",
+                                            diagnostics.model_calls,
+                                            diagnostics.request_tokens,
+                                            diagnostics.tool_output_tokens
+                                        ),
+                                        cx,
+                                    )
+                                });
+                                view.finalize_stream(cx);
+                            })
+                            .ok();
+                            break;
+                        }
+                        Some(AgentStreamEvent::RepeatTerminated {
+                            reason,
+                            diagnostics,
+                        }) => {
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
+                                    let message = view.push_text_message(
+                                        ChatMessageRole::Assistant,
+                                        String::new(),
+                                        cx,
+                                    );
+                                    view.streaming_assistant = Some(message.clone());
+                                    message
+                                });
+                                msg.update(cx, |message, cx| {
+                                    message.append_text(
+                                        &format!(
+                                            "\n[Agent repeat stop: {reason} Used {} model call(s).]",
+                                            diagnostics.model_calls
+                                        ),
+                                        cx,
+                                    )
+                                });
+                                view.finalize_stream(cx);
+                            })
+                            .ok();
+                            break;
+                        }
                         Some(AgentStreamEvent::Finished { .. }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 view.finalize_stream(cx);
@@ -2401,6 +2466,7 @@ mod tests {
             sampling: ChatDeviceConfig::default(),
             effective_limits: None,
             max_tool_turns: 5,
+            agent_budget: EffectiveAgentBudget::default(),
         }
     }
 
@@ -2466,6 +2532,9 @@ mod tests {
                 diagnostics: Vec::new(),
             }),
             max_tool_turns: 7,
+            agent_budget: u_forge_core::AgentBudgetConfig::default()
+                .reconcile(4096, 512, 7)
+                .unwrap(),
         };
         let params = model.agent_params();
         assert_eq!(params.max_tokens, Some(300));
@@ -2473,6 +2542,7 @@ mod tests {
         assert!((params.top_p.unwrap() - 0.8).abs() < 1e-6);
         assert!((params.repetition_penalty.unwrap() - 1.1).abs() < 1e-6);
         assert_eq!(params.max_tool_turns, 7);
+        assert_eq!(params.budget.context_tokens, 4096);
         assert!(model.uses_gpu());
     }
 

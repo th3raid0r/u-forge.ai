@@ -111,6 +111,18 @@ pub enum ChatEvent {
         content: String,
     },
     Usage(ChatUsage),
+    /// Safe, aggregate accounting for one complete agent request.
+    AgentDiagnostics(AgentBudgetDiagnostics),
+    /// The agent deliberately stopped before exceeding a token budget.
+    BudgetTerminated {
+        reason: String,
+        diagnostics: AgentBudgetDiagnostics,
+    },
+    /// The agent deliberately stopped an unchanged tool-call loop.
+    RepeatTerminated {
+        reason: String,
+        diagnostics: AgentBudgetDiagnostics,
+    },
     Finished {
         reason: ChatTerminalReason,
         full_text: Option<String>,
@@ -122,6 +134,18 @@ pub enum ChatEvent {
 pub enum ChatTerminalReason {
     Provider(String),
     AgentComplete,
+}
+
+/// Non-sensitive aggregate token and turn accounting for one agent request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentBudgetDiagnostics {
+    pub model_calls: usize,
+    pub request_tokens: usize,
+    pub reserved_response_tokens: usize,
+    pub assistant_output_tokens: usize,
+    pub tool_argument_tokens: usize,
+    pub tool_output_tokens: usize,
+    pub estimation_fallback: bool,
 }
 
 impl From<StreamToken> for ChatEvent {
