@@ -602,10 +602,14 @@ pub async fn build_hq_embed_queue_with_connection(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
     use tempfile::TempDir;
+    use tokio::sync::Semaphore;
 
     use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
     use crate::lemonade::{BuiltProvider, Capability, ProviderSlot};
@@ -619,6 +623,40 @@ mod tests {
 
     struct MockEmbeddingProvider {
         dimensions: usize,
+    }
+
+    struct BlockingEmbeddingProvider {
+        calls: Arc<AtomicUsize>,
+        started: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for BlockingEmbeddingProvider {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            std::future::pending().await
+        }
+
+        async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            unreachable!()
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(crate::EMBEDDING_DIMENSIONS)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
     }
 
     #[async_trait]
@@ -753,6 +791,56 @@ mod tests {
             stats.embedded_count, 12,
             "All 12 chunks should now be embedded"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_embedding_batch_performs_no_vector_writes() {
+        let (graph, _tmp) = make_graph();
+        let graph = Arc::new(graph);
+        let object_id = ObjectBuilder::character("Cancelled character".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph
+            .add_text_chunk(
+                object_id,
+                "This embedding must never be stored.".to_string(),
+                ChunkType::Description,
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        let queue = InferenceQueueBuilder::new()
+            .with_provider(BuiltProvider {
+                name: "blocking-embed".to_string(),
+                capability: Capability::Embedding,
+                provider: ProviderSlot::Embedding(Arc::new(BlockingEmbeddingProvider {
+                    calls: calls.clone(),
+                    started: started.clone(),
+                })),
+                weight: 100,
+            })
+            .build();
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn({
+            let graph = graph.clone();
+            let queue = queue.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                embed_all_chunks_with_cancellation(
+                    &graph,
+                    &queue,
+                    EmbeddingTarget::Standard,
+                    cancellation,
+                )
+                .await
+            }
+        });
+        started.acquire().await.unwrap().forget();
+        cancellation.cancel();
+        assert!(task.await.unwrap().is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.get_stats().unwrap().embedded_count, 0);
     }
 
     #[tokio::test]

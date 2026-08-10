@@ -973,6 +973,76 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn token_cancellation_interrupts_first_token_wait_and_releases_gpu() {
+        let gpu = GpuResourceManager::new();
+        let (provider, server) = mock_stream_provider(
+            vec![(
+                std::time::Duration::from_secs(5),
+                b"data: [DONE]\n\n" as &'static [u8],
+            )],
+            LemonadeTimeouts::default(),
+            Some(gpu.clone()),
+        )
+        .await;
+        let cancellation = crate::queue::CancellationToken::new();
+        let mut stream = provider.complete_stream_with_cancellation(
+            ChatRequest::new(vec![ChatMessage::user("x")]),
+            cancellation.clone(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while gpu.current_workload() != super::super::GpuWorkload::LlmActive {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(gpu.current_workload(), super::super::GpuWorkload::Idle);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn token_cancellation_interrupts_established_stream() {
+        let gpu = GpuResourceManager::new();
+        let (provider, server) = mock_stream_provider(
+            vec![
+                (
+                    std::time::Duration::ZERO,
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                ),
+                (std::time::Duration::from_secs(5), b"data: [DONE]\n\n"),
+            ],
+            LemonadeTimeouts::default(),
+            Some(gpu.clone()),
+        )
+        .await;
+        let cancellation = crate::queue::CancellationToken::new();
+        let mut stream = provider.complete_stream_with_cancellation(
+            ChatRequest::new(vec![ChatMessage::user("x")]),
+            cancellation.clone(),
+        );
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamToken::Content(_)
+        ));
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(gpu.current_workload(), super::super::GpuWorkload::Idle);
+        server.abort();
+    }
+
     #[test]
     fn sse_rejects_malformed_json_protocol_and_server_errors() {
         assert!(decode_sse_event(b"data: {not-json}").is_err());

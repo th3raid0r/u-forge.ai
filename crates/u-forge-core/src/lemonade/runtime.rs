@@ -229,6 +229,24 @@ impl LemonadeRuntime {
         })
     }
 
+    /// Acquire or activate a profile while allowing the owning operation to
+    /// interrupt gate wait, health discovery, and the model load request.
+    pub async fn acquire_with_cancellation(
+        self: &Arc<Self>,
+        profile: &LemonadeRuntimeProfile,
+        cancellation: &crate::queue::CancellationToken,
+    ) -> crate::queue::InferenceResult<LemonadeRuntimeLease> {
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(cancellation.error()),
+            result = self.acquire(profile) => result.map_err(|error| {
+                crate::queue::InferenceError::classify_timeout(
+                    error,
+                    crate::queue::TimeoutClass::ModelActivation,
+                )
+            }),
+        }
+    }
+
     /// Compatibility activation. Prefer `acquire` and retain its lease through
     /// the complete request/stream.
     pub async fn activate(self: &Arc<Self>, profile: &LemonadeRuntimeProfile) -> Result<bool> {
@@ -483,6 +501,79 @@ mod tests {
         assert!(external_change.reload_performed);
         drop(external_change);
         assert_eq!(reloads.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_model_load_releases_runtime_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let load_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_started = load_started.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let load_started = server_started.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = socket.read(&mut buffer).await.unwrap();
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let headers = String::from_utf8_lossy(&request);
+                    let path = headers.split_whitespace().nth(1).unwrap_or_default();
+                    if path == "/v1/health" {
+                        let body = r#"{"status":"ok","all_models_loaded":[]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                    } else if path == "/v1/load" {
+                        load_started.add_permits(1);
+                        // Keep the load request active until cancellation drops
+                        // the HTTP future and closes the client connection.
+                        let _ = socket.read(&mut buffer).await;
+                    }
+                });
+            }
+        });
+        let connection =
+            Arc::new(LemonadeConnection::external(&format!("http://{address}/v1")).unwrap());
+        let runtime = Arc::new(LemonadeRuntime::from_connection(connection));
+        let profile = LemonadeRuntimeProfile::new("model", false, ModelLoadOptions::default())
+            .with_backend_profile("llamacpp", Some("cpu".into()), Some("cpu".into()));
+        let cancellation = crate::queue::CancellationToken::new();
+        let acquire = tokio::spawn({
+            let runtime = runtime.clone();
+            let profile = profile.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                runtime
+                    .acquire_with_cancellation(&profile, &cancellation)
+                    .await
+            }
+        });
+        load_started.acquire().await.unwrap().forget();
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), acquire)
+            .await
+            .expect("model load did not react to cancellation")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(crate::queue::InferenceError::Cancelled)
+        ));
+        assert!(
+            runtime.gate.try_lock().is_ok(),
+            "runtime gate remained held"
+        );
         server.abort();
     }
 }

@@ -18,6 +18,7 @@
 //! the created or reused graph ID for the relationship phase.
 
 use crate::KnowledgeGraph;
+use crate::queue::CancellationToken;
 use crate::schema::{EdgeTypeSchema, ObjectTypeSchema};
 use crate::types::*;
 use anyhow::{Context, Result, bail};
@@ -191,10 +192,21 @@ impl<'a> DataIngestion<'a> {
 
     /// Import JSONL data from a file into the knowledge graph.
     pub async fn import_json_data<P: AsRef<Path>>(&mut self, data_file: P) -> Result<()> {
+        self.import_json_data_with_cancellation(data_file, &CancellationToken::new())
+            .await
+    }
+
+    /// Import JSONL data while honoring one parent operation token.
+    pub async fn import_json_data_with_cancellation<P: AsRef<Path>>(
+        &mut self,
+        data_file: P,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
         let data_file = data_file.as_ref();
         let total_start = Instant::now();
         info!("Loading JSON data from: {:?}", data_file);
 
+        cancellation.check_cancelled()?;
         let read_start = Instant::now();
         let file_content = fs::read_to_string(data_file)
             .with_context(|| format!("Failed to read file: {:?}", data_file))?;
@@ -205,6 +217,7 @@ impl<'a> DataIngestion<'a> {
 
         let parse_start = Instant::now();
         for (line_num, line) in file_content.lines().enumerate() {
+            cancellation.check_cancelled()?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -249,6 +262,7 @@ impl<'a> DataIngestion<'a> {
             &mut name_to_candidates,
             &mut source_id_to_candidates,
             &mut id_to_type,
+            cancellation,
         )
         .await?;
         let object_phase_duration_ms = object_phase_start.elapsed().as_millis() as u64;
@@ -259,10 +273,12 @@ impl<'a> DataIngestion<'a> {
             &source_id_to_candidates,
             &id_to_type,
             &mut name_resolution_cache,
+            cancellation,
         )
         .await?;
         let relationship_phase_duration_ms = relationship_phase_start.elapsed().as_millis() as u64;
         let diagnostics_start = Instant::now();
+        cancellation.check_cancelled()?;
         self.write_import_diagnostics(data_file)?;
         self.log_import_diagnostics();
         let diagnostics_duration_ms = diagnostics_start.elapsed().as_millis() as u64;
@@ -292,9 +308,11 @@ impl<'a> DataIngestion<'a> {
         name_to_candidates: &mut HashMap<String, Vec<ResolutionCandidate>>,
         source_id_to_candidates: &mut HashMap<ObjectId, Vec<ResolutionCandidate>>,
         id_to_type: &mut HashMap<ObjectId, String>,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
         let start = Instant::now();
         info!("Creating {} objects...", nodes.len());
+        cancellation.check_cancelled()?;
         let existing_load_start = Instant::now();
         let mut existing_by_type_name: HashMap<(String, String), Vec<ObjectId>> = HashMap::new();
         for object in self.graph.get_all_objects()? {
@@ -308,6 +326,7 @@ impl<'a> DataIngestion<'a> {
 
         let prepare_start = Instant::now();
         for entry in nodes {
+            cancellation.check_cancelled()?;
             if let JsonEntry::Node {
                 id: source_id,
                 node_type,
@@ -399,6 +418,7 @@ impl<'a> DataIngestion<'a> {
                         continue;
                     }
                 };
+                cancellation.check_cancelled()?;
 
                 existing_by_type_name
                     .entry((node_type.clone(), name.clone()))
@@ -422,6 +442,7 @@ impl<'a> DataIngestion<'a> {
             name_to_candidates,
             source_id_to_candidates,
             id_to_type,
+            cancellation,
         )?;
         let persist_duration_ms = persist_start.elapsed().as_millis() as u64;
 
@@ -464,7 +485,9 @@ impl<'a> DataIngestion<'a> {
         name_to_candidates: &mut HashMap<String, Vec<ResolutionCandidate>>,
         source_id_to_candidates: &mut HashMap<ObjectId, Vec<ResolutionCandidate>>,
         id_to_type: &mut HashMap<ObjectId, String>,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
+        cancellation.check_cancelled()?;
         if pending.is_empty() {
             return Ok(());
         }
@@ -489,6 +512,7 @@ impl<'a> DataIngestion<'a> {
         }
 
         for pending in pending {
+            cancellation.check_cancelled()?;
             match self.graph.add_object(pending.metadata.clone()) {
                 Ok(id) => {
                     let candidate = ResolutionCandidate {
@@ -531,6 +555,7 @@ impl<'a> DataIngestion<'a> {
         source_id_to_candidates: &HashMap<ObjectId, Vec<ResolutionCandidate>>,
         id_to_type: &HashMap<ObjectId, String>,
         name_resolution_cache: &mut NameResolutionCache,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
         let start = Instant::now();
         info!("Creating {} relationships...", edges.len());
@@ -538,6 +563,7 @@ impl<'a> DataIngestion<'a> {
 
         let prepare_start = Instant::now();
         for entry in edges {
+            cancellation.check_cancelled()?;
             if let JsonEntry::Edge {
                 from,
                 to,
@@ -591,6 +617,7 @@ impl<'a> DataIngestion<'a> {
                             );
                             continue;
                         }
+                        cancellation.check_cancelled()?;
                         pending.push(PendingImportEdge {
                             from_name: from,
                             to_name: to,
@@ -636,7 +663,7 @@ impl<'a> DataIngestion<'a> {
 
         let pending_edges = pending.len();
         let persist_start = Instant::now();
-        self.persist_import_edges(pending)?;
+        self.persist_import_edges(pending, cancellation)?;
         let persist_duration_ms = persist_start.elapsed().as_millis() as u64;
 
         info!(
@@ -657,7 +684,12 @@ impl<'a> DataIngestion<'a> {
         Ok(())
     }
 
-    fn persist_import_edges(&mut self, pending: Vec<PendingImportEdge>) -> Result<()> {
+    fn persist_import_edges(
+        &mut self,
+        pending: Vec<PendingImportEdge>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        cancellation.check_cancelled()?;
         if pending.is_empty() {
             return Ok(());
         }
@@ -672,6 +704,7 @@ impl<'a> DataIngestion<'a> {
         }
 
         for pending in pending {
+            cancellation.check_cancelled()?;
             match self.graph.connect_objects_str(
                 pending.edge.from,
                 pending.edge.to,

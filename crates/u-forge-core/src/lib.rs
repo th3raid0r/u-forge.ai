@@ -50,8 +50,9 @@ pub use ingest::{
     DataIngestion, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, EmbeddingResult,
     EmbeddingTarget, IngestionStats, SetupResult, build_hq_embed_queue,
     build_hq_embed_queue_with_connection, embed_all_chunks, embed_all_chunks_with_cancellation,
-    import_schemas_and_data, rechunk_and_embed, rechunk_and_embed_with_cancellation,
-    setup_and_index,
+    import_data_only, import_data_only_with_cancellation, import_schemas_and_data,
+    import_schemas_and_data_with_cancellation, rechunk_and_embed,
+    rechunk_and_embed_with_cancellation, setup_and_index, setup_and_index_with_cancellation,
 };
 pub use lemonade::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChatRequest, ChatUsage, GpuResourceManager,

@@ -690,7 +690,10 @@ impl ChatPanel {
                     tokio_rt.block_on(async move {
                         tokio::select! {
                             _ = acquire_cancellation.cancelled() => None,
-                            result = runtime.acquire(&profile) => Some(result),
+                            result = runtime.acquire_with_cancellation(
+                                &profile,
+                                &acquire_cancellation,
+                            ) => Some(result),
                         }
                     })
                 })

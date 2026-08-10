@@ -82,6 +82,7 @@ build:
 
 check:
 	$(call run_silent,u-forge-core check,$(CARGO) check -p u-forge-core)
+	$(call run_silent,u-forge-core benchmark check,$(CARGO) check -p u-forge-core --benches)
 	$(call run_silent,convert_memorymesh example check,$(CARGO) check -p u-forge-core --example convert_memorymesh)
 	$(call run_silent,u-forge-graph-view benchmark check,$(CARGO) check -p u-forge-graph-view --benches)
 	$(call run_silent,workspace clippy check,$(CARGO) clippy $(CARGO_CLIPPY_FLAGS))

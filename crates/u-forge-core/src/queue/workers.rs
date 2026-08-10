@@ -39,6 +39,11 @@ const EMBED_MAX_ATTEMPTS: u32 = 3;
 /// (100 ms → 200 ms) so three attempts add at most ~300 ms of backoff.
 const EMBED_RETRY_BASE_MS: u64 = 100;
 
+// Evidence decision (inference_lifecycle/retry_recovery_lockstep): two
+// deterministic workers recover concurrently in the same bounded 300 ms
+// backoff window as one worker. No shared-provider contention appeared, so
+// adding random jitter would add variance without evidence of benefit.
+
 fn queue_job_span(
     context: &super::jobs::JobContext,
     capability: &'static str,
@@ -84,6 +89,29 @@ fn finish_queue_span<T>(span: &tracing::Span, result: &Result<T, InferenceError>
     }
 }
 
+fn record_pending_cancellation(
+    context: &super::jobs::JobContext,
+    capability: &'static str,
+    device_name: &str,
+    error: &InferenceError,
+) {
+    context.metrics.cancelled_pending(error);
+    let outcome = match error {
+        InferenceError::Superseded => "superseded",
+        InferenceError::TimedOut { .. } => "timed_out",
+        _ => "cancelled",
+    };
+    tracing::info!(
+        job_id = context.id,
+        capability,
+        selected_worker = device_name,
+        queue_wait_us = context.enqueued_at.elapsed().as_micros() as u64,
+        cancellation_point = "pending",
+        outcome,
+        "Inference queue job skipped before provider invocation"
+    );
+}
+
 /// Generic single-consumer worker loop shared by all non-embedding workers.
 ///
 /// On each iteration:
@@ -123,7 +151,7 @@ pub(super) async fn run_llm_worker(
         async move {
             if job.context.cancellation.is_cancelled() {
                 let error = job.context.cancellation.error();
-                job.context.metrics.cancelled_pending(&error);
+                record_pending_cancellation(&job.context, "text_generation", &device_name, &error);
                 let _ = job.response.send(Err(error));
                 return;
             }
@@ -144,7 +172,7 @@ pub(super) async fn run_llm_worker(
             .await;
             finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
             job.context.metrics.finished(
-                &result.as_ref().map(|_| ()).map_err(|error| error),
+                &result.as_ref().map(|_| ()),
                 start.elapsed().as_micros() as u64,
             );
             debug!(
@@ -172,7 +200,12 @@ pub(super) async fn run_llm_stream_worker(
         async move {
             if job.context.cancellation.is_cancelled() {
                 let error = job.context.cancellation.error();
-                job.context.metrics.cancelled_pending(&error);
+                record_pending_cancellation(
+                    &job.context,
+                    "text_generation_stream",
+                    &device_name,
+                    &error,
+                );
                 let _ = job.completion.send(Err(error));
                 return;
             }
@@ -189,10 +222,13 @@ pub(super) async fn run_llm_stream_worker(
                     .response
                     .send(Err(InferenceError::provider(&error)))
                     .await;
+                let terminal = Err(error);
+                let service_us = start.elapsed().as_micros() as u64;
                 job.context
                     .metrics
-                    .finished(&Err(&error), start.elapsed().as_micros() as u64);
-                let _ = job.completion.send(Err(error));
+                    .finished(&terminal.as_ref().map(|_| ()), service_us);
+                finish_queue_span(&span, &terminal, service_us);
+                let _ = job.completion.send(terminal);
                 return;
             }
             let mut profile = provider.profile.clone();
@@ -200,26 +236,31 @@ pub(super) async fn run_llm_stream_worker(
             let lease = tokio::select! {
                 _ = job.context.cancellation.cancelled() => {
                     let error = job.context.cancellation.error();
+                    let terminal = Err(error);
+                    let service_us = start.elapsed().as_micros() as u64;
                     job.context.metrics.finished(
-                        &Err(&error),
-                        start.elapsed().as_micros() as u64,
+                        &terminal.as_ref().map(|_| ()),
+                        service_us,
                     );
-                    let _ = job.completion.send(Err(error));
+                    finish_queue_span(&span, &terminal, service_us);
+                    let _ = job.completion.send(terminal);
                     return;
                 }
-                result = provider.runtime.acquire(&profile) => match result {
+                result = provider.runtime.acquire_with_cancellation(
+                    &profile,
+                    &job.context.cancellation,
+                ) => match result {
                     Ok(lease) => lease,
                     Err(error) => {
-                        let error = InferenceError::classify_timeout(
-                            error,
-                            TimeoutClass::ModelActivation,
-                        );
                         let _ = job.response.send(Err(InferenceError::provider(&error))).await;
+                        let terminal = Err(error);
+                        let service_us = start.elapsed().as_micros() as u64;
                         job.context.metrics.finished(
-                            &Err(&error),
-                            start.elapsed().as_micros() as u64,
+                            &terminal.as_ref().map(|_| ()),
+                            service_us,
                         );
-                        let _ = job.completion.send(Err(error));
+                        finish_queue_span(&span, &terminal, service_us);
+                        let _ = job.completion.send(terminal);
                         return;
                     }
                 }
@@ -254,7 +295,7 @@ pub(super) async fn run_llm_stream_worker(
                 }
             };
             job.context.metrics.finished(
-                &terminal.as_ref().map(|_| ()).map_err(|error| error),
+                &terminal.as_ref().map(|_| ()),
                 start.elapsed().as_micros() as u64,
             );
             finish_queue_span(&span, &terminal, start.elapsed().as_micros() as u64);
@@ -311,7 +352,7 @@ pub(super) async fn run_rerank_worker(
         async move {
             if job.context.cancellation.is_cancelled() {
                 let error = job.context.cancellation.error();
-                job.context.metrics.cancelled_pending(&error);
+                record_pending_cancellation(&job.context, "reranking", &device_name, &error);
                 let _ = job.response.send(Err(error));
                 return;
             }
@@ -332,7 +373,7 @@ pub(super) async fn run_rerank_worker(
             .await;
             finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
             job.context.metrics.finished(
-                &result.as_ref().map(|_| ()).map_err(|error| error),
+                &result.as_ref().map(|_| ()),
                 start.elapsed().as_micros() as u64,
             );
             debug!(
@@ -369,7 +410,7 @@ async fn execute_embed_job(
 ) {
     if job.context.cancellation.is_cancelled() {
         let error = job.context.cancellation.error();
-        job.context.metrics.cancelled_pending(&error);
+        record_pending_cancellation(&job.context, "embedding", device_name, &error);
         let _ = job.response.send(Err(error));
         return;
     }
@@ -403,7 +444,8 @@ async fn execute_embed_job(
             ) => {
                 let elapsed_us = start.elapsed().as_micros() as u64;
                 job.context.metrics.finished(&Err(&error), elapsed_us);
-                let _ = job.response.send(Err(error));
+                finish_queue_span::<Vec<f32>>(&span, &Err(error), elapsed_us);
+                let _ = job.response.send(Err(job.context.cancellation.error()));
                 return;
             }
             Err(e) => {
@@ -425,6 +467,11 @@ async fn execute_embed_job(
                             let error = job.context.cancellation.error();
                             job.context.metrics.finished(
                                 &Err(&error),
+                                start.elapsed().as_micros() as u64,
+                            );
+                            finish_queue_span::<Vec<f32>>(
+                                &span,
+                                &Err(job.context.cancellation.error()),
                                 start.elapsed().as_micros() as u64,
                             );
                             let _ = job.response.send(Err(error));
@@ -451,10 +498,9 @@ async fn execute_embed_job(
         "Embed job complete"
     );
 
-    job.context.metrics.finished(
-        &final_result.as_ref().map(|_| ()).map_err(|error| error),
-        elapsed_us,
-    );
+    job.context
+        .metrics
+        .finished(&final_result.as_ref().map(|_| ()), elapsed_us);
     finish_queue_span(&span, &final_result, elapsed_us);
 
     // Cancellation never trains the dispatch estimator. Successful work and
@@ -540,7 +586,7 @@ pub(super) async fn run_transcribe_worker(
         async move {
             if job.context.cancellation.is_cancelled() {
                 let error = job.context.cancellation.error();
-                job.context.metrics.cancelled_pending(&error);
+                record_pending_cancellation(&job.context, "transcription", &device_name, &error);
                 let _ = job.response.send(Err(error));
                 return;
             }
@@ -560,7 +606,7 @@ pub(super) async fn run_transcribe_worker(
             .await;
             finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
             job.context.metrics.finished(
-                &result.as_ref().map(|_| ()).map_err(|error| error),
+                &result.as_ref().map(|_| ()),
                 start.elapsed().as_micros() as u64,
             );
             debug!(
@@ -588,7 +634,7 @@ pub(super) async fn run_tts_worker(
         async move {
             if job.context.cancellation.is_cancelled() {
                 let error = job.context.cancellation.error();
-                job.context.metrics.cancelled_pending(&error);
+                record_pending_cancellation(&job.context, "text_to_speech", &device_name, &error);
                 let _ = job.response.send(Err(error));
                 return;
             }
@@ -614,7 +660,7 @@ pub(super) async fn run_tts_worker(
             .await;
             finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
             job.context.metrics.finished(
-                &result.as_ref().map(|_| ()).map_err(|error| error),
+                &result.as_ref().map(|_| ()),
                 start.elapsed().as_micros() as u64,
             );
             debug!(

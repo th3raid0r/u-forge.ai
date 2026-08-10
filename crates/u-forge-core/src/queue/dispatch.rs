@@ -973,6 +973,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_remain_consistent_during_concurrent_completion_and_cancellation() {
+        let queue = build_mock_queue();
+        let mut jobs = Vec::new();
+        for index in 0..200 {
+            let job = queue.submit_embed(format!("job-{index}"));
+            if index % 3 == 0 {
+                job.cancel();
+            }
+            jobs.push(job);
+        }
+        futures::future::join_all(jobs).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let counters = queue.stats().counters;
+                if counters.started + counters.cancelled_pending == counters.submitted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let counters = queue.stats().counters;
+        assert_eq!(counters.submitted, 200);
+        assert_eq!(
+            counters.started,
+            counters.succeeded + counters.provider_failed + counters.cancelled_active
+        );
+        assert_eq!(counters.queue_wait.samples, counters.started);
+        assert_eq!(counters.service_time.samples, counters.started);
+        assert_eq!(
+            counters.submitted,
+            counters.started + counters.cancelled_pending
+        );
+    }
+
+    #[tokio::test]
     async fn test_transcribe_returns_string() {
         let queue = build_mock_queue();
         let wav = vec![0u8; 64]; // dummy audio

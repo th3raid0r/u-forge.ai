@@ -168,6 +168,15 @@ impl CancellationToken {
         self.state.token.cancelled().await;
     }
 
+    /// Return the recorded cancellation reason when this operation has ended.
+    pub fn check_cancelled(&self) -> InferenceResult<()> {
+        if self.is_cancelled() {
+            Err(self.error())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn error(&self) -> InferenceError {
         CancellationReason::decode(self.state.reason.load(Ordering::Acquire)).error()
     }
@@ -298,5 +307,46 @@ mod tests {
             JobCompletion::from_receiver(token, rx, None).await.unwrap(),
             42
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_and_worker_drop_are_distinct_terminal_outcomes() {
+        let timeout = CancellationToken::new();
+        let (_tx, rx) = oneshot::channel::<InferenceResult<()>>();
+        let completion = JobCompletion::from_receiver(timeout.clone(), rx, None);
+        timeout.time_out(TimeoutClass::FirstToken);
+        assert!(matches!(
+            completion.await,
+            Err(InferenceError::TimedOut {
+                class: TimeoutClass::FirstToken
+            })
+        ));
+
+        let metrics = Arc::new(QueueMetrics::default());
+        let token = CancellationToken::new();
+        let (tx, rx) = oneshot::channel::<InferenceResult<()>>();
+        drop(tx);
+        assert!(matches!(
+            JobCompletion::from_receiver(token, rx, Some(metrics.clone())).await,
+            Err(InferenceError::WorkerDropped)
+        ));
+        assert_eq!(metrics.snapshot().worker_dropped, 1);
+    }
+
+    #[test]
+    fn provider_timeout_text_is_classified_by_phase() {
+        assert!(matches!(
+            InferenceError::classify_timeout(
+                "Lemonade first token timeout after 1s",
+                TimeoutClass::Provider
+            ),
+            InferenceError::TimedOut {
+                class: TimeoutClass::FirstToken
+            }
+        ));
+        assert!(matches!(
+            InferenceError::classify_timeout("connection refused", TimeoutClass::Provider),
+            InferenceError::ProviderFailed { .. }
+        ));
     }
 }

@@ -19,7 +19,7 @@ use u_forge_core::{
         chat_component_state, component_state, initial_setup_components,
         resolve_runtime_connection, select_setup_backend,
     },
-    queue::InferenceQueueBuilder,
+    queue::{CancellationToken, InferenceQueueBuilder},
     types::ObjectId,
 };
 use u_forge_graph_view::GraphSnapshot;
@@ -165,6 +165,10 @@ pub struct AppView {
     last_region_focus: HashMap<FocusRegion, FocusHandle>,
     workspace_state_path: std::path::PathBuf,
     workspace_persist_task: Option<gpui::Task<()>>,
+    /// Owns the user-initiated import so replacement and shutdown are explicit.
+    import_cancellation: Option<CancellationToken>,
+    import_task: Option<gpui::Task<()>>,
+    import_generation: u64,
     // ── Path picker modal ─────────────────────────────────────────────────────
     /// Active path-picker dialog and which field it's editing, or None.
     pub(crate) path_picker: Option<(PathPickerKind, Entity<PathPickerModal>)>,
@@ -965,6 +969,10 @@ impl AppView {
         // model unload and child reap are allowed to complete.
         let app_quit_sub = cx.on_app_quit(|this, _cx| {
             this.state.embedding_plan.cancel();
+            if let Some(cancellation) = this.import_cancellation.take() {
+                cancellation.cancel();
+            }
+            this.import_task.take();
             if let Some(embedded) = this.state.embedded_lemonade.clone() {
                 this.state.tokio_rt.block_on(embedded.shutdown());
             }
@@ -1001,6 +1009,9 @@ impl AppView {
             last_region_focus: HashMap::new(),
             workspace_state_path,
             workspace_persist_task: None,
+            import_cancellation: None,
+            import_task: None,
+            import_generation: 0,
             path_picker: None,
             _path_picker_subs: vec![],
             confirmation: None,
@@ -1356,6 +1367,14 @@ impl AppView {
 
         let graph = self.state.graph.clone();
         let data_file = self.state.data_file.clone();
+        if let Some(previous) = self.import_cancellation.take() {
+            previous.supersede();
+        }
+        self.import_task.take();
+        self.import_generation = self.import_generation.wrapping_add(1);
+        let generation = self.import_generation;
+        let cancellation = CancellationToken::new();
+        self.import_cancellation = Some(cancellation.clone());
         tracing::info!(
             ui_action = "import_data",
             phase = "clicked",
@@ -1366,9 +1385,14 @@ impl AppView {
         self.state.data_status = Some("Importing…".to_string());
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let import_start = std::time::Instant::now();
-            let result = u_forge_core::ingest::import_data_only(&graph, &data_file).await;
+            let result = u_forge_core::ingest::import_data_only_with_cancellation(
+                &graph,
+                &data_file,
+                cancellation.clone(),
+            )
+            .await;
             let import_duration_ms = import_start.elapsed().as_millis() as u64;
             tracing::info!(
                 ui_action = "import_data",
@@ -1379,6 +1403,10 @@ impl AppView {
             );
 
             this.update(cx, |view: &mut AppView, cx| {
+                if generation != view.import_generation {
+                    return;
+                }
+                view.import_cancellation = None;
                 match result {
                     Ok(stats) => {
                         let reused = if stats.objects_reused > 0 {
@@ -1427,6 +1455,10 @@ impl AppView {
                         // Trigger embedding after successful import.
                         view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
                     }
+                    Err(_) if cancellation.is_cancelled() => {
+                        view.state.data_status = Some("Import cancelled.".to_string());
+                        cx.notify();
+                    }
                     Err(e) => {
                         view.state.data_status = Some(format!("Import failed: {e}"));
                         cx.notify();
@@ -1434,8 +1466,8 @@ impl AppView {
                 }
             })
             .ok();
-        })
-        .detach();
+        });
+        self.import_task = Some(task);
     }
 
     pub(crate) fn do_import_data_picker(
