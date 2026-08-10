@@ -4,10 +4,372 @@
 //! supported, then select this chrome only from GPUI's negotiated [`Decorations`]
 //! value. Desktop-name environment variables are deliberately absent.
 
-use gpui::{Decorations, Pixels, Point, ResizeEdge, Size, Tiling};
+use std::rc::Rc;
+
+use gpui::{
+    AnyElement, App, BoxShadow, CursorStyle, Decorations, FocusHandle, HitboxBehavior, Hsla,
+    IntoElement, KeyDownEvent, MouseButton, Pixels, Point, RenderOnce, ResizeEdge, Size, Tiling,
+    Window, WindowControlArea, WindowControls, canvas, div, point, prelude::*, px,
+};
+
+use crate::ui::{
+    components::Tooltip,
+    icons::{Icon, IconName, IconSize},
+    theme::UiTheme,
+};
 
 pub const APPLICATION_NAME: &str = "u-forge.ai";
 pub const APPLICATION_ID: &str = "ai.u-forge.u-forge";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowChromeAction {
+    Minimize,
+    ToggleMaximize,
+    Close,
+    Move,
+    DoubleClick,
+    ShowMenu(Point<Pixels>),
+}
+
+pub type WindowChromeActionHandler =
+    Rc<dyn Fn(WindowChromeAction, &mut Window, &mut App) + 'static>;
+
+#[derive(Clone)]
+pub struct WindowControlFocusHandles {
+    pub minimize: FocusHandle,
+    pub maximize: FocusHandle,
+    pub close: FocusHandle,
+}
+
+#[derive(IntoElement)]
+pub struct WindowTitleBar {
+    side: WindowControlSide,
+    controls: WindowControls,
+    maximized: bool,
+    active: bool,
+    focus: WindowControlFocusHandles,
+    on_action: WindowChromeActionHandler,
+}
+
+impl WindowTitleBar {
+    pub fn new(
+        side: WindowControlSide,
+        controls: WindowControls,
+        maximized: bool,
+        active: bool,
+        focus: WindowControlFocusHandles,
+        on_action: WindowChromeActionHandler,
+    ) -> Self {
+        Self {
+            side,
+            controls,
+            maximized,
+            active,
+            focus,
+            on_action,
+        }
+    }
+}
+
+fn window_control_button(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    area: WindowControlArea,
+    focus: FocusHandle,
+    action: WindowChromeAction,
+    active: bool,
+    handler: WindowChromeActionHandler,
+    theme: UiTheme,
+) -> impl IntoElement {
+    let focus_on_press = focus.clone();
+    let click_handler = handler.clone();
+    let key_handler = handler;
+    let color = if active {
+        theme.colors.text
+    } else {
+        theme.colors.text_muted
+    };
+
+    div()
+        .id(id)
+        .window_control_area(area)
+        .track_focus(&focus)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(theme.metrics.title_bar_height)
+        .cursor_pointer()
+        .text_color(color)
+        .hover(move |style| style.bg(theme.colors.selected))
+        .active(move |style| style.bg(theme.colors.border))
+        .focus_visible(move |style| style.border_1().border_color(theme.colors.focus))
+        .tooltip(Tooltip::text(label))
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            focus_on_press.focus(window);
+            cx.stop_propagation();
+        })
+        .on_click(move |event, window, cx| {
+            if !event.is_right_click() {
+                click_handler(action, window, cx);
+            }
+            cx.stop_propagation();
+        })
+        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                key_handler(action, window, cx);
+                cx.stop_propagation();
+            }
+        })
+        .child(Icon::new(icon, IconSize::Medium, color))
+}
+
+impl RenderOnce for WindowTitleBar {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
+        let on_action = self.on_action.clone();
+        let show_window_menu = self.controls.window_menu;
+        let control_count =
+            usize::from(self.controls.minimize) + usize::from(self.controls.maximize) + 1;
+        let side_width = theme.metrics.title_bar_height * control_count as f32;
+        let mut controls = div()
+            .id("window-controls")
+            .flex()
+            .flex_none()
+            .h_full()
+            .w(side_width);
+
+        if self.controls.minimize {
+            controls = controls.child(window_control_button(
+                "window-minimize",
+                IconName::WindowMinimize,
+                "Minimize window",
+                WindowControlArea::Min,
+                self.focus.minimize,
+                WindowChromeAction::Minimize,
+                self.active,
+                self.on_action.clone(),
+                theme,
+            ));
+        }
+        if self.controls.maximize {
+            controls = controls.child(window_control_button(
+                "window-maximize",
+                if self.maximized {
+                    IconName::WindowRestore
+                } else {
+                    IconName::WindowMaximize
+                },
+                if self.maximized {
+                    "Restore window"
+                } else {
+                    "Maximize window"
+                },
+                WindowControlArea::Max,
+                self.focus.maximize,
+                WindowChromeAction::ToggleMaximize,
+                self.active,
+                self.on_action.clone(),
+                theme,
+            ));
+        }
+        controls = controls.child(window_control_button(
+            "window-close",
+            IconName::WindowClose,
+            "Close window",
+            WindowControlArea::Close,
+            self.focus.close,
+            WindowChromeAction::Close,
+            self.active,
+            self.on_action.clone(),
+            theme,
+        ));
+
+        let (left_side, right_side) = match self.side {
+            WindowControlSide::Left => (
+                controls.into_any_element(),
+                div().flex_none().h_full().w(side_width).into_any_element(),
+            ),
+            WindowControlSide::Right => (
+                div().flex_none().h_full().w(side_width).into_any_element(),
+                controls.into_any_element(),
+            ),
+        };
+        let background = if self.active {
+            theme.colors.title_bar_surface
+        } else {
+            theme.colors.title_bar_surface_inactive
+        };
+
+        div()
+            .id("window-title-bar")
+            .window_control_area(WindowControlArea::Drag)
+            .relative()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .h(theme.metrics.title_bar_height)
+            .bg(background)
+            .border_b_1()
+            .border_color(theme.colors.border_subtle)
+            .text_size(theme.typography.chrome)
+            .text_color(if self.active {
+                theme.colors.text
+            } else {
+                theme.colors.text_muted
+            })
+            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                on_action(
+                    if event.click_count >= 2 {
+                        WindowChromeAction::DoubleClick
+                    } else {
+                        WindowChromeAction::Move
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .when(show_window_menu, |title_bar| {
+                title_bar.on_click({
+                    let on_action = self.on_action.clone();
+                    move |event, window, cx| {
+                        if event.is_right_click() {
+                            on_action(WindowChromeAction::ShowMenu(event.position()), window, cx);
+                        }
+                    }
+                })
+            })
+            .child(left_side)
+            .child(
+                div()
+                    .id("window-title")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(APPLICATION_NAME),
+            )
+            .child(right_side)
+    }
+}
+
+#[derive(IntoElement)]
+pub struct ClientWindowFrame {
+    content: AnyElement,
+    geometry: FrameGeometry,
+    title_bar: Option<WindowTitleBar>,
+}
+
+impl ClientWindowFrame {
+    pub fn new(
+        content: AnyElement,
+        geometry: FrameGeometry,
+        title_bar: Option<WindowTitleBar>,
+    ) -> Self {
+        Self {
+            content,
+            geometry,
+            title_bar,
+        }
+    }
+}
+
+impl RenderOnce for ClientWindowFrame {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
+        let geometry = self.geometry;
+        let frame = div()
+            .id("client-window-frame")
+            .relative()
+            .size_full()
+            .bg(gpui::transparent_black())
+            .pt(px(geometry.inset.top))
+            .pr(px(geometry.inset.right))
+            .pb(px(geometry.inset.bottom))
+            .pl(px(geometry.inset.left))
+            .on_mouse_move(|_, window, _| window.refresh())
+            .on_mouse_down(MouseButton::Left, move |event, window, _| {
+                if let Some(edge) = geometry.resize_edge(event.position, window.viewport_size()) {
+                    window.start_window_resize(edge);
+                }
+            })
+            .child(
+                canvas(
+                    |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    move |_, hitbox, window, _| {
+                        let Some(edge) =
+                            geometry.resize_edge(window.mouse_position(), window.viewport_size())
+                        else {
+                            return;
+                        };
+                        let cursor = match edge {
+                            ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
+                            ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
+                            ResizeEdge::TopLeft | ResizeEdge::BottomRight => {
+                                CursorStyle::ResizeUpLeftDownRight
+                            }
+                            ResizeEdge::TopRight | ResizeEdge::BottomLeft => {
+                                CursorStyle::ResizeUpRightDownLeft
+                            }
+                        };
+                        window.set_cursor_style(cursor, &hitbox);
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
+
+        let mut body = div()
+            .id("client-window-body")
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .overflow_hidden()
+            .bg(theme.colors.app_surface)
+            .border_t(px(geometry.border.top))
+            .border_r(px(geometry.border.right))
+            .border_b(px(geometry.border.bottom))
+            .border_l(px(geometry.border.left))
+            .border_color(theme.colors.border)
+            .rounded_tl(px(geometry.corners.top_left))
+            .rounded_tr(px(geometry.corners.top_right))
+            .rounded_br(px(geometry.corners.bottom_right))
+            .rounded_bl(px(geometry.corners.bottom_left));
+        if geometry.draw_shadow {
+            body = body.shadow(vec![BoxShadow {
+                color: Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 0.0,
+                    a: 0.45,
+                },
+                blur_radius: px(geometry.inset.top / 2.0),
+                spread_radius: px(0.0),
+                offset: point(px(0.0), px(0.0)),
+            }]);
+        }
+        if let Some(title_bar) = self.title_bar {
+            body = body.child(title_bar);
+        }
+        let mut content = div()
+            .id("client-window-content")
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .child(self.content);
+        content.style().flex_grow = Some(1.0);
+        content.style().flex_shrink = Some(1.0);
+        frame.child(body.child(content))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecorationMode {

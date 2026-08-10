@@ -1,10 +1,15 @@
 use std::sync::Arc;
 
-use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{
+    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
+};
+#[cfg(target_os = "linux")]
+use gpui::{WindowBackgroundAppearance, WindowDecorations};
 use u_forge_core::AppConfig;
 use u_forge_ui_gpui::{
     ActionContext, AppView, Assets, UiTheme, action_key_bindings, native_menus,
     startup::{StartupTimeline, prepare_app},
+    window_chrome::{APPLICATION_ID, APPLICATION_NAME},
 };
 
 fn main() {
@@ -45,20 +50,31 @@ fn main() {
         }));
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+        let mut window_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(APPLICATION_NAME.into()),
                 ..Default::default()
-            },
-            |_, cx| {
-                cx.new(|cx| {
-                    AppView::new_profiled(
-                        snapshot, graph, schema_mgr, data_file, schema_dir, cfg, rt, startup, None,
-                        cx,
-                    )
-                })
-            },
-        )
+            }),
+            app_id: Some(APPLICATION_ID.to_owned()),
+            ..Default::default()
+        };
+        #[cfg(target_os = "linux")]
+        {
+            // Ask the compositor for application chrome, then honor the mode
+            // that it actually negotiates via Window::window_decorations().
+            window_options.window_decorations = Some(WindowDecorations::Client);
+            window_options.window_background = WindowBackgroundAppearance::Transparent;
+        }
+        cx.open_window(window_options, |window, cx| {
+            window.set_window_title(APPLICATION_NAME);
+            window.set_app_id(APPLICATION_ID);
+            cx.new(|cx| {
+                AppView::new_profiled(
+                    snapshot, graph, schema_mgr, data_file, schema_dir, cfg, rt, startup, None, cx,
+                )
+            })
+        })
         .unwrap();
     });
 }

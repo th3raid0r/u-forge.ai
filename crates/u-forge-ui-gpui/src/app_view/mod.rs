@@ -49,6 +49,7 @@ use crate::setup_panel::{
 };
 use crate::startup::{LEMONADE_METADATA_READY_MESSAGE, StartupMilestone, StartupTimeline};
 use crate::ui::theme::UiTheme;
+use crate::window_chrome::WindowControlFocusHandles;
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -149,6 +150,7 @@ pub struct AppView {
     pub(crate) view_menu_button_focus: FocusHandle,
     pub(crate) file_menu_focus: FocusHandle,
     pub(crate) view_menu_focus: FocusHandle,
+    pub(crate) window_control_focus: WindowControlFocusHandles,
     pub(crate) setup_open: bool,
     pub(crate) settings_open: bool,
     pub(crate) settings_focus: FocusHandle,
@@ -1040,6 +1042,11 @@ impl AppView {
             view_menu_button_focus: cx.focus_handle().tab_stop(true),
             file_menu_focus: cx.focus_handle(),
             view_menu_focus: cx.focus_handle(),
+            window_control_focus: WindowControlFocusHandles {
+                minimize: cx.focus_handle(),
+                maximize: cx.focus_handle(),
+                close: cx.focus_handle(),
+            },
             setup_open: false,
             settings_open: false,
             settings_focus: cx.focus_handle(),
