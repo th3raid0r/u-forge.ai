@@ -1057,6 +1057,7 @@ impl Render for AppView {
                 let decrease_interface = handle.clone();
                 let increase_interface = handle.clone();
                 let toggle_advanced = handle.clone();
+                let toggle_window_controls = handle.clone();
                 let cancel = handle.clone();
                 let dismiss = handle.clone();
                 let save = handle.clone();
@@ -1169,6 +1170,27 @@ impl Render for AppView {
                             toggle_advanced
                                 .update(cx, |view, cx| {
                                     view.settings_draft_advanced = !view.settings_draft_advanced;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                    )
+                    .child(
+                        Button::new(
+                            "settings-window-controls-side",
+                            if self.settings_draft_window_controls_left {
+                                "Window controls on left"
+                            } else {
+                                "Window controls on right"
+                            },
+                        )
+                        .selected(self.settings_draft_window_controls_left)
+                        .tooltip("Place client-side minimize, maximize, and close controls")
+                        .on_click(move |_, _, cx| {
+                            toggle_window_controls
+                                .update(cx, |view, cx| {
+                                    view.settings_draft_window_controls_left =
+                                        !view.settings_draft_window_controls_left;
                                     cx.notify();
                                 })
                                 .ok();
