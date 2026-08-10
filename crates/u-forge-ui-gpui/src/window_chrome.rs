@@ -71,18 +71,22 @@ impl WindowTitleBar {
     }
 }
 
-fn window_control_button(
+struct WindowControlButtonSpec {
     id: &'static str,
     icon: IconName,
     label: &'static str,
     area: WindowControlArea,
     focus: FocusHandle,
     action: WindowChromeAction,
+}
+
+fn window_control_button(
+    spec: WindowControlButtonSpec,
     active: bool,
     handler: WindowChromeActionHandler,
     theme: UiTheme,
 ) -> impl IntoElement {
-    let focus_on_press = focus.clone();
+    let focus_on_press = spec.focus.clone();
     let click_handler = handler.clone();
     let key_handler = handler;
     let color = if active {
@@ -92,10 +96,10 @@ fn window_control_button(
     };
 
     div()
-        .id(id)
-        .debug_selector(move || id.to_owned())
-        .window_control_area(area)
-        .track_focus(&focus)
+        .id(spec.id)
+        .debug_selector(move || spec.id.to_owned())
+        .window_control_area(spec.area)
+        .track_focus(&spec.focus)
         .flex()
         .flex_none()
         .items_center()
@@ -106,24 +110,24 @@ fn window_control_button(
         .hover(move |style| style.bg(theme.colors.selected))
         .active(move |style| style.bg(theme.colors.border))
         .focus_visible(move |style| style.border_1().border_color(theme.colors.focus))
-        .tooltip(Tooltip::text(label))
+        .tooltip(Tooltip::text(spec.label))
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             focus_on_press.focus(window);
             cx.stop_propagation();
         })
         .on_click(move |event, window, cx| {
             if !event.is_right_click() {
-                click_handler(action, window, cx);
+                click_handler(spec.action, window, cx);
             }
             cx.stop_propagation();
         })
         .on_key_down(move |event: &KeyDownEvent, window, cx| {
             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                key_handler(action, window, cx);
+                key_handler(spec.action, window, cx);
                 cx.stop_propagation();
             }
         })
-        .child(Icon::new(icon, IconSize::Medium, color))
+        .child(Icon::new(spec.icon, IconSize::Medium, color))
 }
 
 impl RenderOnce for WindowTitleBar {
@@ -143,12 +147,14 @@ impl RenderOnce for WindowTitleBar {
 
         if self.controls.minimize {
             controls = controls.child(window_control_button(
-                "window-minimize",
-                IconName::WindowMinimize,
-                "Minimize window",
-                WindowControlArea::Min,
-                self.focus.minimize,
-                WindowChromeAction::Minimize,
+                WindowControlButtonSpec {
+                    id: "window-minimize",
+                    icon: IconName::WindowMinimize,
+                    label: "Minimize window",
+                    area: WindowControlArea::Min,
+                    focus: self.focus.minimize,
+                    action: WindowChromeAction::Minimize,
+                },
                 self.active,
                 self.on_action.clone(),
                 theme,
@@ -156,32 +162,36 @@ impl RenderOnce for WindowTitleBar {
         }
         if self.controls.maximize {
             controls = controls.child(window_control_button(
-                "window-maximize",
-                if self.maximized {
-                    IconName::WindowRestore
-                } else {
-                    IconName::WindowMaximize
+                WindowControlButtonSpec {
+                    id: "window-maximize",
+                    icon: if self.maximized {
+                        IconName::WindowRestore
+                    } else {
+                        IconName::WindowMaximize
+                    },
+                    label: if self.maximized {
+                        "Restore window"
+                    } else {
+                        "Maximize window"
+                    },
+                    area: WindowControlArea::Max,
+                    focus: self.focus.maximize,
+                    action: WindowChromeAction::ToggleMaximize,
                 },
-                if self.maximized {
-                    "Restore window"
-                } else {
-                    "Maximize window"
-                },
-                WindowControlArea::Max,
-                self.focus.maximize,
-                WindowChromeAction::ToggleMaximize,
                 self.active,
                 self.on_action.clone(),
                 theme,
             ));
         }
         controls = controls.child(window_control_button(
-            "window-close",
-            IconName::WindowClose,
-            "Close window",
-            WindowControlArea::Close,
-            self.focus.close,
-            WindowChromeAction::Close,
+            WindowControlButtonSpec {
+                id: "window-close",
+                icon: IconName::WindowClose,
+                label: "Close window",
+                area: WindowControlArea::Close,
+                focus: self.focus.close,
+                action: WindowChromeAction::Close,
+            },
             self.active,
             self.on_action.clone(),
             theme,
