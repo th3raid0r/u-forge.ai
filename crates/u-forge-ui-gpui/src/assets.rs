@@ -128,6 +128,22 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../../../assets/icons/warning-triangle.svg"),
     ),
     (
+        "icons/window-close.svg",
+        include_bytes!("../../../assets/icons/window-close.svg"),
+    ),
+    (
+        "icons/window-maximize.svg",
+        include_bytes!("../../../assets/icons/window-maximize.svg"),
+    ),
+    (
+        "icons/window-minimize.svg",
+        include_bytes!("../../../assets/icons/window-minimize.svg"),
+    ),
+    (
+        "icons/window-restore.svg",
+        include_bytes!("../../../assets/icons/window-restore.svg"),
+    ),
+    (
         "icons/world.svg",
         include_bytes!("../../../assets/icons/world.svg"),
     ),

@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{rc::Rc, time::Instant};
 
 use gpui::{
     AnyElement, AnyView, App, ClickEvent, Context, Corner, FocusHandle, MouseButton,
@@ -26,6 +26,10 @@ use crate::ui::components::{
     Button, ButtonStyle, Dialog, LabelTone, Menu, MenuItem, StatusItem, StatusTone, Tab as UiTab,
 };
 use crate::ui::theme::UiTheme;
+use crate::window_chrome::{
+    ClientWindowFrame, DecorationMode, FrameGeometry, FrameMetrics, WindowChromeAction,
+    WindowChromeActionHandler, WindowControlSide, WindowTitleBar,
+};
 
 fn operation_status_tone(message: &str) -> StatusTone {
     let message = message.to_ascii_lowercase();
@@ -195,7 +199,7 @@ impl Render for AppView {
         // Weak handle used by drag-move closures to update panel sizes.
         let handle = cx.weak_entity();
 
-        div()
+        let app_root = div()
             .id("app-root")
             .flex()
             .flex_col()
@@ -1057,6 +1061,7 @@ impl Render for AppView {
                 let decrease_interface = handle.clone();
                 let increase_interface = handle.clone();
                 let toggle_advanced = handle.clone();
+                let toggle_window_controls = handle.clone();
                 let cancel = handle.clone();
                 let dismiss = handle.clone();
                 let save = handle.clone();
@@ -1174,6 +1179,27 @@ impl Render for AppView {
                                 .ok();
                         }),
                     )
+                    .child(
+                        Button::new(
+                            "settings-window-controls-side",
+                            if self.settings_draft_window_controls_left {
+                                "Window controls on left"
+                            } else {
+                                "Window controls on right"
+                            },
+                        )
+                        .selected(self.settings_draft_window_controls_left)
+                        .tooltip("Place client-side minimize, maximize, and close controls")
+                        .on_click(move |_, _, cx| {
+                            toggle_window_controls
+                                .update(cx, |view, cx| {
+                                    view.settings_draft_window_controls_left =
+                                        !view.settings_draft_window_controls_left;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                    )
                     .child(div().text_xs().text_color(theme.colors.text_muted).child(
                         if show_advanced_controls {
                             "Advanced diagnostics are currently available."
@@ -1264,7 +1290,44 @@ impl Render for AppView {
                     .w(px(1.0))
                     .h(px(1.0)),
                 )
-            })
+            });
+
+        let decorations = window.window_decorations();
+        if DecorationMode::negotiated(decorations) == DecorationMode::Server {
+            return app_root.into_any_element();
+        }
+
+        let gpui::Decorations::Client { tiling } = decorations else {
+            unreachable!("client decoration mode must include tiling state");
+        };
+        let maximized = window.is_maximized();
+        let fullscreen = window.is_fullscreen();
+        let metrics = FrameMetrics::for_interface_size(theme.interface_size);
+        let geometry = FrameGeometry::for_window(tiling, maximized, fullscreen, metrics);
+        window.set_client_inset(px(if fullscreen { 0.0 } else { metrics.inset }));
+
+        let action_handler: WindowChromeActionHandler =
+            Rc::new(|action, window, _cx| match action {
+                WindowChromeAction::Minimize => window.minimize_window(),
+                WindowChromeAction::ToggleMaximize | WindowChromeAction::DoubleClick => {
+                    window.zoom_window();
+                }
+                WindowChromeAction::Close => window.remove_window(),
+                WindowChromeAction::Move => window.start_window_move(),
+                WindowChromeAction::ShowMenu(position) => window.show_window_menu(position),
+            });
+        let title_bar = geometry.show_title_bar.then(|| {
+            WindowTitleBar::new(
+                WindowControlSide::from_left_preference(self.window_controls_left),
+                window.window_controls(),
+                maximized,
+                window.is_window_active(),
+                self.window_control_focus.clone(),
+                action_handler,
+            )
+        });
+
+        ClientWindowFrame::new(app_root.into_any_element(), geometry, title_bar).into_any_element()
     }
 }
 

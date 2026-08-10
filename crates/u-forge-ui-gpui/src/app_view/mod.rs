@@ -49,6 +49,7 @@ use crate::setup_panel::{
 };
 use crate::startup::{LEMONADE_METADATA_READY_MESSAGE, StartupMilestone, StartupTimeline};
 use crate::ui::theme::UiTheme;
+use crate::window_chrome::WindowControlFocusHandles;
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -149,6 +150,7 @@ pub struct AppView {
     pub(crate) view_menu_button_focus: FocusHandle,
     pub(crate) file_menu_focus: FocusHandle,
     pub(crate) view_menu_focus: FocusHandle,
+    pub(crate) window_control_focus: WindowControlFocusHandles,
     pub(crate) setup_open: bool,
     pub(crate) settings_open: bool,
     pub(crate) settings_focus: FocusHandle,
@@ -156,9 +158,11 @@ pub struct AppView {
     pub(crate) ui_font_size: f32,
     pub(crate) ui_interface_size: f32,
     pub(crate) show_advanced_controls: bool,
+    pub(crate) window_controls_left: bool,
     pub(crate) settings_draft_font_size: f32,
     pub(crate) settings_draft_interface_size: f32,
     pub(crate) settings_draft_advanced: bool,
+    pub(crate) settings_draft_window_controls_left: bool,
     pub(crate) dock_state: DockState,
     /// Last focused descendant per workspace region, used when a dock is
     /// revisited after F6 traversal or a close/reopen cycle.
@@ -676,6 +680,7 @@ impl AppView {
         self.settings_draft_font_size = self.ui_font_size;
         self.settings_draft_interface_size = self.ui_interface_size;
         self.settings_draft_advanced = self.show_advanced_controls;
+        self.settings_draft_window_controls_left = self.window_controls_left;
         self.settings_return_focus = window.focused(cx);
         self.settings_open = true;
         let focus = self.settings_focus.clone();
@@ -698,6 +703,7 @@ impl AppView {
             font_size,
             interface_size,
             self.settings_draft_advanced,
+            self.settings_draft_window_controls_left,
         ) {
             Ok(path) => {
                 self.ui_font_size = font_size;
@@ -709,6 +715,7 @@ impl AppView {
                 self.chat_panel.update(cx, |_panel, cx| cx.notify());
                 self.setup_panel.update(cx, |_panel, cx| cx.notify());
                 self.show_advanced_controls = self.settings_draft_advanced;
+                self.window_controls_left = self.settings_draft_window_controls_left;
                 self.refresh_native_menus(cx);
                 self.settings_open = false;
                 if let Some(return_focus) = self.settings_return_focus.take() {
@@ -835,6 +842,7 @@ impl AppView {
         let ui_interface_size = app_config.ui.interface_size;
         UiTheme::set_interface_size(cx, ui_interface_size);
         let show_advanced_controls = app_config.ui.show_advanced_controls;
+        let window_controls_left = app_config.ui.window_controls_left;
 
         // Build child entities — clone Arc handles before they move into AppState.
         let selection = {
@@ -1034,6 +1042,11 @@ impl AppView {
             view_menu_button_focus: cx.focus_handle().tab_stop(true),
             file_menu_focus: cx.focus_handle(),
             view_menu_focus: cx.focus_handle(),
+            window_control_focus: WindowControlFocusHandles {
+                minimize: cx.focus_handle(),
+                maximize: cx.focus_handle(),
+                close: cx.focus_handle(),
+            },
             setup_open: false,
             settings_open: false,
             settings_focus: cx.focus_handle(),
@@ -1041,9 +1054,11 @@ impl AppView {
             ui_font_size,
             ui_interface_size,
             show_advanced_controls,
+            window_controls_left,
             settings_draft_font_size: ui_font_size,
             settings_draft_interface_size: ui_interface_size,
             settings_draft_advanced: show_advanced_controls,
+            settings_draft_window_controls_left: window_controls_left,
             dock_state,
             last_region_focus: HashMap::new(),
             workspace_state_path,

@@ -747,6 +747,12 @@ pub struct UiConfig {
     /// available when this is false.
     #[serde(default)]
     pub show_advanced_controls: bool,
+
+    /// Place application-rendered window controls on the left edge of a
+    /// client-side title bar. The default follows the common Linux/Windows
+    /// convention and keeps minimize, maximize, and close on the right.
+    #[serde(default)]
+    pub window_controls_left: bool,
 }
 
 impl UiConfig {
@@ -765,6 +771,7 @@ impl Default for UiConfig {
             font_size: Self::default_font_size(),
             interface_size: Self::default_interface_size(),
             show_advanced_controls: false,
+            window_controls_left: false,
         }
     }
 }
@@ -961,6 +968,7 @@ impl AppConfig {
         font_size: f32,
         interface_size: f32,
         show_advanced_controls: bool,
+        window_controls_left: bool,
     ) -> Result<PathBuf> {
         use toml_edit::{DocumentMut, Item, Table, value};
 
@@ -981,6 +989,7 @@ impl AppConfig {
         document["ui"]["font_size"] = value(font_size as f64);
         document["ui"]["interface_size"] = value(interface_size as f64);
         document["ui"]["show_advanced_controls"] = value(show_advanced_controls);
+        document["ui"]["window_controls_left"] = value(window_controls_left);
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1087,6 +1096,7 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.ui.font_size, 16.0);
         assert_eq!(cfg.ui.interface_size, DEFAULT_UI_INTERFACE_SIZE);
+        assert!(!cfg.ui.window_controls_left);
         assert!(cfg.embedding.npu_enabled);
         assert!(cfg.embedding.gpu_enabled);
         assert!(cfg.embedding.cpu_enabled);
@@ -1225,7 +1235,7 @@ mod tests {
             ..AppConfig::default()
         };
 
-        let written = config.persist_ui_settings(18.0, 24.0, true).unwrap();
+        let written = config.persist_ui_settings(18.0, 24.0, true, true).unwrap();
         assert_eq!(written, path);
         let text = std::fs::read_to_string(written).unwrap();
         assert!(text.contains("# keep this comment"));
@@ -1233,11 +1243,13 @@ mod tests {
         assert!(text.contains("font_size = 18.0"));
         assert!(text.contains("interface_size = 24.0"));
         assert!(text.contains("show_advanced_controls = true"));
+        assert!(text.contains("window_controls_left = true"));
 
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.ui.font_size, 18.0);
         assert_eq!(reloaded.ui.interface_size, 24.0);
         assert!(reloaded.ui.show_advanced_controls);
+        assert!(reloaded.ui.window_controls_left);
     }
 
     #[test]
