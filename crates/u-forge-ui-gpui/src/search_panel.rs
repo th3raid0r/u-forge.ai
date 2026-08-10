@@ -8,8 +8,8 @@ use tracing::Instrument;
 use u_forge_core::{
     AppConfig, EmbeddingTarget, HybridSearchConfig, KnowledgeGraph, ObjectId, SearchStageOutcomes,
     SearchStageStatus,
-    queue::{InferenceQueue, InferenceQueueBuilder},
-    search_hybrid_response,
+    queue::{CancellationToken, InferenceQueue, InferenceQueueBuilder},
+    search_hybrid_response_with_cancellation,
 };
 use u_forge_ui_traits::node_color_for_type;
 
@@ -152,6 +152,7 @@ pub(crate) struct SearchPanel {
     search_generation: u64,
     /// Retaining the task lets a new search cancel its predecessor promptly.
     search_task: Option<gpui::Task<()>>,
+    search_cancellation: Option<CancellationToken>,
     search_limit: usize,
     inference_queue: Option<InferenceQueue>,
     hq_queue: Option<InferenceQueue>,
@@ -193,6 +194,7 @@ impl SearchPanel {
             degradation_hint: None,
             search_generation: 0,
             search_task: None,
+            search_cancellation: None,
             search_limit,
             inference_queue: None,
             hq_queue: None,
@@ -267,7 +269,12 @@ impl SearchPanel {
         self.results_list.reset(0);
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
+        if let Some(previous) = self.search_cancellation.take() {
+            previous.supersede();
+        }
         self.search_task.take();
+        let cancellation = CancellationToken::new();
+        self.search_cancellation = Some(cancellation.clone());
         cx.notify();
 
         let graph = self.graph.clone();
@@ -313,12 +320,13 @@ impl SearchPanel {
                                 limit,
                                 hq_semantic_boost: app_config.chat.hq_semantic_boost,
                             };
-                            let response = search_hybrid_response(
+                            let response = search_hybrid_response_with_cancellation(
                                 &graph,
                                 queue,
                                 hq_queue.as_ref(),
                                 &query,
                                 &config,
+                                cancellation,
                             )
                             .await?;
                             Ok(CompletedSearch {
@@ -344,6 +352,7 @@ impl SearchPanel {
                     return;
                 }
                 panel.searching = false;
+                panel.search_cancellation = None;
                 match result {
                     Ok(completed) => {
                         panel.degradation_hint = degradation_hint(&completed.outcomes);
@@ -380,6 +389,15 @@ impl SearchPanel {
             .ok();
         });
         self.search_task = Some(task);
+    }
+}
+
+impl Drop for SearchPanel {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.search_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.search_task.take();
     }
 }
 

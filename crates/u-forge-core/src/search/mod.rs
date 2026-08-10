@@ -76,7 +76,7 @@ use anyhow::Result;
 use tracing::{debug, info, instrument, warn};
 
 use crate::KnowledgeGraph;
-use crate::queue::InferenceQueue;
+use crate::queue::{CancellationToken, InferenceQueue};
 use crate::types::{Edge, ObjectId, ObjectMetadata, TextChunk};
 
 // ── Public configuration ──────────────────────────────────────────────────────
@@ -436,6 +436,29 @@ pub async fn search_hybrid_response(
     query: &str,
     config: &HybridSearchConfig,
 ) -> Result<SearchResponse> {
+    search_hybrid_response_with_cancellation(
+        graph,
+        queue,
+        hq_queue,
+        query,
+        config,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Run the complete search pipeline under one parent cancellation token.
+pub async fn search_hybrid_response_with_cancellation(
+    graph: &KnowledgeGraph,
+    queue: &InferenceQueue,
+    hq_queue: Option<&InferenceQueue>,
+    query: &str,
+    config: &HybridSearchConfig,
+    cancellation: CancellationToken,
+) -> Result<SearchResponse> {
+    if cancellation.is_cancelled() {
+        return Err(cancellation.error().into());
+    }
     tracing::Span::current().record("query", query);
 
     let alpha = config.alpha.clamp(0.0, 1.0);
@@ -519,7 +542,13 @@ pub async fn search_hybrid_response(
 
     let semantic_results = if standard_space_valid {
         debug!("Embedding query for semantic ANN search");
-        match queue.embed(query).await {
+        match queue
+            .submit_embed_with_cancellation(query, cancellation.clone())
+            .await
+        {
+            Err(_e) if cancellation.is_cancelled() => {
+                return Err(cancellation.error().into());
+            }
             Err(e) => {
                 warn!("Query embedding failed — falling back to FTS-only results: {e}");
                 outcomes.standard_semantic = SearchStageOutcome::failed(
@@ -536,6 +565,9 @@ pub async fn search_hybrid_response(
                     Ok(results) => {
                         outcomes.standard_semantic = SearchStageOutcome::applied();
                         results
+                    }
+                    Err(_e) if cancellation.is_cancelled() => {
+                        return Err(cancellation.error().into());
                     }
                     Err(e) => {
                         warn!("Semantic ANN search failed — falling back to FTS results: {e}");
@@ -596,7 +628,13 @@ pub async fn search_hybrid_response(
                     }) =>
             {
                 debug!("Embedding query for HQ semantic ANN search");
-                match hq_q.embed(query).await {
+                match hq_q
+                    .submit_embed_with_cancellation(query, cancellation.clone())
+                    .await
+                {
+                    Err(_e) if cancellation.is_cancelled() => {
+                        return Err(cancellation.error().into());
+                    }
                     Err(e) => {
                         warn!("HQ query embedding failed — skipping HQ path: {e}");
                         outcomes.high_quality_semantic = SearchStageOutcome::failed(
@@ -644,6 +682,10 @@ pub async fn search_hybrid_response(
         semantic_results.len(),
         hq_semantic_results.len()
     );
+
+    if cancellation.is_cancelled() {
+        return Err(cancellation.error().into());
+    }
 
     // ── Diagnostic: Stage 1 (FTS5) results ──────────────────────────────────
     {
@@ -1082,7 +1124,18 @@ pub async fn search_hybrid_response(
             debug!("{buf}");
         }
 
-        match queue.rerank(query, documents, Some(results.len())).await {
+        match queue
+            .submit_rerank_with_cancellation(
+                query,
+                documents,
+                Some(results.len()),
+                cancellation.clone(),
+            )
+            .await
+        {
+            Err(_e) if cancellation.is_cancelled() => {
+                return Err(cancellation.error().into());
+            }
             Err(e) => {
                 warn!("Reranking failed — returning RRF-scored results instead: {e}");
                 outcomes.reranking = SearchStageOutcome::failed(
@@ -1185,6 +1238,26 @@ pub async fn search_hybrid(
             .await?
             .results,
     )
+}
+
+pub async fn search_hybrid_with_cancellation(
+    graph: &KnowledgeGraph,
+    queue: &InferenceQueue,
+    hq_queue: Option<&InferenceQueue>,
+    query: &str,
+    config: &HybridSearchConfig,
+    cancellation: CancellationToken,
+) -> Result<Vec<NodeSearchResult>> {
+    Ok(search_hybrid_response_with_cancellation(
+        graph,
+        queue,
+        hq_queue,
+        query,
+        config,
+        cancellation,
+    )
+    .await?
+    .results)
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

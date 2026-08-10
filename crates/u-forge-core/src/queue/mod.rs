@@ -78,8 +78,15 @@
 mod builder;
 mod dispatch;
 mod jobs;
+mod lifecycle;
+mod telemetry;
 mod weighted;
 mod workers;
 
 pub use builder::InferenceQueueBuilder;
 pub use dispatch::{InferenceQueue, QueueStats};
+pub use lifecycle::{
+    CancellationToken, InferenceError, InferenceJob, InferenceResult, JobCompletion,
+    StreamingInferenceJob, TimeoutClass,
+};
+pub use telemetry::{LatencySummary, QueueCounters};

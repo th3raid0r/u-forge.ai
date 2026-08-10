@@ -964,6 +964,7 @@ impl AppView {
         // owned-process shutdown synchronously in the observer callback so the
         // model unload and child reap are allowed to complete.
         let app_quit_sub = cx.on_app_quit(|this, _cx| {
+            this.state.embedding_plan.cancel();
             if let Some(embedded) = this.state.embedded_lemonade.clone() {
                 this.state.tokio_rt.block_on(embedded.shutdown());
             }
@@ -1040,16 +1041,54 @@ impl AppView {
                 if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
                     return;
                 }
+                let mut lagged_messages = match event {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => skipped,
+                    _ => 0,
+                };
 
                 // Imports and agent tool chains can commit bursts of changes.
                 // One frame-sized debounce turns them into one snapshot refresh.
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(16))
                     .await;
-                while graph_changes.try_recv().is_ok() {}
+                loop {
+                    match graph_changes.try_recv() {
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            lagged_messages = lagged_messages.saturating_add(skipped);
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let Some(this) = this.upgrade() else { return };
                 if this
-                    .update(cx, |view: &mut AppView, cx| view.refresh_snapshot(cx))
+                    .update(cx, |view: &mut AppView, cx| {
+                        if lagged_messages > 0 {
+                            view.state.graph_event_lag_events =
+                                view.state.graph_event_lag_events.saturating_add(1);
+                            view.state.graph_event_lagged_messages = view
+                                .state
+                                .graph_event_lagged_messages
+                                .saturating_add(lagged_messages);
+                            tracing::warn!(
+                                lagged_messages,
+                                lag_events = view.state.graph_event_lag_events,
+                                lagged_total = view.state.graph_event_lagged_messages,
+                                recovery = "full_snapshot_refresh",
+                                "Graph change receiver lagged"
+                            );
+                        }
+                        let recovered = view.refresh_snapshot(cx);
+                        if lagged_messages > 0 && recovered {
+                            view.state.graph_lag_recoveries =
+                                view.state.graph_lag_recoveries.saturating_add(1);
+                            tracing::info!(
+                                lagged_messages,
+                                recoveries = view.state.graph_lag_recoveries,
+                                "Graph event lag recovered by full snapshot refresh"
+                            );
+                        }
+                    })
                     .is_err()
                 {
                     return;
@@ -1067,7 +1106,7 @@ impl AppView {
     /// Uses `build_snapshot_incremental` when a previous snapshot exists so
     /// legend bookkeeping can reuse the prior type set. Spatial state is always
     /// bulk-rebuilt from the newly committed node positions.
-    pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) -> bool {
         let snapshot_start = std::time::Instant::now();
         let result = {
             let prev = self.state.snapshot.read();
@@ -1102,9 +1141,11 @@ impl AppView {
                 self.node_panel
                     .update(cx, |panel, cx| panel.refresh_groups(cx));
                 cx.notify();
+                true
             }
             Err(e) => {
                 eprintln!("Failed to rebuild snapshot: {e}");
+                false
             }
         }
     }
@@ -1827,9 +1868,9 @@ impl AppView {
             hq_enabled = hq_queue.as_ref().is_some_and(|q| q.has_embedding()),
             "UI action scheduled"
         );
-        let (generation, superseded) = self.state.embedding_plan.start();
+        let (generation, superseded, cancellation) = self.state.embedding_plan.start();
         self.state.embedding_status = Some(if superseded {
-            format!("{} (previous work still finishing)", plan.label())
+            format!("{} (previous work cancelled)", plan.label())
         } else {
             plan.label()
         });
@@ -1838,7 +1879,7 @@ impl AppView {
                 ui_action = "embedding",
                 phase = "superseded",
                 plan_kind,
-                "Previous embedding work remains queued but may no longer update UI status"
+                "Previous embedding work was cancelled and may no longer update UI status"
             );
         }
         cx.notify();
@@ -1891,9 +1932,13 @@ impl AppView {
                             "UI action started"
                         );
                         let outcome = tokio_rt.block_on(async move {
-                            plan.execute(&graph, &queue, hq_queue.as_ref(), move |p| {
-                                *progress_write.lock() = Some(p)
-                            })
+                            plan.execute_with_cancellation(
+                                &graph,
+                                &queue,
+                                hq_queue.as_ref(),
+                                cancellation,
+                                move |p| *progress_write.lock() = Some(p),
+                            )
                             .await
                         });
                         tracing::info!(

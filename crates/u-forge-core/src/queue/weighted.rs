@@ -192,15 +192,21 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::queue::jobs::EmbedJob;
+    use crate::queue::jobs::{EmbedJob, JobContext};
+    use crate::queue::lifecycle::{CancellationToken, InferenceResult};
+    use crate::queue::telemetry::QueueMetrics;
 
     fn make_job() -> (
         EmbedJob,
-        tokio::sync::oneshot::Receiver<anyhow::Result<Vec<f32>>>,
+        tokio::sync::oneshot::Receiver<InferenceResult<Vec<f32>>>,
     ) {
         let (tx, rx) = oneshot::channel();
         (
             EmbedJob {
+                context: JobContext::new(
+                    CancellationToken::new(),
+                    Arc::new(QueueMetrics::default()),
+                ),
                 text: "test".into(),
                 response: tx,
             },

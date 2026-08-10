@@ -15,6 +15,7 @@ use super::dispatch::InferenceQueue;
 use super::jobs::{
     EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
 };
+use super::telemetry::QueueMetrics;
 use super::weighted::WeightedEmbedDispatcher;
 use super::workers::{
     run_embed_worker, run_llm_stream_worker, run_llm_worker, run_rerank_worker,
@@ -120,6 +121,7 @@ impl InferenceQueueBuilder {
         let generate_queue = Arc::new(WorkQueue::<GenerateJob>::new());
         let generate_stream_queue = Arc::new(WorkQueue::<GenerateStreamJob>::new());
         let rerank_queue = Arc::new(WorkQueue::<RerankJob>::new());
+        let metrics = Arc::new(QueueMetrics::default());
 
         let mut embed_specs: Vec<EmbedWorkerSpec> = Vec::new();
         let mut transcription_workers: usize = 0;
@@ -253,6 +255,7 @@ impl InferenceQueueBuilder {
             generate_queue,
             generate_stream_queue,
             rerank_queue,
+            metrics,
             embedding_space_fingerprint,
             embedding_workers,
             transcription_workers,

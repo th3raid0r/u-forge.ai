@@ -20,7 +20,7 @@ use crate::config::AppConfig;
 use crate::lemonade::catalog::LemonadeServerCatalog;
 use crate::lemonade::provider_factory::{BuiltProvider, Capability, ProviderFactory};
 use crate::lemonade::selector::{ModelSelector, QualityTier};
-use crate::queue::{InferenceQueue, InferenceQueueBuilder};
+use crate::queue::{CancellationToken, InferenceQueue, InferenceQueueBuilder};
 
 /// Which embedding index to target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +140,25 @@ impl EmbeddingPlan {
         hq_queue: Option<&InferenceQueue>,
         on_progress: impl Fn(EmbeddingProgress) + Send,
     ) -> EmbeddingOutcome {
+        self.execute_with_cancellation(
+            graph,
+            queue,
+            hq_queue,
+            CancellationToken::new(),
+            on_progress,
+        )
+        .await
+    }
+
+    /// Execute every child embedding job under one parent token.
+    pub async fn execute_with_cancellation(
+        self,
+        graph: &KnowledgeGraph,
+        queue: &InferenceQueue,
+        hq_queue: Option<&InferenceQueue>,
+        cancellation: CancellationToken,
+        on_progress: impl Fn(EmbeddingProgress) + Send,
+    ) -> EmbeddingOutcome {
         let t0 = std::time::Instant::now();
         let inflight = Arc::new(AtomicUsize::new(0));
         let max_inflight = Arc::new(AtomicUsize::new(0));
@@ -150,10 +169,27 @@ impl EmbeddingPlan {
                 let mut stored = 0usize;
                 let mut skipped = 0usize;
                 for (done, oid) in node_ids.iter().enumerate() {
+                    if cancellation.is_cancelled() {
+                        skipped += total.saturating_sub(done);
+                        break;
+                    }
                     let cur = inflight.fetch_add(1, Ordering::Relaxed) + 1;
                     max_inflight.fetch_max(cur, Ordering::Relaxed);
-                    match rechunk_and_embed(graph, queue, hq_queue, *oid).await {
+                    match rechunk_and_embed_with_cancellation(
+                        graph,
+                        queue,
+                        hq_queue,
+                        *oid,
+                        cancellation.clone(),
+                    )
+                    .await
+                    {
                         Ok(n) => stored += n,
+                        Err(_) if cancellation.is_cancelled() => {
+                            skipped += total.saturating_sub(done);
+                            inflight.fetch_sub(1, Ordering::Relaxed);
+                            break;
+                        }
                         Err(e) => {
                             warn!(object_id = %oid, %e, "rechunk_and_embed failed");
                             skipped += 1;
@@ -181,15 +217,31 @@ impl EmbeddingPlan {
                 }
             }
             EmbeddingTask::EmbedAll => {
-                let std_result = embed_all_chunks(graph, queue, EmbeddingTarget::Standard).await;
-                let hq_result = if let Some(hq) = hq_queue {
-                    Some(embed_all_chunks(graph, hq, EmbeddingTarget::HighQuality).await)
+                let std_result = embed_all_chunks_with_cancellation(
+                    graph,
+                    queue,
+                    EmbeddingTarget::Standard,
+                    cancellation.clone(),
+                )
+                .await;
+                let hq_result = if let Some(hq) = hq_queue.filter(|_| !cancellation.is_cancelled())
+                {
+                    Some(
+                        embed_all_chunks_with_cancellation(
+                            graph,
+                            hq,
+                            EmbeddingTarget::HighQuality,
+                            cancellation.clone(),
+                        )
+                        .await,
+                    )
                 } else {
                     None
                 };
 
                 let (stored, skipped, total_jobs) = match std_result {
                     Ok(r) => (r.stored, r.skipped, r.total),
+                    Err(_) if cancellation.is_cancelled() => (0, 0, 0),
                     Err(e) => {
                         warn!(%e, "embed_all_chunks (standard) failed");
                         (0, 0, 0)
@@ -245,7 +297,22 @@ pub async fn rechunk_and_embed(
     hq_queue: Option<&InferenceQueue>,
     object_id: crate::types::ObjectId,
 ) -> Result<usize> {
+    rechunk_and_embed_with_cancellation(graph, queue, hq_queue, object_id, CancellationToken::new())
+        .await
+}
+
+pub async fn rechunk_and_embed_with_cancellation(
+    graph: &KnowledgeGraph,
+    queue: &InferenceQueue,
+    hq_queue: Option<&InferenceQueue>,
+    object_id: crate::types::ObjectId,
+    cancellation: CancellationToken,
+) -> Result<usize> {
     use crate::types::ChunkType;
+
+    if cancellation.is_cancelled() {
+        return Err(cancellation.error().into());
+    }
 
     let has_standard = queue.has_embedding();
     let hq_queue = hq_queue.filter(|queue| queue.has_embedding());
@@ -274,12 +341,18 @@ pub async fn rechunk_and_embed(
     let flat_text = meta.flatten_for_embedding(&edge_lines);
 
     // Remove stale chunks (triggers clean up FTS5 + vector tables).
+    if cancellation.is_cancelled() {
+        return Err(cancellation.error().into());
+    }
     let deleted = graph.delete_chunks_for_node(object_id)?;
     if deleted > 0 {
         tracing::debug!(object_id = %object_id, deleted, "Deleted old chunks");
     }
 
     // Create fresh chunks from the flattened text.
+    if cancellation.is_cancelled() {
+        return Err(cancellation.error().into());
+    }
     let chunk_ids = graph.add_text_chunk(object_id, flat_text, ChunkType::Description)?;
     if chunk_ids.is_empty() {
         return Ok(0);
@@ -291,7 +364,15 @@ pub async fn rechunk_and_embed(
     if has_standard {
         let mut embeddings = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
-            embeddings.push((chunk.id, queue.embed(&chunk.content).await?));
+            embeddings.push((
+                chunk.id,
+                queue
+                    .submit_embed_with_cancellation(&chunk.content, cancellation.clone())
+                    .await?,
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Err(cancellation.error().into());
         }
         graph.upsert_chunk_embeddings(embeddings)?;
     }
@@ -300,7 +381,14 @@ pub async fn rechunk_and_embed(
     if let Some(hq) = hq_queue {
         let mut hq_embeddings = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
-            hq_embeddings.push((chunk.id, hq.embed(&chunk.content).await?));
+            hq_embeddings.push((
+                chunk.id,
+                hq.submit_embed_with_cancellation(&chunk.content, cancellation.clone())
+                    .await?,
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Err(cancellation.error().into());
         }
         graph.upsert_chunk_embeddings_hq(hq_embeddings)?;
     }
@@ -330,6 +418,18 @@ pub async fn embed_all_chunks(
     queue: &InferenceQueue,
     target: EmbeddingTarget,
 ) -> Result<EmbeddingResult> {
+    embed_all_chunks_with_cancellation(graph, queue, target, CancellationToken::new()).await
+}
+
+pub async fn embed_all_chunks_with_cancellation(
+    graph: &KnowledgeGraph,
+    queue: &InferenceQueue,
+    target: EmbeddingTarget,
+    cancellation: CancellationToken,
+) -> Result<EmbeddingResult> {
+    if cancellation.is_cancelled() {
+        return Err(cancellation.error().into());
+    }
     if !queue.has_embedding() {
         return Ok(EmbeddingResult {
             stored: 0,
@@ -372,7 +472,11 @@ pub async fn embed_all_chunks(
     let total = chunks_to_embed.len();
     let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
 
-    match queue.embed_many(texts).await {
+    match queue
+        .embed_many_with_cancellation(texts, cancellation.clone())
+        .await
+    {
+        Err(_) if cancellation.is_cancelled() => Err(cancellation.error().into()),
         Err(e) => {
             warn!(%e, target = ?target, "Embedding failed");
             Ok(EmbeddingResult {
@@ -382,6 +486,9 @@ pub async fn embed_all_chunks(
             })
         }
         Ok(vecs) => {
+            if cancellation.is_cancelled() {
+                return Err(cancellation.error().into());
+            }
             let embeddings = chunks_to_embed
                 .iter()
                 .zip(vecs)

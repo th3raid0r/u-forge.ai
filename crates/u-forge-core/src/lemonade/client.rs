@@ -116,6 +116,17 @@ pub struct LemonadeConnection {
     llm_runtime_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Content-free links to Lemonade's own observability surfaces.
+///
+/// u-forge records only client-side queue lifecycle data. Server token,
+/// scheduler, backend, and device metrics remain authoritative at Lemonade's
+/// Prometheus/OTLP surfaces instead of being copied into queue counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LemonadeTelemetryLinks {
+    pub prometheus_metrics_url: String,
+    pub otlp_is_server_managed: bool,
+}
+
 impl fmt::Debug for LemonadeConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LemonadeConnection")
@@ -180,6 +191,15 @@ impl LemonadeConnection {
 
     pub fn has_api_key(&self) -> bool {
         self.api_key.is_some()
+    }
+
+    /// Return safe links describing where server telemetry is owned.
+    /// Credentials and configured OTLP headers are intentionally excluded.
+    pub fn telemetry_links(&self) -> LemonadeTelemetryLinks {
+        LemonadeTelemetryLinks {
+            prometheus_metrics_url: self.origin_url("/metrics"),
+            otlp_is_server_managed: true,
+        }
     }
 
     pub fn has_admin_api_key(&self) -> bool {
@@ -547,6 +567,18 @@ mod tests {
         .unwrap();
         assert_eq!(connection.origin(), "http://localhost:13305");
         assert_eq!(connection.api_base(), "http://localhost:13305/v1");
+    }
+
+    #[test]
+    fn telemetry_links_keep_server_metrics_authoritative() {
+        let connection = LemonadeConnection::external("http://127.0.0.1:13305/api/v1").unwrap();
+        assert_eq!(
+            connection.telemetry_links(),
+            LemonadeTelemetryLinks {
+                prometheus_metrics_url: "http://127.0.0.1:13305/metrics".to_string(),
+                otlp_is_server_managed: true,
+            }
+        );
     }
 
     #[test]
