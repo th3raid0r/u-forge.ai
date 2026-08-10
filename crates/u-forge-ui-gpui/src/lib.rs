@@ -17,6 +17,7 @@ mod setup_panel;
 pub mod startup;
 pub mod text_field;
 pub mod ui;
+pub mod window_chrome;
 
 #[cfg(test)]
 mod startup_tests;

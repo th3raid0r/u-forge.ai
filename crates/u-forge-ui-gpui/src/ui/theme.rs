@@ -15,6 +15,8 @@ const BASE_INTERFACE_SIZE: f32 = 16.0;
 pub struct UiColors {
     pub app_surface: Rgba,
     pub panel_surface: Rgba,
+    pub title_bar_surface: Rgba,
+    pub title_bar_surface_inactive: Rgba,
     pub elevated_surface: Rgba,
     pub input_surface: Rgba,
     pub overlay: Rgba,
@@ -48,6 +50,7 @@ pub struct UiMetrics {
     pub menu_bar_height: Pixels,
     pub panel_header_height: Pixels,
     pub status_bar_height: Pixels,
+    pub title_bar_height: Pixels,
 }
 
 /// Content type sizes remain relative to the text setting. Icon sizes are
@@ -89,6 +92,8 @@ impl UiTheme {
             colors: UiColors {
                 app_surface: rgba(0x1e1e2eff),
                 panel_surface: rgba(0x181825ff),
+                title_bar_surface: rgba(0x292a3eff),
+                title_bar_surface_inactive: rgba(0x222334ff),
                 elevated_surface: rgba(0x313244ff),
                 input_surface: rgba(0x11111bff),
                 overlay: rgba(0x0000008c),
@@ -118,6 +123,7 @@ impl UiTheme {
                 menu_bar_height: px(scaled(28.0)),
                 panel_header_height: px(scaled(32.0)),
                 status_bar_height: px(scaled(30.0)),
+                title_bar_height: px(scaled(34.0)),
             },
             typography: UiTypography {
                 body: rems(1.0),
