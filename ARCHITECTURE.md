@@ -229,7 +229,16 @@ FTS5 instead of querying incompatible vectors.
 
 `SchemaManager` caches schemas in `parking_lot::RwLock<HashMap>`. Validation helpers (`is_valid_object_type`, `all_object_type_names`, etc.) read from the in-memory cache without touching SQLite. `validate_and_coerce_properties` coerces compatible primitive strings in-place and returns `Vec<PropertyIssue>` for type mismatches and invalid enum values. The JSONL import boundary is stricter: it drops undeclared properties and skips records that reference unknown types, omit required properties, or use invalid edge endpoints.
 
-`KnowledgeGraph::schema_prompt_summary_all()` merges all persisted schemas and returns `prompt_summary()` output — used by `GraphAgent::new` to inject schema context into the system prompt.
+`KnowledgeGraph::merged_schema_definition()` merges all persisted schemas into
+the structured definition consumed by `GraphAgent`; the legacy
+`schema_prompt_summary_all()` convenience method still returns the complete
+unbounded text summary.
+
+Agent schema injection is request-bounded. `u-forge-agent::budget` selects
+complete object/edge records under `[chat.agent].schema_summary_tokens`, with
+types named in the current request or retained history first, recent tool-result
+types second, and the remainder in stable name order. Omitted records are
+reported explicitly; schema records and JSON are never sliced to fit.
 
 ---
 
@@ -238,6 +247,15 @@ FTS5 instead of querying incompatible vectors.
 Tool arguments emitted by the LLM are validated against each tool's JSON Schema (derived via `schemars::JsonSchema` and strict against unknown fields via `#[serde(deny_unknown_fields)]`) before deserialization. Each tool accepts `serde_json::Value` as its rig `Args` type, calls `tool_validation::validate_tool_args` first, and only then runs `serde_json::from_value` into the typed struct. Validators are compiled once per process via `std::sync::LazyLock` and reused across all calls. Validation failures return a `ToolError` whose message names the offending field path (JSON Pointer format), so the LLM can self-correct without burning extra turns. See `crates/u-forge-agent/src/lib.rs` — `tool_validation` module.
 
 `SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and derives edge schemas from declared relationship fields, including their allowed target types.
+
+The Rig loop carries a per-request ledger through lifecycle hooks. Every model
+call is checked against the active context window, response reserve, and
+cumulative request budget before dispatch. Validated tool calls use canonical
+name/JSON fingerprints; unchanged results consume a configurable repeat
+allowance while changed arguments/results and successful mutations count as
+progress. Tool results are bounded at semantic record boundaries. Deliberate
+budget and repeat stops are distinct `ChatEvent` outcomes, not provider errors,
+and aggregate token/turn diagnostics are emitted without prompt content.
 
 ---
 

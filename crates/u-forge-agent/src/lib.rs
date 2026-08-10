@@ -12,9 +12,7 @@
 //! suited for LLM consumption.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-
-use tiktoken_rs::CoreBPE;
+use std::sync::Arc;
 
 use rig::tool::{Tool, ToolContext};
 use schemars::{JsonSchema, schema_for};
@@ -26,9 +24,15 @@ use u_forge_core::search::{
 };
 use u_forge_core::types::ObjectMetadata;
 use u_forge_core::{
-    KnowledgeGraph,
+    EffectiveAgentBudget, KnowledgeGraph,
     queue::{CancellationToken, InferenceQueue},
     types::ObjectId,
+};
+
+mod budget;
+pub use budget::{
+    BoundedSchemaSummary, SchemaPriorityContext, TokenEstimate, bounded_schema_summary,
+    count_tokens, estimate_tokens,
 };
 
 // ── History and token counting ────────────────────────────────────────────────
@@ -40,26 +44,6 @@ use u_forge_core::{
 pub struct HistoryMessage {
     pub role: String,
     pub content: String,
-}
-
-/// Token overhead added per message in the OpenAI chat format
-/// (role markers + separator bytes).
-const TOKENS_PER_MESSAGE: usize = 4;
-
-/// Cached o200k_harmony BPE tokenizer — constructed once, reused forever.
-///
-/// `o200k_harmony()` parses a ~200 k-entry vocabulary on every call; caching
-/// it here keeps repeated `count_tokens` invocations (e.g. inside
-/// [`select_history_window`]) from rebuilding the tokenizer each time.
-static O200K_BPE: LazyLock<CoreBPE> =
-    LazyLock::new(|| tiktoken_rs::o200k_harmony().expect("o200k_harmony is always available"));
-
-/// Count BPE tokens in `text` using the o200k_harmony encoding.
-///
-/// o200k_harmony is used by GPT-4o and is becoming the standard for local
-/// open-weight models. Close enough for context-window budgeting.
-pub fn count_tokens(text: &str) -> usize {
-    O200K_BPE.encode_with_special_tokens(text).len()
 }
 
 /// Return the subset of `history` that fits inside the available token budget.
@@ -79,27 +63,14 @@ pub fn select_history_window(
     max_context_tokens: usize,
     response_reserve: usize,
 ) -> Vec<HistoryMessage> {
-    let fixed = count_tokens(system_prompt)
-        + TOKENS_PER_MESSAGE
-        + count_tokens(current_msg)
-        + TOKENS_PER_MESSAGE
-        + 3; // reply-priming
-    let budget = max_context_tokens
-        .saturating_sub(response_reserve)
-        .saturating_sub(fixed);
-
-    let mut selected: Vec<&HistoryMessage> = Vec::new();
-    let mut used = 0usize;
-    for msg in history.iter().rev() {
-        let cost = count_tokens(&msg.content) + TOKENS_PER_MESSAGE;
-        if used + cost > budget {
-            break;
-        }
-        used += cost;
-        selected.push(msg);
-    }
-
-    selected.into_iter().rev().cloned().collect()
+    budget::select_history_window(
+        history,
+        system_prompt,
+        current_msg,
+        0,
+        max_context_tokens,
+        response_reserve,
+    )
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -234,33 +205,6 @@ fn format_node_result(result: &NodeSearchResult, index: usize) -> String {
     if !tags.is_empty() {
         s.push_str(&format!("  Tags: {}\n", tags.join(", ")));
     }
-    if !result.edges.is_empty() {
-        s.push_str("  Relationships:\n");
-        for edge in &result.edges {
-            let from_name = if edge.from == result.node.id {
-                result.node.name.clone()
-            } else {
-                result
-                    .connected_node_names
-                    .get(&edge.from)
-                    .map(|cn| cn.name.clone())
-                    .unwrap_or_else(|| edge.from.hyphenated().to_string())
-            };
-            let to_name = if edge.to == result.node.id {
-                result.node.name.clone()
-            } else {
-                result
-                    .connected_node_names
-                    .get(&edge.to)
-                    .map(|cn| cn.name.clone())
-                    .unwrap_or_else(|| edge.to.hyphenated().to_string())
-            };
-            s.push_str(&format!(
-                "    • {from_name} -[{}]-> {to_name}\n",
-                edge.edge_type.as_str()
-            ));
-        }
-    }
     let content_chunks: Vec<&str> = if result.matched_chunks.is_empty() {
         result
             .chunks
@@ -275,19 +219,24 @@ fn format_node_result(result: &NodeSearchResult, index: usize) -> String {
             .collect()
     };
 
-    if !content_chunks.is_empty() {
-        s.push_str("  Matched content:\n");
-        for chunk in content_chunks.iter().take(3) {
-            s.push_str(&format!("    • {chunk}\n"));
-        }
-        if content_chunks.len() > 3 {
-            s.push_str(&format!(
-                "    (… {} more chunks)\n",
-                content_chunks.len() - 3
-            ));
-        }
+    if let Some(summary) = compact_search_content(&content_chunks) {
+        s.push_str(&format!("  Matched content: {summary}\n"));
     }
     s
+}
+
+/// Keep search results ID/summary-oriented instead of duplicating full nodes.
+fn compact_search_content(chunks: &[&str]) -> Option<String> {
+    let first = chunks.first()?;
+    if count_tokens(first) <= 128 {
+        Some((*first).to_string())
+    } else {
+        Some(format!(
+            "{} complete matching chunk(s); content omitted because the first chunk is over 128 \
+             tokens. Refine the query to retrieve a narrower match.",
+            chunks.len()
+        ))
+    }
 }
 
 // ── FtsSearchTool ─────────────────────────────────────────────────────────────
@@ -397,8 +346,9 @@ impl Tool for FtsSearchTool {
                         meta.object_type,
                         obj_id
                     ));
-                    for chunk in chunks.iter().take(3) {
-                        output.push_str(&format!("  • {chunk}\n"));
+                    let chunk_refs = chunks.iter().map(String::as_str).collect::<Vec<_>>();
+                    if let Some(summary) = compact_search_content(&chunk_refs) {
+                        output.push_str(&format!("  Matched content: {summary}\n"));
                     }
                     output.push('\n');
                 }
@@ -537,8 +487,12 @@ impl Tool for SemanticSearchTool {
                         obj_id,
                         best_dist
                     ));
-                    for (chunk, _dist) in chunks.iter().take(3) {
-                        output.push_str(&format!("  • {chunk}\n"));
+                    let chunk_refs = chunks
+                        .iter()
+                        .map(|(chunk, _distance)| chunk.as_str())
+                        .collect::<Vec<_>>();
+                    if let Some(summary) = compact_search_content(&chunk_refs) {
+                        output.push_str(&format!("  Matched content: {summary}\n"));
                     }
                     output.push('\n');
                 }
@@ -1081,6 +1035,8 @@ pub struct AgentParams {
     pub stop: Option<Vec<String>>,
     /// Maximum tool-call round-trips per user message.
     pub max_tool_turns: usize,
+    /// Active-model-safe context, cumulative, output, and repeat limits.
+    pub budget: EffectiveAgentBudget,
 }
 
 impl Default for AgentParams {
@@ -1097,6 +1053,7 @@ impl Default for AgentParams {
             seed: None,
             stop: None,
             max_tool_turns: 5,
+            budget: EffectiveAgentBudget::default(),
         }
     }
 }
@@ -1114,7 +1071,10 @@ pub struct GraphAgent {
     graph: Arc<KnowledgeGraph>,
     queue: Arc<InferenceQueue>,
     hq_queue: Option<Arc<InferenceQueue>>,
-    system_prompt: String,
+    base_prompt: String,
+    tool_guidance: String,
+    schema: Option<u_forge_core::SchemaDefinition>,
+    tool_definition_tokens: TokenEstimate,
     params: AgentParams,
     gpu: Option<Arc<u_forge_core::GpuResourceManager>>,
 }
@@ -1171,7 +1131,7 @@ impl GraphAgent {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build rig client: {e}"))?;
         let base_prompt: String = system_prompt.into();
-        let schema_summary = graph.schema_prompt_summary_all();
+        let schema = graph.merged_schema_definition()?;
 
         let tool_guidance = "\
 ## Tool-use guidelines
@@ -1182,20 +1142,56 @@ impl GraphAgent {
 3. **Refer to the schema below** for valid object_type values and their properties. \
    Use the property names and types exactly as listed.
 4. **Stop when done.** After a successful tool call, report the result to the user. \
-   Do not re-call a tool for the same node unless asked.";
+   Do not re-call a tool for the same node unless asked."
+            .to_string();
 
-        let full_prompt = if schema_summary.is_empty() {
-            format!("{base_prompt}\n\n{tool_guidance}")
-        } else {
-            format!("{base_prompt}\n\n{tool_guidance}\n\n{schema_summary}")
+        let definition = |name: &str, description: String, parameters: serde_json::Value| {
+            serde_json::to_string(&serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            }))
         };
+        let tool_definitions = vec![
+            definition(
+                FtsSearchTool::NAME,
+                FtsSearchTool::new(graph.clone()).description(),
+                FtsSearchTool::new(graph.clone()).parameters(),
+            )?,
+            definition(
+                SemanticSearchTool::NAME,
+                SemanticSearchTool::new(graph.clone(), queue.clone()).description(),
+                SemanticSearchTool::new(graph.clone(), queue.clone()).parameters(),
+            )?,
+            definition(
+                HybridSearchTool::NAME,
+                HybridSearchTool::new(graph.clone(), queue.clone()).description(),
+                HybridSearchTool::new(graph.clone(), queue.clone()).parameters(),
+            )?,
+            definition(
+                UpsertNodeTool::NAME,
+                UpsertNodeTool::new(graph.clone(), queue.clone(), hq_queue.clone()).description(),
+                UpsertNodeTool::new(graph.clone(), queue.clone(), hq_queue.clone()).parameters(),
+            )?,
+            definition(
+                UpsertEdgeTool::NAME,
+                UpsertEdgeTool::new(graph.clone(), queue.clone(), hq_queue.clone()).description(),
+                UpsertEdgeTool::new(graph.clone(), queue.clone(), hq_queue.clone()).parameters(),
+            )?,
+        ];
 
         Ok(Self {
             client,
             graph,
             queue,
             hq_queue,
-            system_prompt: full_prompt,
+            base_prompt,
+            tool_guidance,
+            schema,
+            tool_definition_tokens: budget::estimate_tool_definitions(&tool_definitions),
             params,
             gpu,
         })
@@ -1253,22 +1249,55 @@ impl GraphAgent {
         value
     }
 
-    /// Build a rig agent configured with all sampling params and tools.
-    fn build_agent(
+    fn prepare_budget(
         &self,
-        model_id: &str,
-        reasoning_enabled: bool,
-    ) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
-        self.build_agent_with_params(
-            model_id,
-            if reasoning_enabled {
-                u_forge_core::ReasoningPolicy::Enabled
-            } else {
-                u_forge_core::ReasoningPolicy::Disabled
-            },
-            &self.params,
-            CancellationToken::new(),
-        )
+        user_message: &str,
+        history: &[HistoryMessage],
+        params: &AgentParams,
+    ) -> (budget::BudgetController, Vec<HistoryMessage>) {
+        let response_reserve = params
+            .max_tokens
+            .map(|tokens| tokens.min(usize::MAX as u64) as usize)
+            .unwrap_or(params.budget.response_reserve_tokens);
+        let history_text = history
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preliminary = budget::BudgetController::new(
+            params.budget.clone(),
+            response_reserve,
+            self.schema.clone(),
+            self.base_prompt.clone(),
+            self.tool_guidance.clone(),
+            user_message.to_string(),
+            history_text,
+            self.tool_definition_tokens,
+        );
+        let selected = budget::select_history_window(
+            history,
+            &preliminary.initial_preamble(),
+            user_message,
+            self.tool_definition_tokens.tokens,
+            params.budget.context_tokens,
+            response_reserve,
+        );
+        let retained_history = selected
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let controller = budget::BudgetController::new(
+            params.budget.clone(),
+            response_reserve,
+            self.schema.clone(),
+            self.base_prompt.clone(),
+            self.tool_guidance.clone(),
+            user_message.to_string(),
+            retained_history,
+            self.tool_definition_tokens,
+        );
+        (controller, selected)
     }
 
     fn build_agent_with_params(
@@ -1277,8 +1306,14 @@ impl GraphAgent {
         reasoning: u_forge_core::ReasoningPolicy,
         params: &AgentParams,
         cancellation: CancellationToken,
+        budget: budget::BudgetController,
     ) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
-        let mut builder = self.client.agent(model_id).preamble(&self.system_prompt);
+        let initial_preamble = budget.initial_preamble();
+        let mut builder = self
+            .client
+            .agent(model_id)
+            .preamble(&initial_preamble)
+            .add_hook(budget);
         if let Some(temp) = params.temperature {
             builder = builder.temperature(temp);
         }
@@ -1410,14 +1445,20 @@ impl GraphAgent {
     ) -> mpsc::Receiver<AgentStreamEvent> {
         let (tx, rx) = mpsc::channel(64);
 
-        let agent =
-            self.build_agent_with_params(model_id, reasoning, &params, cancellation.clone());
+        let (budget, selected_history) = self.prepare_budget(user_message, history, &params);
+        let agent = self.build_agent_with_params(
+            model_id,
+            reasoning,
+            &params,
+            cancellation.clone(),
+            budget.clone(),
+        );
         let max_turns = params.max_tool_turns;
         let gpu = uses_gpu.then(|| self.gpu.clone()).flatten();
 
         let user_message = user_message.to_string();
         // Convert HistoryMessage → rig::completion::message::Message.
-        let rig_history: Vec<rig::completion::message::Message> = history
+        let rig_history: Vec<rig::completion::message::Message> = selected_history
             .iter()
             .map(|m| {
                 if m.role == "assistant" {
@@ -1571,6 +1612,24 @@ impl GraphAgent {
                         {
                             break 'stream;
                         }
+                        let diagnostics = budget.diagnostics();
+                        tracing::info!(
+                            model_calls = diagnostics.model_calls,
+                            request_tokens = diagnostics.request_tokens,
+                            reserved_response_tokens = diagnostics.reserved_response_tokens,
+                            assistant_output_tokens = diagnostics.assistant_output_tokens,
+                            tool_argument_tokens = diagnostics.tool_argument_tokens,
+                            tool_output_tokens = diagnostics.tool_output_tokens,
+                            estimation_fallback = diagnostics.estimation_fallback,
+                            "Agent request completed"
+                        );
+                        if tx
+                            .send(AgentStreamEvent::AgentDiagnostics(diagnostics))
+                            .await
+                            .is_err()
+                        {
+                            break 'stream;
+                        }
                         let _ = tx
                             .send(AgentStreamEvent::Finished {
                                 reason: u_forge_core::lemonade::ChatTerminalReason::AgentComplete,
@@ -1583,7 +1642,43 @@ impl GraphAgent {
                         // Non-exhaustive: ignore any new MultiTurnStreamItem variants.
                     }
                     Err(e) => {
-                        let _ = tx.send(AgentStreamEvent::FatalError(e.to_string())).await;
+                        let diagnostics = budget.diagnostics();
+                        match budget.termination() {
+                            Some(budget::BudgetTermination::Budget(reason)) => {
+                                tracing::warn!(
+                                    %reason,
+                                    model_calls = diagnostics.model_calls,
+                                    request_tokens = diagnostics.request_tokens,
+                                    tool_output_tokens = diagnostics.tool_output_tokens,
+                                    estimation_fallback = diagnostics.estimation_fallback,
+                                    "Agent request stopped by budget"
+                                );
+                                let _ = tx
+                                    .send(AgentStreamEvent::BudgetTerminated {
+                                        reason,
+                                        diagnostics,
+                                    })
+                                    .await;
+                            }
+                            Some(budget::BudgetTermination::Repeat(reason)) => {
+                                tracing::warn!(
+                                    %reason,
+                                    model_calls = diagnostics.model_calls,
+                                    request_tokens = diagnostics.request_tokens,
+                                    tool_output_tokens = diagnostics.tool_output_tokens,
+                                    "Agent request stopped by repeat guard"
+                                );
+                                let _ = tx
+                                    .send(AgentStreamEvent::RepeatTerminated {
+                                        reason,
+                                        diagnostics,
+                                    })
+                                    .await;
+                            }
+                            None => {
+                                let _ = tx.send(AgentStreamEvent::FatalError(e.to_string())).await;
+                            }
+                        }
                         break 'stream;
                     }
                 }
@@ -1602,8 +1697,15 @@ impl GraphAgent {
         user_message: &str,
         history: &[HistoryMessage],
     ) -> Result<String, String> {
-        let agent = self.build_agent(model_id, true);
-        let rig_history: Vec<rig::completion::message::Message> = history
+        let (budget, selected_history) = self.prepare_budget(user_message, history, &self.params);
+        let agent = self.build_agent_with_params(
+            model_id,
+            u_forge_core::ReasoningPolicy::Enabled,
+            &self.params,
+            CancellationToken::new(),
+            budget.clone(),
+        );
+        let rig_history: Vec<rig::completion::message::Message> = selected_history
             .iter()
             .map(|m| {
                 if m.role == "assistant" {
@@ -1618,7 +1720,11 @@ impl GraphAgent {
             .history(rig_history)
             .max_turns(self.params.max_tool_turns)
             .await
-            .map_err(|e: PromptError| e.to_string())
+            .map_err(|e: PromptError| match budget.termination() {
+                Some(budget::BudgetTermination::Budget(reason))
+                | Some(budget::BudgetTermination::Repeat(reason)) => reason,
+                None => e.to_string(),
+            })
     }
 }
 

@@ -54,6 +54,12 @@ hq_semantic_boost = 3           # RRF weight multiplier for the 4096-dim HQ sema
 max_tool_turns = 5              # max tool-call round-trips per user message
 reasoning_control = "request"
 
+[chat.agent]
+schema_summary_tokens = 768          # bounded whole-record schema prompt
+cumulative_request_tokens = 16384   # model input + response reservations across the tool loop
+cumulative_tool_output_tokens = 2048
+repeated_call_limit = 1              # unchanged repeats allowed per canonical call
+
 [chat.gpu]
 #model = "Qwen3.5-27B-GGUF"
 model = "Gemma-4-E4B-it-GGUF"

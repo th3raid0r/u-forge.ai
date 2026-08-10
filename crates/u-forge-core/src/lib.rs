@@ -38,8 +38,9 @@ pub use ai::embeddings::{
 };
 pub use builder::ObjectBuilder;
 pub use config::{
-    AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig, EmbeddingDeviceConfig,
-    ModelConfig, ModelLoadParams, ReasoningControl, StorageConfig, UiConfig,
+    AgentBudgetConfig, AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig,
+    EffectiveAgentBudget, EmbeddingDeviceConfig, ModelConfig, ModelLoadParams, ReasoningControl,
+    StorageConfig, UiConfig,
 };
 pub use error::{EmbeddingDimensionMismatch, EmbeddingSpaceMismatch, UnidentifiedEmbeddingSpace};
 pub use graph::{
@@ -756,12 +757,20 @@ impl KnowledgeGraph {
     /// merged into a single prompt block.  Node/edge types from every schema
     /// are combined and deduplicated (later schemas win on conflicts).
     pub fn schema_prompt_summary_all(&self) -> String {
-        let names = match self.storage.list_schemas() {
-            Ok(n) => n,
-            Err(_) => return String::new(),
-        };
+        self.merged_schema_definition()
+            .ok()
+            .flatten()
+            .map_or_else(String::new, |schema| schema.prompt_summary())
+    }
+
+    /// Merge every persisted schema into one virtual definition.
+    ///
+    /// The agent consumes this structured form so bounded summaries select
+    /// whole object and edge records instead of slicing serialized text.
+    pub fn merged_schema_definition(&self) -> Result<Option<crate::schema::SchemaDefinition>> {
+        let names = self.storage.list_schemas()?;
         if names.is_empty() {
-            return String::new();
+            return Ok(None);
         }
 
         // Merge all schemas into one virtual SchemaDefinition for the summary.
@@ -780,7 +789,7 @@ impl KnowledgeGraph {
                 }
             }
         }
-        merged.prompt_summary()
+        Ok(Some(merged))
     }
 }
 

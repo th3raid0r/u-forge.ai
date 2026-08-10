@@ -48,8 +48,8 @@ pub mod unload;
 
 pub use catalog::{CatalogModel, InstalledBackend, LemonadeServerCatalog, LoadedModel};
 pub use chat::{
-    ChatChoice, ChatCompletionResponse, ChatEvent, ChatMessage, ChatRequest, ChatTerminalReason,
-    ChatUsage, LemonadeChatProvider, StreamToken,
+    AgentBudgetDiagnostics, ChatChoice, ChatCompletionResponse, ChatEvent, ChatMessage,
+    ChatRequest, ChatTerminalReason, ChatUsage, LemonadeChatProvider, StreamToken,
 };
 pub use client::{
     LemonadeConnection, LemonadeHttpClient, LemonadeOwnership, LemonadeSecret,
