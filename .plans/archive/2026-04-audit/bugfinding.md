@@ -190,7 +190,7 @@ can proceed.
 
 ### C4. `paint_entity.update(...)` is called from inside a canvas paint closure
 
-**Where:** `crates/u-forge-ui-gpui/src/text_field.rs:808-810` and `:833-840`.
+**Where:** `crates/u-forge/src/text_field.rs:808-810` and `:833-840`.
 
 **What:** During canvas paint, the closure mutates `TextFieldView` state via
 `paint_entity.update(cx, |this, _cx| { this.shaped_layout = … })` and again
@@ -340,7 +340,7 @@ Alternatively, escalate from `warn!` to `error!` and emit metrics.
 
 ### H4. Detached search task leaks results across rapid re-queries
 
-**Where:** `crates/u-forge-ui-gpui/src/search_panel.rs:236`.
+**Where:** `crates/u-forge/src/search_panel.rs:236`.
 
 **What:** `do_search` does `cx.spawn(...).detach()` with no task handle stored.
 If the user types quickly (e.g. in an autocomplete pattern) two tasks are
@@ -396,7 +396,7 @@ fragment. The `jsonschema` crate handles this in 4 lines.
 
 ### H7. `chat_panel` epoch / cancel-flag interaction has a brief two-poller window
 
-**Where:** `crates/u-forge-ui-gpui/src/app_view/mod.rs:655-701`.
+**Where:** `crates/u-forge/src/app_view/mod.rs:655-701`.
 
 **What:** When the user fires a second embedding plan while the first is still
 in flight, the new plan bumps the epoch *and* installs a fresh cancel flag.
@@ -544,7 +544,7 @@ maintainer's local box.
 
 ### M10. Action-bar / list-state interactions are correct but underdocumented
 
-**Where:** `crates/u-forge-ui-gpui/src/chat_panel.rs:242-258, 271, 286, 343,
+**Where:** `crates/u-forge/src/chat_panel.rs:242-258, 271, 286, 343,
 785, 815, 838`.
 
 **What:** The split between `ListState::reset()` (full structural change) and

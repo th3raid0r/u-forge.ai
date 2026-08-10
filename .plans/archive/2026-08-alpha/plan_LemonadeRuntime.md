@@ -85,7 +85,7 @@ output:
 
    ```text
    u-forge-<version>-ubuntu-x64/
-     u-forge-ui-gpui
+     u-forge
      lemonade/
        lemond
        LICENSE
@@ -95,7 +95,7 @@ output:
          defaults.json
    ```
 
-4. Build `u-forge-ui-gpui` in release mode and have the Ubuntu x64 workflow copy
+4. Build `u-forge` in release mode and have the Ubuntu x64 workflow copy
    Cargo's already verified and patched `target/release/lemonade/` directory.
    Verify executable modes, `lemond --version`, required files, and dynamic
    library resolution.

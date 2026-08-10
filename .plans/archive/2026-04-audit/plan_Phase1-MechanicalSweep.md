@@ -25,8 +25,8 @@ files.
 | M8 | Remove or relocate `[profile.test]` from non-root crate | `crates/cosmic-text-patched/Cargo.toml:186-188` |
 | L1 | Trim stale `EdgeType` deprecated-variant references | `.rulesdir/rust-patterns.mdc:91-97` |
 | L2 | De-duplicate `fts5_sanitize`: keep one in core, re-export, import in agent | `crates/u-forge-core/src/search/sanitize.rs` ↔ `crates/u-forge-agent/src/lib.rs:113-128` |
-| L3 | Apply clippy `sort_by_key` suggestion | `crates/u-forge-ui-gpui/src/node_editor/render.rs:1034`, `node_editor/mod.rs:635`, `node_panel.rs:85,90` |
-| L5 | Skip blink task installation when `read_only == true` | `crates/u-forge-ui-gpui/src/text_field.rs` (search for blink task setup) |
+| L3 | Apply clippy `sort_by_key` suggestion | `crates/u-forge/src/node_editor/render.rs:1034`, `node_editor/mod.rs:635`, `node_panel.rs:85,90` |
+| L5 | Skip blink task installation when `read_only == true` | `crates/u-forge/src/text_field.rs` (search for blink task setup) |
 | L6 | Either derive `CELL_SIZE` from `IDEAL_LENGTH` or document the 2.5× ratio | `crates/u-forge-graph-view/src/layout.rs` |
 | D3 | Cross-check `.rulesdir/rust-patterns.mdc:74-79` for removed-symbol references; trim if stale | `.rulesdir/rust-patterns.mdc:74-79` |
 

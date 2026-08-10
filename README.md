@@ -39,11 +39,14 @@ subscription, or hosted service. Graph exploration, editing, import/export,
 and word search continue to work without any AI server.
 
 Optional AI features run through
-[Lemonade Server](https://github.com/lemonade-sdk/lemonade). On Ubuntu x64,
-u-forge can provision and run its own private Lemonade runtime. Its guided setup
-discovers the available hardware and manages the models needed for search and
-chat. You can also connect to a separately managed server; world data leaves
-the machine only if you explicitly point u-forge at a non-local one.
+[Lemonade Server](https://github.com/lemonade-sdk/lemonade). On x86_64 Linux
+with GNU libc, u-forge can provision and run its own private Lemonade runtime.
+That runtime is distributed upstream as an Ubuntu artifact; Arch Linux and
+CachyOS are the primary development and dogfooding platforms for u-forge. Its
+guided setup discovers the available hardware and manages the models needed for
+search and chat. You can also connect to a separately managed server; world
+data leaves the machine only if you explicitly point u-forge at a non-local
+one.
 
 ## Made for a GM's desk
 
@@ -76,13 +79,18 @@ Then build and launch from the repository root:
 
 ```bash
 make build
-cargo run -p u-forge-ui-gpui
+cargo run -p u-forge
 ```
 
-On Ubuntu x64, the first build downloads and verifies the pinned Embeddable
-Lemonade runtime. The app starts that private runtime automatically and opens
-Lemonade AI Setup when required components are missing. Models and backend
-executables are downloaded only when selected in that setup flow.
+On x86_64 Linux with GNU libc, the first build downloads and verifies the
+pinned upstream Ubuntu x64 Embeddable Lemonade runtime. The app starts that
+private runtime automatically and opens Lemonade AI Setup when required
+components are missing. Models and backend executables are downloaded only
+when selected in that setup flow.
+
+For a reproducible optimized build of the distributable application and its
+required embedded runtime, run `make release`. The executable is written to
+`target/release/u-forge` and the runtime to `target/release/lemonade`.
 
 To build without the embedded runtime, set
 `UFORGE_SKIP_EMBEDDED_LEMONADE=1`. On other platforms, or when using an

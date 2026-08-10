@@ -11,7 +11,7 @@ These are active failure modes observed in this codebase. Violating them produce
 
 ### 1. Env vars are overrides, not requirements
 
-`cargo run -p u-forge-ui-gpui` must work with **zero environment variables set**, degrading gracefully when no Lemonade Server is present. `LEMONADE_URL` exists only to override a non-standard location or port.
+`cargo run -p u-forge` must work with **zero environment variables set**, degrading gracefully when no Lemonade Server is present. `LEMONADE_URL` exists only to override a non-standard location or port.
 
 - Always honor `LEMONADE_URL` first, then try the sensible loopback defaults.
   `lemonade::resolve_lemonade_url()` implements this — follow it, never bypass
@@ -112,7 +112,7 @@ Every test gets its own `TempDir`. Mock providers for unit tests; `lemonade_url(
 ### Data files (`defaults/data/*.jsonl`) or the import pipeline
 → **`.rulesdir/json-data-formats.mdc`**
 
-### UI work (`crates/u-forge-ui-gpui/`, `crates/u-forge-graph-view/`, `crates/u-forge-ui-traits/`)
+### UI work (`crates/u-forge/`, `crates/u-forge-graph-view/`, `crates/u-forge-ui-traits/`)
 → **`.rulesdir/project-structure.mdc`** (integration points, cross-cutting constraints)
 → **`.rulesdir/gpui-patterns.mdc`** (caching, panel patterns, canvas coords, TextFieldView)
 

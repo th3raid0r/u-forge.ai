@@ -8,8 +8,9 @@ description: Development workflow and setup guide
 
 ```bash
 make build                                                     # Build all crates
+make release                                                   # Build the distributable app and embedded runtime
 make test                                                      # Run all tests with one pinned embedded server
-cargo run -p u-forge-ui-gpui                                   # Run the desktop app
+cargo run -p u-forge                                           # Run the desktop app
 ```
 
 Bundled SQLite compiles with a standard C compiler on `PATH`. Environment
@@ -22,17 +23,17 @@ variables are optional overrides; see
 
 1. Install Rust stable ([rustup.rs](https://rustup.rs)), a C compiler (`gcc`,
    `clang`, or MSVC), and the platform GPUI libraries listed in `README.md`.
-2. `make build` — the first Ubuntu x64 build also downloads the pinned
-   Embeddable Lemonade artifact. Set `UFORGE_SKIP_EMBEDDED_LEMONADE=1` to skip
-   automatic provisioning; without an existing artifact the app stays
-   graph-only.
+2. `make build` — the first x86_64 Linux GNU build also downloads the pinned
+   upstream Ubuntu x64 Embeddable Lemonade artifact. Set
+   `UFORGE_SKIP_EMBEDDED_LEMONADE=1` to skip automatic provisioning; without an
+   existing artifact the app stays graph-only.
 3. Optionally install a standalone
    [Lemonade Server](https://github.com/lemonade-sdk/lemonade) when developing
    against an externally managed service.
 4. `make test` — provisions and owns one checksum-pinned embedded server for
    the complete suite, then tears down its process tree. No external server or
    environment configuration is required.
-5. `cargo run -p u-forge-ui-gpui` — launch the desktop app.
+5. `cargo run -p u-forge` — launch the desktop app.
 
 ---
 

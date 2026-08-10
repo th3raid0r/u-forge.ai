@@ -1,4 +1,4 @@
-name: Draft Ubuntu x64 release
+name: Draft Linux x64 release
 
 on:
   workflow_dispatch:
@@ -37,20 +37,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build u-forge
-        env:
-          UFORGE_REQUIRE_EMBEDDED_LEMONADE: "1"
-        run: cargo build --locked --release -p u-forge-ui-gpui
+        run: make release V=1
 
       - name: Assemble stable bundle layout
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          bundle="u-forge-${RELEASE_TAG}-ubuntu-x64"
+          bundle="u-forge-${RELEASE_TAG}-linux-x64"
           mkdir -p "$bundle"
-          install -m 0755 target/release/u-forge-ui-gpui "$bundle/u-forge-ui-gpui"
+          install -m 0755 target/release/u-forge "$bundle/u-forge"
           cp -a target/release/lemonade "$bundle/lemonade"
-          test -x "$bundle/u-forge-ui-gpui"
+          test -x "$bundle/u-forge"
           test -x "$bundle/lemonade/lemond"
           "$bundle/lemonade/lemond" --version
           if ldd "$bundle/lemonade/lemond" | grep -q 'not found'; then
@@ -66,7 +64,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
-          bundle="u-forge-${RELEASE_TAG}-ubuntu-x64.tar.gz"
+          bundle="u-forge-${RELEASE_TAG}-linux-x64.tar.gz"
           gh release create "$RELEASE_TAG" \
             --draft \
             --target "$SOURCE_REF" \

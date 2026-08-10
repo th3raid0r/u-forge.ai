@@ -5,12 +5,12 @@ use gpui::{
 };
 #[cfg(target_os = "linux")]
 use gpui::{WindowBackgroundAppearance, WindowDecorations};
-use u_forge_core::AppConfig;
-use u_forge_ui_gpui::{
+use u_forge::{
     ActionContext, AppView, Assets, UiTheme, action_key_bindings, native_menus,
     startup::{StartupTimeline, prepare_app},
     window_chrome::{APPLICATION_ID, APPLICATION_NAME},
 };
+use u_forge_core::AppConfig;
 
 fn main() {
     let startup = StartupTimeline::from_env();

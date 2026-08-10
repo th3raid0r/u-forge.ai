@@ -23,7 +23,7 @@ export UFORGE_LEMOND_PATH="/path/to/lemonade/lemond" # Owned-development binary 
 
 ### Why env vars are overrides, not requirements
 
-`cargo run -p u-forge-ui-gpui` must work with zero env vars set. An unset env
+`cargo run -p u-forge` must work with zero env vars set. An unset env
 var must never be a hard error for core functionality.
 `lemonade::resolve_lemonade_url()` encodes this — never `env::var(...).unwrap()`
 at the top level.
@@ -71,12 +71,13 @@ The desktop app uses the persistent path from `[storage].db_path`.
 ## Lemonade Server
 
 Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
-TTS) via an OpenAI-compatible HTTP API. On Ubuntu x64, building the desktop UI
-downloads the checksum-pinned Embeddable Lemonade release into `target/` and
-places its runtime beside the application executable. The build adds the
-`reasoning` catalog label to built-in Gemma 4 GGUF models before installation.
-If provisioning is skipped or unavailable, AI features degrade gracefully and
-the knowledge graph remains usable.
+TTS) via an OpenAI-compatible HTTP API. On x86_64 Linux with GNU libc, building
+the desktop UI downloads the checksum-pinned upstream Ubuntu x64 Embeddable
+Lemonade release into `target/` and places its runtime beside the application
+executable. Arch Linux and CachyOS are the primary development and dogfooding
+platforms. The build adds the `reasoning` catalog label to built-in Gemma 4 GGUF
+models before installation. If provisioning is skipped or unavailable, AI
+features degrade gracefully and the knowledge graph remains usable.
 
 ### Setup
 

@@ -1,15 +1,15 @@
 [package]
-name = "u-forge-ui-gpui"
+name = "u-forge"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
 [lib]
-name = "u_forge_ui_gpui"
+name = "u_forge"
 path = "src/lib.rs"
 
 [[bin]]
-name = "u-forge-ui-gpui"
+name = "u-forge"
 path = "src/main.rs"
 
 [dependencies]

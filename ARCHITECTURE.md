@@ -11,7 +11,7 @@ High-level architecture, data model, storage schema, inference design, and desig
 | `u-forge-core` | lib | Complete | Storage, AI traits, Lemonade integration, queue, search, schema, ingest |
 | `u-forge-graph-view` | lib | Complete | Graph view model + force-directed layout + R-tree spatial index |
 | `u-forge-ui-traits` | lib | Complete | Framework-agnostic rendering contracts (`DrawCommands`, `Viewport`, `generate_draw_commands`) |
-| `u-forge-ui-gpui` | lib + bin | Alpha | GPUI native desktop app — DM workspace, World Canvas, Details editing, search, chat, and managed setup |
+| `u-forge` | lib + bin | Alpha | Authoritative application package; currently the GPUI native desktop app — DM workspace, World Canvas, Details editing, search, chat, and managed setup |
 | `u-forge-agent` | lib | Complete | Rig-based LLM agent with five graph tools and streaming event loop |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox — not started |
 
@@ -350,7 +350,7 @@ instrumented with `info_span!("embedding_plan", plan_kind)`.
 
 ---
 
-## Desktop Workspace (`u-forge-ui-gpui`)
+## Desktop Workspace (`u-forge`)
 
 `AppView` composes a permanent World Canvas with four behavioral dock panels:
 World and Search on the left, Assistant on the right, and Details at the
@@ -371,7 +371,7 @@ the force-directed layout, culling, local-coordinate paint path, spatial index,
 selection, saved node positions, and Fit Connections behavior behind a center
 item boundary that does not encode Connections as the only valid item type.
 
-## Chat UI Component Model (`u-forge-ui-gpui`)
+## Chat UI Component Model (`u-forge`)
 
 ### Component hierarchy
 
@@ -557,7 +557,7 @@ Standard Rust stable toolchain + a C compiler (`gcc`, `clang`, or MSVC) for
 bundled SQLite compilation. No system SQLite, ONNX Runtime, or RocksDB is
 required.
 
-`cargo run -p u-forge-ui-gpui` works with zero environment variables set. On Ubuntu x64, the UI crate's build step downloads the checksum-pinned Embeddable Lemonade artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, and places `lemonade/lemond` beside the application executable. With no `LEMONADE_URL`, the application launches that private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
+`cargo run -p u-forge` works with zero environment variables set. On x86_64 Linux with GNU libc, the application package's build step downloads the checksum-pinned upstream Ubuntu x64 Embeddable Lemonade artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, and places `lemonade/lemond` beside the application executable. Arch Linux and CachyOS are the primary development and dogfooding platforms. With no `LEMONADE_URL`, the application launches that private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
 
 Mutable embedded state follows the XDG cache contract at
 `${XDG_CACHE_HOME:-~/.cache}/u-forge/lemonade`. Models, backend executables,

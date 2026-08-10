@@ -11,12 +11,12 @@ case "$scenario" in
 esac
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
-binary="$repo_root/target/release/u-forge-ui-gpui"
+binary="$repo_root/target/release/u-forge"
 report_dir="$repo_root/target/startup-profiles"
 mkdir -p "$report_dir"
 report="$report_dir/$scenario-$(date -u +%Y%m%dT%H%M%SZ).jsonl"
 
-cargo build --release -p u-forge-ui-gpui --manifest-path "$repo_root/Cargo.toml"
+cargo build --release -p u-forge --manifest-path "$repo_root/Cargo.toml"
 
 export UFORGE_STARTUP_PROFILE="$scenario"
 export UFORGE_STARTUP_PROFILE_OUTPUT="$report"

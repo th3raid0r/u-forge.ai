@@ -19,7 +19,7 @@ a small UI feature on its own but pairs naturally because both are about
 | ID | What | Where |
 |----|------|-------|
 | F7 | Submitted jobs cannot be cancelled | `crates/u-forge-core/src/queue/` (workers, dispatch); chat already has stream cancellation but embed/transcribe/rerank do not |
-| F9 | Window focus/blur not handled — modals/dropdowns persist on Alt+Tab | `crates/u-forge-ui-gpui/src/app_view/` (`render` is the natural hook) |
+| F9 | Window focus/blur not handled — modals/dropdowns persist on Alt+Tab | `crates/u-forge/src/app_view/` (`render` is the natural hook) |
 
 ---
 

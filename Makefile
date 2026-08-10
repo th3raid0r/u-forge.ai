@@ -62,11 +62,13 @@ fi
 endef
 endif
 
-.PHONY: help build check test test-ci _test-with-embedded-lemonade fmt fmt-check clippy startup-profile-fresh startup-profile-configured
+.PHONY: help build release clean check test test-ci _test-with-embedded-lemonade fmt fmt-check clippy startup-profile-fresh startup-profile-configured
 
 help:
 	@printf '%s\n' 'u-forge.ai development targets'
 	@printf '%s\n' '  make build      Build the workspace'
+	@printf '%s\n' '  make release    Build the distributable u-forge binary and embedded runtime'
+	@printf '%s\n' '  make clean      Remove workspace and vendored crate build outputs'
 	@printf '%s\n' '  make check      Check required targets and run workspace clippy'
 	@printf '%s\n' '  make test       Test serially with one pinned embedded Lemonade server'
 	@printf '%s\n' '  make test-ci    Test serially without provisioning or Lemonade tests'
@@ -79,6 +81,13 @@ help:
 
 build:
 	$(call run_silent,workspace build,$(CARGO) build --workspace)
+
+release:
+	$(call run_silent,u-forge release build,env -u UFORGE_SKIP_EMBEDDED_LEMONADE -u UFORGE_LEMOND_PATH UFORGE_REQUIRE_EMBEDDED_LEMONADE=1 $(CARGO) build --locked --release -p u-forge)
+
+clean:
+	$(call run_silent,workspace clean,$(CARGO) clean)
+	$(call run_silent,cosmic-text clean,$(CARGO) clean --manifest-path $(COSMIC_TEXT_MANIFEST))
 
 check:
 	$(call run_silent,u-forge-core check,$(CARGO) check -p u-forge-core)
