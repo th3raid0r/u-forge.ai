@@ -21,23 +21,29 @@ CI_OFFLINE_ENV := env \
 
 ifeq ($(V),1)
 define run_silent
-$(1)
+@printf '%s\n' '$(1): starting'
+$(2)
+@printf '%s\n' '$(1): succeeded'
 endef
 define run_tests
+@printf '%s\n' '$(1): starting'
 $(2)
+@printf '%s\n' '$(1): succeeded'
 endef
 else
 define run_silent
+@printf '%s\n' '$(1): starting'
 @log_file="$$(mktemp)"; \
 trap 'rm -f "$$log_file"' EXIT; \
-if $(1) >"$$log_file" 2>&1; then \
-	:; \
+if $(2) >"$$log_file" 2>&1; then \
+	printf '%s\n' '$(1): succeeded'; \
 else \
 	cat "$$log_file" >&2; \
 	exit 1; \
 fi
 endef
 define run_tests
+@printf '%s\n' '$(1): starting'
 @log_file="$$(mktemp)"; \
 trap 'rm -f "$$log_file"' EXIT; \
 if $(2) >"$$log_file" 2>&1; then \
@@ -48,6 +54,7 @@ if $(2) >"$$log_file" 2>&1; then \
 		printf "$(1): %d passed; %d failed; %d ignored; %d measured; %d filtered out across %d suites\n", \
 			passed, failed, ignored, measured, filtered, suites \
 	}' "$$log_file"; \
+	printf '%s\n' '$(1): succeeded'; \
 else \
 	cat "$$log_file" >&2; \
 	exit 1; \
@@ -71,17 +78,17 @@ help:
 	@printf '%s\n' '  make startup-profile-configured  Profile configured metadata readiness'
 
 build:
-	$(call run_silent,$(CARGO) build --workspace)
+	$(call run_silent,workspace build,$(CARGO) build --workspace)
 
 check:
-	$(call run_silent,$(CARGO) check -p u-forge-core)
-	$(call run_silent,$(CARGO) check -p u-forge-core --example convert_memorymesh)
-	$(call run_silent,$(CARGO) check -p u-forge-graph-view --benches)
-	$(call run_silent,$(CARGO) clippy $(CARGO_CLIPPY_FLAGS))
+	$(call run_silent,u-forge-core check,$(CARGO) check -p u-forge-core)
+	$(call run_silent,convert_memorymesh example check,$(CARGO) check -p u-forge-core --example convert_memorymesh)
+	$(call run_silent,u-forge-graph-view benchmark check,$(CARGO) check -p u-forge-graph-view --benches)
+	$(call run_silent,workspace clippy check,$(CARGO) clippy $(CARGO_CLIPPY_FLAGS))
 
 test:
-	$(call run_silent,env -u UFORGE_SKIP_EMBEDDED_LEMONADE -u UFORGE_LEMOND_PATH UFORGE_REQUIRE_EMBEDDED_LEMONADE=1 $(CARGO) test --workspace --no-run)
-	$(call run_silent,$(CARGO) test --manifest-path $(COSMIC_TEXT_MANIFEST) --no-run)
+	$(call run_silent,workspace test build,env -u UFORGE_SKIP_EMBEDDED_LEMONADE -u UFORGE_LEMOND_PATH UFORGE_REQUIRE_EMBEDDED_LEMONADE=1 $(CARGO) test --workspace --no-run)
+	$(call run_silent,cosmic-text test build,$(CARGO) test --manifest-path $(COSMIC_TEXT_MANIFEST) --no-run)
 	@env -u UFORGE_LEMOND_PATH $(CARGO) run --quiet -p u-forge-core --example with_embedded_lemonade -- $(MAKE) --no-print-directory _test-with-embedded-lemonade
 
 test-ci:
@@ -94,15 +101,15 @@ _test-with-embedded-lemonade:
 	$(call run_tests,cosmic-text,$(CARGO) test --manifest-path $(COSMIC_TEXT_MANIFEST) -- --test-threads=$(TEST_THREADS))
 
 fmt:
-	$(call run_silent,$(CARGO) fmt --all)
-	$(call run_silent,$(CARGO) fmt --manifest-path $(COSMIC_TEXT_MANIFEST) --all)
+	$(call run_silent,workspace format,$(CARGO) fmt --all)
+	$(call run_silent,cosmic-text format,$(CARGO) fmt --manifest-path $(COSMIC_TEXT_MANIFEST) --all)
 
 fmt-check:
-	$(call run_silent,$(CARGO) fmt --all -- --check)
-	$(call run_silent,$(CARGO) fmt --manifest-path $(COSMIC_TEXT_MANIFEST) --all -- --check)
+	$(call run_silent,workspace format check,$(CARGO) fmt --all -- --check)
+	$(call run_silent,cosmic-text format check,$(CARGO) fmt --manifest-path $(COSMIC_TEXT_MANIFEST) --all -- --check)
 
 clippy:
-	$(call run_silent,$(CARGO) clippy $(CARGO_CLIPPY_FLAGS) -- -D warnings)
+	$(call run_silent,workspace clippy,$(CARGO) clippy $(CARGO_CLIPPY_FLAGS) -- -D warnings)
 
 startup-profile-fresh:
 	bash ./scripts/profile-startup.sh fresh
