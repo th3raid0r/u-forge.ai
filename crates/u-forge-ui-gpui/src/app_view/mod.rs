@@ -972,7 +972,9 @@ impl AppView {
             if let Some(cancellation) = this.import_cancellation.take() {
                 cancellation.cancel();
             }
-            this.import_task.take();
+            if let Some(task) = this.import_task.take() {
+                task.detach();
+            }
             if let Some(embedded) = this.state.embedded_lemonade.clone() {
                 this.state.tokio_rt.block_on(embedded.shutdown());
             }
@@ -1370,7 +1372,11 @@ impl AppView {
         if let Some(previous) = self.import_cancellation.take() {
             previous.supersede();
         }
-        self.import_task.take();
+        if let Some(previous) = self.import_task.take() {
+            // Observe token-driven termination without allowing the old import
+            // to update this generation's UI state.
+            previous.detach();
+        }
         self.import_generation = self.import_generation.wrapping_add(1);
         let generation = self.import_generation;
         let cancellation = CancellationToken::new();

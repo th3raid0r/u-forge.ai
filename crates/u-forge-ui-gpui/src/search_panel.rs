@@ -272,7 +272,11 @@ impl SearchPanel {
         if let Some(previous) = self.search_cancellation.take() {
             previous.supersede();
         }
-        self.search_task.take();
+        if let Some(previous) = self.search_task.take() {
+            // Keep observing the cancelled operation until its backend closes;
+            // the generation guard below rejects any stale UI update.
+            previous.detach();
+        }
         let cancellation = CancellationToken::new();
         self.search_cancellation = Some(cancellation.clone());
         cx.notify();
@@ -397,7 +401,9 @@ impl Drop for SearchPanel {
         if let Some(cancellation) = self.search_cancellation.take() {
             cancellation.cancel();
         }
-        self.search_task.take();
+        if let Some(task) = self.search_task.take() {
+            task.detach();
+        }
     }
 }
 
