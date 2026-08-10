@@ -19,6 +19,7 @@ use crate::{HistoryMessage, tool_validation};
 
 const TOKENS_PER_MESSAGE: usize = 4;
 const REPLY_PRIMING_TOKENS: usize = 3;
+const REQUEST_ENVELOPE_TOKENS: usize = 32;
 const MIN_TOOL_RESULT_TOKENS: usize = 16;
 const MAX_RECENT_TOOL_RESULTS: usize = 4;
 
@@ -302,7 +303,8 @@ pub(crate) fn select_history_window(
         .saturating_add(count_tokens(&current_message))
         .saturating_add(tool_definition_tokens)
         .saturating_add(TOKENS_PER_MESSAGE * 2)
-        .saturating_add(REPLY_PRIMING_TOKENS);
+        .saturating_add(REPLY_PRIMING_TOKENS)
+        .saturating_add(REQUEST_ENVELOPE_TOKENS);
     let available = context_tokens
         .saturating_sub(response_reserve_tokens)
         .saturating_sub(fixed);
@@ -575,7 +577,10 @@ fn bounded_tool_output(tool_name: &str, text: &str, budget: usize) -> Option<Str
         return Some(text.to_string());
     }
 
-    let records = text.split("\n\n").collect::<Vec<_>>();
+    let records = text
+        .split("\n\n")
+        .filter(|record| !record.trim().is_empty())
+        .collect::<Vec<_>>();
     if tool_name.starts_with("search_") && records.len() > 1 {
         let result_count = records.len() - 1;
         let mut kept = Vec::new();
@@ -656,7 +661,8 @@ impl AgentHook for BudgetController {
         }
         request_tokens = request_tokens
             .saturating_add(TOKENS_PER_MESSAGE)
-            .saturating_add(REPLY_PRIMING_TOKENS);
+            .saturating_add(REPLY_PRIMING_TOKENS)
+            .saturating_add(REQUEST_ENVELOPE_TOKENS);
 
         let mut state = self.lock();
         state.diagnostics.estimation_fallback |= fallback;
@@ -785,16 +791,11 @@ impl AgentHook for BudgetController {
             serde_json::to_string(event.content).unwrap_or_else(|_| format!("{:?}", event.content));
         let estimate = estimate_tokens(&rendered);
         let mut state = self.lock();
-        let reported = event.usage.output_tokens.min(usize::MAX as u64) as usize;
         state.diagnostics.assistant_output_tokens = state
             .diagnostics
             .assistant_output_tokens
-            .saturating_add(if reported > 0 {
-                reported
-            } else {
-                estimate.tokens
-            });
-        state.diagnostics.estimation_fallback |= reported == 0 && estimate.used_fallback;
+            .saturating_add(estimate.tokens);
+        state.diagnostics.estimation_fallback |= estimate.used_fallback;
         ObservationAction::continue_run()
     }
 
@@ -868,7 +869,27 @@ mod tests {
         assert!(first.estimated_tokens <= budget);
         assert!(first.text.contains("`location`"));
         assert!(first.text.contains("omitted"));
-        assert!(!first.text.contains("多字\n"));
+        assert!(
+            !first.text.contains("`魔法`") || first.text.contains("- object `魔法`: 多字节描述\n")
+        );
+    }
+
+    #[test]
+    fn schema_priority_orders_request_history_then_tool_results() {
+        let summary = bounded_schema_summary(
+            &schema(),
+            SchemaPriorityContext {
+                current_request: "location",
+                retained_history: "",
+                recent_tool_results: "character",
+            },
+            usize::MAX,
+        );
+        let location = summary.text.find("`location`").unwrap();
+        let character = summary.text.find("`character`").unwrap();
+        let remaining = summary.text.find("`located_in`").unwrap();
+        assert!(location < character);
+        assert!(character < remaining);
     }
 
     #[test]
@@ -1041,7 +1062,8 @@ mod tests {
                 })
                 .sum::<usize>()
             + TOKENS_PER_MESSAGE * 2
-            + REPLY_PRIMING_TOKENS;
+            + REPLY_PRIMING_TOKENS
+            + REQUEST_ENVELOPE_TOKENS;
         assert!(estimated + reserve <= context);
         assert!(selected.len() < history.len());
     }

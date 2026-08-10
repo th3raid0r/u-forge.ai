@@ -768,10 +768,7 @@ impl KnowledgeGraph {
     /// The agent consumes this structured form so bounded summaries select
     /// whole object and edge records instead of slicing serialized text.
     pub fn merged_schema_definition(&self) -> Result<Option<crate::schema::SchemaDefinition>> {
-        let names = match self.storage.list_schemas() {
-            Ok(n) => n,
-            Err(error) => return Err(error),
-        };
+        let names = self.storage.list_schemas()?;
         if names.is_empty() {
             return Ok(None);
         }

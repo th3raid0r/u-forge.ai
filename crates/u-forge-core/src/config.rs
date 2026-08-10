@@ -368,8 +368,10 @@ impl AgentBudgetConfig {
         if context < 2 || response_reserve >= context {
             anyhow::bail!("effective context leaves no agent prompt allocation");
         }
-        if self.schema_summary_tokens == 0 {
-            anyhow::bail!("chat.agent.schema_summary_tokens must be greater than zero");
+        if self.schema_summary_tokens < 32 {
+            anyhow::bail!(
+                "chat.agent.schema_summary_tokens must be at least 32 so omission guidance fits"
+            );
         }
         if self.cumulative_request_tokens == 0 {
             anyhow::bail!("chat.agent.cumulative_request_tokens must be greater than zero");
@@ -1125,7 +1127,7 @@ mod tests {
         assert_eq!(effective.diagnostics.len(), 3);
 
         let invalid = AgentBudgetConfig {
-            schema_summary_tokens: 0,
+            schema_summary_tokens: 31,
             ..AgentBudgetConfig::default()
         };
         assert!(invalid.reconcile(4_096, 1_024, 5).is_err());

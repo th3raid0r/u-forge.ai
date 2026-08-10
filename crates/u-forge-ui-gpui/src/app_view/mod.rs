@@ -406,42 +406,41 @@ async fn activate_lemonade_capabilities(
                 )
                 .map_err(|error| tracing::warn!(%error, "chat context is unusable"))
                 .ok();
-            let agent_budget = effective_limits
+            let context = effective_limits
                 .as_ref()
-                .and_then(|limits| {
+                .map_or(app_config.chat.max_context_tokens, |limits| limits.context)
+                .max(2);
+            let reserve = effective_limits.as_ref().map_or_else(
+                || {
                     app_config
                         .chat
-                        .agent
-                        .reconcile(
-                            limits.context,
-                            limits.response_reserve,
-                            app_config.chat.max_tool_turns,
-                        )
-                        .map_err(|error| {
-                            tracing::warn!(%error, "agent budget configuration is unusable");
-                            error
-                        })
-                        .ok()
-                })
-                .unwrap_or_else(|| {
-                    let context = effective_limits
-                        .as_ref()
-                        .map_or(app_config.chat.max_context_tokens, |limits| limits.context);
-                    let reserve = effective_limits.as_ref().map_or_else(
-                        || {
-                            app_config
-                                .chat
-                                .response_reserve
-                                .min(context.saturating_sub(1))
-                        },
-                        |limits| limits.response_reserve,
-                    );
-                    u_forge_core::AgentBudgetConfig::default()
-                        .reconcile(context.max(2), reserve, app_config.chat.max_tool_turns)
-                        .expect("safe fallback agent budget reconciles")
-                });
+                        .response_reserve
+                        .min(context.saturating_sub(1))
+                },
+                |limits| limits.response_reserve,
+            );
+            let (agent_budget, invalid_agent_budget) = match app_config.chat.agent.reconcile(
+                context,
+                reserve,
+                app_config.chat.max_tool_turns,
+            ) {
+                Ok(budget) => (budget, None),
+                Err(error) => {
+                    tracing::warn!(%error, "agent budget configuration is unusable");
+                    let fallback = u_forge_core::AgentBudgetConfig::default()
+                        .reconcile(context, reserve, app_config.chat.max_tool_turns)
+                        .expect("safe fallback agent budget reconciles");
+                    (
+                        fallback,
+                        Some(format!(
+                            "invalid agent budget configuration ({error}); safe defaults applied"
+                        )),
+                    )
+                }
+            };
             if let Some(limits) = &mut effective_limits {
                 limits.diagnostics.extend(agent_budget.diagnostics.clone());
+                limits.diagnostics.extend(invalid_agent_budget);
             }
             if index == preferred_idx
                 && let (Some(limits), Some(diagnostic)) =

@@ -1145,47 +1145,42 @@ impl GraphAgent {
    Do not re-call a tool for the same node unless asked."
             .to_string();
 
+        let definition = |name: &str, description: String, parameters: serde_json::Value| {
+            serde_json::to_string(&serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            }))
+        };
         let tool_definitions = vec![
-            format!(
-                "{}\n{}\n{}",
+            definition(
                 FtsSearchTool::NAME,
                 FtsSearchTool::new(graph.clone()).description(),
-                serde_json::to_string(&FtsSearchTool::new(graph.clone()).parameters())?
-            ),
-            format!(
-                "{}\n{}\n{}",
+                FtsSearchTool::new(graph.clone()).parameters(),
+            )?,
+            definition(
                 SemanticSearchTool::NAME,
                 SemanticSearchTool::new(graph.clone(), queue.clone()).description(),
-                serde_json::to_string(
-                    &SemanticSearchTool::new(graph.clone(), queue.clone()).parameters()
-                )?
-            ),
-            format!(
-                "{}\n{}\n{}",
+                SemanticSearchTool::new(graph.clone(), queue.clone()).parameters(),
+            )?,
+            definition(
                 HybridSearchTool::NAME,
                 HybridSearchTool::new(graph.clone(), queue.clone()).description(),
-                serde_json::to_string(
-                    &HybridSearchTool::new(graph.clone(), queue.clone()).parameters()
-                )?
-            ),
-            format!(
-                "{}\n{}\n{}",
+                HybridSearchTool::new(graph.clone(), queue.clone()).parameters(),
+            )?,
+            definition(
                 UpsertNodeTool::NAME,
                 UpsertNodeTool::new(graph.clone(), queue.clone(), hq_queue.clone()).description(),
-                serde_json::to_string(
-                    &UpsertNodeTool::new(graph.clone(), queue.clone(), hq_queue.clone())
-                        .parameters()
-                )?
-            ),
-            format!(
-                "{}\n{}\n{}",
+                UpsertNodeTool::new(graph.clone(), queue.clone(), hq_queue.clone()).parameters(),
+            )?,
+            definition(
                 UpsertEdgeTool::NAME,
                 UpsertEdgeTool::new(graph.clone(), queue.clone(), hq_queue.clone()).description(),
-                serde_json::to_string(
-                    &UpsertEdgeTool::new(graph.clone(), queue.clone(), hq_queue.clone())
-                        .parameters()
-                )?
-            ),
+                UpsertEdgeTool::new(graph.clone(), queue.clone(), hq_queue.clone()).parameters(),
+            )?,
         ];
 
         Ok(Self {
