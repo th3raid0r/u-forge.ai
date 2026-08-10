@@ -12,8 +12,7 @@ use u_forge_graph_view::GraphSnapshot;
 ///
 /// All fields here are free of GPUI types — no `Entity`, no `Context`, no
 /// `Subscription`. That boundary makes this struct testable in isolation and
-/// gives future frontends (web, embedded TS sandbox) a seam to reuse without
-/// pulling in the GPUI render layer.
+/// keeps non-render state testable without pulling in the GPUI render layer.
 pub(crate) struct AppState {
     pub(crate) graph: Arc<KnowledgeGraph>,
     pub(crate) snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -55,8 +54,8 @@ pub(crate) struct EmbeddingPlanAuthority {
 }
 
 impl EmbeddingPlanAuthority {
-    /// Start a plan, returning its generation and whether older work remains
-    /// active in the queue.
+    /// Start a plan, returning its generation and whether older work was
+    /// superseded through its parent cancellation token.
     pub(crate) fn start(&mut self) -> (u64, bool, CancellationToken) {
         let superseded = self.active;
         if let Some(previous) = self.cancellation.take() {

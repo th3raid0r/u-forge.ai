@@ -103,10 +103,10 @@ The app opens with an empty local database:
 ## For developers
 
 [ARCHITECTURE.md](ARCHITECTURE.md) covers the crate layout, SQLite and vector
-storage, inference pipeline, schema boundaries, and UI architecture. Current
-implementation briefs and their status live in
-[the active plan ledger](.plans/README.md); archived plans are historical audit
-material.
+storage, inference pipeline, schema boundaries, and UI architecture. Open
+product work and completed implementation briefs are indexed by
+[the plan ledger](.plans/README.md); archived plans are historical audit
+material rather than current instructions.
 
 ```bash
 make fmt-check

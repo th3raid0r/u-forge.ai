@@ -1,10 +1,13 @@
 # Approved Plan: Lemonade Runtime and Embedded Distribution
 
+> Archived detailed plan. Source and current descriptive documentation are
+> authoritative where implementation details differ from this specification.
+
 ## Status and upstream basis
 
 Approved on 2026-08-04 and updated with the verified Cargo bootstrap on
 2026-08-05. This is the decision-complete implementation plan for
-the active checklist in `feature_LemonadeRuntime.md`. Source remains
+the completed companion checklist in `feature_LemonadeRuntime.md`. Source remains
 authoritative where the repository has already implemented part of the older
 runtime plan.
 
@@ -15,7 +18,7 @@ capacity and context metadata, runtime management, and request-scoped thinking
 normalization. The old assumption that every reasoning-mode change must reload
 the model is therefore no longer unconditional. Request controls are the
 default, while the known llama.cpp load-time workaround remains available by
-configuration until it has been validated across the models u-forge supports.
+configuration. Source and current runtime tests define the supported behavior.
 
 Primary upstream sources:
 

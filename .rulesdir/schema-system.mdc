@@ -1,117 +1,109 @@
 ---
-description: Schema system usage and patterns
+description: Schema system usage and invariants
 ---
 
 # Schema System
 
-The schema system is one of u-forge.ai's strengths and is **retained through all migration phases**.
+Schemas are authoritative contracts, not hints inferred from data. The graph
+facade, import pipeline, editor, and agent tools all preserve the loaded object
+types, property definitions, required fields, edge types, and allowed endpoint
+pairs.
 
-## Architecture
+## Implementation boundaries
 
-Three files implement the schema system:
-- [src/schema/definition.rs](mdc:src/schema/definition.rs) — Type definitions (`SchemaDefinition`, `ObjectTypeSchema`, `PropertySchema`, `EdgeTypeSchema`, validation types)
-- [src/schema/manager.rs](mdc:src/schema/manager.rs) — Runtime load/validate/cache via `DashMap`, persists to storage
-- [src/schema/ingestion.rs](mdc:src/schema/ingestion.rs) — Reads `.schema.json` files from disk, strips `add_` prefix, adds 24 common TTRPG edge types
+- `crates/u-forge-core/src/schema/definition.rs` owns
+  `SchemaDefinition`, object/property/edge schemas, and validation types.
+- `crates/u-forge-core/src/schema/manager.rs` persists schemas and caches them
+  in a `parking_lot::RwLock<HashMap<...>>`.
+- `crates/u-forge-core/src/schema/ingestion.rs` reads `.schema.json` files,
+  strips the external `add_` action prefix, and derives edge schemas from
+  properties that declare `relationship` metadata.
+- `KnowledgeGraph::merged_schema_definition()` is the structured union used by
+  the agent. Request-bounded prompt selection happens in
+  `u-forge-agent::budget`, not in `SchemaManager`.
 
-## Schema File Format
+`SchemaManager::save_schema` is synchronous. Some higher-level validation and
+registration methods remain async because they load persisted schema state;
+do not make callers await the synchronous save path.
 
-Files live in `defaults/schemas/` (or `$UFORGE_SCHEMA_DIR`). Named `{type}.schema.json`:
+## Schema file contract
+
+Files in `defaults/schemas/` use the MCP-shaped external name and per-property
+required flag:
 
 ```json
 {
   "name": "add_npc",
-  "description": "Add a new NPC to the knowledge graph",
+  "description": "Add an NPC",
   "properties": {
-    "name": {
-      "type": "string",
-      "description": "NPC name",
-      "required": true,
-      "validation": { "min_length": 1, "max_length": 100 }
-    },
+    "name": { "type": "string", "required": true },
     "role": {
       "type": "string",
-      "description": "NPC's role",
       "required": true,
-      "validation": { "allowed_values": ["merchant", "guard", "noble", "commoner"] }
-    },
-    "level": {
-      "type": "number",
-      "description": "NPC level",
-      "validation": { "min_value": 1, "max_value": 20 }
+      "validation": { "allowed_values": ["merchant", "guard"] }
     },
     "currentLocation": {
       "type": "string",
-      "description": "Current location",
       "relationship": {
         "edgeType": "located_in",
-        "targetType": "location",
-        "description": "Where the NPC currently is"
+        "targetType": "location"
       }
     }
   }
 }
 ```
 
-**Note:** Schema files use `add_` prefix in the `name` field (MCP tool naming convention). `SchemaIngestion` strips this prefix automatically — internal type name becomes `npc`.
+The internal object type is `npc`. Relationship metadata makes the owning
+object type an allowed source and `targetType` an allowed target; no unrelated
+“common edge” registry is added implicitly.
 
-## Property Types
+Supported property kinds are `string`, `text`, `number`, `boolean`, `array`,
+`object`, `reference`, and `enum`. Validation rules include length/range,
+regex, and allowed-value constraints.
 
-| Type | Description | Validation |
-|---|---|---|
-| `string` | Short text | `min_length`, `max_length`, `pattern`, `allowed_values` |
-| `text` | Long text | Same as string |
-| `number` | Numeric | `min_value`, `max_value` |
-| `boolean` | True/false | — |
-| `array` | Collection | Nested type via `Array(Box<PropertyType>)` |
-| `object` | Nested object | Nested property schemas |
-| `reference` | Object reference | Target type name |
-| `enum` | Predefined values | `allowed_values` list |
+## Validation boundaries
 
-## Validation
+`SchemaManager::validate_and_coerce_properties` reports missing required
+properties, unknown properties, type mismatches, and invalid enum values while
+coercing only compatible primitive representations. Callers must consume the
+issues; invoking the helper and discarding them defeats the schema boundary.
 
-`SchemaManager::validate_object()` checks:
-1. Object type exists in schema
-2. Required properties present
-3. Property types match (with coercion: number stored as string)
-4. Validation rules pass (length, range, regex `pattern`, `allowed_values`)
-5. Unknown properties generate warnings (not errors)
+When one or more schemas are persisted, the JSONL importer is stricter than the
+general warning-oriented validation API:
 
-## Using the Schema System
+- unknown object/edge types, missing required properties, and invalid endpoint
+  pairs skip the record;
+- undeclared properties are dropped;
+- coercible values are normalized;
+- skipped records and dropped fields are counted and written to the import
+  diagnostics sidecar.
 
-```rust
-// Load schemas from directory
-let schemas = SchemaIngestion::load_default_schemas()?;
-let schema_manager = graph.get_schema_manager();
-schema_manager.save_schema(&schemas)?;
+Never derive a schema from the records being imported, register an observed
+unknown type, preserve undeclared fields, or choose an endpoint outside the
+declared source/target sets. Accepted shape changes require an explicit schema
+edit and schema import.
 
-// Validate an object
-let result = schema_manager.validate_object(&object).await?;
-if result.is_valid() {
-    graph.add_object(object)?;
-} else {
-    for error in result.errors { /* handle */ }
-}
+`DataIngestion` retains a legacy schema-less compatibility mode when its graph
+contains no persisted schema: it maps known node kinds through `ObjectBuilder`
+and stores open properties. The desktop UI prevents entry into this mode by
+disabling data import until a non-default schema is present. Core callers that
+need authoritative validation must also persist a schema before invoking
+`import_data_only`; the low-level compatibility behavior is not a strict import.
 
-// Register new type at runtime
-schema_manager.register_object_type("default", "spell", spell_schema).await?;
-```
+## Persistence and UI import
 
-## Edge Type Schemas
+The desktop app does not auto-import `defaults/schemas` on startup. **File →
+Import Schema…** loads the selected directory into the `imported_schemas`
+namespace. **File → Import Data…** is enabled only when persisted schemas are
+present. Core callers use `SchemaIngestion::load_schemas_from_directory`
+followed by synchronous `SchemaManager::save_schema`.
 
-Define relationship constraints:
-```rust
-let edge_schema = EdgeTypeSchema::new("learned_spell", "Character spell knowledge")
-    .with_source_types(vec!["character"])
-    .with_target_types(vec!["spell"]);
-```
+The included schema types are: `npc`, `player_character`, `location`,
+`faction`, `quest`, `artifact`, `currency`, `inventory`, `skills`, `temporal`,
+`setting_reference`, `system_reference`, and `transportation`.
 
-`SchemaIngestion` auto-adds 24 common TTRPG edge types (owned_by, led_by, allied_with, located_in, etc.).
+## Naming constraint
 
-## Included Schema Types (13 files)
-
-npc, player_character, location, faction, quest, artifact, currency, inventory, skills, temporal, setting_reference, system_reference, transportation
-
-## Known Limitations
-
-- Schema files use `add_` prefix naming (MCP convention leak)
-- Async methods on `SchemaManager` contain no `.await` points (unnecessary async wrapper)
+The `add_` prefix is an external MCP action convention retained in schema file
+names. Internal graph types never include it. Keep prefix stripping at the
+ingestion boundary rather than leaking action names into stored object types.

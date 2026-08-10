@@ -1,28 +1,24 @@
 ---
-globs: env.sh,dev.sh,*.toml,*.yaml,*.yml,config.*
+globs: *.toml,*.yaml,*.yml,config.*
 ---
 
 # Environment and Configuration
-
-## env.sh is optional
-
-`env.sh` no longer sets compiler variables — bundled SQLite compiles with any
-standard C compiler on PATH. Source it only if you want the convenience path
-exports.
 
 ## Environment Variables
 
 ```bash
 # All optional — the app runs with nothing set.
 export LEMONADE_URL="http://localhost:13305/api/v1"  # Only needed for non-default server URL
-export UFORGE_SCHEMA_DIR="./defaults/schemas"        # Override schema directory
-export UFORGE_DATA_FILE="./defaults/data/memory.jsonl" # Override data file
+export LEMONADE_API_KEY="..."                        # Optional inference key override
+export LEMONADE_ADMIN_API_KEY="..."                  # Optional management key override
+export UFORGE_SCHEMA_DIR="./defaults/schemas"        # load_default_schemas() override
 export RUST_LOG=info                                 # Log verbosity
 
 # Direct `cargo test` integration control (canonical `make test` overrides this)
 export UFORGE_INTEGRATION_TESTS=require  # Panic instead of skip when server unreachable
 export UFORGE_INTEGRATION_TESTS=skip     # Force-skip even when a server is present
 export UFORGE_SKIP_EMBEDDED_LEMONADE=1   # Skip automatic runtime provisioning
+export UFORGE_LEMOND_PATH="/path/to/lemonade/lemond" # Owned-development binary override
 ```
 
 ### Why env vars are overrides, not requirements
@@ -50,17 +46,13 @@ Set that JSON field to `"debug"` when Lemonade's default informational child
 events are insufficient; u-forge forwards those lines only when the dedicated
 `lemond` tracing target above is enabled and redacts both runtime credentials.
 
-## Path Resolution
+## Import Path Resolution
 
-### Schema Directory (checked in order)
-1. `$UFORGE_SCHEMA_DIR`
-2. `./defaults/schemas`
-3. `../defaults/schemas`
-
-### Data File (checked in order)
-1. `$UFORGE_DATA_FILE`
-2. `./defaults/data/memory.jsonl`
-3. `../defaults/data/memory.jsonl`
+The desktop app reads `[data].schema_dir` and `[data].import_file` from
+`u-forge.toml` to pre-populate its explicit import dialogs. It does not import
+either path automatically. The lower-level
+`SchemaIngestion::load_default_schemas()` helper checks `UFORGE_SCHEMA_DIR`
+and otherwise uses `./defaults/schemas`.
 
 ## Database Location
 
@@ -72,8 +64,7 @@ events are insufficient; u-forge forwards those lines only when the dedicated
 lanes (defaults: 768 and 4096). Dimensions are persisted in database metadata;
 changing either value requires rebuilding the database.
 
-The desktop app uses a persistent database. Set `UFORGE_DATA_FILE` /
-`UFORGE_SCHEMA_DIR` to customise import sources.
+The desktop app uses the persistent path from `[storage].db_path`.
 
 ---
 

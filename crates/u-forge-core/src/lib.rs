@@ -103,10 +103,9 @@ use text::split_text_with_counts;
 ///     .add_to_graph(&graph)
 ///     .unwrap();
 /// ```
-// KnowledgeGraph is Send + Sync:
-//   - KnowledgeGraphStorage wraps rusqlite::Connection in Arc<parking_lot::Mutex<Connection>> (see graph/storage.rs)
-//   - SchemaManager holds Arc<KnowledgeGraphStorage> + DashMap (both Send + Sync)
-// This means Arc<KnowledgeGraph> is a valid axum State<T> type for Phase 3.
+// KnowledgeGraph is Send + Sync: KnowledgeGraphStorage wraps its rusqlite
+// connection in Arc<parking_lot::Mutex<_>>, and SchemaManager owns the same
+// storage plus a parking_lot::RwLock-protected cache.
 pub struct KnowledgeGraph {
     storage: Arc<KnowledgeGraphStorage>,
     schema_manager: Arc<SchemaManager>,

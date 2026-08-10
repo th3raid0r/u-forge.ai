@@ -1,5 +1,8 @@
 # Feature Checklist: Lemonade Runtime and Embedded Distribution
 
+> Archived completion brief. Source and current descriptive documentation are
+> authoritative where implementation details differ from this checklist.
+
 ## Status and authority
 
 Implemented and verified on 2026-08-05. `plan_LemonadeRuntime.md` is the
@@ -169,8 +172,8 @@ fallback is selected.
 - AUR and non-Ubuntu-x64 packaging.
 - Bundled models or backends.
 - Setup/UI for STT, TTS, image, audio generation, or 3D/STL generation.
-- Generic provider abstraction and the broader cancellation/observability work
-  owned by `feature_InferenceLifecycle.md`.
+- Generic provider abstraction. The cancellation/observability work deferred
+  here was subsequently completed in `feature_InferenceLifecycle.md`.
 
 ## Primary external references
 

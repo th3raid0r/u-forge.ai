@@ -80,7 +80,7 @@ impl SchemaManager {
 
     /// Validate an object against its schema
     pub async fn validate_object(&self, object: &ObjectMetadata) -> Result<ValidationResult> {
-        // For now, use default schema. In the future, objects could specify their schema
+        // This convenience path validates against the named default schema.
         let schema = self.load_schema("default").await?;
         self.validate_object_with_schema(object, &schema)
     }

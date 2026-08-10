@@ -1,5 +1,8 @@
 # Feature Plan: Inference Lifecycle, Cancellation, and Queue Evidence
 
+> Archived completion brief. Source and current descriptive documentation are
+> authoritative where implementation details differ from this checklist.
+
 ## Status
 
 Implemented and verified on 2026-08-09. The evidence run retained the existing

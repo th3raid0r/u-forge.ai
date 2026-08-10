@@ -21,9 +21,9 @@
 //! gpu_weight   = 50
 //! cpu_weight   = 10
 //!
-//! [models.context_limits]
-//! "embed-gemma-300m-FLM"                = 2048
-//! "some-new-model-FLM"                  = 4096
+//! [models.load_params]
+//! "embed-gemma-300m-FLM" = { ctx_size = 2048 }
+//! "some-new-model-FLM"   = { ctx_size = 4096 }
 //! ```
 //!
 //! # Typical use-cases for disabling a device
@@ -66,10 +66,9 @@ pub struct EmbeddingDeviceConfig {
 
     /// Enable high-quality 4096-dim embedding via `Qwen3-Embedding-8B-GGUF`.
     ///
-    /// When `true`, the registry includes the Qwen3 model and embeddings are
-    /// stored in the `chunks_vec_hq` 4096-dim index alongside the standard
-    /// 768-dim `chunks_vec` index.  NPU embedding should typically be disabled
-    /// when this is active (the NPU model only produces 768-dim vectors).
+    /// When `true`, downloaded configured HQ models are eligible and embeddings
+    /// are stored in the `chunks_vec_hq` 4096-dim index alongside the standard
+    /// 768-dim `chunks_vec` index.
     #[serde(default)]
     pub high_quality_embedding: bool,
 
@@ -137,9 +136,8 @@ pub struct ModelLoadParams {
 ///
 /// Corresponds to the `[models]` section of `u-forge.toml`.
 ///
-/// Built-in defaults cover all models shipped with u-forge.  Add entries to
-/// `u-forge.toml` under `[models.load_params]` to tune new models without
-/// recompiling.
+/// Built-in defaults cover the preferred Lemonade catalog models. Additional
+/// entries under `[models.load_params]` configure models without recompiling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
@@ -241,8 +239,8 @@ impl Default for ModelConfig {
 pub enum ChatDevice {
     /// Let u-forge choose based on available hardware.
     ///
-    /// Currently resolves to `gpu`.  A smarter selection policy (latency,
-    /// model quality, task complexity) will be added in a future release.
+    /// Currently resolves to `gpu`; automatic selection does not score latency,
+    /// model quality, or task complexity.
     #[default]
     Auto,
     /// AMD/Nvidia GPU — llamacpp GGUF models via ROCm / Vulkan / CUDA.

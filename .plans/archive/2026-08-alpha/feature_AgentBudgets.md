@@ -1,5 +1,8 @@
 # Feature Plan: Agent Context, Token, and Tool Budgets
 
+> Archived completion brief. Source and current descriptive documentation are
+> authoritative where implementation details differ from this checklist.
+
 ## Status
 
 Implemented. Tool JSON-schema validation and conversation-history windowing

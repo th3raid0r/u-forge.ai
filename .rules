@@ -28,7 +28,13 @@ These are active failure modes observed in this codebase. Violating them produce
 
 ### 2. Fetch live state before making capability decisions
 
-Before assuming available models or hardware, fetch actual server state. `SystemInfo::fetch(url)` and `LemonadeServerCatalog::discover(url)` exist for exactly this reason — use them. Build a `ModelSelector` from the catalog to pick the best available model per capability. `AppView::do_init_lemonade()` (fetch → select → build providers → degrade gracefully) is the canonical example. Do not hardcode model IDs, device presence, or capability flags without a live catalog check.
+Before assuming available models or hardware, fetch actual server state.
+`LemonadeServerCatalog::discover(connection)` requires the model catalog and
+retains `/health` and `/system-info` failures as optional diagnostics. Build a
+`ModelSelector` from that snapshot. `AppView::do_init_lemonade()` (connect →
+discover → select → build providers → degrade gracefully) is the canonical
+example. Do not hardcode model IDs, device presence, or capability flags
+without a live catalog check.
 
 ### 3. Prescriptive plans belong in feature or bug files — not in shared docs
 
@@ -54,10 +60,9 @@ Every `.rs` file is thoroughly commented. `.md` and `.mdc` files tell you **wher
 → **`.rulesdir/environment-config.mdc`**
 → **`.rulesdir/development-workflow.mdc`**
 
-`env.sh` is optional — no longer required for compilation. `make build` and
-`make test` work with no env vars; the latter requires a supported embedded
-runtime platform and either a cached pinned artifact or network access to
-provision it.
+`make build`, `make test`, and the desktop app work with no environment
+variables. `make test` requires a supported embedded-runtime platform and
+either a cached pinned artifact or network access to provision it.
 
 ### 6. Imported data must conform to loaded schemas
 
@@ -65,6 +70,11 @@ Schemas are authoritative during JSONL import. Never derive object or edge types
 from observed records, widen a schema with undeclared properties, or accept an
 edge endpoint pair the schema disallows. Skipped records and dropped fields must
 remain visible through import statistics and diagnostic JSONL output.
+
+The desktop and `import_data_only` workflow require callers to persist schemas
+first. `DataIngestion` itself retains a legacy schema-less compatibility path
+for empty graphs; do not use that low-level mode where strict shape enforcement
+is required.
 
 ### Writing or modifying Rust source (`crates/**/*.rs`)
 → **`.rulesdir/rust-patterns.mdc`**
@@ -76,6 +86,18 @@ Error handling (`anyhow`), `EmbeddingProvider` trait (do NOT bypass it), `Transc
 → **`.rulesdir/development-workflow.mdc`** (provider addition workflow)
 
 Implement the relevant trait. Build via `ProviderFactory`, register with `InferenceQueueBuilder::with_provider`. Do NOT call provider HTTP clients directly from business logic. There is no `DeviceWorker` trait — that abstraction was removed in the hardware refactor.
+
+Parent multi-step work with `queue::CancellationToken`, pass it through every
+`*_with_cancellation` call, and preserve `InferenceError` distinctions. A
+dropped receiver is only a fallback; it is not the cancellation contract.
+
+### Modifying agent prompts or tool loops
+→ **`.rulesdir/rust-patterns.mdc`** (agent budget and tool validation sections)
+
+Schema summaries use whole-record selection. Model calls and tool results are
+admitted through the per-request budget ledger, and repeated calls are compared
+using validated canonical arguments and observed progress. Do not add an
+unbounded prompt or tool-output path alongside that ledger.
 
 ### Writing, running, or debugging tests
 → **`.rulesdir/testing-debugging.mdc`**
@@ -93,3 +115,6 @@ Every test gets its own `TempDir`. Mock providers for unit tests; `lemonade_url(
 ### UI work (`crates/u-forge-ui-gpui/`, `crates/u-forge-graph-view/`, `crates/u-forge-ui-traits/`)
 → **`.rulesdir/project-structure.mdc`** (integration points, cross-cutting constraints)
 → **`.rulesdir/gpui-patterns.mdc`** (caching, panel patterns, canvas coords, TextFieldView)
+
+Window chrome follows `Window::window_decorations()` and compositor-reported
+state. Never infer decoration mode from desktop-name environment variables.

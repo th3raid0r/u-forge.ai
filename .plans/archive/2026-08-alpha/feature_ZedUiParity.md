@@ -1,5 +1,8 @@
 # Feature Plan: Zed-Structured, DM-Oriented Workspace
 
+> Archived completion brief. Source and current descriptive documentation are
+> authoritative where implementation details differ from this checklist.
+
 ## Status and target
 
 Implemented and verified on 2026-08-07, except for the explicitly deferred

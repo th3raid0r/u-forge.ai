@@ -1892,9 +1892,8 @@ impl AppView {
     ///
     /// Replaces the former `do_rechunk_and_embed` / `do_embed_all` /
     /// `spawn_embedding_sampler` / `stop_embedding_sampler` quartet.
-    /// A newer plan supersedes older UI progress. Queue work already dispatched
-    /// by an older plan continues in the background until queue cancellation is
-    /// supported.
+    /// A newer plan supersedes older UI progress and cancels queued/active child
+    /// work through the previous plan's parent token.
     pub(crate) fn run_embedding_plan(&mut self, plan: EmbeddingPlan, cx: &mut Context<Self>) {
         let queue = match self.state.inference_queue.clone() {
             Some(q) => q,

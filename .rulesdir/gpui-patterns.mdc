@@ -72,7 +72,29 @@ div()
 
 The inner absolute-positioned div gives the cached view stable bounds; the outer width controls visibility via clipping. Toggle is a cache-hit. Resize still invalidates (correct — user sees the resize).
 
-Applied to `ChatPanel` in `app_view/render.rs`. Apply to any future heavy-to-layout side panel.
+The dock panels use this pattern in `app_view/render.rs`; keep the same boundary
+for every heavy-to-layout dock view.
+
+---
+
+## Async ownership and inference cancellation
+
+GPUI `Task<()>` ownership prevents stale UI writes, but task drop alone is not
+enough for queued or active inference. Search, chat, imports, and embedding
+plans retain both the GPUI task and one parent
+`u_forge_core::queue::CancellationToken`.
+
+- Replacing an operation calls `supersede()` on the old token.
+- User Stop/close calls `cancel()`.
+- Every child queue/search/ingest call receives the same token.
+- Completion remains observed after cancellation so runtime and GPU leases are
+  known to be released; epoch/generation checks only reject late presentation.
+- `Cancelled`, `Superseded`, timeout classes, provider failure, and worker loss
+  remain distinct at the UI boundary.
+
+Path-picker browse and other non-inference prompts still store their GPUI task
+handle. Replacing a prompt drops the old task so a stale portal response cannot
+overwrite newer modal state.
 
 ---
 
@@ -148,7 +170,10 @@ The 60-frame average uses `FrameTimeRing` (`[u64; 60]` circular buffer in `app_v
 
 - `render()` spans are useful for measuring re-render *frequency* (catching unnecessary `cx.notify()` calls), not shaping cost. Use `samply` for the latter.
 - **Never hand a multi-kilobyte `SharedString` to a div child unless the message is likely to stay in view.** The collapse-by-default on `Thinking` blocks exists partly for this reason — a collapsed block renders only a header line, so only that line shapes on scroll-in instead of hundreds.
-- When adding any new text-heavy view (log viewer, diff display, long node descriptions), default to collapsed or paginated to bound the cold-shape cost per scroll-in. The ShapePlan cache amortises the per-word plan cost but does not eliminate the per-line layout cost for lines that have never been seen before.
+- Text-heavy views (log viewers, diffs, long node descriptions) default to
+  collapsed or paginated presentation so cold-shape cost per scroll-in stays
+  bounded. The ShapePlan cache amortises per-word plan cost but not first-time
+  per-line layout.
 - **Do not mix large text rendering with `cx.notify()` hot paths.** Streaming tokens call `notify()` on the target `ChatMessageView` only; all sibling messages are not dirtied. If you restructure the streaming path so that a parent entity notifies, all visible chat messages will re-shape every token — catastrophic at 50 tok/s.
 
 ---
@@ -162,7 +187,8 @@ When a list container needs action buttons (retry, delete, copy) on its child en
 
 Applied to `ChatPanel`: the action bar (⟳ retry, × delete, ⎘ copy) is built in the list item closure in `chat_panel.rs`, not inside `ChatMessageView::render`. The closure captures a `WeakEntity<ChatPanel>` and calls `retry_message`, `delete_message_at`, etc. via `handle.update(cx, ...)`.
 
-**Rule:** Future per-message actions should follow this render-site pattern. Do NOT reintroduce a `msg_subscriptions: Vec<gpui::Subscription>` vector.
+**Rule:** Per-message actions follow this render-site pattern. Do not
+reintroduce a `msg_subscriptions: Vec<gpui::Subscription>` vector.
 
 ---
 
@@ -266,3 +292,47 @@ GPUI CE 0.3.3 has no built-in context menu widget. Pattern used in `TextFieldVie
 5. Menu item clicks must call `cx.stop_propagation()` after handling to prevent the click from re-triggering dismiss handlers.
 
 **Empty menu shortcut:** if there would be no visible items (e.g. read-only field with no selection → no Copy, no Paste), return early from the right-click handler WITHOUT calling `cx.stop_propagation()`. This lets outer containers (e.g. the chat row) receive the event and open their own menu.
+
+---
+
+## Negotiated client-side window chrome
+
+On Linux the app requests client decorations, then branches exclusively on
+`Window::window_decorations()`. `DecorationMode::negotiated` is the testable
+policy boundary. Never infer decoration mode from `XDG_CURRENT_DESKTOP`,
+session type, or compositor names; server-decorated windows must not receive a
+second title bar or changed workspace bounds.
+
+`window_chrome.rs` centralizes title-bar controls, hit-test roles, frame
+metrics, tiling-aware free edges/corners, and resize hit regions. Preserve
+these interaction rules:
+
+- compositor-reported capabilities determine which native controls render;
+- drag, double-click maximize, and native context menu live on empty title-bar
+  space, while controls stop propagation into that region;
+- resize hit regions exist only on untiled free edges/corners and sit behind
+  application controls;
+- fullscreen removes client chrome; maximized/tiled state removes affected
+  inset, radius, border, shadow, and resize geometry;
+- window-control focus handles stay outside the workspace F6/tab cycle but
+  accept pointer focus and Enter/Space activation;
+- left/right control placement comes from persisted `[ui]` configuration and
+  uses interface-scale geometry.
+
+GNOME Wayland and a server-decorated Linux session are the validated Linux
+configurations. GNOME X11 is outside the supported configuration set.
+
+---
+
+## Vendored ShapePlan cache maintenance
+
+`crates/cosmic-text-patched` backports the `(font, direction, script)`
+`ShapePlan` cache from cosmic-text 0.17 to GPUI CE's 0.14 dependency. The crate
+is excluded from workspace resolution, activated by the root Cargo patch, and
+formatted/tested separately by the Makefile.
+
+Before removing it, confirm `cargo tree -p gpui-ce --depth 1 | rg cosmic`
+resolves cosmic-text 0.17 or newer, remove the root patch/exclude and standalone
+Makefile hooks together, run the canonical targets, and profile a cold chat
+scroll. A clean compile alone does not prove the original
+`find_language_feature` hotspot is gone.

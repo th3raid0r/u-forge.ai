@@ -1,15 +1,15 @@
 # Feature: TypeScript Agentic Sandbox
 
-## Status: Design gate — post Alpha
+## Status: Active design gate — post Alpha
 
 The workspace crate is a placeholder with no `deno_core` dependency or runtime
 implementation. This document records the questions and invariants that must be
 resolved before dependencies or code land; it is not implementation approval.
 
-Prerequisites are the active Alpha correctness, Lemonade runtime, and inference
-lifecycle plans in `.plans/README.md`. In particular, the sandbox must consume
-the final coordinated generation and cancellation contracts rather than freeze
-today's transitional queue API.
+The Alpha correctness, Lemonade runtime, inference lifecycle, agent-budget, and
+desktop-foundation prerequisites are complete. The sandbox consumes the
+implemented `InferenceJob` / `StreamingInferenceJob` and parent
+`CancellationToken` contracts rather than defining a parallel queue API.
 
 ## Product goal
 
@@ -94,16 +94,17 @@ Read-only graph operations are the default v1 candidate:
 | Edges for a node | `KnowledgeGraph::get_relationships` |
 | Bounded subgraph | `KnowledgeGraph::query_subgraph` |
 | FTS search | `KnowledgeGraph::search_chunks_fts` |
-| Hybrid search | `search_hybrid_response(graph, queue, hq_queue, query, config)` |
+| Hybrid search | `search_hybrid_response_with_cancellation(graph, queue, hq_queue, query, config, token)` |
 
 Potential later write ops must construct typed `GraphMutation` values or call
 equivalent validated facade methods. They must not rely on stale names such as
 `delete_node`, and relationship writes must preserve loaded-schema endpoint
 validation.
 
-Potential inference ops must use the final coordinated/cancellable request
-types from the Lemonade and inference lifecycle plans. The current
-`InferenceQueue::generate(ChatRequest)` shape is not frozen as a sandbox API.
+Potential inference ops use the coordinated/cancellable request types in
+`u_forge_core::queue`. The await-only `InferenceQueue::generate(ChatRequest)`
+convenience method is not itself a sandbox API; sandbox work is parented by an
+explicit cancellation token.
 
 ## Resource-control design requirements
 

@@ -45,14 +45,18 @@ hardware refactor. Physical device differences are handled by `ModelSelector`
 The end-to-end path for embedding, transcription, TTS, LLM generation, or
 reranking is always:
 
-1. `LemonadeServerCatalog::discover(url)` — fetches `/models`, `/system-info`,
-   `/health` concurrently.
-2. `ModelSelector::new(catalog, config)` — picks best downloaded model per
+1. Construct one shared `Arc<LemonadeConnection>` carrying the normalized API
+   origin, ownership, and split inference/admin authentication.
+2. `LemonadeServerCatalog::discover(connection)` — requires `/models` and
+   independently enriches the snapshot from `/system-info` and `/health`.
+   Optional endpoint failures remain in `CatalogDiagnostics`.
+3. `ModelSelector::new(catalog, config)` — picks the best downloaded model per
    capability + device slot; deduplicates to one provider per slot.
-3. `ProviderFactory::build(sel, capability, url, queue_depth, gpu_mgr, already_loaded)`.
-   Pass `catalog.loaded` IDs as `already_loaded` to skip `/load` round-trips
-   for models already in RAM.
-4. `InferenceQueueBuilder::with_provider(built_provider)` to register.
+4. `ProviderFactory::build_with_connection(...)` — creates the provider and,
+   for chat, the coordinated runtime/profile wrapper. Catalog-loaded IDs are a
+   warm-start hint; the runtime lease still compares live effective state.
+5. `InferenceQueueBuilder::with_provider(built_provider)` — registers the
+   provider on the capability queue.
 
 `AppView::do_init_lemonade()` is the canonical example: fetch → select → build
 providers → degrade gracefully on any failure.
@@ -69,20 +73,31 @@ AI capabilities are opt-in — construct them separately. **Do not regress this.
 `ProviderFactory` attaches the manager for llamacpp:rocm/vulkan/metal recipes
 and omits it for FLM (NPU) and kokoro (CPU). Do not set this field manually.
 
+### Inference operations have explicit lifetime ownership
+
+Await-only queue methods are conveniences for one-shot calls. UI operations,
+imports, search, chat, and other parent workflows create one
+`queue::CancellationToken`, pass it to every `*_with_cancellation` call, and
+retain the GPUI task until termination is observed. Cancellation is checked
+while pending, during retry backoff, model activation, active provider work,
+stream startup/read, and bounded embedding fan-out.
+
+`InferenceError` distinguishes cancellation, supersession, timeout class,
+provider failure, unavailable capability, and worker loss. Preserve those
+variants at subsystem and UI boundaries; expected user cancellation is not a
+provider error.
+
 ---
 
 ## Integration Test Threading
 
-Integration tests hit a shared live Lemonade Server. When `LEMONADE_URL` is
-set, all modules' integration tests run concurrently by default, causing
-intermittent GPU/NPU resource contention on the server side.
-
-**Always run the full test suite with `--test-threads=1`.** `dev.sh` sets this
-flag automatically when it detects `LEMONADE_URL` in the environment.
+`make test` owns one pinned Lemonade runtime across all test binaries. The
+hardware-backed suite is serial because concurrent modules otherwise contend
+for the same GPU/NPU server resources.
 
 ```bash
-cargo test --workspace -- --test-threads=1                         # always
-LEMONADE_URL=http://localhost:13305/api/v1 ./dev.sh --backend-only # dev.sh handles it
+make test
+cargo test --workspace -- --test-threads=1 # narrow direct iteration
 ```
 
 ---
@@ -92,14 +107,10 @@ LEMONADE_URL=http://localhost:13305/api/v1 ./dev.sh --backend-only # dev.sh hand
 - [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — workspace layout, SQLite schema,
   inference design, design decisions. **Read this first** for any architectural
   work.
-- [env.sh](mdc:env.sh) — optional. Sets `UFORGE_*` path variables only; no
-  longer required for compilation.
-- [dev.sh](mdc:dev.sh) — development runner. Auto-sets `--test-threads=1` when
-  `LEMONADE_URL` is present.
 - [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files
   (workspace root, not inside any crate).
 - [defaults/data/memory.jsonl](mdc:defaults/data/memory.jsonl) — Foundation
-  universe sample data (~220 nodes, ~312 edges). Canonical JSONL format.
+  universe sample data. Canonical JSONL format.
 
 All per-file roles and types are covered by comments inside each source file.
 Browse the crate source directly rather than duplicating a file index here.

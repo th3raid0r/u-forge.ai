@@ -8,9 +8,9 @@ description: Testing and debugging patterns
 
 All storage tests use `TempDir` for isolation.
 `KnowledgeGraph::new(temp_dir.path())` creates `<temp_dir>/knowledge.db`
-automatically. No `env.sh` is needed. The canonical target provisions and owns
-the pinned embedded inference server, reuses the XDG-scoped model/backend
-cache, and skips optional live capabilities whose models are not cached.
+automatically. The canonical target provisions and owns the pinned embedded
+inference server, reuses the XDG-scoped model/backend cache, and skips optional
+live capabilities whose models are not cached.
 
 Bind the `TempDir` to a named variable (`_tmp`), not `_` — `TempDir` deletes its
 directory on drop. Discarding to `_` can drop before the test body runs.
@@ -86,8 +86,8 @@ direct `cargo test`, it probes a live server and skips silently when none is
 reachable. Resolution order:
 
 1. `LEMONADE_URL` env var — normalized and accepted as-is
-2. `http://localhost:13305/v1` — probed via `GET /v1/health` (2 s timeout)
-3. `http://127.0.0.1:13305/v1` — explicit IPv4 loopback
+2. the supported API prefixes on `localhost:13305` — health-probed with a 2 s timeout
+3. the same prefixes on explicit IPv4 loopback `127.0.0.1:13305`
 
 Control variable:
 - `UFORGE_INTEGRATION_TESTS=require` — panic instead of skip (CI enforcement)
@@ -133,13 +133,12 @@ RUST_LOG=u_forge_core::ingest=warn                   # Suppress noisy modules
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `openssl-sys` compile error | Missing system OpenSSL headers | `apt install pkg-config libssl-dev` (Ubuntu) |
 | `Lemonade Server not available` | Server not running | `lemonade-server serve` — `localhost:13305` is auto-discovered |
 | Transcription returns immediate error | Model not pulled or server can't open audio | `lemonade-server pull whisper-v3-turbo-FLM`; verify audio bytes are non-empty |
 | Transcription test passes but text is noise | Silence input hallucinations are normal | Use real speech for content assertions; only check `result.is_ok()` for silence |
 | FTS5 search returns nothing | Chunk not yet added for the object | Call `add_text_chunk` before `search_chunks_fts` |
 | `database is locked` | Two processes sharing the same `knowledge.db` | Ensure only one writer at a time |
-| Import creates 0 edges | Node names in edges don't match node names exactly | Check spelling; `resolve_node_id` does exact-match lookup |
+| Import creates 0 edges | References are unresolved, ambiguous, or schema-invalid | Inspect the `.u-forge-import-diagnostics` sidecar; use a UUID or `object_type:name` to disambiguate |
 | Schema validation fails on known type | Schema not loaded before validation | Call `SchemaIngestion::load_schemas_from_directory` and `save_schema` first |
 | `cannot borrow … as mutable` in test | `TempDir` dropped too early | Bind `_tmp` to a named variable, not `_` |
 
@@ -149,13 +148,13 @@ RUST_LOG=u_forge_core::ingest=warn                   # Suppress noisy modules
 
 ```bash
 make fmt-check
+make check
 make clippy
 make test-ci
-cargo doc --no-deps --workspace
 ```
 
-No `source env.sh`, embedded-runtime download, model download, or live Lemonade
-server is allowed in CI. The CI job also exports the skip controls for its
-check and Clippy steps so the UI build script cannot provision Lemonade before
-the test step. Local `make test` remains the full embedded-runtime suite.
-Direct Cargo invocations retain `UFORGE_INTEGRATION_TESTS` for focused work.
+No embedded-runtime download, model download, or live Lemonade server is
+allowed in CI. The CI job exports the skip controls for every Cargo step so the
+UI build script cannot provision Lemonade before the test step. Local
+`make test` remains the full embedded-runtime suite. Direct Cargo invocations
+retain `UFORGE_INTEGRATION_TESTS` for focused work.

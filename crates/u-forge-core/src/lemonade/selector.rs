@@ -2,7 +2,7 @@
 //!
 //! [`ModelSelector`] consumes a [`LemonadeServerCatalog`] and the application
 //! config to produce ordered lists of [`SelectedModel`] values, ready for
-//! `ProviderFactory::build` (Phase 4).
+//! `ProviderFactory::build_with_connection`.
 //!
 //! No hardcoded model IDs appear here — all defaults live in `ModelConfig` as
 //! configurable preference lists.  Selection methods filter to **downloaded**

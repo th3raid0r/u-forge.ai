@@ -1,5 +1,8 @@
 # Bug Plan: Alpha Correctness and Diagnostics
 
+> Archived completion brief. Source and current descriptive documentation are
+> authoritative where implementation details differ from this checklist.
+
 ## Status
 
 Implemented and verified on 2026-08-04. This plan consolidates correctness work

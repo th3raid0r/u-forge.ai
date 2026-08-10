@@ -1,17 +1,20 @@
 # Feature Plan: Negotiated Client-Side Window Decorations
 
+> Archived completion brief. Source and current descriptive documentation are
+> authoritative where implementation details differ from this checklist.
+
 ## Status and target
 
 Implemented and user-validated on supported Linux sessions. GNOME X11 is an
-unsupported configuration and has no validation requirement. This is a
-first-binary-release requirement alongside `feature_InferenceLifecycle.md` and
-`feature_AgentBudgets.md`.
+unsupported configuration and has no validation requirement. This completed
+the client-decoration release gate alongside `feature_InferenceLifecycle.md`
+and `feature_AgentBudgets.md`.
 
-Provide complete native-window behavior on Linux compositors that delegate
-window chrome to the application, especially GNOME on Wayland. Preserve native
-or server-side decorations everywhere GPUI reports that they are available.
-The implementation must follow the negotiated GPUI decoration mode rather than
-guessing from desktop-name environment variables.
+The implementation provides complete native-window behavior on Linux
+compositors that delegate window chrome to the application, especially GNOME
+on Wayland. Native or server-side decorations are preserved everywhere GPUI
+reports them, and the app follows negotiated GPUI decoration mode rather than
+desktop-name environment variables.
 
 ## Decoration contract
 

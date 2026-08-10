@@ -1,9 +1,41 @@
 # u-forge.ai — Bug-Finding Audit
 
+> **Archived audit snapshot.** This document describes the 2026-04-24 tree and
+> is not a list of current defects or implementation instructions. The Alpha
+> correctness, inference lifecycle, agent-budget, Lemonade runtime, and desktop
+> foundation work reconciled its actionable findings. Current behavior is
+> documented in source, `ARCHITECTURE.md`, and `.rulesdir/`; the remaining
+> product decisions are recorded in `.plans/README.md`.
+
 Date: 2026-04-24
 Scope: every Rust crate in the workspace plus configuration, sample data, tests,
 and tooling. Findings come from five focused subagent passes synthesised here,
 with the most consequential claims spot-verified against source.
+
+## Final reconciliation (2026-08-09)
+
+The audit no longer contains active defect status. Its actionable findings were
+reconciled as follows:
+
+- schema-aware import validation, endpoint ambiguity, required properties,
+  graph finiteness/spatial rebuilding, paint-phase mutation, async UI ownership,
+  structured search degradation, and the mechanical cleanup landed in the
+  Alpha correctness work;
+- partial Lemonade discovery and timeout/resource-release behavior landed in
+  the Lemonade runtime work;
+- cancellable jobs, parent cancellation, explicit outcomes, queue/graph
+  telemetry, and evidence-led EWMA/retry decisions landed in inference
+  lifecycle;
+- bounded schema injection, cumulative request/tool budgets, repeat detection,
+  and semantic output truncation landed in agent budgets;
+- Linux window behavior landed through negotiated client-side decorations;
+- provider generalization, multi-user identity, typed/indexed properties, a
+  general embedding-space registry, undo/redo, and TypeScript execution were
+  product/design topics rather than current Alpha defects. Their present state
+  is recorded in `.plans/README.md`.
+
+The dated status notes and suggested fixes below are preserved exactly as audit
+history; they do not override that final reconciliation.
 
 The list is opinionated about prioritisation: items are grouped by **what they
 block**, not just by raw severity. If a finding would make a future feature

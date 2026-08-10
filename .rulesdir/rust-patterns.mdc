@@ -15,9 +15,10 @@ re-reading the code.
 - **`anyhow::Result`** for internal fallible operations throughout the codebase.
   `.context()` wraps lower-level errors; `anyhow!(...)` constructs formatted
   errors.
-- **`thiserror::Error`** for typed error enums at system boundaries (e.g. HTTP
-  handler responses, where consumers need to discriminate variants). `thiserror`
-  generates `Display`/`From`/`std::error::Error` — do not hand-write them.
+- **`thiserror::Error`** for typed errors at boundaries where consumers
+  discriminate variants, such as `InferenceError` and embedding-space guards.
+  `thiserror` generates `Display`/`From`/`std::error::Error` — do not hand-write
+  them.
 
 Rule of thumb: if a caller will pattern-match on the error, use `thiserror`;
 otherwise `anyhow` with `.context()`.
@@ -56,13 +57,14 @@ split:
   provider. Use whenever STT may contend with LLM on the same GPU.
 
 Construct directly — there is no `TranscriptionManager`. To wire into the queue,
-go through `ProviderFactory::build` with `Capability::Transcription`.
+go through `ProviderFactory::build_with_connection` with
+`Capability::Transcription`.
 
 ---
 
 ## `KnowledgeGraph` invariants
 
-- `::new(db_path: &Path)` is **synchronous** and takes **one argument**. Creates
+- `::new(db_path: impl AsRef<Path>)` is **synchronous** and takes **one argument**. Creates
   `<db_path>/knowledge.db` automatically. No async, no server needed.
 - Holds `Arc<KnowledgeGraphStorage>` and `Arc<SchemaManager>` — no embedding
   field, no `InferenceQueue`, no Lemonade dependency.
@@ -130,7 +132,7 @@ Always use `params![]` for parameterised inserts.
 
 ### Removed, do not reintroduce
 
-- RocksDB (dropped in Phase 2 — column families, `WriteBatch`, etc.)
+- RocksDB (`ColumnFamily`, `WriteBatch`, and related persistence paths)
 - `bincode` — use `serde_json` for all serialisation
 
 ---
@@ -167,10 +169,39 @@ deletion cascades to vectors. **Never manually manage `chunks_vec` /
 `chunks_vec_hq`** — always go through `upsert_chunk_embedding` /
 `upsert_chunk_embedding_hq`.
 
-A chunk must be explicitly indexed before it becomes searchable via ANN. The
-incremental embedding workflow (`do_embed_all`) checks `GraphStats.embedded_count`
-and skips work when the index is already populated — startup builds embeddings
-once; subsequent starts are fast.
+A chunk must be explicitly indexed before it becomes searchable via ANN.
+`EmbeddingPlan::embed_all()` performs the bulk missing-embedding sweep;
+`EmbeddingPlan::rechunk(ids)` replaces one or more nodes' chunks. Both standard
+and available HQ lanes are filled, and each lane records the sorted provider
+fingerprint before semantic search may use it. Never infer compatibility from
+matching dimensions alone.
+
+---
+
+## Inference lifetime and result semantics
+
+`InferenceQueue` exposes await-only conveniences and explicit submission APIs.
+Use `submit_*` when the caller owns one job; use `*_with_cancellation` when
+several jobs belong to one search, import, embedding, chat, or sandbox
+operation.
+
+- Create one `queue::CancellationToken` at the parent boundary and clone it
+  into every child job.
+- Keep the GPUI/async owner alive until completion is observed. Dropping a
+  result receiver is a safety fallback, not the primary contract.
+- Check cancellation before graph or vector writes. Provider completion after
+  cancellation must not commit stale work.
+- Preserve `InferenceError::{Cancelled, Superseded, TimedOut,
+  ProviderFailed, WorkerDropped, CapabilityUnavailable}` instead of flattening
+  them into an `anyhow` string too early.
+- Cancellation does not train embedding EWMA and does not count as successful
+  service. Queue counters are content-free and saturating.
+
+Workers check the token while pending, during embedding retry backoff, model
+activation, provider futures, first-token/stream reads, and bounded batch
+fan-out. Retry delays and EWMA fallback are evidence-retained constants; change
+them only with the deterministic scenarios in
+`crates/u-forge-core/benches/inference_lifecycle.rs` and queue tests.
 
 ---
 
@@ -227,11 +258,29 @@ fields manually via `Span::current().record(...)` after the fact (e.g. recording
 `pending_jobs` after calling `stats()`). See `dispatch.rs::embed` for the pattern.
 
 For spawned tasks that outlive the calling frame, attach a span with
-`.instrument(tracing::info_span!("task_name"))` on the future before detaching.
-See `app_view/mod.rs::run_embedding_plan` and `do_init_lemonade`.
+`.instrument(tracing::info_span!("task_name"))`. Long-running user operations
+also retain a task handle and parent cancellation token; detachment is reserved
+for work whose lifetime is intentionally independent. See
+`app_view/mod.rs::run_embedding_plan` and `do_init_lemonade`.
 
 ---
 
-## Agent Tool Arg Validation
+## Agent tool validation and budgets
 
 Tool args in `u-forge-agent` are validated against JSON Schema before deserialization. Do not call `serde_json::from_value` directly on a raw tool arg payload — call `tool_validation::validate_tool_args(tool_name, &raw)?` first. The validated value is then safe to deserialize into the typed Args struct.
+
+The graph agent applies one model-reconciled `EffectiveAgentBudget` per request.
+It accounts for system/tool definitions, whole-record schema selection,
+retained history, response reserve, every model turn, tool arguments, and
+model-visible tool output through the shared cached token estimator.
+
+- Never concatenate `schema_prompt_summary_all()` into a request. Use
+  `bounded_schema_summary`; schema records and JSON are never byte-sliced.
+- Admit every model/tool turn through the request ledger before dispatch.
+- Bound tool output at semantic record boundaries and include omission counts
+  or continuation guidance.
+- Fingerprint the validated tool name + canonical JSON arguments. Identical
+  unchanged reads consume the repeat allowance; corrected arguments, changed
+  results, and committed graph mutations count as progress.
+- Budget and repeat stops are deliberate `ChatEvent` outcomes, not transport
+  failures. Diagnostics expose aggregate counts only, never prompt content.
