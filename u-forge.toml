@@ -57,7 +57,7 @@ reasoning_control = "request"
 [chat.agent]
 schema_summary_tokens = 768          # bounded whole-record schema prompt
 cumulative_request_tokens = 16384   # model input + response reservations across the tool loop
-cumulative_tool_output_tokens = 4096
+cumulative_tool_output_tokens = 2048
 repeated_call_limit = 1              # unchanged repeats allowed per canonical call
 
 [chat.gpu]

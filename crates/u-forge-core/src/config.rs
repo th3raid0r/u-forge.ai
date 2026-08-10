@@ -351,7 +351,7 @@ impl AgentBudgetConfig {
     }
 
     fn default_cumulative_tool_output_tokens() -> usize {
-        4_096
+        2_048
     }
 
     fn default_repeated_call_limit() -> usize {
@@ -1107,8 +1107,27 @@ mod tests {
         );
         assert_eq!(cfg.chat.agent.schema_summary_tokens, 768);
         assert_eq!(cfg.chat.agent.cumulative_request_tokens, 16_384);
-        assert_eq!(cfg.chat.agent.cumulative_tool_output_tokens, 4_096);
+        assert_eq!(cfg.chat.agent.cumulative_tool_output_tokens, 2_048);
         assert_eq!(cfg.chat.agent.repeated_call_limit, 1);
+    }
+
+    #[test]
+    fn default_agent_budgets_do_not_require_clamping() {
+        let chat = ChatConfig::default();
+        let effective = chat
+            .agent
+            .reconcile(
+                chat.max_context_tokens,
+                chat.response_reserve,
+                chat.max_tool_turns,
+            )
+            .unwrap();
+
+        assert!(
+            effective.diagnostics.is_empty(),
+            "default agent budgets should be valid without adjustment: {:?}",
+            effective.diagnostics
+        );
     }
 
     #[test]
