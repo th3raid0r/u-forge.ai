@@ -93,6 +93,7 @@ fn window_control_button(
 
     div()
         .id(id)
+        .debug_selector(move || id.to_owned())
         .window_control_area(area)
         .track_focus(&focus)
         .flex()
@@ -204,6 +205,7 @@ impl RenderOnce for WindowTitleBar {
 
         div()
             .id("window-title-bar")
+            .debug_selector(|| "window-title-bar".to_owned())
             .window_control_area(WindowControlArea::Drag)
             .relative()
             .flex()
@@ -233,12 +235,10 @@ impl RenderOnce for WindowTitleBar {
                 );
             })
             .when(show_window_menu, |title_bar| {
-                title_bar.on_click({
+                title_bar.on_mouse_down(MouseButton::Right, {
                     let on_action = self.on_action.clone();
                     move |event, window, cx| {
-                        if event.is_right_click() {
-                            on_action(WindowChromeAction::ShowMenu(event.position()), window, cx);
-                        }
+                        on_action(WindowChromeAction::ShowMenu(event.position), window, cx);
                     }
                 })
             })
@@ -246,6 +246,7 @@ impl RenderOnce for WindowTitleBar {
             .child(
                 div()
                     .id("window-title")
+                    .debug_selector(|| "window-title".to_owned())
                     .absolute()
                     .top_0()
                     .left_0()
@@ -287,6 +288,7 @@ impl RenderOnce for ClientWindowFrame {
         let geometry = self.geometry;
         let frame = div()
             .id("client-window-frame")
+            .debug_selector(|| "client-window-frame".to_owned())
             .relative()
             .size_full()
             .bg(gpui::transparent_black())
@@ -328,6 +330,7 @@ impl RenderOnce for ClientWindowFrame {
 
         let mut body = div()
             .id("client-window-body")
+            .debug_selector(|| "client-window-body".to_owned())
             .relative()
             .flex()
             .flex_col()
@@ -361,6 +364,7 @@ impl RenderOnce for ClientWindowFrame {
         }
         let mut content = div()
             .id("client-window-content")
+            .debug_selector(|| "client-window-content".to_owned())
             .flex()
             .flex_col()
             .min_h_0()
@@ -527,9 +531,85 @@ impl FrameGeometry {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Decorations, Tiling, point, px, size};
+    use std::{cell::RefCell, rc::Rc};
 
-    use super::{DecorationMode, FrameGeometry, FrameMetrics, ResizeEdge, WindowControlSide};
+    use gpui::{
+        Context, Decorations, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Render,
+        TestAppContext, Tiling, Window, WindowControls, div, point, prelude::*, px, size,
+    };
+
+    use super::{
+        ClientWindowFrame, DecorationMode, FrameGeometry, FrameMetrics, ResizeEdge,
+        WindowChromeAction, WindowControlFocusHandles, WindowControlSide, WindowTitleBar,
+    };
+    use crate::UiTheme;
+
+    struct ChromeHarness {
+        side: WindowControlSide,
+        controls: WindowControls,
+        maximized: bool,
+        focus: WindowControlFocusHandles,
+        actions: Rc<RefCell<Vec<WindowChromeAction>>>,
+    }
+
+    impl ChromeHarness {
+        fn new(side: WindowControlSide, controls: WindowControls, cx: &mut Context<Self>) -> Self {
+            Self {
+                side,
+                controls,
+                maximized: false,
+                focus: WindowControlFocusHandles {
+                    minimize: cx.focus_handle(),
+                    maximize: cx.focus_handle(),
+                    close: cx.focus_handle(),
+                },
+                actions: Rc::default(),
+            }
+        }
+    }
+
+    impl Render for ChromeHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let actions = self.actions.clone();
+            let title_bar = WindowTitleBar::new(
+                self.side,
+                self.controls,
+                self.maximized,
+                true,
+                self.focus.clone(),
+                Rc::new(move |action, _, _| actions.borrow_mut().push(action)),
+            );
+            let geometry = FrameGeometry::for_window(
+                Tiling::default(),
+                false,
+                false,
+                FrameMetrics::for_interface_size(UiTheme::get(cx).interface_size),
+            );
+            div()
+                .id("harness-root")
+                .debug_selector(|| "harness-root".to_owned())
+                .w(px(800.0))
+                .h(px(600.0))
+                .child(ClientWindowFrame::new(
+                    div()
+                        .id("harness-content")
+                        .debug_selector(|| "harness-content".to_owned())
+                        .size_full()
+                        .into_any_element(),
+                    geometry,
+                    Some(title_bar),
+                ))
+        }
+    }
+
+    fn all_controls() -> WindowControls {
+        WindowControls {
+            fullscreen: true,
+            maximize: true,
+            minimize: true,
+            window_menu: true,
+        }
+    }
 
     #[test]
     fn decoration_mode_uses_the_negotiated_gpui_value() {
@@ -633,5 +713,150 @@ mod tests {
         assert_eq!(large.inset, compact.inset * 1.5);
         assert_eq!(large.corner_radius, compact.corner_radius * 1.5);
         assert_eq!(large.resize_width, compact.resize_width * 1.5);
+    }
+
+    #[gpui::test]
+    fn pointer_controls_emit_native_actions_without_triggering_drag(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let (harness, cx) = cx.add_window_view(|_, cx| {
+            ChromeHarness::new(WindowControlSide::Right, all_controls(), cx)
+        });
+        cx.update(|window, app| {
+            harness.update(app, |_, cx| cx.notify());
+            window.refresh();
+        });
+        cx.run_until_parked();
+
+        for id in ["window-minimize", "window-maximize", "window-close"] {
+            let bounds = cx.debug_bounds(id).expect("control should be rendered");
+            cx.simulate_click(bounds.center(), Modifiers::none());
+        }
+
+        assert_eq!(
+            harness.read_with(cx, |harness, _| harness.actions.borrow().clone()),
+            vec![
+                WindowChromeAction::Minimize,
+                WindowChromeAction::ToggleMaximize,
+                WindowChromeAction::Close,
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn title_bar_emits_drag_double_click_and_native_menu_actions(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let (harness, cx) = cx.add_window_view(|_, cx| {
+            ChromeHarness::new(WindowControlSide::Right, all_controls(), cx)
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let position = cx.debug_bounds("window-title-bar").unwrap().center();
+
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::none());
+        cx.simulate_event(MouseDownEvent {
+            position,
+            modifiers: Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position,
+            modifiers: Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 2,
+        });
+        cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::none());
+        cx.simulate_mouse_up(position, MouseButton::Right, Modifiers::none());
+
+        let actions = harness.read_with(cx, |harness, _| harness.actions.borrow().clone());
+        assert_eq!(actions[0], WindowChromeAction::Move);
+        assert_eq!(actions[1], WindowChromeAction::DoubleClick);
+        assert!(matches!(actions[2], WindowChromeAction::ShowMenu(_)));
+    }
+
+    #[gpui::test]
+    fn controls_support_keyboard_activation_but_are_not_workspace_tab_stops(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(UiTheme::init);
+        let (harness, cx) = cx.add_window_view(|_, cx| {
+            ChromeHarness::new(WindowControlSide::Right, all_controls(), cx)
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            window.focus_next();
+            assert!(window.focused(app).is_none());
+            harness.read(app).focus.minimize.focus(window);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, app| harness.read(app).focus.maximize.focus(window));
+        cx.simulate_keystrokes("space");
+        cx.update(|window, app| harness.read(app).focus.close.focus(window));
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            harness.read_with(cx, |harness, _| harness.actions.borrow().clone()),
+            vec![
+                WindowChromeAction::Minimize,
+                WindowChromeAction::ToggleMaximize,
+                WindowChromeAction::Close,
+            ]
+        );
+
+        let close = cx.debug_bounds("window-close").unwrap();
+        cx.simulate_click(close.center(), Modifiers::none());
+        cx.update(|window, app| assert!(harness.read(app).focus.close.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn control_side_capabilities_and_interface_scale_drive_layout(cx: &mut TestAppContext) {
+        cx.update(|app| UiTheme::set_interface_size(app, 16.0));
+        let controls = WindowControls {
+            minimize: false,
+            maximize: true,
+            ..all_controls()
+        };
+        let (harness, cx) = cx.add_window_view(move |_, cx| {
+            ChromeHarness::new(WindowControlSide::Left, controls, cx)
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("window-minimize").is_none());
+        let compact_title = cx.debug_bounds("window-title-bar").unwrap();
+        let compact_close = cx.debug_bounds("window-close").unwrap();
+        assert!(compact_close.center().x < compact_title.center().x);
+
+        cx.update(|window, app| {
+            UiTheme::set_interface_size(app, 24.0);
+            harness.update(app, |_, cx| cx.notify());
+            window.refresh();
+        });
+        cx.run_until_parked();
+        let large_title = cx.debug_bounds("window-title-bar").unwrap();
+        assert_eq!(
+            f32::from(large_title.size.height),
+            f32::from(compact_title.size.height) * 1.5
+        );
+
+        harness.update(cx, |harness, cx| {
+            harness.side = WindowControlSide::Right;
+            harness.controls.window_menu = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let right_close = cx.debug_bounds("window-close").unwrap();
+        let title = cx.debug_bounds("window-title-bar").unwrap();
+        assert!(right_close.center().x > title.center().x);
+
+        harness.update(cx, |harness, _| harness.actions.borrow_mut().clear());
+        let title_position = title.center();
+        cx.simulate_mouse_down(title_position, MouseButton::Right, Modifiers::none());
+        cx.simulate_mouse_up(title_position, MouseButton::Right, Modifiers::none());
+        assert!(harness.read_with(cx, |harness, _| harness.actions.borrow().is_empty()));
     }
 }

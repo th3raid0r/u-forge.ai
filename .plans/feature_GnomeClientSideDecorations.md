@@ -1,8 +1,8 @@
-# Feature Plan: GNOME-Compatible Client-Side Window Decorations
+# Feature Plan: Negotiated Client-Side Window Decorations
 
 ## Status and target
 
-Approved, not implemented. This is a first-binary-release requirement alongside
+Implemented, pending user validation. This is a first-binary-release requirement alongside
 `feature_InferenceLifecycle.md` and `feature_AgentBudgets.md`.
 
 Provide complete native-window behavior on Linux compositors that delegate
@@ -13,25 +13,25 @@ guessing from desktop-name environment variables.
 
 ## Decoration contract
 
-- [ ] **CSD-01 — Negotiated mode.** Give the window a stable title and
+- [x] **CSD-01 — Negotiated mode.** Give the window a stable title and
   application identity, then render application chrome only when
   `Window::window_decorations()` reports client-side decorations. Server-side
   mode must retain the current workspace bounds without duplicate chrome.
-- [ ] **CSD-02 — Title bar.** Add a theme-aligned title bar with the u-forge
+- [x] **CSD-02 — Title bar.** Add a theme-aligned title bar with the u-forge
   identity, a draggable region, and minimize, maximize/restore, and close
   controls that reflect the window manager's available controls and active
   state.
-- [ ] **CSD-03 — Native interactions.** Support drag-to-move, title-bar
+- [x] **CSD-03 — Native interactions.** Support drag-to-move, title-bar
   double-click behavior, the native title-bar context menu, and resize hit
   regions on untiled edges and corners through GPUI's window APIs.
-- [ ] **CSD-04 — Frame geometry.** Apply client insets, borders, corner radii,
+- [x] **CSD-04 — Frame geometry.** Apply client insets, borders, corner radii,
   and shadows according to the reported tiling/maximized/fullscreen state.
   Client chrome must not reduce or overlap the existing menu, workspace, or
   status-bar content unexpectedly.
-- [ ] **CSD-05 — Accessible controls.** Use semantic icons, labels, tooltips,
+- [x] **CSD-05 — Accessible controls.** Use semantic icons, labels, tooltips,
   focus-visible behavior, and interface-scale tokens. Window controls must work
   by pointer and keyboard without entering the normal workspace focus cycle.
-- [ ] **CSD-06 — Platform preservation.** Keep macOS, Windows, and Linux
+- [x] **CSD-06 — Platform preservation.** Keep macOS, Windows, and Linux
   server-decorated behavior unchanged. Unsupported X11 compositors may fall
   back to server-side decorations without losing resize or move behavior.
 
@@ -47,3 +47,23 @@ guessing from desktop-name environment variables.
   resize hit region intercepts application controls.
 - Final verification is `make fmt-check`, `make check`, `make clippy`, and the
   unfiltered `make test`.
+
+## User validation gate
+
+Do not mark this feature complete until a user has completed and reported the
+following cycle. Record the compositor/session and any defects below.
+
+- [ ] GNOME Wayland, floating: one title bar only; centered `u-forge.ai`;
+  controls work; empty title-bar space drags; double-click toggles maximize;
+  right-click opens the native menu; every free edge/corner resizes.
+- [ ] GNOME Wayland, maximized, fullscreen, and left/right tiled: chrome and
+  resize regions follow the state; application menus, workspace, and status bar
+  remain fully usable.
+- [ ] Settings: left/right placement applies after Save Settings, survives a
+  restart, and remains usable at interface sizes 14, 22, and 32.
+- [ ] GNOME X11 where available: move, resize, controls, and native menu work;
+  unsupported CSD falls back without losing native decorations.
+- [ ] At least one server-decorated Linux session: no duplicate application
+  title bar and no change to workspace bounds.
+
+Validation result: pending.
