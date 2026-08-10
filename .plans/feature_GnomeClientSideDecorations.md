@@ -2,9 +2,10 @@
 
 ## Status and target
 
-Implemented and user-validated on the available Linux sessions. GNOME X11 was
-not available for this cycle. This is a first-binary-release requirement
-alongside `feature_InferenceLifecycle.md` and `feature_AgentBudgets.md`.
+Implemented and user-validated on supported Linux sessions. GNOME X11 is an
+unsupported configuration and has no validation requirement. This is a
+first-binary-release requirement alongside `feature_InferenceLifecycle.md` and
+`feature_AgentBudgets.md`.
 
 Provide complete native-window behavior on Linux compositors that delegate
 window chrome to the application, especially GNOME on Wayland. Preserve native
@@ -33,8 +34,8 @@ guessing from desktop-name environment variables.
   focus-visible behavior, and interface-scale tokens. Window controls must work
   by pointer and keyboard without entering the normal workspace focus cycle.
 - [x] **CSD-06 — Platform preservation.** Keep macOS, Windows, and Linux
-  server-decorated behavior unchanged. Unsupported X11 compositors may fall
-  back to server-side decorations without losing resize or move behavior.
+  server-decorated behavior unchanged. X11 is outside the supported
+  configuration set; GPUI may still fall back to server-side decorations.
 
 ## Tests and acceptance
 
@@ -42,8 +43,8 @@ guessing from desktop-name environment variables.
 - GPUI interaction tests cover each window control, drag regions, double-click,
   context-menu invocation, focus behavior, and interface scaling.
 - Manual acceptance covers GNOME Wayland at normal, maximized, fullscreen, and
-  tiled sizes; GNOME X11 where available; and at least one server-decorated
-  Linux session to confirm that duplicate chrome is never rendered.
+  tiled sizes and at least one server-decorated Linux session to confirm that
+  duplicate chrome is never rendered.
 - The window remains movable and resizable at every supported scale, and no
   resize hit region intercepts application controls.
 - Final verification is `make fmt-check`, `make check`, `make clippy`, and the
@@ -51,8 +52,7 @@ guessing from desktop-name environment variables.
 
 ## User validation
 
-Completed by the user on 2026-08-09. The unavailable X11 session is recorded
-explicitly rather than treated as a supported-session failure.
+Completed by the user on 2026-08-09 across the supported Linux configurations.
 
 - [X] GNOME Wayland, floating: one title bar only; centered `u-forge.ai`;
   controls work; empty title-bar space drags; double-click toggles maximize;
@@ -62,10 +62,9 @@ explicitly rather than treated as a supported-session failure.
   remain fully usable.
 - [X] Settings: left/right placement applies after Save Settings, survives a
   restart, and remains usable at interface sizes 14, 22, and 32.
-- [!!!] GNOME X11 where available: move, resize, controls, and native menu work;
-  unsupported CSD falls back without losing native decorations. (UNSUPPORTED CONFIG - NO TEST)
+- GNOME X11: intentionally unsupported; no validation required.
 - [X] At least one server-decorated Linux session: no duplicate application
   title bar and no change to workspace bounds.
 
 Validation result: complete on GNOME Wayland and a server-decorated Linux
-session; GNOME X11 was unavailable and remains untested.
+session. GNOME X11 is out of scope.
