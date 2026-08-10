@@ -1860,6 +1860,7 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
+ "futures",
  "is-terminal",
  "itertools 0.10.5",
  "num-traits",
@@ -1872,6 +1873,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 
@@ -9705,6 +9707,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -10022,6 +10025,7 @@ dependencies = [
  "async-openai",
  "async-trait",
  "chrono",
+ "criterion",
  "dashmap",
  "futures",
  "libc",
@@ -10037,6 +10041,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tiktoken-rs",
  "tokio",
+ "tokio-util",
  "toml 1.1.4+spec-1.1.0",
  "toml_edit 0.25.11+spec-1.1.0",
  "tracing",

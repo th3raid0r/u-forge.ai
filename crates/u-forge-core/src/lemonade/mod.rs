@@ -52,8 +52,9 @@ pub use chat::{
     ChatUsage, LemonadeChatProvider, StreamToken,
 };
 pub use client::{
-    LemonadeConnection, LemonadeHttpClient, LemonadeOwnership, LemonadeSecret, LemonadeTimeouts,
-    make_lemonade_openai_client, make_lemonade_openai_client_for,
+    LemonadeConnection, LemonadeHttpClient, LemonadeOwnership, LemonadeSecret,
+    LemonadeTelemetryLinks, LemonadeTimeouts, make_lemonade_openai_client,
+    make_lemonade_openai_client_for,
 };
 pub use duplicate_guard::DuplicateGuard;
 pub use embedded::{EmbeddedLemonade, EmbeddedRuntimeError};

@@ -4,7 +4,7 @@ use parking_lot::RwLock;
 use u_forge_core::{
     AppConfig, KnowledgeGraph,
     lemonade::{EmbeddedLemonade, LemonadeConnection, LemonadeServerCatalog},
-    queue::InferenceQueue,
+    queue::{CancellationToken, InferenceQueue},
 };
 use u_forge_graph_view::GraphSnapshot;
 
@@ -39,22 +39,34 @@ pub(crate) struct AppState {
     pub(crate) embedding_status: Option<String>,
     /// Single authority for which embedding plan may update UI progress.
     pub(crate) embedding_plan: EmbeddingPlanAuthority,
+    /// Number of broadcast receive points that observed dropped graph events.
+    pub(crate) graph_event_lag_events: u64,
+    /// Total graph events skipped by the bounded broadcast channel.
+    pub(crate) graph_event_lagged_messages: u64,
+    /// Successful correctness-preserving full refreshes after lag.
+    pub(crate) graph_lag_recoveries: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct EmbeddingPlanAuthority {
     generation: u64,
     active: bool,
+    cancellation: Option<CancellationToken>,
 }
 
 impl EmbeddingPlanAuthority {
     /// Start a plan, returning its generation and whether older work remains
     /// active in the queue.
-    pub(crate) fn start(&mut self) -> (u64, bool) {
+    pub(crate) fn start(&mut self) -> (u64, bool, CancellationToken) {
         let superseded = self.active;
+        if let Some(previous) = self.cancellation.take() {
+            previous.supersede();
+        }
         self.generation = self.generation.wrapping_add(1);
         self.active = true;
-        (self.generation, superseded)
+        let cancellation = CancellationToken::new();
+        self.cancellation = Some(cancellation.clone());
+        (self.generation, superseded, cancellation)
     }
 
     pub(crate) fn is_current(&self, generation: u64) -> bool {
@@ -66,7 +78,15 @@ impl EmbeddingPlanAuthority {
             return false;
         }
         self.active = false;
+        self.cancellation = None;
         true
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+        }
+        self.active = false;
     }
 }
 
@@ -100,6 +120,9 @@ impl AppState {
             data_status: None,
             embedding_status: None,
             embedding_plan: EmbeddingPlanAuthority::default(),
+            graph_event_lag_events: 0,
+            graph_event_lagged_messages: 0,
+            graph_lag_recoveries: 0,
         }
     }
 }
@@ -111,12 +134,13 @@ mod tests {
     #[test]
     fn embedding_plan_authority_rejects_superseded_updates() {
         let mut authority = EmbeddingPlanAuthority::default();
-        let (first, superseded) = authority.start();
+        let (first, superseded, first_token) = authority.start();
         assert!(!superseded);
         assert!(authority.is_current(first));
 
-        let (second, superseded) = authority.start();
+        let (second, superseded, _second_token) = authority.start();
         assert!(superseded);
+        assert!(first_token.is_cancelled());
         assert!(!authority.is_current(first));
         assert!(authority.is_current(second));
         assert!(!authority.finish(first));

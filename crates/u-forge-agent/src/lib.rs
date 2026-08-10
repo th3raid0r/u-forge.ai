@@ -20,10 +20,16 @@ use rig::tool::{Tool, ToolContext};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
-use u_forge_core::ingest::rechunk_and_embed;
-use u_forge_core::search::{HybridSearchConfig, NodeSearchResult, fts5_sanitize, search_hybrid};
+use u_forge_core::ingest::rechunk_and_embed_with_cancellation;
+use u_forge_core::search::{
+    HybridSearchConfig, NodeSearchResult, fts5_sanitize, search_hybrid_with_cancellation,
+};
 use u_forge_core::types::ObjectMetadata;
-use u_forge_core::{KnowledgeGraph, queue::InferenceQueue, types::ObjectId};
+use u_forge_core::{
+    KnowledgeGraph,
+    queue::{CancellationToken, InferenceQueue},
+    types::ObjectId,
+};
 
 // ── History and token counting ────────────────────────────────────────────────
 
@@ -426,11 +432,21 @@ pub struct SemanticSearchArgs {
 pub struct SemanticSearchTool {
     graph: Arc<KnowledgeGraph>,
     queue: Arc<InferenceQueue>,
+    cancellation: CancellationToken,
 }
 
 impl SemanticSearchTool {
     pub fn new(graph: Arc<KnowledgeGraph>, queue: Arc<InferenceQueue>) -> Self {
-        Self { graph, queue }
+        Self {
+            graph,
+            queue,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 }
 
@@ -468,7 +484,7 @@ impl Tool for SemanticSearchTool {
 
         let query_vec = self
             .queue
-            .embed(&args.query)
+            .submit_embed_with_cancellation(&args.query, self.cancellation.clone())
             .await
             .map_err(|e| ToolError(format!("Embedding failed: {e:#}")))?;
 
@@ -561,11 +577,21 @@ pub struct HybridSearchArgs {
 pub struct HybridSearchTool {
     graph: Arc<KnowledgeGraph>,
     queue: Arc<InferenceQueue>,
+    cancellation: CancellationToken,
 }
 
 impl HybridSearchTool {
     pub fn new(graph: Arc<KnowledgeGraph>, queue: Arc<InferenceQueue>) -> Self {
-        Self { graph, queue }
+        Self {
+            graph,
+            queue,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 }
 
@@ -608,9 +634,16 @@ impl Tool for HybridSearchTool {
             ..HybridSearchConfig::default()
         };
 
-        let results = search_hybrid(&self.graph, &self.queue, None, &args.query, &config)
-            .await
-            .map_err(ToolError::from)?;
+        let results = search_hybrid_with_cancellation(
+            &self.graph,
+            &self.queue,
+            None,
+            &args.query,
+            &config,
+            self.cancellation.clone(),
+        )
+        .await
+        .map_err(ToolError::from)?;
 
         if results.is_empty() {
             return Ok(format!(
@@ -663,6 +696,7 @@ pub struct UpsertNodeTool {
     graph: Arc<KnowledgeGraph>,
     queue: Arc<InferenceQueue>,
     hq_queue: Option<Arc<InferenceQueue>>,
+    cancellation: CancellationToken,
 }
 
 impl UpsertNodeTool {
@@ -675,7 +709,13 @@ impl UpsertNodeTool {
             graph,
             queue,
             hq_queue,
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 }
 
@@ -777,6 +817,9 @@ impl Tool for UpsertNodeTool {
         }
 
         // Persist the node.
+        if self.cancellation.is_cancelled() {
+            return Err(ToolError(self.cancellation.error().to_string()));
+        }
         if is_update {
             self.graph
                 .update_object(meta.clone())
@@ -789,9 +832,15 @@ impl Tool for UpsertNodeTool {
 
         // Re-chunk and embed (standard + HQ). This blocks until all embeddings are stored.
         let hq_ref = self.hq_queue.as_deref();
-        let chunks = rechunk_and_embed(&self.graph, &self.queue, hq_ref, object_id)
-            .await
-            .map_err(|e| ToolError(format!("Embedding failed: {e:#}")))?;
+        let chunks = rechunk_and_embed_with_cancellation(
+            &self.graph,
+            &self.queue,
+            hq_ref,
+            object_id,
+            self.cancellation.clone(),
+        )
+        .await
+        .map_err(|e| ToolError(format!("Embedding failed: {e:#}")))?;
 
         let action = if is_update { "Updated" } else { "Created" };
         let output = format!(
@@ -829,6 +878,7 @@ pub struct UpsertEdgeTool {
     graph: Arc<KnowledgeGraph>,
     queue: Arc<InferenceQueue>,
     hq_queue: Option<Arc<InferenceQueue>>,
+    cancellation: CancellationToken,
 }
 
 impl UpsertEdgeTool {
@@ -841,7 +891,13 @@ impl UpsertEdgeTool {
             graph,
             queue,
             hq_queue,
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 }
 
@@ -923,6 +979,9 @@ impl Tool for UpsertEdgeTool {
         let target_id = resolve_node(&self.graph, &args.target)?;
 
         let weight = args.weight.unwrap_or(1.0);
+        if self.cancellation.is_cancelled() {
+            return Err(ToolError(self.cancellation.error().to_string()));
+        }
         self.graph
             .connect_objects_weighted_str(source_id, target_id, &args.edge_type, weight)
             .map_err(|e| ToolError(format!("Failed to upsert edge: {e:#}")))?;
@@ -938,7 +997,15 @@ impl Tool for UpsertEdgeTool {
         }
         let mut reembed_warnings: Vec<String> = Vec::new();
         for &oid in &to_reembed {
-            if let Err(e) = rechunk_and_embed(&self.graph, &self.queue, hq_ref, oid).await {
+            if let Err(e) = rechunk_and_embed_with_cancellation(
+                &self.graph,
+                &self.queue,
+                hq_ref,
+                oid,
+                self.cancellation.clone(),
+            )
+            .await
+            {
                 tracing::warn!(object_id = %oid, %e, "Re-embed after edge upsert failed");
                 reembed_warnings.push(format!("[warning] endpoint {oid} re-embed failed: {e:#}"));
             }
@@ -1200,6 +1267,7 @@ impl GraphAgent {
                 u_forge_core::ReasoningPolicy::Disabled
             },
             &self.params,
+            CancellationToken::new(),
         )
     }
 
@@ -1208,6 +1276,7 @@ impl GraphAgent {
         model_id: &str,
         reasoning: u_forge_core::ReasoningPolicy,
         params: &AgentParams,
+        cancellation: CancellationToken,
     ) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
         let mut builder = self.client.agent(model_id).preamble(&self.system_prompt);
         if let Some(temp) = params.temperature {
@@ -1223,25 +1292,31 @@ impl GraphAgent {
         }
 
         builder
-            .tool(HybridSearchTool::new(
-                self.graph.clone(),
-                self.queue.clone(),
-            ))
+            .tool(
+                HybridSearchTool::new(self.graph.clone(), self.queue.clone())
+                    .with_cancellation(cancellation.clone()),
+            )
             .tool(FtsSearchTool::new(self.graph.clone()))
-            .tool(SemanticSearchTool::new(
-                self.graph.clone(),
-                self.queue.clone(),
-            ))
-            .tool(UpsertNodeTool::new(
-                self.graph.clone(),
-                self.queue.clone(),
-                self.hq_queue.clone(),
-            ))
-            .tool(UpsertEdgeTool::new(
-                self.graph.clone(),
-                self.queue.clone(),
-                self.hq_queue.clone(),
-            ))
+            .tool(
+                SemanticSearchTool::new(self.graph.clone(), self.queue.clone())
+                    .with_cancellation(cancellation.clone()),
+            )
+            .tool(
+                UpsertNodeTool::new(
+                    self.graph.clone(),
+                    self.queue.clone(),
+                    self.hq_queue.clone(),
+                )
+                .with_cancellation(cancellation.clone()),
+            )
+            .tool(
+                UpsertEdgeTool::new(
+                    self.graph.clone(),
+                    self.queue.clone(),
+                    self.hq_queue.clone(),
+                )
+                .with_cancellation(cancellation),
+            )
             .build()
     }
 
@@ -1307,9 +1382,36 @@ impl GraphAgent {
         runtime_lease: Option<u_forge_core::LemonadeRuntimeLease>,
         uses_gpu: bool,
     ) -> mpsc::Receiver<AgentStreamEvent> {
+        self.prompt_stream_with_profile_and_cancellation(
+            model_id,
+            user_message,
+            history,
+            reasoning,
+            params,
+            runtime_lease,
+            uses_gpu,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Stream a complete agent/tool operation under one parent token.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prompt_stream_with_profile_and_cancellation(
+        &self,
+        model_id: &str,
+        user_message: &str,
+        history: &[HistoryMessage],
+        reasoning: u_forge_core::ReasoningPolicy,
+        params: AgentParams,
+        runtime_lease: Option<u_forge_core::LemonadeRuntimeLease>,
+        uses_gpu: bool,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<AgentStreamEvent> {
         let (tx, rx) = mpsc::channel(64);
 
-        let agent = self.build_agent_with_params(model_id, reasoning, &params);
+        let agent =
+            self.build_agent_with_params(model_id, reasoning, &params, cancellation.clone());
         let max_turns = params.max_tool_turns;
         let gpu = uses_gpu.then(|| self.gpu.clone()).flatten();
 
@@ -1329,7 +1431,10 @@ impl GraphAgent {
         tokio::spawn(async move {
             let _runtime_lease = runtime_lease;
             let mut gpu_guard = match &gpu {
-                Some(gpu) => Some(gpu.begin_llm().await),
+                Some(gpu) => tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    guard = gpu.begin_llm() => Some(guard),
+                },
                 None => None,
             };
             let mut stream = agent
@@ -1344,7 +1449,12 @@ impl GraphAgent {
             // If the receiver is dropped (user closed the chat panel, app exited) we stop
             // driving the rig stream instead of burning LLM inference and potentially
             // running write tools the caller will never observe.
-            'stream: while let Some(item) = stream.next().await {
+            'stream: loop {
+                let item = tokio::select! {
+                    _ = cancellation.cancelled() => break 'stream,
+                    item = stream.next() => item,
+                };
+                let Some(item) = item else { break 'stream };
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
                         StreamedAssistantContent::Text(t) => {
@@ -1432,7 +1542,10 @@ impl GraphAgent {
                             }
                             // The next poll begins the following LLM turn.
                             if let Some(gpu) = &gpu {
-                                gpu_guard = Some(gpu.begin_llm().await);
+                                gpu_guard = tokio::select! {
+                                    _ = cancellation.cancelled() => break 'stream,
+                                    guard = gpu.begin_llm() => Some(guard),
+                                };
                             }
                         }
                     },

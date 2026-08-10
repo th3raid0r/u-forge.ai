@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 use crate::KnowledgeGraph;
 use crate::ingest::DataIngestion;
+use crate::queue::CancellationToken;
 use crate::schema::SchemaIngestion;
 use crate::types::{ChunkType, ObjectId};
 
@@ -48,12 +49,21 @@ pub async fn import_data_only<P: AsRef<Path>>(
     graph: &KnowledgeGraph,
     data_file: P,
 ) -> Result<SetupResult> {
+    import_data_only_with_cancellation(graph, data_file, CancellationToken::new()).await
+}
+
+/// Import data and build FTS indexes under one parent cancellation token.
+pub async fn import_data_only_with_cancellation<P: AsRef<Path>>(
+    graph: &KnowledgeGraph,
+    data_file: P,
+    cancellation: CancellationToken,
+) -> Result<SetupResult> {
     let data_file = data_file.as_ref();
     info!(
         data_file = %data_file.display(),
         "Importing data (schema-independent)"
     );
-    import_loaded_data(graph, data_file).await
+    import_loaded_data(graph, data_file, &cancellation).await
 }
 
 /// Load schemas, import data, and index for FTS5 without the populated-graph guard.
@@ -65,19 +75,38 @@ pub async fn import_schemas_and_data(
     schema_dir: &Path,
     data_file: &Path,
 ) -> Result<SetupResult> {
-    load_schemas_into_graph(graph, schema_dir, true).await?;
-    import_loaded_data(graph, data_file).await
+    import_schemas_and_data_with_cancellation(
+        graph,
+        schema_dir,
+        data_file,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Load schemas and import data under one parent cancellation token.
+pub async fn import_schemas_and_data_with_cancellation(
+    graph: &KnowledgeGraph,
+    schema_dir: &Path,
+    data_file: &Path,
+    cancellation: CancellationToken,
+) -> Result<SetupResult> {
+    load_schemas_into_graph(graph, schema_dir, true, &cancellation).await?;
+    import_loaded_data(graph, data_file, &cancellation).await
 }
 
 async fn import_loaded_data<P: AsRef<Path>>(
     graph: &KnowledgeGraph,
     data_file: P,
+    cancellation: &CancellationToken,
 ) -> Result<SetupResult> {
     let data_file = data_file.as_ref();
     info!(data_file = %data_file.display(), "Importing data");
     let import_start = Instant::now();
     let mut ingestion = DataIngestion::new(graph);
-    ingestion.import_json_data(data_file).await?;
+    ingestion
+        .import_json_data_with_cancellation(data_file, cancellation)
+        .await?;
     let import_duration_ms = import_start.elapsed().as_millis() as u64;
     let stats = ingestion.get_stats();
     let objects_created = stats.objects_created;
@@ -106,6 +135,7 @@ async fn import_loaded_data<P: AsRef<Path>>(
     );
 
     info!("Indexing text for full-text search");
+    cancellation.check_cancelled()?;
     let index_start = Instant::now();
     let load_objects_start = Instant::now();
     let all_objects = graph.get_all_objects()?;
@@ -118,6 +148,7 @@ async fn import_loaded_data<P: AsRef<Path>>(
     let all_edges = graph.get_all_edges()?;
     let all_edges_count = all_edges.len();
     for edge in all_edges {
+        cancellation.check_cancelled()?;
         let Some(from_name) = id_to_name.get(&edge.from) else {
             continue;
         };
@@ -137,6 +168,7 @@ async fn import_loaded_data<P: AsRef<Path>>(
     let mut chunks_indexed = 0usize;
     let mut chunk_inputs = Vec::with_capacity(all_objects.len());
     for obj in &all_objects {
+        cancellation.check_cancelled()?;
         let edge_lines = edges_by_object.remove(&obj.id).unwrap_or_default();
         let text = obj.flatten_for_embedding(&edge_lines);
         chunk_inputs.push((obj.id, text, ChunkType::Imported));
@@ -144,6 +176,7 @@ async fn import_loaded_data<P: AsRef<Path>>(
     let flatten_duration_ms = flatten_start.elapsed().as_millis() as u64;
 
     let chunk_write_start = Instant::now();
+    cancellation.check_cancelled()?;
     chunks_indexed += graph.add_text_chunks(chunk_inputs)?.len();
     let chunk_write_duration_ms = chunk_write_start.elapsed().as_millis() as u64;
     let index_duration_ms = index_start.elapsed().as_millis() as u64;
@@ -188,6 +221,17 @@ pub async fn setup_and_index(
     schema_dir: &str,
     data_file: &str,
 ) -> Result<SetupResult> {
+    setup_and_index_with_cancellation(graph, schema_dir, data_file, CancellationToken::new()).await
+}
+
+/// Load schemas, import data, and index FTS under one parent token.
+pub async fn setup_and_index_with_cancellation(
+    graph: &KnowledgeGraph,
+    schema_dir: &str,
+    data_file: &str,
+    cancellation: CancellationToken,
+) -> Result<SetupResult> {
+    cancellation.check_cancelled()?;
     let pre_stats = graph.get_stats()?;
     if pre_stats.node_count > 0 {
         info!(
@@ -211,25 +255,29 @@ pub async fn setup_and_index(
 
     // ── Schemas ──────────────────────────────────────────────────────────────
 
-    load_schemas_into_graph(graph, Path::new(schema_dir), false).await?;
+    load_schemas_into_graph(graph, Path::new(schema_dir), false, &cancellation).await?;
 
     // ── Data import ─────────────────────────────────────────────────────────
 
-    import_loaded_data(graph, data_file).await
+    import_loaded_data(graph, data_file, &cancellation).await
 }
 
 async fn load_schemas_into_graph(
     graph: &KnowledgeGraph,
     schema_dir: &Path,
     require_success: bool,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
+    cancellation.check_cancelled()?;
     info!(schema_dir = %schema_dir.display(), "Loading schemas");
     match SchemaIngestion::load_schemas_from_directory(schema_dir, "imported_schemas", "1.0.0") {
         Ok(schema_def) => {
             let mgr = graph.get_schema_manager();
             // Remove the hardcoded "default" placeholder (character, location...)
             // before saving the real imported schema set.
+            cancellation.check_cancelled()?;
             let _ = mgr.delete_schema("default");
+            cancellation.check_cancelled()?;
             match mgr.save_schema(&schema_def) {
                 Ok(()) => {
                     info!(count = schema_def.object_types.len(), "Schema types loaded");
@@ -242,4 +290,35 @@ async fn load_schemas_into_graph(
         Err(e) => warn!(%e, schema_dir = %schema_dir.display(), "Could not load schemas"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_import_performs_no_graph_or_index_writes() {
+        let graph_dir = TempDir::new().unwrap();
+        let graph = KnowledgeGraph::new(graph_dir.path()).unwrap();
+        let input_dir = TempDir::new().unwrap();
+        let input = input_dir.path().join("cancelled-import.jsonl");
+        std::fs::write(
+            &input,
+            r#"{"entitytype":"node","id":"source-1","nodetype":"location","properties":{"name":"Never Written"}}"#,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = import_data_only_with_cancellation(&graph, &input, cancellation)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        let stats = graph.get_stats().unwrap();
+        assert_eq!(stats.node_count, 0);
+        assert_eq!(stats.chunk_count, 0);
+    }
 }

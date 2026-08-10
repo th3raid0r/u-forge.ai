@@ -178,6 +178,11 @@ fn estimated_cost(slot: &WeightedWorkerSlot) -> u64 {
     let ewma = slot.ewma_us.load(Ordering::Relaxed);
     let pending = slot.queue.pending() as u64;
     if ewma == 0 {
+        // Evidence decision (inference_lifecycle benchmark): the zero/fallback
+        // cold run stays within the same makespan band as the otherwise
+        // identical preseeded 1 ms/4 ms mock run. Static device seeds would
+        // encode machine-specific assumptions without a demonstrated win, so
+        // cold workers continue to spread by pending depth and weight.
         pending
     } else {
         (pending + 1) * ewma
@@ -192,15 +197,21 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::queue::jobs::EmbedJob;
+    use crate::queue::jobs::{EmbedJob, JobContext};
+    use crate::queue::lifecycle::{CancellationToken, InferenceResult};
+    use crate::queue::telemetry::QueueMetrics;
 
     fn make_job() -> (
         EmbedJob,
-        tokio::sync::oneshot::Receiver<anyhow::Result<Vec<f32>>>,
+        tokio::sync::oneshot::Receiver<InferenceResult<Vec<f32>>>,
     ) {
         let (tx, rx) = oneshot::channel();
         (
             EmbedJob {
+                context: JobContext::new(
+                    CancellationToken::new(),
+                    Arc::new(QueueMetrics::default()),
+                ),
                 text: "test".into(),
                 response: tx,
             },

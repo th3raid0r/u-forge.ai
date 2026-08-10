@@ -14,6 +14,7 @@ use u_forge_core::{
     LemonadeRuntimeProfile, ModelLoadOptions, ReasoningPolicy, StreamToken,
     config::ReasoningControl,
     lemonade::{EffectiveChatLimits, LemonadeChatProvider, SelectedModel},
+    queue::CancellationToken,
 };
 
 use crate::chat_history::{ChatHistoryStore, ChatSessionSummary, StoredChatMessage};
@@ -83,6 +84,8 @@ pub(crate) struct ChatPanel {
     /// consumer, which closes the mpsc::Receiver and causes the next tx.send()
     /// inside prompt_stream to return Err — breaking the stream loop.
     stream_task: Option<gpui::Task<()>>,
+    /// Explicit owner for runtime loading, provider streams, and agent tools.
+    stream_cancellation: Option<CancellationToken>,
     /// During streaming: handle to the Thinking message entity being appended to
     /// (lazily created on the first ReasoningDelta / Thinking token).
     streaming_thinking: Option<Entity<ChatMessageView>>,
@@ -324,6 +327,7 @@ impl ChatPanel {
             messages,
             streaming: false,
             stream_task: None,
+            stream_cancellation: None,
             streaming_thinking: None,
             streaming_assistant: None,
             streaming_tool_calls: HashMap::new(),
@@ -571,6 +575,7 @@ impl ChatPanel {
     fn finalize_stream(&mut self, cx: &mut Context<Self>) {
         self.streaming = false;
         self.stream_task = None;
+        self.stream_cancellation = None;
         self.streaming_thinking = None;
         self.streaming_assistant = None;
         self.streaming_tool_calls.clear();
@@ -579,6 +584,9 @@ impl ChatPanel {
     }
 
     fn stop_stream(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancellation) = self.stream_cancellation.take() {
+            cancellation.cancel();
+        }
         self.stream_task.take();
         if let Some(msg) = self.streaming_assistant.clone() {
             msg.update(cx, |m, cx| m.append_text("\n[Cancelled]", cx));
@@ -658,25 +666,41 @@ impl ChatPanel {
         self.model_dropdown_open = false;
         self.history_dropdown_open = false;
         self.toolbar_menu_open = false;
+        if let Some(previous) = self.stream_cancellation.take() {
+            previous.supersede();
+        }
+        let cancellation = CancellationToken::new();
+        self.stream_cancellation = Some(cancellation.clone());
         let Some(runtime) = self.runtime.clone() else {
-            self.start_send_with_text(text, None, cx);
+            self.start_send_with_text(text, None, cancellation, cx);
             return;
         };
         let Some(profile) = self.selected_runtime_profile() else {
-            self.start_send_with_text(text, None, cx);
+            self.start_send_with_text(text, None, cancellation, cx);
             return;
         };
         let tokio_rt = self.tokio_rt.clone();
         self.streaming = true;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
+            let acquire_cancellation = cancellation.clone();
             let lease = cx
                 .background_executor()
-                .spawn(async move { tokio_rt.block_on(runtime.acquire(&profile)) })
+                .spawn(async move {
+                    tokio_rt.block_on(async move {
+                        tokio::select! {
+                            _ = acquire_cancellation.cancelled() => None,
+                            result = runtime.acquire_with_cancellation(
+                                &profile,
+                                &acquire_cancellation,
+                            ) => Some(result),
+                        }
+                    })
+                })
                 .await;
             this.update(cx, |view: &mut ChatPanel, cx| match lease {
-                Ok(lease) => view.start_send_with_text(text, Some(lease), cx),
-                Err(error) => {
+                Some(Ok(lease)) => view.start_send_with_text(text, Some(lease), cancellation, cx),
+                Some(Err(error)) => {
                     view.profile_reload_state = ProfileReloadState::Failed(format!(
                         "Could not load the selected Assistant model: {error:#}"
                     ));
@@ -688,6 +712,7 @@ impl ChatPanel {
                     );
                     view.finalize_stream(cx);
                 }
+                None => {}
             })
             .ok();
         });
@@ -698,6 +723,7 @@ impl ChatPanel {
         &mut self,
         text: String,
         runtime_lease: Option<LemonadeRuntimeLease>,
+        cancellation: CancellationToken,
         cx: &mut Context<Self>,
     ) {
         // Build token-windowed history from prior User/Assistant turns before
@@ -755,7 +781,7 @@ impl ChatPanel {
                 let mut rx = cx
                     .background_executor()
                     .spawn(async move {
-                        tokio_rt.block_on(agent.prompt_stream_with_profile(
+                        tokio_rt.block_on(agent.prompt_stream_with_profile_and_cancellation(
                             &model_id,
                             &text,
                             &history,
@@ -767,6 +793,7 @@ impl ChatPanel {
                             agent_params,
                             runtime_lease,
                             uses_gpu,
+                            cancellation,
                         ))
                     })
                     .await;
@@ -930,6 +957,7 @@ impl ChatPanel {
         }
 
         let tokio_rt = self.tokio_rt.clone();
+        let provider_cancellation = cancellation.clone();
 
         // Spawn a background task to drive the stream.
         let task = cx.spawn(async move |this, cx| {
@@ -938,8 +966,13 @@ impl ChatPanel {
                 .spawn(async move {
                     tokio_rt.block_on(async {
                         match runtime_lease {
-                            Some(lease) => provider.complete_stream_with_lease(req, lease),
-                            None => provider.complete_stream(req),
+                            Some(lease) => provider.complete_stream_with_lease_and_cancellation(
+                                req,
+                                lease,
+                                provider_cancellation,
+                            ),
+                            None => provider
+                                .complete_stream_with_cancellation(req, provider_cancellation),
                         }
                     })
                 })
@@ -1212,6 +1245,15 @@ impl ChatPanel {
         self.session_list = store.list_sessions().unwrap_or_default();
         self.history_list_state.reset(self.session_list.len());
         cx.notify();
+    }
+}
+
+impl Drop for ChatPanel {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.stream_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.stream_task.take();
     }
 }
 

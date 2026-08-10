@@ -424,7 +424,15 @@ impl LemonadeChatProvider {
     /// deltas alongside (or before) normal `content` deltas; these are surfaced
     /// as [`StreamToken::Thinking`] items.
     pub fn complete_stream(&self, req: ChatRequest) -> mpsc::Receiver<Result<StreamToken>> {
-        self.complete_stream_inner(req, None)
+        self.complete_stream_inner(req, None, crate::queue::CancellationToken::new())
+    }
+
+    pub fn complete_stream_with_cancellation(
+        &self,
+        req: ChatRequest,
+        cancellation: crate::queue::CancellationToken,
+    ) -> mpsc::Receiver<Result<StreamToken>> {
+        self.complete_stream_inner(req, None, cancellation)
     }
 
     /// Stream while retaining an acquired runtime lease until completion,
@@ -434,13 +442,25 @@ impl LemonadeChatProvider {
         req: ChatRequest,
         lease: LemonadeRuntimeLease,
     ) -> mpsc::Receiver<Result<StreamToken>> {
-        self.complete_stream_inner(req, Some(lease))
+        self.complete_stream_inner(req, Some(lease), crate::queue::CancellationToken::new())
+    }
+
+    /// Stream with a queue-owned token that interrupts GPU acquisition, HTTP
+    /// startup, first-token wait, and established stream reads.
+    pub fn complete_stream_with_lease_and_cancellation(
+        &self,
+        req: ChatRequest,
+        lease: LemonadeRuntimeLease,
+        cancellation: crate::queue::CancellationToken,
+    ) -> mpsc::Receiver<Result<StreamToken>> {
+        self.complete_stream_inner(req, Some(lease), cancellation)
     }
 
     fn complete_stream_inner(
         &self,
         req: ChatRequest,
         lease: Option<LemonadeRuntimeLease>,
+        cancellation: crate::queue::CancellationToken,
     ) -> mpsc::Receiver<Result<StreamToken>> {
         let (tx, rx) = mpsc::channel(64);
         let provider = self.clone();
@@ -448,7 +468,10 @@ impl LemonadeChatProvider {
         tokio::spawn(async move {
             let _runtime_lease = lease;
             let _guard = if let Some(gpu) = &provider.gpu {
-                Some(gpu.begin_llm().await)
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    guard = gpu.begin_llm() => Some(guard),
+                }
             } else {
                 None
             };
@@ -476,11 +499,13 @@ impl LemonadeChatProvider {
 
             let timeouts = provider.client.connection().timeouts();
             let first_token_deadline = tokio::time::Instant::now() + timeouts.first_token;
-            let response = match tokio::time::timeout(
-                timeouts.first_token,
-                provider.client.post_stream("/chat/completions", &body),
-            )
-            .await
+            let response = match tokio::select! {
+                _ = cancellation.cancelled() => return,
+                response = tokio::time::timeout(
+                    timeouts.first_token,
+                    provider.client.post_stream("/chat/completions", &body),
+                ) => response,
+            }
             .context("Timed out waiting for chat response headers")
             .and_then(|result| result.context("Stream init failed"))
             {
@@ -510,7 +535,10 @@ impl LemonadeChatProvider {
                         .await;
                     return;
                 }
-                let next = match tokio::time::timeout(deadline, byte_stream.next()).await {
+                let next = match tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    next = tokio::time::timeout(deadline, byte_stream.next()) => next,
+                } {
                     Ok(next) => next,
                     Err(_) => {
                         let phase = if semantic_seen {
@@ -539,7 +567,11 @@ impl LemonadeChatProvider {
                         Ok(SseEvent::Tokens(tokens)) => {
                             semantic_seen |= !tokens.is_empty();
                             for token in tokens {
-                                if tx.send(Ok(token)).await.is_err() {
+                                let sent = tokio::select! {
+                                    _ = cancellation.cancelled() => return,
+                                    sent = tx.send(Ok(token)) => sent,
+                                };
+                                if sent.is_err() {
                                     return;
                                 }
                             }
@@ -938,6 +970,76 @@ mod tests {
         })
         .await
         .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn token_cancellation_interrupts_first_token_wait_and_releases_gpu() {
+        let gpu = GpuResourceManager::new();
+        let (provider, server) = mock_stream_provider(
+            vec![(
+                std::time::Duration::from_secs(5),
+                b"data: [DONE]\n\n" as &'static [u8],
+            )],
+            LemonadeTimeouts::default(),
+            Some(gpu.clone()),
+        )
+        .await;
+        let cancellation = crate::queue::CancellationToken::new();
+        let mut stream = provider.complete_stream_with_cancellation(
+            ChatRequest::new(vec![ChatMessage::user("x")]),
+            cancellation.clone(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while gpu.current_workload() != super::super::GpuWorkload::LlmActive {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(gpu.current_workload(), super::super::GpuWorkload::Idle);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn token_cancellation_interrupts_established_stream() {
+        let gpu = GpuResourceManager::new();
+        let (provider, server) = mock_stream_provider(
+            vec![
+                (
+                    std::time::Duration::ZERO,
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                ),
+                (std::time::Duration::from_secs(5), b"data: [DONE]\n\n"),
+            ],
+            LemonadeTimeouts::default(),
+            Some(gpu.clone()),
+        )
+        .await;
+        let cancellation = crate::queue::CancellationToken::new();
+        let mut stream = provider.complete_stream_with_cancellation(
+            ChatRequest::new(vec![ChatMessage::user("x")]),
+            cancellation.clone(),
+        );
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamToken::Content(_)
+        ));
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(gpu.current_workload(), super::super::GpuWorkload::Idle);
         server.abort();
     }
 

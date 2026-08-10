@@ -16,7 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use tracing::debug;
+use tracing::{Instrument, debug};
 
 use crate::ai::embeddings::EmbeddingProvider;
 use crate::ai::transcription::TranscriptionProvider;
@@ -27,6 +27,7 @@ use crate::lemonade::{
 use super::jobs::{
     EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
 };
+use super::lifecycle::{InferenceError, TimeoutClass};
 use super::weighted::WeightedEmbedDispatcher;
 
 /// Maximum number of attempts for a single embed job before the error is
@@ -37,6 +38,79 @@ const EMBED_MAX_ATTEMPTS: u32 = 3;
 /// Base delay before the first retry.  Doubles on each subsequent attempt
 /// (100 ms → 200 ms) so three attempts add at most ~300 ms of backoff.
 const EMBED_RETRY_BASE_MS: u64 = 100;
+
+// Evidence decision (inference_lifecycle/retry_recovery_lockstep): two
+// deterministic workers recover concurrently in the same bounded 300 ms
+// backoff window as one worker. No shared-provider contention appeared, so
+// adding random jitter would add variance without evidence of benefit.
+
+fn queue_job_span(
+    context: &super::jobs::JobContext,
+    capability: &'static str,
+    device_name: &str,
+    stolen: bool,
+) -> tracing::Span {
+    tracing::info_span!(
+        "inference_queue_job",
+        job_id = context.id,
+        capability,
+        selected_worker = device_name,
+        stolen,
+        queue_wait_us = context.enqueued_at.elapsed().as_micros() as u64,
+        service_time_us = tracing::field::Empty,
+        retries = 0_u32,
+        cancellation_point = tracing::field::Empty,
+        timeout_class = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    )
+}
+
+fn finish_queue_span<T>(span: &tracing::Span, result: &Result<T, InferenceError>, service_us: u64) {
+    span.record("service_time_us", service_us);
+    let (outcome, cancellation_point, timeout_class) = match result {
+        Ok(_) => ("succeeded", None, None),
+        Err(InferenceError::Cancelled) => ("cancelled", Some("active_provider"), None),
+        Err(InferenceError::Superseded) => ("superseded", Some("active_provider"), None),
+        Err(InferenceError::TimedOut { class }) => (
+            "timed_out",
+            Some("active_provider"),
+            Some(class.to_string()),
+        ),
+        Err(InferenceError::ProviderFailed { .. }) => ("provider_failed", None, None),
+        Err(InferenceError::WorkerDropped) => ("worker_dropped", None, None),
+        Err(InferenceError::CapabilityUnavailable { .. }) => ("unavailable", None, None),
+    };
+    span.record("outcome", outcome);
+    if let Some(point) = cancellation_point {
+        span.record("cancellation_point", point);
+    }
+    if let Some(class) = timeout_class {
+        span.record("timeout_class", class);
+    }
+}
+
+fn record_pending_cancellation(
+    context: &super::jobs::JobContext,
+    capability: &'static str,
+    device_name: &str,
+    error: &InferenceError,
+) {
+    context.metrics.cancelled_pending(error);
+    let outcome = match error {
+        InferenceError::Superseded => "superseded",
+        InferenceError::TimedOut { .. } => "timed_out",
+        _ => "cancelled",
+    };
+    tracing::info!(
+        job_id = context.id,
+        capability,
+        selected_worker = device_name,
+        queue_wait_us = context.enqueued_at.elapsed().as_micros() as u64,
+        cancellation_point = "pending",
+        outcome,
+        "Inference queue job skipped before provider invocation"
+    );
+}
 
 /// Generic single-consumer worker loop shared by all non-embedding workers.
 ///
@@ -75,10 +149,34 @@ pub(super) async fn run_llm_worker(
         let provider = provider.clone();
         let device_name = device_name.clone();
         async move {
-            let start = std::time::Instant::now();
+            if job.context.cancellation.is_cancelled() {
+                let error = job.context.cancellation.error();
+                record_pending_cancellation(&job.context, "text_generation", &device_name, &error);
+                let _ = job.response.send(Err(error));
+                return;
+            }
+            let span = queue_job_span(&job.context, "text_generation", &device_name, false);
+            let start = job.context.begin(false);
             let n_messages = job.request.messages.len();
-            let result = complete_coordinated(&provider, job.request).await;
+            let result = async {
+                tokio::select! {
+                    _ = job.context.cancellation.cancelled() => {
+                        Err(job.context.cancellation.error())
+                    }
+                    result = complete_coordinated(&provider, job.request) => {
+                        result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
+                    }
+                }
+            }
+            .instrument(span.clone())
+            .await;
+            finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
+            job.context.metrics.finished(
+                &result.as_ref().map(|_| ()),
+                start.elapsed().as_micros() as u64,
+            );
             debug!(
+                job_id = job.context.id,
                 device = %device_name,
                 n_messages,
                 ok = result.is_ok(),
@@ -100,41 +198,115 @@ pub(super) async fn run_llm_stream_worker(
         let provider = provider.clone();
         let device_name = device_name.clone();
         async move {
-            let start = std::time::Instant::now();
+            if job.context.cancellation.is_cancelled() {
+                let error = job.context.cancellation.error();
+                record_pending_cancellation(
+                    &job.context,
+                    "text_generation_stream",
+                    &device_name,
+                    &error,
+                );
+                let _ = job.completion.send(Err(error));
+                return;
+            }
+            let span = queue_job_span(&job.context, "text_generation_stream", &device_name, false);
+            let start = job.context.begin(false);
             let requested_model = job.request.model.as_deref();
             if requested_model.is_some_and(|model| model != provider.profile.model_id) {
+                let error = InferenceError::provider(anyhow::anyhow!(
+                    "queued provider {} cannot serve requested model {}",
+                    provider.profile.model_id,
+                    requested_model.unwrap_or_default()
+                ));
                 let _ = job
                     .response
-                    .send(Err(anyhow::anyhow!(
-                        "queued provider {} cannot serve requested model {}",
-                        provider.profile.model_id,
-                        requested_model.unwrap_or_default()
-                    )))
+                    .send(Err(InferenceError::provider(&error)))
                     .await;
+                let terminal = Err(error);
+                let service_us = start.elapsed().as_micros() as u64;
+                job.context
+                    .metrics
+                    .finished(&terminal.as_ref().map(|_| ()), service_us);
+                finish_queue_span(&span, &terminal, service_us);
+                let _ = job.completion.send(terminal);
                 return;
             }
             let mut profile = provider.profile.clone();
             profile.reasoning = reasoning_policy(job.request.enable_thinking);
-            let lease = match provider.runtime.acquire(&profile).await {
-                Ok(lease) => lease,
-                Err(error) => {
-                    let _ = job.response.send(Err(error)).await;
+            let lease = tokio::select! {
+                _ = job.context.cancellation.cancelled() => {
+                    let error = job.context.cancellation.error();
+                    let terminal = Err(error);
+                    let service_us = start.elapsed().as_micros() as u64;
+                    job.context.metrics.finished(
+                        &terminal.as_ref().map(|_| ()),
+                        service_us,
+                    );
+                    finish_queue_span(&span, &terminal, service_us);
+                    let _ = job.completion.send(terminal);
                     return;
+                }
+                result = provider.runtime.acquire_with_cancellation(
+                    &profile,
+                    &job.context.cancellation,
+                ) => match result {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        let _ = job.response.send(Err(InferenceError::provider(&error))).await;
+                        let terminal = Err(error);
+                        let service_us = start.elapsed().as_micros() as u64;
+                        job.context.metrics.finished(
+                            &terminal.as_ref().map(|_| ()),
+                            service_us,
+                        );
+                        finish_queue_span(&span, &terminal, service_us);
+                        let _ = job.completion.send(terminal);
+                        return;
+                    }
                 }
             };
             let mut stream = provider
                 .provider
-                .complete_stream_with_lease(job.request, lease);
-            while let Some(item) = stream.recv().await {
+                .complete_stream_with_lease_and_cancellation(
+                    job.request,
+                    lease,
+                    job.context.cancellation.clone(),
+                );
+            let terminal = loop {
+                let item = tokio::select! {
+                    _ = job.context.cancellation.cancelled() => {
+                        break Err(job.context.cancellation.error());
+                    }
+                    item = stream.recv() => item,
+                };
+                let Some(item) = item else {
+                    break Ok(());
+                };
+                let item = item.map_err(|error| {
+                    InferenceError::classify_timeout(error, TimeoutClass::Provider)
+                });
+                let failed = item.is_err();
                 if job.response.send(item).await.is_err() {
-                    break;
+                    job.context.cancellation.cancel();
+                    break Err(job.context.cancellation.error());
                 }
-            }
+                if failed {
+                    break Err(InferenceError::provider("stream provider failed"));
+                }
+            };
+            job.context.metrics.finished(
+                &terminal.as_ref().map(|_| ()),
+                start.elapsed().as_micros() as u64,
+            );
+            finish_queue_span(&span, &terminal, start.elapsed().as_micros() as u64);
             debug!(
+                job_id = job.context.id,
                 device = %device_name,
+                ok = terminal.is_ok(),
                 duration_ms = start.elapsed().as_millis(),
                 "LLM streaming job complete"
             );
+            let _ = job.completion.send(terminal);
         }
     })
     .await;
@@ -178,10 +350,34 @@ pub(super) async fn run_rerank_worker(
         let provider = Arc::clone(&provider);
         let device_name = device_name.clone();
         async move {
-            let start = std::time::Instant::now();
+            if job.context.cancellation.is_cancelled() {
+                let error = job.context.cancellation.error();
+                record_pending_cancellation(&job.context, "reranking", &device_name, &error);
+                let _ = job.response.send(Err(error));
+                return;
+            }
+            let span = queue_job_span(&job.context, "reranking", &device_name, false);
+            let start = job.context.begin(false);
             let n_docs = job.documents.len();
-            let result = provider.rerank(&job.query, job.documents, job.top_n).await;
+            let result = async {
+                tokio::select! {
+                    _ = job.context.cancellation.cancelled() => {
+                        Err(job.context.cancellation.error())
+                    }
+                    result = provider.rerank(&job.query, job.documents, job.top_n) => {
+                        result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
+                    }
+                }
+            }
+            .instrument(span.clone())
+            .await;
+            finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
+            job.context.metrics.finished(
+                &result.as_ref().map(|_| ()),
+                start.elapsed().as_micros() as u64,
+            );
             debug!(
+                job_id = job.context.id,
                 device = %device_name,
                 n_docs,
                 top_n = ?job.top_n,
@@ -210,16 +406,47 @@ async fn execute_embed_job(
     provider: &Arc<dyn EmbeddingProvider>,
     device_name: &str,
     ewma_us: &Arc<AtomicU64>,
+    stolen: bool,
 ) {
-    let start = std::time::Instant::now();
-    let mut last_err: Option<anyhow::Error> = None;
+    if job.context.cancellation.is_cancelled() {
+        let error = job.context.cancellation.error();
+        record_pending_cancellation(&job.context, "embedding", device_name, &error);
+        let _ = job.response.send(Err(error));
+        return;
+    }
+    let span = queue_job_span(&job.context, "embedding", device_name, stolen);
+    let start = job.context.begin(stolen);
+    let mut last_err: Option<InferenceError> = None;
     let mut result: Option<Vec<f32>> = None;
 
     for attempt in 1..=EMBED_MAX_ATTEMPTS {
-        match provider.embed(&job.text).await {
+        let attempt_result = async {
+            tokio::select! {
+                _ = job.context.cancellation.cancelled() => {
+                    Err(job.context.cancellation.error())
+                }
+                result = provider.embed(&job.text) => result.map_err(|error| {
+                    InferenceError::classify_timeout(error, TimeoutClass::Provider)
+                }),
+            }
+        }
+        .instrument(span.clone())
+        .await;
+        match attempt_result {
             Ok(vec) => {
                 result = Some(vec);
                 break;
+            }
+            Err(
+                error @ (InferenceError::Cancelled
+                | InferenceError::Superseded
+                | InferenceError::TimedOut { .. }),
+            ) => {
+                let elapsed_us = start.elapsed().as_micros() as u64;
+                job.context.metrics.finished(&Err(&error), elapsed_us);
+                finish_queue_span::<Vec<f32>>(&span, &Err(error), elapsed_us);
+                let _ = job.response.send(Err(job.context.cancellation.error()));
+                return;
             }
             Err(e) => {
                 let delay_ms = EMBED_RETRY_BASE_MS * (1 << (attempt - 1));
@@ -233,18 +460,37 @@ async fn execute_embed_job(
                 );
                 last_err = Some(e);
                 if attempt < EMBED_MAX_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    job.context.metrics.retry();
+                    span.record("retries", attempt);
+                    tokio::select! {
+                        _ = job.context.cancellation.cancelled() => {
+                            let error = job.context.cancellation.error();
+                            job.context.metrics.finished(
+                                &Err(&error),
+                                start.elapsed().as_micros() as u64,
+                            );
+                            finish_queue_span::<Vec<f32>>(
+                                &span,
+                                &Err(job.context.cancellation.error()),
+                                start.elapsed().as_micros() as u64,
+                            );
+                            let _ = job.response.send(Err(error));
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                    }
                 }
             }
         }
     }
 
     let final_result = result.ok_or_else(|| {
-        last_err.unwrap_or_else(|| anyhow::anyhow!("embed failed with no error detail"))
+        last_err.unwrap_or_else(|| InferenceError::provider("embed failed with no error detail"))
     });
 
     let elapsed_us = start.elapsed().as_micros() as u64;
     debug!(
+        job_id = job.context.id,
         device = %device_name,
         text_len = job.text.len(),
         ok = final_result.is_ok(),
@@ -252,15 +498,28 @@ async fn execute_embed_job(
         "Embed job complete"
     );
 
-    // Update EWMA (α = 0.5): first sample is used directly; subsequent samples
-    // converge quickly to the actual device latency.
-    let old = ewma_us.load(Ordering::Relaxed);
-    let new_ewma = if old == 0 {
-        elapsed_us
-    } else {
-        old / 2 + elapsed_us / 2
-    };
-    ewma_us.store(new_ewma, Ordering::Relaxed);
+    job.context
+        .metrics
+        .finished(&final_result.as_ref().map(|_| ()), elapsed_us);
+    finish_queue_span(&span, &final_result, elapsed_us);
+
+    // Cancellation never trains the dispatch estimator. Successful work and
+    // terminal provider failures do, because both represent occupied service
+    // time on this worker.
+    if !matches!(
+        final_result,
+        Err(InferenceError::Cancelled
+            | InferenceError::Superseded
+            | InferenceError::TimedOut { .. })
+    ) {
+        let old = ewma_us.load(Ordering::Relaxed);
+        let new_ewma = if old == 0 {
+            elapsed_us
+        } else {
+            old / 2 + elapsed_us / 2
+        };
+        ewma_us.store(new_ewma, Ordering::Relaxed);
+    }
 
     let _ = job.response.send(final_result);
 }
@@ -294,7 +553,7 @@ pub(super) async fn run_embed_worker(
         // Own queue first.
         if let Some(job) = queue.try_pop() {
             idle.store(false, Ordering::Relaxed);
-            execute_embed_job(job, &provider, &device_name, &ewma_us).await;
+            execute_embed_job(job, &provider, &device_name, &ewma_us, false).await;
             continue;
         }
 
@@ -303,7 +562,7 @@ pub(super) async fn run_embed_worker(
         if let Some(job) = dispatcher.steal_from_busiest(&queue) {
             idle.store(false, Ordering::Relaxed);
             debug!(device = %device_name, "Work-stealing embed job from neighbour queue");
-            execute_embed_job(job, &provider, &device_name, &ewma_us).await;
+            execute_embed_job(job, &provider, &device_name, &ewma_us, true).await;
             continue;
         }
 
@@ -325,9 +584,33 @@ pub(super) async fn run_transcribe_worker(
         let provider = Arc::clone(&provider);
         let device_name = device_name.clone();
         async move {
-            let start = std::time::Instant::now();
-            let result = provider.transcribe(job.audio_bytes, &job.filename).await;
+            if job.context.cancellation.is_cancelled() {
+                let error = job.context.cancellation.error();
+                record_pending_cancellation(&job.context, "transcription", &device_name, &error);
+                let _ = job.response.send(Err(error));
+                return;
+            }
+            let span = queue_job_span(&job.context, "transcription", &device_name, false);
+            let start = job.context.begin(false);
+            let result = async {
+                tokio::select! {
+                    _ = job.context.cancellation.cancelled() => {
+                        Err(job.context.cancellation.error())
+                    }
+                    result = provider.transcribe(job.audio_bytes, &job.filename) => {
+                        result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
+                    }
+                }
+            }
+            .instrument(span.clone())
+            .await;
+            finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
+            job.context.metrics.finished(
+                &result.as_ref().map(|_| ()),
+                start.elapsed().as_micros() as u64,
+            );
             debug!(
+                job_id = job.context.id,
                 device = %device_name,
                 filename = %job.filename,
                 ok = result.is_ok(),
@@ -349,12 +632,39 @@ pub(super) async fn run_tts_worker(
         let tts = tts.clone();
         let device_name = device_name.clone();
         async move {
-            let start = std::time::Instant::now();
-            let result = match &job.voice {
-                Some(voice) => tts.synthesize(&job.text, Some(voice)).await,
-                None => tts.synthesize_default(&job.text).await,
+            if job.context.cancellation.is_cancelled() {
+                let error = job.context.cancellation.error();
+                record_pending_cancellation(&job.context, "text_to_speech", &device_name, &error);
+                let _ = job.response.send(Err(error));
+                return;
+            }
+            let span = queue_job_span(&job.context, "text_to_speech", &device_name, false);
+            let start = job.context.begin(false);
+            let provider_call = async {
+                match &job.voice {
+                    Some(voice) => tts.synthesize(&job.text, Some(voice)).await,
+                    None => tts.synthesize_default(&job.text).await,
+                }
             };
+            let result = async {
+                tokio::select! {
+                    _ = job.context.cancellation.cancelled() => {
+                        Err(job.context.cancellation.error())
+                    }
+                    result = provider_call => result.map_err(|error| {
+                        InferenceError::classify_timeout(error, TimeoutClass::Provider)
+                    }),
+                }
+            }
+            .instrument(span.clone())
+            .await;
+            finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
+            job.context.metrics.finished(
+                &result.as_ref().map(|_| ()),
+                start.elapsed().as_micros() as u64,
+            );
             debug!(
+                job_id = job.context.id,
                 device = %device_name,
                 text_len = job.text.len(),
                 voice = job.voice.as_ref().map(|v| v.as_str()).unwrap_or("default"),
