@@ -20,8 +20,8 @@ embedding_dimensions = 768
 high_quality_embedding_dimensions = 4096
 
 [data]
-import_file = "./defaults/data/memory.jsonl"
-schema_dir  = "./defaults/schemas"
+import_file = "./defaults/example_data/foundation-example.jsonl"
+schema_dir  = "./defaults/schemas/Sine Nomine"
 
 [embedding]
 npu_enabled = true
