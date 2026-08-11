@@ -793,6 +793,26 @@ impl AppView {
         }));
     }
 
+    /// Stop user work and synchronously reap the complete owned Lemonade
+    /// process group. `EmbeddedLemonade::shutdown` is idempotent, and taking
+    /// the handle makes repeated quit/release paths a cheap no-op.
+    fn shutdown_for_exit(&mut self) {
+        self.state.embedding_plan.cancel();
+        if let Some(cancellation) = self.import_cancellation.take() {
+            cancellation.cancel();
+        }
+        if let Some(task) = self.import_task.take() {
+            task.detach();
+        }
+        if let Some(signal_task) = self._lemonade_signal_task.take() {
+            signal_task.abort();
+        }
+        if let Some(embedded) = self.state.embedded_lemonade.take() {
+            tracing::info!("Shutting down owned Lemonade process tree");
+            self.state.tokio_rt.block_on(embedded.shutdown());
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: GraphSnapshot,
@@ -1011,18 +1031,11 @@ impl AppView {
 
         // GPUI only polls asynchronous quit observers for 100 ms. Perform the
         // owned-process shutdown synchronously in the observer callback so the
-        // model unload and child reap are allowed to complete.
+        // model unload and child reap are allowed to complete. AppView::drop
+        // repeats this idempotent cleanup because closing the last window can
+        // release the root entity independently of this subscription.
         let app_quit_sub = cx.on_app_quit(|this, _cx| {
-            this.state.embedding_plan.cancel();
-            if let Some(cancellation) = this.import_cancellation.take() {
-                cancellation.cancel();
-            }
-            if let Some(task) = this.import_task.take() {
-                task.detach();
-            }
-            if let Some(embedded) = this.state.embedded_lemonade.clone() {
-                this.state.tokio_rt.block_on(embedded.shutdown());
-            }
+            this.shutdown_for_exit();
             async {}
         });
 
@@ -2754,6 +2767,16 @@ impl AppView {
             .ok();
         })
         .detach();
+    }
+}
+
+impl Drop for AppView {
+    fn drop(&mut self) {
+        // On Linux the default GPUI quit mode is LastWindowClosed. The root
+        // entity can therefore be released as part of closing the final
+        // window; do not rely exclusively on its app-quit subscription still
+        // being registered at that point.
+        self.shutdown_for_exit();
     }
 }
 

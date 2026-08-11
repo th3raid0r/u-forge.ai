@@ -566,8 +566,10 @@ model resolution does not use the global Hugging Face cache. Older u-forge
 cache entries under XDG data storage or a build profile's `lemonade/models`
 directory are moved into this location on the next owned launch.
 
-The canonical `make test` target prebuilds against that same pinned artifact,
-launches one owned instance for all test binaries, and exports its private
-connection rather than probing or adopting an external server. Shutdown first
-unloads models and requests `lemond` exit, then terminates the private Unix
-process group so backend grandchildren cannot survive the suite.
+Owned shutdown first unloads models and requests `lemond` exit, then terminates
+the private Unix process group so backend grandchildren cannot survive. The
+desktop root invokes that path both on application quit and as an idempotent
+entity-drop fallback when the last window closes. The canonical `make test`
+target prebuilds against the same pinned artifact, launches one owned instance
+for all test binaries, exports its private connection rather than probing or
+adopting an external server, and invokes the same awaited shutdown path.

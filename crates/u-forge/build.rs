@@ -7,7 +7,7 @@ use std::{
     process::Command,
 };
 
-const LEMONADE_VERSION: &str = "11.5.1";
+const LEMONADE_VERSION: &str = "11.5.2";
 const INSTALL_REVISION: &str = "ubuntu-x64-minimal-v1";
 const PATCH_REVISION: &str = "gemma4-gguf-reasoning-v1";
 const CHECKSUM_FILE: &str = "../../packaging/lemonade-embeddable.sha256";
