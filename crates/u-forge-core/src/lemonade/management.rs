@@ -506,6 +506,15 @@ fn management_event_stream(
     target: String,
 ) -> ManagementProgressReceiver {
     let (tx, rx) = mpsc::unbounded_channel();
+    let _ = tx.send(Ok(ManagementProgressEvent {
+        operation,
+        target: target.clone(),
+        kind: ManagementEventKind::Progress,
+        progress_percent: None,
+        transferred_bytes: None,
+        total_bytes: None,
+        message: Some("Starting…".to_string()),
+    }));
     tokio::spawn(async move {
         let mut bytes = response.bytes_stream();
         let mut buffer = Vec::new();

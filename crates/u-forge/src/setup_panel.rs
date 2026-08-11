@@ -18,6 +18,7 @@ use u_forge_core::{
 use crate::startup::{StartupMilestone, StartupTimeline};
 use crate::ui::components::Tooltip;
 use crate::ui::icons::{Icon, IconName, IconSize};
+use crate::ui::theme::UiTheme;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SetupRequested {
@@ -146,6 +147,13 @@ struct ChatChoice {
     recipe: String,
     downloaded: bool,
     tools: bool,
+    reasoning: bool,
+}
+
+impl ChatChoice {
+    fn is_recommended(&self) -> bool {
+        self.tools && self.reasoning
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +177,8 @@ pub(crate) struct SetupPanel {
     component_rows: Vec<ComponentRow>,
     chat_models: Vec<ChatChoice>,
     selected_chat: usize,
+    show_advanced_models: bool,
+    chat_dropdown_open: bool,
     high_quality_embedding: bool,
     npu_embedding_enabled: bool,
     preferred_device: ChatDevice,
@@ -203,12 +213,21 @@ impl SetupPanel {
                 recipe: model.recipe.clone(),
                 downloaded: model.downloaded,
                 tools: model.supports_tool_calling(),
+                reasoning: model.supports_reasoning(),
             })
             .collect();
-        let selected_chat = selected_chat_model
-            .and_then(|selected| chat_models.iter().position(|model| model.id == selected))
-            .or_else(|| chat_models.iter().position(|model| model.downloaded))
+        let saved_selection = selected_chat_model
+            .and_then(|selected| chat_models.iter().position(|model| model.id == selected));
+        let selected_chat = saved_selection
+            .filter(|index| chat_models[*index].is_recommended())
+            .or_else(|| {
+                chat_models
+                    .iter()
+                    .position(|model| model.is_recommended() && model.downloaded)
+            })
+            .or_else(|| chat_models.iter().position(ChatChoice::is_recommended))
             .unwrap_or(0);
+        let show_advanced_models = !chat_models.iter().any(ChatChoice::is_recommended);
         let component_rows = component_rows(catalog, high_quality_embedding, npu_embedding_enabled);
         Self {
             ownership,
@@ -219,6 +238,8 @@ impl SetupPanel {
             component_rows,
             chat_models,
             selected_chat,
+            show_advanced_models,
+            chat_dropdown_open: false,
             high_quality_embedding,
             npu_embedding_enabled,
             preferred_device,
@@ -264,12 +285,23 @@ impl SetupPanel {
                 recipe: model.recipe.clone(),
                 downloaded: model.downloaded,
                 tools: model.supports_tool_calling(),
+                reasoning: model.supports_reasoning(),
             })
             .collect();
         self.selected_chat = selected
             .as_deref()
             .and_then(|id| self.chat_models.iter().position(|model| model.id == id))
+            .filter(|index| self.show_advanced_models || self.chat_models[*index].is_recommended())
+            .or_else(|| {
+                self.chat_models
+                    .iter()
+                    .position(|model| model.is_recommended() && model.downloaded)
+            })
+            .or_else(|| self.chat_models.iter().position(ChatChoice::is_recommended))
             .unwrap_or(0);
+        if !self.chat_models.iter().any(ChatChoice::is_recommended) {
+            self.show_advanced_models = true;
+        }
         self.component_rows = component_rows(
             catalog,
             self.high_quality_embedding,
@@ -304,18 +336,6 @@ impl SetupPanel {
             ManagementEventKind::Complete => format!("{} is ready{detail}", event.target),
             ManagementEventKind::Failed => format!("{} failed{detail}", event.target),
         };
-    }
-
-    fn cycle_chat(&mut self, direction: isize, cx: &mut Context<Self>) {
-        if !self.chat_models.is_empty() {
-            self.selected_chat = self
-                .selected_chat
-                .checked_add_signed(direction)
-                .unwrap_or(self.chat_models.len() - 1)
-                % self.chat_models.len();
-            self.external_confirmation_armed = false;
-            cx.notify();
-        }
     }
 
     fn cycle_device(&mut self, cx: &mut Context<Self>) {
@@ -743,8 +763,24 @@ fn device_text(device: &ChatDevice) -> &'static str {
     }
 }
 
+fn chat_choice_label(model: &ChatChoice) -> String {
+    format!(
+        "{} · {} · {}{}{}",
+        model.id,
+        model.recipe,
+        if model.downloaded {
+            "ready"
+        } else {
+            "download"
+        },
+        if model.tools { " · tools" } else { "" },
+        if model.reasoning { " · thinking" } else { "" },
+    )
+}
+
 impl Render for SetupPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *UiTheme::get(cx);
         let startup = self.startup.clone();
         let mut components = div().flex().flex_col().gap(px(3.0));
         for (index, row) in self.component_rows.iter().enumerate() {
@@ -914,24 +950,52 @@ impl Render for SetupPanel {
         let chat_label = self
             .chat_models
             .get(self.selected_chat)
-            .map(|model| {
-                format!(
-                    "{} · {} · {}{}",
-                    model.id,
-                    model.recipe,
-                    if model.downloaded {
-                        "ready"
-                    } else {
-                        "download"
-                    },
-                    if model.tools {
-                        " · tools"
-                    } else {
-                        " · direct chat"
-                    }
-                )
-            })
+            .map(chat_choice_label)
             .unwrap_or_else(|| "No compatible chat model".to_string());
+        let visible_chat_models = self
+            .chat_models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| self.show_advanced_models || model.is_recommended())
+            .map(|(index, model)| (index, chat_choice_label(model)))
+            .collect::<Vec<_>>();
+        let mut chat_options = div()
+            .id("setup-chat-options")
+            .w_full()
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .border_1()
+            .border_color(rgb(0x585b70))
+            .rounded(px(4.0))
+            .bg(rgb(0x1e1e2e));
+        for (index, label) in visible_chat_models {
+            let selected = index == self.selected_chat;
+            chat_options = chat_options.child(
+                div()
+                    .id(format!("setup-chat-option-{index}"))
+                    .h(px(30.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .bg(if selected {
+                        rgba(0x89b4fa30)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .hover(|style| style.bg(rgba(0x45475aaa)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.selected_chat = index;
+                            this.chat_dropdown_open = false;
+                            this.external_confirmation_armed = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
 
         let mut downloads = div().flex().flex_col().gap(px(3.0));
         for (index, job) in self.downloads.iter().enumerate() {
@@ -1168,57 +1232,73 @@ impl Render for SetupPanel {
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap(px(6.0))
                     .child("Chat model")
                     .child(
                         div()
+                            .id("setup-chat-dropdown")
+                            .w_full()
+                            .min_h(px(32.0))
+                            .px_3()
                             .flex()
                             .flex_row()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .id("setup-chat-prev")
-                                    .size(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .tooltip(Tooltip::text("Previous chat model"))
-                                    .hover(|style| style.bg(rgba(0x45475aaa)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.cycle_chat(-1, cx)),
-                                    )
-                                    .child(Icon::new(
-                                        IconName::ChevronLeft,
-                                        IconSize::Medium,
-                                        rgba(0xcdd6f4ff),
-                                    )),
+                            .items_center()
+                            .justify_between()
+                            .border_1()
+                            .border_color(rgb(0x585b70))
+                            .rounded(px(4.0))
+                            .bg(rgb(0x1e1e2e))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.chat_dropdown_open = !this.chat_dropdown_open;
+                                    cx.notify();
+                                }),
                             )
                             .child(chat_label)
-                            .child(
-                                div()
-                                    .id("setup-chat-next")
-                                    .size(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .tooltip(Tooltip::text("Next chat model"))
-                                    .hover(|style| style.bg(rgba(0x45475aaa)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.cycle_chat(1, cx)),
-                                    )
-                                    .child(Icon::new(
-                                        IconName::ChevronRight,
-                                        IconSize::Medium,
-                                        rgba(0xcdd6f4ff),
-                                    )),
-                            ),
-                    ),
+                            .child(Icon::new(
+                                IconName::ChevronDown,
+                                IconSize::Medium,
+                                rgba(0xcdd6f4ff),
+                            )),
+                    )
+                    .when(self.chat_dropdown_open, |field| field.child(chat_options)),
+            )
+            .child(
+                div()
+                    .id("setup-advanced-models")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.show_advanced_models = !this.show_advanced_models;
+                            if !this.show_advanced_models
+                                && this
+                                    .chat_models
+                                    .get(this.selected_chat)
+                                    .is_some_and(|model| !model.is_recommended())
+                                && let Some(index) =
+                                    this.chat_models.iter().position(ChatChoice::is_recommended)
+                            {
+                                this.selected_chat = index;
+                            }
+                            this.chat_dropdown_open = false;
+                            this.external_confirmation_armed = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(if self.show_advanced_models {
+                        "☑"
+                    } else {
+                        "☐"
+                    })
+                    .child("Advanced · show models without both tool use and thinking"),
             )
             .child(
                 div()
@@ -1319,7 +1399,7 @@ impl Render for SetupPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x000000a0))
+                .bg(theme.colors.overlay)
                 .child(
                     div()
                         .id("setup-dialog")
@@ -1327,20 +1407,20 @@ impl Render for SetupPanel {
                         .max_h(px(680.0))
                         .flex()
                         .flex_col()
-                        .bg(rgb(0x313244))
+                        .bg(theme.colors.elevated_surface)
                         .border_1()
-                        .border_color(rgb(0x585b70))
-                        .rounded(px(6.0))
-                        .text_color(rgba(0xcdd6f4ff))
-                        .text_sm()
+                        .border_color(theme.colors.border)
+                        .rounded(px(theme.metrics.radius_medium))
+                        .text_color(theme.colors.text)
+                        .text_size(theme.typography.label)
                         .child(
                             div()
-                                .h(px(42.0))
-                                .px_4()
+                                .h(theme.metrics.panel_header_height)
+                                .px(px(theme.metrics.space_4))
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .bg(rgb(0x1e1e2e))
+                                .bg(theme.colors.title_bar_surface)
                                 .child("Lemonade AI Setup")
                                 .child(
                                     div()
@@ -1364,14 +1444,14 @@ impl Render for SetupPanel {
                         })
                         .child(
                             div()
-                                .h(px(48.0))
-                                .px_4()
+                                .min_h(theme.metrics.panel_header_height)
+                                .px(px(theme.metrics.space_4))
                                 .flex()
                                 .items_center()
                                 .justify_end()
                                 .gap(px(8.0))
                                 .border_t_1()
-                                .border_color(rgb(0x45475a))
+                                .border_color(theme.colors.border)
                                 .when(self.page == SetupPage::Configuration, |footer| {
                                     footer.child(
                                         div()
@@ -1469,6 +1549,65 @@ impl Render for SetupPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat_model(
+        id: &str,
+        labels: &[&str],
+        downloaded: bool,
+    ) -> u_forge_core::lemonade::CatalogModel {
+        u_forge_core::lemonade::CatalogModel {
+            id: id.to_string(),
+            recipe: "llamacpp".to_string(),
+            labels: labels.iter().map(|label| (*label).to_string()).collect(),
+            downloaded,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn basic_model_picker_defaults_to_tools_and_thinking_models() {
+        let catalog = LemonadeServerCatalog {
+            models: vec![
+                chat_model("plain", &[], true),
+                chat_model("tools-only", &["tool-calling"], true),
+                chat_model("recommended", &["tool-calling", "reasoning"], false),
+            ],
+            ..Default::default()
+        };
+
+        let panel = SetupPanel::new(
+            LemonadeOwnership::Embedded,
+            &catalog,
+            Some("plain"),
+            false,
+            false,
+            ChatDevice::Auto,
+            ReasoningControl::Request,
+        );
+
+        assert_eq!(panel.chat_models[panel.selected_chat].id, "recommended");
+        assert!(!panel.show_advanced_models);
+    }
+
+    #[test]
+    fn model_picker_falls_back_to_advanced_when_catalog_has_no_recommended_model() {
+        let catalog = LemonadeServerCatalog {
+            models: vec![chat_model("plain", &[], true)],
+            ..Default::default()
+        };
+        let panel = SetupPanel::new(
+            LemonadeOwnership::Embedded,
+            &catalog,
+            None,
+            false,
+            false,
+            ChatDevice::Auto,
+            ReasoningControl::Request,
+        );
+
+        assert!(panel.show_advanced_models);
+        assert_eq!(panel.chat_models[panel.selected_chat].id, "plain");
+    }
 
     #[test]
     fn parses_current_and_legacy_download_collections() {

@@ -20,9 +20,10 @@ use u_forge_core::{
     lemonade::{
         Capability, EffectiveChatLimits, EmbeddedLemonade, GpuResourceManager,
         LemonadeChatProvider, LemonadeConnection, LemonadeManagement, LemonadeOwnership,
-        LemonadeRuntime, LemonadeServerCatalog, ManagementProgressEvent, ModelSelector,
-        ProviderFactory, QualityTier, SetupRole, chat_component_state, component_state,
-        initial_setup_components, resolve_runtime_connection, select_setup_backend,
+        LemonadeRuntime, LemonadeServerCatalog, ManagementEventKind, ManagementProgressEvent,
+        ModelSelector, ProviderFactory, QualityTier, SetupRole, chat_component_state,
+        component_state, initial_setup_components, resolve_runtime_connection,
+        select_setup_backend,
     },
     queue::{CancellationToken, InferenceQueueBuilder},
     types::ObjectId,
@@ -329,11 +330,23 @@ async fn forward_management_events(
     mut receiver: u_forge_core::lemonade::ManagementProgressReceiver,
     events: &tokio::sync::broadcast::Sender<ManagementProgressEvent>,
 ) -> anyhow::Result<()> {
+    let mut latest: Option<ManagementProgressEvent> = None;
     while let Some(event) = receiver.recv().await {
-        let event = event?;
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                if let Some(mut failed_event) = latest {
+                    failed_event.kind = ManagementEventKind::Failed;
+                    failed_event.message = Some(error.to_string());
+                    let _ = events.send(failed_event);
+                }
+                return Err(error);
+            }
+        };
         let terminal = event.is_terminal();
         let failed = event.kind == u_forge_core::lemonade::ManagementEventKind::Failed;
         let message = event.message.clone();
+        latest = Some(event.clone());
         let _ = events.send(event);
         if failed {
             anyhow::bail!(message.unwrap_or_else(|| "Lemonade management operation failed".into()));
@@ -357,12 +370,14 @@ async fn provision_managed_baseline(
     }
     let manager = LemonadeManagement::new(connection);
     let mut changed = false;
-    if let Some(cpu) = catalog
+    let cpu = catalog
         .backends
         .iter()
         .find(|backend| backend.recipe == "llamacpp" && backend.backend == "cpu")
-        && cpu.state != "installed"
-    {
+        .ok_or_else(|| {
+            anyhow::anyhow!("Lemonade did not report an installable llama.cpp CPU backend")
+        })?;
+    if cpu.state != "installed" {
         let receiver = manager
             .install_backend_stream("llamacpp", "cpu", true)
             .await?;
@@ -2451,6 +2466,7 @@ impl AppView {
             return;
         };
         let tokio_rt = self.state.tokio_rt.clone();
+        let events = self.state.management_events.clone();
         let label = format!("{}:{}", request.recipe, request.backend);
         self.setup_panel.update(cx, |panel, cx| {
             panel.set_busy(true, format!("Installing backend {label}…"));
@@ -2462,13 +2478,14 @@ impl AppView {
                 .spawn(async move {
                     tokio_rt.block_on(async move {
                         let manager = LemonadeManagement::new(connection.clone());
-                        manager
-                            .install_backend(
+                        let receiver = manager
+                            .install_backend_stream(
                                 &request.recipe,
                                 &request.backend,
                                 request.confirmed_external,
                             )
                             .await?;
+                        forward_management_events(receiver, &events).await?;
                         let catalog = LemonadeServerCatalog::discover_with_connection(
                             connection.clone(),
                         )
@@ -2516,6 +2533,7 @@ impl AppView {
             return;
         };
         let tokio_rt = self.state.tokio_rt.clone();
+        let events = self.state.management_events.clone();
         self.setup_panel.update(cx, |panel, cx| {
             panel.set_busy(
                 true,
@@ -2567,8 +2585,8 @@ impl AppView {
                                         )
                                     })
                                     .unwrap_or((request.model_name.as_str(), None, None, None));
-                                manager
-                                    .pull(
+                                let receiver = manager
+                                    .pull_stream(
                                         model_name,
                                         checkpoint,
                                         recipe,
@@ -2576,6 +2594,7 @@ impl AppView {
                                         request.confirmed_external,
                                     )
                                     .await?;
+                                forward_management_events(receiver, &events).await?;
                             }
                         }
                         manager.downloads().await
@@ -2650,6 +2669,7 @@ impl AppView {
         self.state.app_config = Arc::new(next_config.clone());
 
         let tokio_rt = self.state.tokio_rt.clone();
+        let events = self.state.management_events.clone();
         self.setup_panel.update(cx, |panel, cx| {
             panel.set_busy(true, "Starting server-owned provisioning jobs…");
             cx.notify();
@@ -2663,6 +2683,7 @@ impl AppView {
                         catalog,
                         next_config,
                         request,
+                        events,
                     ))
                 })
                 .await;
@@ -3247,10 +3268,12 @@ async fn provision_lemonade(
     catalog: LemonadeServerCatalog,
     config: AppConfig,
     request: SetupRequested,
+    events: tokio::sync::broadcast::Sender<ManagementProgressEvent>,
 ) -> anyhow::Result<(LemonadeServerCatalog, serde_json::Value, String)> {
     let manager = LemonadeManagement::new(connection.clone());
-    // Managed setup requires the durable download plane before it mutates an
-    // external or embedded runtime. This avoids invisible client-owned jobs.
+    // Verify that the management plane is available before mutating an
+    // external or embedded runtime. Each mutation below remains subscribed to
+    // its SSE stream until a terminal event arrives.
     manager.downloads().await?;
     if let Some(error) = &catalog.diagnostics.system_info {
         anyhow::bail!(
@@ -3291,15 +3314,20 @@ async fn provision_lemonade(
             if choice.needs_install()
                 && installed.insert((choice.recipe.clone(), choice.backend.clone()))
             {
-                manager
-                    .install_backend(&choice.recipe, &choice.backend, request.confirmed_external)
+                let receiver = manager
+                    .install_backend_stream(
+                        &choice.recipe,
+                        &choice.backend,
+                        request.confirmed_external,
+                    )
                     .await?;
+                forward_management_events(receiver, &events).await?;
             }
         }
         if state.needs_pull() {
             let pull = component.pull_spec();
-            manager
-                .pull(
+            let receiver = manager
+                .pull_stream(
                     pull.model_name,
                     pull.checkpoint,
                     pull.recipe,
@@ -3307,6 +3335,7 @@ async fn provision_lemonade(
                     request.confirmed_external,
                 )
                 .await?;
+            forward_management_events(receiver, &events).await?;
             jobs_started += 1;
         }
     }
@@ -3333,13 +3362,14 @@ async fn provision_lemonade(
         )
     })?;
     if choice.needs_install() && installed.insert((choice.recipe.clone(), choice.backend.clone())) {
-        manager
-            .install_backend(&choice.recipe, &choice.backend, request.confirmed_external)
+        let receiver = manager
+            .install_backend_stream(&choice.recipe, &choice.backend, request.confirmed_external)
             .await?;
+        forward_management_events(receiver, &events).await?;
     }
     if chat_state.needs_pull() {
-        manager
-            .pull(
+        let receiver = manager
+            .pull_stream(
                 &request.chat_model,
                 None,
                 None,
@@ -3347,6 +3377,7 @@ async fn provision_lemonade(
                 request.confirmed_external,
             )
             .await?;
+        forward_management_events(receiver, &events).await?;
         jobs_started += 1;
     }
 
@@ -3355,9 +3386,7 @@ async fn provision_lemonade(
     let message = if jobs_started == 0 {
         "Selections saved; all selected models are already downloaded.".to_string()
     } else {
-        format!(
-            "Started {jobs_started} server-owned download job(s). Setup can be closed safely; use Refresh to restore progress."
-        )
+        format!("Completed {jobs_started} model download(s). The setup catalog is current.")
     };
     Ok((refreshed, downloads, message))
 }
