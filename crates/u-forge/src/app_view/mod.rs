@@ -1,10 +1,15 @@
 mod render;
 mod state;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::{App, Context, Empty, Entity, FocusHandle, Focusable, Subscription, Window, prelude::*};
+use gpui::{
+    App, Context, Empty, Entity, FocusHandle, Focusable, Pixels, Point, Subscription, Window,
+    point, prelude::*, px,
+};
 use parking_lot::RwLock;
 use tracing::Instrument;
 use u_forge_agent::{AgentParams, GraphAgent};
@@ -154,6 +159,8 @@ pub struct AppView {
     pub(crate) view_menu_button_focus: FocusHandle,
     pub(crate) file_menu_focus: FocusHandle,
     pub(crate) view_menu_focus: FocusHandle,
+    /// Bottom-left window coordinates measured from the File/View buttons.
+    pub(crate) menu_anchors: Rc<Cell<[Point<Pixels>; 2]>>,
     pub(crate) window_control_focus: WindowControlFocusHandles,
     pub(crate) setup_open: bool,
     pub(crate) settings_open: bool,
@@ -171,6 +178,7 @@ pub struct AppView {
     /// Last focused descendant per workspace region, used when a dock is
     /// revisited after F6 traversal or a close/reopen cycle.
     last_region_focus: HashMap<FocusRegion, FocusHandle>,
+    last_selected_panel: Option<PanelId>,
     workspace_state_path: std::path::PathBuf,
     workspace_persist_task: Option<gpui::Task<()>>,
     /// Owns the user-initiated import so replacement and shutdown are explicit.
@@ -813,6 +821,9 @@ impl AppView {
                 .contains(&focused, window)
             {
                 self.last_region_focus.insert(region, focused);
+                if let FocusRegion::Panel(panel) = region {
+                    self.last_selected_panel = Some(panel);
+                }
                 return;
             }
         }
@@ -864,7 +875,7 @@ impl AppView {
         {
             Some(PanelId::Details)
         } else {
-            None
+            self.last_selected_panel
         };
         if let Some(panel) = panel {
             self.dock_state.toggle_zoom(panel);
@@ -1009,6 +1020,50 @@ impl AppView {
             tracing::info!("Shutting down owned Lemonade process tree");
             self.state.tokio_rt.block_on(embedded.shutdown());
         }
+    }
+
+    /// GPUI window-close guard for client-owned management streams. Closing
+    /// setup is safe, but exiting the process would terminate active pulls.
+    pub fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.active_management_operations.is_empty() {
+            return true;
+        }
+        if self.confirmation.is_some() {
+            return false;
+        }
+        let count = self.active_management_operations.len();
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.graph_canvas.read(cx).focus_handle(cx));
+        let modal = cx.new(|cx| {
+            ConfirmationModal::new(
+                "Downloads are still running".to_string(),
+                format!(
+                    "{count} Lemonade download or backend install operation(s) are still active. Quitting now will stop them."
+                ),
+                "Quit Anyway".to_string(),
+                return_focus,
+                cx,
+            )
+            .with_cancel_label("Stay")
+        });
+        let accepted = cx.subscribe(&modal, |this, _modal, _event: &ConfirmationAccepted, cx| {
+            this.confirmation = None;
+            this._confirmation_subs.clear();
+            cx.quit();
+        });
+        let cancelled = cx.subscribe(
+            &modal,
+            |this, _modal, _event: &ConfirmationCancelled, cx| {
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                cx.notify();
+            },
+        );
+        self.confirmation = Some(modal);
+        self._confirmation_subs = vec![accepted, cancelled];
+        cx.notify();
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1255,6 +1310,10 @@ impl AppView {
             view_menu_button_focus: cx.focus_handle().tab_stop(true),
             file_menu_focus: cx.focus_handle(),
             view_menu_focus: cx.focus_handle(),
+            menu_anchors: Rc::new(Cell::new([
+                point(px(0.0), px(0.0)),
+                point(px(0.0), px(0.0)),
+            ])),
             window_control_focus: WindowControlFocusHandles {
                 minimize: cx.focus_handle(),
                 maximize: cx.focus_handle(),
@@ -1274,6 +1333,7 @@ impl AppView {
             settings_draft_window_controls_left: window_controls_left,
             dock_state,
             last_region_focus: HashMap::new(),
+            last_selected_panel: None,
             workspace_state_path,
             workspace_persist_task: None,
             import_cancellation: None,

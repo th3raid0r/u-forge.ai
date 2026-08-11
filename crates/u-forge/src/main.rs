@@ -69,11 +69,17 @@ fn main() {
         cx.open_window(window_options, |window, cx| {
             window.set_window_title(APPLICATION_NAME);
             window.set_app_id(APPLICATION_ID);
-            cx.new(|cx| {
+            let view = cx.new(|cx| {
                 AppView::new_profiled(
                     snapshot, graph, schema_mgr, data_file, schema_dir, cfg, rt, startup, None, cx,
                 )
-            })
+            });
+            let weak = view.downgrade();
+            window.on_window_should_close(cx, move |window, cx| {
+                weak.update(cx, |view, cx| view.should_close_window(window, cx))
+                    .unwrap_or(true)
+            });
+            view
         })
         .unwrap();
     });

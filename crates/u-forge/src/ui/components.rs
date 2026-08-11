@@ -815,7 +815,7 @@ impl RenderOnce for MenuItem {
             .gap(px(theme.metrics.space_6))
             .h(theme.metrics.control_height)
             .px(px(theme.metrics.space_4))
-            .text_size(theme.typography.label)
+            .text_size(theme.typography.chrome)
             .text_color(if self.disabled {
                 theme.colors.text_disabled
             } else {

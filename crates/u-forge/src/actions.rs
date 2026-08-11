@@ -485,8 +485,8 @@ pub const ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     descriptor!(
         ToggleFocusedPanelZoom,
         "toggle-panel-zoom-item",
-        "Maximize Focused Panel",
-        "Maximize or restore the focused dock panel",
+        "Maximize Selected Panel",
+        "Maximize or restore the most recently selected dock panel",
         shortcut("ctrl-shift-m", "Ctrl+Shift+M", None),
         menu(ActionMenu::View, 1),
         None,

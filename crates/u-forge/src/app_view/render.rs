@@ -136,7 +136,7 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.ui_font_size));
         let theme = *UiTheme::get(cx);
-        let menu_bar_height = theme.metrics.menu_bar_height;
+        let [file_menu_position, view_menu_position] = self.menu_anchors.get();
 
         // Capture frame start time. The canvas element appended at the end of the
         // tree records elapsed time in its paint closure — after GPUI's full layout
@@ -349,6 +349,23 @@ impl Render for AppView {
             // ── Menu bar ──────────────────────────────────────────────────────
             .child(
                 div()
+                    .on_children_prepainted({
+                        let anchors = self.menu_anchors.clone();
+                        move |bounds, _window, _cx| {
+                            if bounds.len() >= 2 {
+                                anchors.set([
+                                    point(
+                                        bounds[0].origin.x,
+                                        bounds[0].origin.y + bounds[0].size.height,
+                                    ),
+                                    point(
+                                        bounds[1].origin.x,
+                                        bounds[1].origin.y + bounds[1].size.height,
+                                    ),
+                                ]);
+                            }
+                        }
+                    })
                     .id("menu-bar")
                     .flex()
                     .flex_none()
@@ -378,6 +395,7 @@ impl Render for AppView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    this.remember_current_region_focus(window, cx);
                                     this.file_menu_button_focus.focus(window);
                                     this.file_menu_open = !this.file_menu_open;
                                     this.view_menu_open = false;
@@ -410,6 +428,7 @@ impl Render for AppView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    this.remember_current_region_focus(window, cx);
                                     this.view_menu_button_focus.focus(window);
                                     this.view_menu_open = !this.view_menu_open;
                                     this.file_menu_open = false;
@@ -979,7 +998,7 @@ impl Render for AppView {
             .when(file_menu_open, |root| {
                 root.child(deferred(
                     anchored()
-                        .position(point(px(0.0), menu_bar_height))
+                        .position(file_menu_position)
                         .anchor(Corner::TopLeft)
                         .child(
                             Menu::new(
@@ -1012,10 +1031,9 @@ impl Render for AppView {
             })
             // ── View dropdown overlay ─────────────────────────────────────────
             .when(view_menu_open, |root| {
-                // Position horizontally after the "File" button (~30px wide + padding).
                 root.child(deferred(
                     anchored()
-                        .position(point(px(32.0), menu_bar_height))
+                        .position(view_menu_position)
                         .anchor(Corner::TopLeft)
                         .child(
                             Menu::new(

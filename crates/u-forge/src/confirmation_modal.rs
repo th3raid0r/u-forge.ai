@@ -18,6 +18,7 @@ pub(crate) struct ConfirmationModal {
     title: String,
     message: String,
     confirm_label: String,
+    cancel_label: String,
     alternative_label: Option<String>,
     destructive: bool,
     focus: FocusHandle,
@@ -47,6 +48,7 @@ impl ConfirmationModal {
             title,
             message,
             confirm_label,
+            cancel_label: "Cancel".to_string(),
             alternative_label: None,
             destructive: true,
             focus: cx.focus_handle(),
@@ -57,6 +59,11 @@ impl ConfirmationModal {
 
     pub(crate) fn with_alternative(mut self, label: impl Into<String>) -> Self {
         self.alternative_label = Some(label.into());
+        self
+    }
+
+    pub(crate) fn with_cancel_label(mut self, label: impl Into<String>) -> Self {
+        self.cancel_label = label.into();
         self
     }
 
@@ -124,9 +131,11 @@ impl Render for ConfirmationModal {
 
         dialog = dialog
             .action(
-                Button::new("confirmation-cancel", "Cancel").on_click(move |_, window, cx| {
-                    cancel.update(cx, |modal, cx| modal.cancel(window, cx)).ok();
-                }),
+                Button::new("confirmation-cancel", self.cancel_label.clone()).on_click(
+                    move |_, window, cx| {
+                        cancel.update(cx, |modal, cx| modal.cancel(window, cx)).ok();
+                    },
+                ),
             )
             .action(
                 Button::new("confirmation-accept", self.confirm_label.clone())
