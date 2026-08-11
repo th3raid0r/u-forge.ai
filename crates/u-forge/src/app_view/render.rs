@@ -23,7 +23,7 @@ use crate::panel_contracts::{DockPosition, PanelId, WorkspaceItemId, WorldCanvas
 use crate::search_panel::SearchPanelStatus;
 use crate::startup::StartupMilestone;
 use crate::ui::components::{
-    Button, ButtonStyle, Dialog, LabelTone, Menu, MenuItem, StatusItem, StatusTone, Tab as UiTab,
+    Button, ButtonStyle, LabelTone, Menu, MenuItem, StatusItem, StatusTone, Tab as UiTab,
 };
 use crate::ui::theme::UiTheme;
 use crate::window_chrome::{
@@ -148,8 +148,6 @@ impl Render for AppView {
         let file_menu_open = self.file_menu_open;
         let view_menu_open = self.view_menu_open;
         let setup_open = self.setup_open;
-        let settings_open = self.settings_open;
-        let show_advanced_controls = self.show_advanced_controls;
         let sidebar_open = self.dock_state.is_open(DockPosition::Left);
         let sidebar_tab = self.dock_state.active_panel(DockPosition::Left);
         let right_panel_open = self.dock_state.is_open(DockPosition::Right);
@@ -207,8 +205,7 @@ impl Render for AppView {
             .bg(theme.colors.app_surface)
             // Handle actions dispatched from native menu or keybindings.
             .when(
-                crate::actions::descriptor(ActionId::SaveActiveItem)
-                    .is_enabled(&action_context),
+                crate::actions::descriptor(ActionId::SaveActiveItem).is_enabled(&action_context),
                 |root| {
                     root.on_action(cx.listener(|this, _: &SaveActiveItem, _window, cx| {
                         this.do_save_active(cx);
@@ -244,8 +241,7 @@ impl Render for AppView {
                 this.cycle_workspace_focus(true, window, cx);
             }))
             .when(
-                crate::actions::descriptor(ActionId::DetailsNextTab)
-                    .is_enabled(&action_context),
+                crate::actions::descriptor(ActionId::DetailsNextTab).is_enabled(&action_context),
                 |root| {
                     root.on_action(cx.listener(|this, _: &DetailsNextTab, _window, cx| {
                         this.node_editor
@@ -264,8 +260,7 @@ impl Render for AppView {
                 },
             )
             .when(
-                crate::actions::descriptor(ActionId::DetailsCloseTab)
-                    .is_enabled(&action_context),
+                crate::actions::descriptor(ActionId::DetailsCloseTab).is_enabled(&action_context),
                 |root| {
                     root.on_action(cx.listener(|this, _: &DetailsCloseTab, window, cx| {
                         this.request_close_active_editor_tab(window, cx);
@@ -333,8 +328,7 @@ impl Render for AppView {
                 },
             )
             .when(
-                crate::actions::descriptor(ActionId::TogglePerfOverlay)
-                    .is_enabled(&action_context),
+                crate::actions::descriptor(ActionId::TogglePerfOverlay).is_enabled(&action_context),
                 |root| {
                     root.on_action(cx.listener(|this, _: &TogglePerfOverlay, _window, cx| {
                         this.perf_enabled = !this.perf_enabled;
@@ -679,9 +673,300 @@ impl Render for AppView {
                         });
                 }
 
-                // World Canvas — Connections is today's center view. The tab
-                // boundary is deliberate: Timeline and Map can become sibling
-                // center views later without renaming the workspace again.
+                // World Canvas center views. Keep Connections mounted while
+                // Settings is active so graph viewport state is preserved.
+                let active_canvas_view = self.active_world_canvas_view;
+                let open_connections = handle.clone();
+                let open_settings = handle.clone();
+                let decrease = handle.clone();
+                let increase = handle.clone();
+                let decrease_interface = handle.clone();
+                let increase_interface = handle.clone();
+                let toggle_advanced = handle.clone();
+                let toggle_window_controls = handle.clone();
+                let decrease_fts = handle.clone();
+                let increase_fts = handle.clone();
+                let decrease_semantic = handle.clone();
+                let increase_semantic = handle.clone();
+                let toggle_rerank = handle.clone();
+                let save_settings = handle.clone();
+                let settings_snapshot = format!("{:#?}", self.state.app_config);
+                let settings_content = div()
+                    .id("settings-view")
+                    .track_focus(&self.settings_focus)
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h_full()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme.metrics.space_6))
+                    .overflow_y_scroll()
+                    .bg(theme.colors.app_surface)
+                    .text_size(theme.typography.label)
+                    .child(
+                        div()
+                            .text_size(theme.typography.body)
+                            .child("Application Settings"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child("Text size")
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme.metrics.space_2))
+                                    .child(
+                                        Button::new("settings-font-smaller", "Smaller").on_click(
+                                            move |_, _, cx| {
+                                                decrease
+                                                    .update(cx, |view, cx| {
+                                                        view.settings_draft_font_size =
+                                                            (view.settings_draft_font_size - 1.0)
+                                                                .max(10.0);
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            },
+                                        ),
+                                    )
+                                    .child(format!("{:.0} px", self.settings_draft_font_size))
+                                    .child(Button::new("settings-font-larger", "Larger").on_click(
+                                        move |_, _, cx| {
+                                            increase
+                                                .update(cx, |view, cx| {
+                                                    view.settings_draft_font_size =
+                                                        (view.settings_draft_font_size + 1.0)
+                                                            .min(28.0);
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                        },
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child("Interface size")
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme.metrics.space_2))
+                                    .child(
+                                        Button::new("settings-interface-smaller", "Smaller")
+                                            .on_click(move |_, _, cx| {
+                                                decrease_interface
+                                                    .update(cx, |view, cx| {
+                                                        view.settings_draft_interface_size = (view
+                                                            .settings_draft_interface_size
+                                                            - 1.0)
+                                                            .max(14.0);
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            }),
+                                    )
+                                    .child(format!("{:.0} px", self.settings_draft_interface_size))
+                                    .child(
+                                        Button::new("settings-interface-larger", "Larger")
+                                            .on_click(move |_, _, cx| {
+                                                increase_interface
+                                                    .update(cx, |view, cx| {
+                                                        view.settings_draft_interface_size = (view
+                                                            .settings_draft_interface_size
+                                                            + 1.0)
+                                                            .min(32.0);
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        Button::new(
+                            "settings-window-controls-side",
+                            if self.settings_draft_window_controls_left {
+                                "Window controls on left"
+                            } else {
+                                "Window controls on right"
+                            },
+                        )
+                        .selected(self.settings_draft_window_controls_left)
+                        .tooltip("Place client-side minimize, maximize, and close controls")
+                        .on_click(move |_, _, cx| {
+                            toggle_window_controls
+                                .update(cx, |view, cx| {
+                                    view.settings_draft_window_controls_left =
+                                        !view.settings_draft_window_controls_left;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                    )
+                    .child(
+                        Button::new(
+                            "settings-advanced",
+                            if self.settings_draft_advanced {
+                                "Hide advanced settings"
+                            } else {
+                                "Show advanced settings"
+                            },
+                        )
+                        .selected(self.settings_draft_advanced)
+                        .tooltip("Show the complete active application configuration")
+                        .on_click(move |_, _, cx| {
+                            toggle_advanced
+                                .update(cx, |view, cx| {
+                                    view.settings_draft_advanced = !view.settings_draft_advanced;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                    )
+                    .when(self.settings_draft_advanced, |settings| {
+                        settings
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child("FTS candidate limit")
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(theme.metrics.space_2))
+                                            .child(Button::new("settings-fts-less", "−").on_click(
+                                                move |_, _, cx| {
+                                                    decrease_fts
+                                                        .update(cx, |view, cx| {
+                                                            view.settings_draft_fts_limit = view
+                                                                .settings_draft_fts_limit
+                                                                .saturating_sub(5)
+                                                                .max(1);
+                                                            cx.notify();
+                                                        })
+                                                        .ok();
+                                                },
+                                            ))
+                                            .child(self.settings_draft_fts_limit.to_string())
+                                            .child(Button::new("settings-fts-more", "+").on_click(
+                                                move |_, _, cx| {
+                                                    increase_fts
+                                                        .update(cx, |view, cx| {
+                                                            view.settings_draft_fts_limit =
+                                                                (view.settings_draft_fts_limit + 5)
+                                                                    .min(1_000);
+                                                            cx.notify();
+                                                        })
+                                                        .ok();
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child("Semantic candidate limit")
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(theme.metrics.space_2))
+                                            .child(
+                                                Button::new("settings-semantic-less", "−")
+                                                    .on_click(move |_, _, cx| {
+                                                        decrease_semantic
+                                                            .update(cx, |view, cx| {
+                                                                view.settings_draft_semantic_limit = view
+                                                                    .settings_draft_semantic_limit
+                                                                    .saturating_sub(5)
+                                                                    .max(1);
+                                                                cx.notify();
+                                                            })
+                                                            .ok();
+                                                    }),
+                                            )
+                                            .child(self.settings_draft_semantic_limit.to_string())
+                                            .child(
+                                                Button::new("settings-semantic-more", "+")
+                                                    .on_click(move |_, _, cx| {
+                                                        increase_semantic
+                                                            .update(cx, |view, cx| {
+                                                                view.settings_draft_semantic_limit =
+                                                                    (view.settings_draft_semantic_limit
+                                                                        + 5)
+                                                                        .min(1_000);
+                                                                cx.notify();
+                                                            })
+                                                            .ok();
+                                                    }),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                Button::new(
+                                    "settings-rerank",
+                                    if self.settings_draft_rerank {
+                                        "Reranking enabled"
+                                    } else {
+                                        "Reranking disabled"
+                                    },
+                                )
+                                .selected(self.settings_draft_rerank)
+                                .on_click(move |_, _, cx| {
+                                    toggle_rerank
+                                        .update(cx, |view, cx| {
+                                            view.settings_draft_rerank =
+                                                !view.settings_draft_rerank;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme.metrics.space_3))
+                                    .p_3()
+                                    .rounded(px(theme.metrics.radius_small))
+                                    .bg(theme.colors.input_surface)
+                                    .border_1()
+                                    .border_color(theme.colors.border)
+                                    .child("Complete active configuration")
+                                    .child(
+                                        div()
+                                            .text_size(theme.typography.caption)
+                                            .text_color(theme.colors.text_muted)
+                                            .child(settings_snapshot),
+                                    ),
+                            )
+                    })
+                    .child(
+                        div().flex().justify_end().child(
+                            Button::new("settings-save", "Save Settings")
+                                .style(ButtonStyle::Filled)
+                                .on_click(move |_, window, cx| {
+                                    save_settings
+                                        .update(cx, |view, cx| view.save_settings(window, cx))
+                                        .ok();
+                                }),
+                        ),
+                    );
                 let mut graph_pane = div()
                     .id("world-canvas")
                     .flex()
@@ -708,21 +993,55 @@ impl Render for AppView {
                                 UiTab::new(
                                     "connections-tab",
                                     WorldCanvasViewId::Connections.title(),
-                                    true,
+                                    active_canvas_view == WorldCanvasViewId::Connections,
                                 )
-                                .tooltip("Show relationships between world items"),
+                                .tooltip("Show relationships between world items")
+                                .on_click(move |_, window, cx| {
+                                    open_connections
+                                        .update(cx, |view, cx| view.close_settings(window, cx))
+                                        .ok();
+                                }),
+                            )
+                            .child(
+                                UiTab::new(
+                                    "settings-tab",
+                                    WorldCanvasViewId::Settings.title(),
+                                    active_canvas_view == WorldCanvasViewId::Settings,
+                                )
+                                .tooltip("Configure u-forge")
+                                .on_click(move |_, window, cx| {
+                                    open_settings
+                                        .update(cx, |view, cx| view.open_settings(window, cx))
+                                        .ok();
+                                }),
                             ),
                     )
                     .child({
-                        let mut canvas = div()
-                            .id("connections-view")
-                            .min_h_0()
-                            .overflow_hidden()
-                            .child(self.graph_canvas.clone());
-                        canvas.style().flex_grow = Some(1.0);
-                        canvas.style().flex_shrink = Some(1.0);
-                        canvas.style().flex_basis = Some(relative(0.).into());
-                        canvas
+                        let mut views = div().relative().min_h_0().overflow_hidden().child(
+                            div()
+                                .id("connections-view")
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .when(
+                                    active_canvas_view == WorldCanvasViewId::Connections,
+                                    |canvas| canvas.w_full(),
+                                )
+                                .when(
+                                    active_canvas_view != WorldCanvasViewId::Connections,
+                                    |canvas| canvas.w(px(0.0)),
+                                )
+                                .h_full()
+                                .overflow_hidden()
+                                .child(self.graph_canvas.clone()),
+                        );
+                        if active_canvas_view == WorldCanvasViewId::Settings {
+                            views = views.child(settings_content);
+                        }
+                        views.style().flex_grow = Some(1.0);
+                        views.style().flex_shrink = Some(1.0);
+                        views.style().flex_basis = Some(relative(0.).into());
+                        views
                     });
                 graph_pane.style().flex_grow = Some(1.0);
                 graph_pane.style().flex_shrink = Some(1.0);
@@ -889,10 +1208,9 @@ impl Render for AppView {
                             .gap(px(2.0))
                             .px_1()
                             .children(
-                                status_descriptors(StatusSide::Left, &action_context)
-                                    .map(|descriptor| {
-                                        status_action_item(descriptor, &action_context)
-                                    }),
+                                status_descriptors(StatusSide::Left, &action_context).map(
+                                    |descriptor| status_action_item(descriptor, &action_context),
+                                ),
                             ),
                     )
                     .child({
@@ -987,10 +1305,9 @@ impl Render for AppView {
                             .gap(px(2.0))
                             .px_1()
                             .children(
-                                status_descriptors(StatusSide::Right, &action_context)
-                                    .map(|descriptor| {
-                                        status_action_item(descriptor, &action_context)
-                                    }),
+                                status_descriptors(StatusSide::Right, &action_context).map(
+                                    |descriptor| status_action_item(descriptor, &action_context),
+                                ),
                             ),
                     ),
             )
@@ -1003,15 +1320,13 @@ impl Render for AppView {
                         .child(
                             Menu::new(
                                 "file-dropdown",
-                                div()
-                                    .w(px(220.0))
-                                    .children(action_menu_entries(
-                                        ActionMenu::File,
-                                        &action_context,
-                                        self.file_menu_button_focus.clone(),
-                                        handle.clone(),
-                                        theme,
-                                    )),
+                                div().w(px(220.0)).children(action_menu_entries(
+                                    ActionMenu::File,
+                                    &action_context,
+                                    self.file_menu_button_focus.clone(),
+                                    handle.clone(),
+                                    theme,
+                                )),
                             )
                             .focus_handle(self.file_menu_focus.clone())
                             .return_focus(self.file_menu_button_focus.clone())
@@ -1038,15 +1353,13 @@ impl Render for AppView {
                         .child(
                             Menu::new(
                                 "view-dropdown",
-                                div()
-                                    .w(px(250.0))
-                                    .children(action_menu_entries(
-                                        ActionMenu::View,
-                                        &action_context,
-                                        self.view_menu_button_focus.clone(),
-                                        handle.clone(),
-                                        theme,
-                                    )),
+                                div().w(px(250.0)).children(action_menu_entries(
+                                    ActionMenu::View,
+                                    &action_context,
+                                    self.view_menu_button_focus.clone(),
+                                    handle.clone(),
+                                    theme,
+                                )),
                             )
                             .focus_handle(self.view_menu_focus.clone())
                             .return_focus(self.view_menu_button_focus.clone())
@@ -1071,198 +1384,6 @@ impl Render for AppView {
             // ── Destructive-action confirmation ──────────────────────────────
             .when(self.confirmation.is_some(), |root| {
                 root.child(self.confirmation.as_ref().unwrap().clone())
-            })
-            // ── User-facing UI settings ─────────────────────────────────────
-            .when(settings_open, |root| {
-                let decrease = handle.clone();
-                let increase = handle.clone();
-                let decrease_interface = handle.clone();
-                let increase_interface = handle.clone();
-                let toggle_advanced = handle.clone();
-                let toggle_window_controls = handle.clone();
-                let cancel = handle.clone();
-                let dismiss = handle.clone();
-                let save = handle.clone();
-                let body = div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme.metrics.space_6))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child("Text size")
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(theme.metrics.space_2))
-                                    .child(
-                                        Button::new("settings-font-smaller", "Smaller").on_click(
-                                            move |_, _, cx| {
-                                                decrease
-                                                    .update(cx, |view, cx| {
-                                                        view.settings_draft_font_size =
-                                                            (view.settings_draft_font_size - 1.0)
-                                                                .max(10.0);
-                                                        cx.notify();
-                                                    })
-                                                    .ok();
-                                            },
-                                        ),
-                                    )
-                                    .child(format!("{:.0} px", self.settings_draft_font_size))
-                                    .child(Button::new("settings-font-larger", "Larger").on_click(
-                                        move |_, _, cx| {
-                                            increase
-                                                .update(cx, |view, cx| {
-                                                    view.settings_draft_font_size =
-                                                        (view.settings_draft_font_size + 1.0)
-                                                            .min(28.0);
-                                                    cx.notify();
-                                                })
-                                                .ok();
-                                        },
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child("Interface size")
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(theme.metrics.space_2))
-                                    .child(
-                                        Button::new("settings-interface-smaller", "Smaller")
-                                            .on_click(move |_, _, cx| {
-                                                decrease_interface
-                                                    .update(cx, |view, cx| {
-                                                        view.settings_draft_interface_size = (view
-                                                            .settings_draft_interface_size
-                                                            - 1.0)
-                                                            .max(14.0);
-                                                        cx.notify();
-                                                    })
-                                                    .ok();
-                                            }),
-                                    )
-                                    .child(format!("{:.0} px", self.settings_draft_interface_size))
-                                    .child(
-                                        Button::new("settings-interface-larger", "Larger")
-                                            .on_click(move |_, _, cx| {
-                                                increase_interface
-                                                    .update(cx, |view, cx| {
-                                                        view.settings_draft_interface_size = (view
-                                                            .settings_draft_interface_size
-                                                            + 1.0)
-                                                            .min(32.0);
-                                                        cx.notify();
-                                                    })
-                                                    .ok();
-                                            }),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme.typography.caption)
-                            .text_color(theme.colors.text_muted)
-                            .child(
-                                "Text size affects readable content; interface size affects panels, controls, spacing, and icons.",
-                            ),
-                    )
-                    .child(
-                        Button::new(
-                            "settings-advanced",
-                            if self.settings_draft_advanced {
-                                "Advanced controls shown"
-                            } else {
-                                "Advanced controls hidden"
-                            },
-                        )
-                        .selected(self.settings_draft_advanced)
-                        .tooltip("Show technical diagnostics and model-tuning controls")
-                        .on_click(move |_, _, cx| {
-                            toggle_advanced
-                                .update(cx, |view, cx| {
-                                    view.settings_draft_advanced = !view.settings_draft_advanced;
-                                    cx.notify();
-                                })
-                                .ok();
-                        }),
-                    )
-                    .child(
-                        Button::new(
-                            "settings-window-controls-side",
-                            if self.settings_draft_window_controls_left {
-                                "Window controls on left"
-                            } else {
-                                "Window controls on right"
-                            },
-                        )
-                        .selected(self.settings_draft_window_controls_left)
-                        .tooltip("Place client-side minimize, maximize, and close controls")
-                        .on_click(move |_, _, cx| {
-                            toggle_window_controls
-                                .update(cx, |view, cx| {
-                                    view.settings_draft_window_controls_left =
-                                        !view.settings_draft_window_controls_left;
-                                    cx.notify();
-                                })
-                                .ok();
-                        }),
-                    )
-                    .child(div().text_xs().text_color(theme.colors.text_muted).child(
-                        if show_advanced_controls {
-                            "Advanced diagnostics are currently available."
-                        } else {
-                            "Everyday worldbuilding features remain visible."
-                        },
-                    ));
-                let mut dialog = Dialog::new("Settings", body)
-                    .id("settings-dialog")
-                    .focus_handle(self.settings_focus.clone())
-                    .on_dismiss(move |window, cx| {
-                        dismiss
-                            .update(cx, |view, cx| view.close_settings(window, cx))
-                            .ok();
-                    })
-                    .action(
-                        Button::new("settings-cancel", "Cancel").on_click(move |_, window, cx| {
-                            cancel
-                                .update(cx, |view, cx| view.close_settings(window, cx))
-                                .ok();
-                        }),
-                    )
-                    .action(
-                        Button::new("settings-save", "Save Settings")
-                            .style(ButtonStyle::Filled)
-                            .on_click(move |_, window, cx| {
-                                save.update(cx, |view, cx| view.save_settings(window, cx))
-                                    .ok();
-                            }),
-                    );
-                if let Some(return_focus) = self.settings_return_focus.clone() {
-                    dialog = dialog.return_focus(return_focus);
-                }
-                root.child(
-                    div()
-                        .id("settings-overlay")
-                        .absolute()
-                        .size_full()
-                        .occlude()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(theme.colors.overlay)
-                        .child(dialog),
-                )
             })
             // ── Reopenable Lemonade setup ───────────────────────────────────
             .when(setup_open, |root| root.child(self.setup_panel.clone()))

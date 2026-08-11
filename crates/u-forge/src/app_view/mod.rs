@@ -43,7 +43,7 @@ use crate::dock_state::{DockFocusIntent, DockState};
 use crate::graph_canvas::GraphCanvas;
 use crate::node_editor::{CloseDirtyTabRequested, NodeEditorPanel};
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
-use crate::panel_contracts::PanelId;
+use crate::panel_contracts::{PanelId, WorldCanvasViewId};
 use crate::path_picker::{
     PathCancelled, PathConfirmed, PathPickerKind, PathPickerModal, PickerMode,
 };
@@ -164,9 +164,8 @@ pub struct AppView {
     pub(crate) menu_anchors: Rc<Cell<[Point<Pixels>; 2]>>,
     pub(crate) window_control_focus: WindowControlFocusHandles,
     pub(crate) setup_open: bool,
-    pub(crate) settings_open: bool,
+    pub(crate) active_world_canvas_view: WorldCanvasViewId,
     pub(crate) settings_focus: FocusHandle,
-    pub(crate) settings_return_focus: Option<FocusHandle>,
     pub(crate) ui_font_size: f32,
     pub(crate) ui_interface_size: f32,
     pub(crate) show_advanced_controls: bool,
@@ -175,6 +174,9 @@ pub struct AppView {
     pub(crate) settings_draft_interface_size: f32,
     pub(crate) settings_draft_advanced: bool,
     pub(crate) settings_draft_window_controls_left: bool,
+    pub(crate) settings_draft_fts_limit: usize,
+    pub(crate) settings_draft_semantic_limit: usize,
+    pub(crate) settings_draft_rerank: bool,
     pub(crate) dock_state: DockState,
     /// Last focused descendant per workspace region, used when a dock is
     /// revisited after F6 traversal or a close/reopen cycle.
@@ -905,30 +907,42 @@ impl AppView {
         self.settings_draft_interface_size = self.ui_interface_size;
         self.settings_draft_advanced = self.show_advanced_controls;
         self.settings_draft_window_controls_left = self.window_controls_left;
-        self.settings_return_focus = window.focused(cx);
-        self.settings_open = true;
+        self.settings_draft_fts_limit = self.state.app_config.chat.fts_limit;
+        self.settings_draft_semantic_limit = self.state.app_config.chat.semantic_limit;
+        self.settings_draft_rerank = self.state.app_config.chat.rerank;
+        self.remember_current_region_focus(window, cx);
+        self.active_world_canvas_view = WorldCanvasViewId::Settings;
         let focus = self.settings_focus.clone();
         window.defer(cx, move |window, _cx| focus.focus(window));
         cx.notify();
     }
 
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings_open = false;
-        if let Some(return_focus) = self.settings_return_focus.take() {
-            return_focus.focus(window);
-        }
+        self.active_world_canvas_view = WorldCanvasViewId::Connections;
+        self.graph_canvas.read(cx).focus_handle(cx).focus(window);
         cx.notify();
     }
 
-    pub(crate) fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn save_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let font_size = self.settings_draft_font_size.clamp(10.0, 28.0);
         let interface_size = self.settings_draft_interface_size.clamp(14.0, 32.0);
-        match self.state.app_config.persist_ui_settings(
+        let ui_result = self.state.app_config.persist_ui_settings(
             font_size,
             interface_size,
             self.settings_draft_advanced,
             self.settings_draft_window_controls_left,
-        ) {
+        );
+        let retrieval_result = ui_result.and_then(|path| {
+            self.state
+                .app_config
+                .persist_retrieval_settings(
+                    self.settings_draft_fts_limit.clamp(1, 1_000),
+                    self.settings_draft_semantic_limit.clamp(1, 1_000),
+                    self.settings_draft_rerank,
+                )
+                .map(|_| path)
+        });
+        match retrieval_result {
             Ok(path) => {
                 self.ui_font_size = font_size;
                 self.ui_interface_size = interface_size;
@@ -940,11 +954,20 @@ impl AppView {
                 self.setup_panel.update(cx, |_panel, cx| cx.notify());
                 self.show_advanced_controls = self.settings_draft_advanced;
                 self.window_controls_left = self.settings_draft_window_controls_left;
+                let mut next_config = (*self.state.app_config).clone();
+                next_config.ui.font_size = font_size;
+                next_config.ui.interface_size = interface_size;
+                next_config.ui.show_advanced_controls = self.settings_draft_advanced;
+                next_config.ui.window_controls_left = self.settings_draft_window_controls_left;
+                next_config.chat.fts_limit = self.settings_draft_fts_limit.clamp(1, 1_000);
+                next_config.chat.semantic_limit =
+                    self.settings_draft_semantic_limit.clamp(1, 1_000);
+                next_config.chat.rerank = self.settings_draft_rerank;
+                let next_config = Arc::new(next_config);
+                self.state.app_config = next_config.clone();
+                self.search_panel
+                    .update(cx, |panel, _cx| panel.set_app_config(next_config));
                 self.refresh_native_menus(cx);
-                self.settings_open = false;
-                if let Some(return_focus) = self.settings_return_focus.take() {
-                    return_focus.focus(window);
-                }
                 self.state.data_status = Some(format!("Settings saved to {}", path.display()));
             }
             Err(error) => {
@@ -1131,6 +1154,9 @@ impl AppView {
         UiTheme::set_interface_size(cx, ui_interface_size);
         let show_advanced_controls = app_config.ui.show_advanced_controls;
         let window_controls_left = app_config.ui.window_controls_left;
+        let settings_draft_fts_limit = app_config.chat.fts_limit;
+        let settings_draft_semantic_limit = app_config.chat.semantic_limit;
+        let settings_draft_rerank = app_config.chat.rerank;
 
         // Build child entities — clone Arc handles before they move into AppState.
         let selection = {
@@ -1335,9 +1361,8 @@ impl AppView {
                 close: cx.focus_handle(),
             },
             setup_open: false,
-            settings_open: false,
+            active_world_canvas_view: WorldCanvasViewId::Connections,
             settings_focus: cx.focus_handle(),
-            settings_return_focus: None,
             ui_font_size,
             ui_interface_size,
             show_advanced_controls,
@@ -1346,6 +1371,9 @@ impl AppView {
             settings_draft_interface_size: ui_interface_size,
             settings_draft_advanced: show_advanced_controls,
             settings_draft_window_controls_left: window_controls_left,
+            settings_draft_fts_limit,
+            settings_draft_semantic_limit,
+            settings_draft_rerank,
             dock_state,
             last_region_focus: HashMap::new(),
             last_selected_panel: None,

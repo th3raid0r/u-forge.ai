@@ -212,6 +212,11 @@ impl SearchPanel {
         self.compatible_semantic_lane = self.resolve_compatible_semantic_lane();
     }
 
+    pub(crate) fn set_app_config(&mut self, app_config: Arc<AppConfig>) {
+        self.search_limit = app_config.chat.search_limit;
+        self.app_config = app_config;
+    }
+
     pub(crate) fn status(&self) -> Option<SearchPanelStatus> {
         if self.searching {
             Some(SearchPanelStatus::Searching)
@@ -313,13 +318,15 @@ impl SearchPanel {
                             let (alpha, rerank) = match mode {
                                 SearchMode::Fts5 => (0.0, false),
                                 SearchMode::Semantic => (1.0, false),
-                                SearchMode::Hybrid => (app_config.chat.alpha, true),
+                                SearchMode::Hybrid => {
+                                    (app_config.chat.alpha, app_config.chat.rerank)
+                                }
                             };
                             debug_assert!(mode != SearchMode::Semantic || semantic_available);
                             let config = HybridSearchConfig {
                                 alpha,
-                                fts_limit: limit * 4,
-                                semantic_limit: limit * 4,
+                                fts_limit: app_config.chat.fts_limit,
+                                semantic_limit: app_config.chat.semantic_limit,
                                 rerank,
                                 limit,
                                 hq_semantic_boost: app_config.chat.hq_semantic_boost,

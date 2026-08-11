@@ -78,12 +78,14 @@ impl WorkspaceItemId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorldCanvasViewId {
     Connections,
+    Settings,
 }
 
 impl WorldCanvasViewId {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Connections => "Connections",
+            Self::Settings => "Settings",
         }
     }
 }
@@ -119,5 +121,11 @@ mod tests {
             serde_json::to_string(&PanelId::Assistant).unwrap(),
             "\"assistant\""
         );
+    }
+
+    #[test]
+    fn world_canvas_exposes_connections_and_settings_views() {
+        assert_eq!(WorldCanvasViewId::Connections.title(), "Connections");
+        assert_eq!(WorldCanvasViewId::Settings.title(), "Settings");
     }
 }

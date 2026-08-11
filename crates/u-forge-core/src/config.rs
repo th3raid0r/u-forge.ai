@@ -128,6 +128,9 @@ pub struct ModelLoadParams {
     /// When `None` and `ctx_size` is set, `--ubatch-size` is auto-injected to
     /// match `ctx_size`.  Set this explicitly to use a different value.
     pub ubatch_size: Option<usize>,
+
+    /// Additional safe arguments forwarded to llama-server.
+    pub llamacpp_args: Option<String>,
 }
 
 // ── ModelConfig ───────────────────────────────────────────────────────────────
@@ -195,6 +198,7 @@ impl ModelConfig {
                 ctx_size: p.ctx_size,
                 batch_size: p.batch_size,
                 ubatch_size: p.ubatch_size,
+                llamacpp_args: p.llamacpp_args.clone(),
                 ..Default::default()
             },
             None => ModelLoadOptions::default(),
@@ -519,6 +523,18 @@ pub struct ChatConfig {
     #[serde(default = "ChatConfig::default_search_limit")]
     pub search_limit: usize,
 
+    /// Maximum lexical candidates gathered before fusion.
+    #[serde(default = "ChatConfig::default_candidate_limit")]
+    pub fts_limit: usize,
+
+    /// Maximum semantic candidates gathered before fusion.
+    #[serde(default = "ChatConfig::default_candidate_limit")]
+    pub semantic_limit: usize,
+
+    /// Apply the configured cross-encoder reranker in hybrid searches.
+    #[serde(default = "default_true")]
+    pub rerank: bool,
+
     /// RRF score multiplier for the high-quality 4096-dim semantic path.
     ///
     /// See [`HybridSearchConfig::hq_semantic_boost`] for full semantics.
@@ -574,6 +590,10 @@ impl ChatConfig {
         3
     }
 
+    fn default_candidate_limit() -> usize {
+        20
+    }
+
     fn default_hq_semantic_boost() -> f32 {
         3.0
     }
@@ -598,6 +618,9 @@ impl Default for ChatConfig {
             agent: AgentBudgetConfig::default(),
             alpha: Self::default_alpha(),
             search_limit: Self::default_search_limit(),
+            fts_limit: Self::default_candidate_limit(),
+            semantic_limit: Self::default_candidate_limit(),
+            rerank: true,
             hq_semantic_boost: Self::default_hq_semantic_boost(),
             max_tool_turns: Self::default_max_tool_turns(),
         }
@@ -997,6 +1020,42 @@ impl AppConfig {
         std::fs::rename(temp, &path)?;
         Ok(path)
     }
+
+    /// Persist retrieval controls revealed by the advanced Settings view.
+    pub fn persist_retrieval_settings(
+        &self,
+        fts_limit: usize,
+        semantic_limit: usize,
+        rerank: bool,
+    ) -> Result<PathBuf> {
+        use toml_edit::{DocumentMut, Item, Table, value};
+
+        let path = self
+            .source_path
+            .clone()
+            .or_else(Self::per_user_config_path)
+            .ok_or_else(|| anyhow::anyhow!("cannot determine a configuration path"))?;
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut document = if text.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            text.parse::<DocumentMut>()?
+        };
+        if document.get("chat").is_none_or(|item| !item.is_table()) {
+            document["chat"] = Item::Table(Table::new());
+        }
+        document["chat"]["fts_limit"] = value(fts_limit as i64);
+        document["chat"]["semantic_limit"] = value(semantic_limit as i64);
+        document["chat"]["rerank"] = value(rerank);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp, document.to_string())?;
+        std::fs::rename(temp, &path)?;
+        Ok(path)
+    }
 }
 
 /// Helper: `$HOME` path, if determinable.
@@ -1117,6 +1176,9 @@ mod tests {
         assert_eq!(cfg.chat.agent.cumulative_request_tokens, 16_384);
         assert_eq!(cfg.chat.agent.cumulative_tool_output_tokens, 2_048);
         assert_eq!(cfg.chat.agent.repeated_call_limit, 1);
+        assert_eq!(cfg.chat.fts_limit, 20);
+        assert_eq!(cfg.chat.semantic_limit, 20);
+        assert!(cfg.chat.rerank);
     }
 
     #[test]
@@ -1251,6 +1313,27 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_persistence_round_trips_advanced_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "# retained\n[ui]\nfont_size = 17.0\n").unwrap();
+        let config = AppConfig {
+            source_path: Some(path.clone()),
+            ..AppConfig::default()
+        };
+
+        config.persist_retrieval_settings(35, 45, false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# retained"));
+        assert!(text.contains("font_size = 17.0"));
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        assert_eq!(reloaded.chat.fts_limit, 35);
+        assert_eq!(reloaded.chat.semantic_limit, 45);
+        assert!(!reloaded.chat.rerank);
+    }
+
+    #[test]
     fn test_default_model_load_params() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.models.ctx_size_for("embed-gemma-300m-FLM"), 2048);
@@ -1342,7 +1425,7 @@ high_quality_embedding_dimensions = 2048
 [models.load_params]
 "embed-gemma-300m-FLM"    = {{ ctx_size = 1024 }}
 "my-custom-model-FLM"     = {{ ctx_size = 8192 }}
-"bge-reranker-v2-m3-GGUF" = {{ ctx_size = 8192, batch_size = 512, ubatch_size = 512 }}
+"bge-reranker-v2-m3-GGUF" = {{ ctx_size = 8192, batch_size = 512, ubatch_size = 512, llamacpp_args = "--threads 6" }}
 "#
         )
         .unwrap();
@@ -1355,6 +1438,7 @@ high_quality_embedding_dimensions = 2048
         assert_eq!(rerank_opts.ctx_size, Some(8192));
         assert_eq!(rerank_opts.batch_size, Some(512));
         assert_eq!(rerank_opts.ubatch_size, Some(512));
+        assert_eq!(rerank_opts.llamacpp_args.as_deref(), Some("--threads 6"));
     }
 
     #[test]
