@@ -99,7 +99,7 @@ Populated via `upsert_chunk_embedding()`. Not every chunk has an entry immediate
 ```
 rowid INTEGER (maps to chunks.rowid), embedding float[4096] distance_metric=cosine
 ```
-Optional — populated only when a high-quality embedding model (e.g. `Qwen3-Embedding-8B-GGUF`) is available and `embedding.high_quality_embedding: true` in config.
+Optional — populated only when a high-quality embedding model (e.g. `Qwen3-Embedding-8B-GGUF`) is available, `embedding.high_quality_embedding: true` in config, and the corresponding chunk already has a standard embedding. HQ augments the standard retrieval signal; it does not replace the standard lane.
 
 **`node_positions`** — canvas layout positions.
 ```
@@ -131,6 +131,9 @@ Holds `chunks_vec_dims` and `chunks_vec_hq_dims`. `check_or_init_embedding_dims`
 ### Catalog-Driven Selection Flow
 
 ```
+LemonadeManagement::set_max_loaded_models(config.lemonade.max_loaded_models)
+  └─ POST /internal/set     (owned embedded runtime only, idempotent)
+
 LemonadeServerCatalog::discover(connection)
   ├─ GET /v1/models       (required catalog + download status)
   ├─ GET /v1/system-info  (optional installed recipe backends)
@@ -254,7 +257,7 @@ the operation instead of becoming a degraded response. The older
 
 `fts5_sanitize` strips characters illegal in FTS5 query syntax before `MATCH`; the original query is passed verbatim to `embed()` and `rerank()` where punctuation is meaningful. Returns `None` for all-punctuation input (FTS stage cleanly skipped).
 
-The standard and high-quality vector spaces are independently configurable and incompatible — do not mix model families within a lane. Their configured dimensions are recorded in `schema_metadata`; changing either dimension requires rebuilding the database and is rejected at open time (`EmbeddingDimensionMismatch`) rather than silently corrupting the vector index.
+The standard and high-quality vector spaces are independently configured and incompatible — do not mix model families within a lane. The standard lane is the required baseline; the optional HQ lane is populated only after standard coverage is complete. Their configured dimensions are recorded in `schema_metadata`; changing either dimension requires rebuilding the database and is rejected at open time (`EmbeddingDimensionMismatch`) rather than silently corrupting the vector index.
 
 Each lane also records its sorted embedding-provider fingerprint on first use.
 Populated legacy lanes without identity and lanes whose provider set changed
@@ -295,14 +298,16 @@ Tool arguments emitted by the LLM are validated against each tool's JSON Schema 
 
 `SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and derives edge schemas from declared relationship fields, including their allowed target types.
 
-The Rig loop carries a per-request ledger through lifecycle hooks. Every model
-call is checked against the active context window, response reserve, and
-cumulative request budget before dispatch. Validated tool calls use canonical
-name/JSON fingerprints; unchanged results consume a configurable repeat
-allowance while changed arguments/results and successful mutations count as
-progress. Tool results are bounded at semantic record boundaries. Deliberate
-budget and repeat stops are distinct `ChatEvent` outcomes, not provider errors,
-and aggregate token/turn diagnostics are emitted without prompt content.
+The Rig loop carries request state through lifecycle hooks. Before each model
+call, it fits the newest structurally valid history suffix to the active context
+window and response reserve; there is no cumulative token ceiling across valid
+tool turns. Validated tool calls use canonical name/JSON fingerprints;
+unchanged results consume a configurable repeat allowance while changed
+arguments/results and successful mutations count as progress. Each tool result
+is independently bounded at semantic record boundaries against the model
+window. Deliberate fit and repeat stops are distinct `ChatEvent` outcomes, not
+provider errors, and aggregate token/turn diagnostics are emitted without
+prompt content.
 
 ---
 
@@ -485,9 +490,9 @@ and server-decorated Linux; GNOME X11 is unsupported.
   handles, and multi-step operations share a parent token. UI task ownership
   prevents stale presentation; the inference token stops pending and active
   backend work. Dropped receivers remain fallback cleanup only.
-- **Agent requests are budget-ledgered** — model-aware limits bound whole-record
-  schema summaries, cumulative model reservations, cumulative tool output, and
-  unchanged tool repeats while preserving the independent max-turn ceiling.
+- **Agent requests are fitted per turn** — model-aware limits bound whole-record
+  schema summaries, retained history, individual tool results, and unchanged
+  tool repeats while preserving the independent max-turn ceiling.
 - **Linux decorations are negotiated** — the app requests client decorations
   on Linux and renders title bar/frame/resize geometry only when GPUI reports
   client-side mode. Server-decorated geometry remains unchanged; GNOME X11 is
@@ -565,6 +570,10 @@ and generated Lemonade configuration share that application-scoped cache;
 model resolution does not use the global Hugging Face cache. Older u-forge
 cache entries under XDG data storage or a build profile's `lemonade/models`
 directory are moved into this location on the next owned launch.
+Before discovery or model activation, u-forge reconciles the owned runtime's
+per-model-type `max_loaded_models` value with `[lemonade].max_loaded_models`
+(default `1`) through Lemonade's atomic runtime configuration API. External
+servers remain operator-owned and are not mutated by this setting.
 
 Owned shutdown first unloads models and requests `lemond` exit, then terminates
 the private Unix process group so backend grandchildren cannot survive. The

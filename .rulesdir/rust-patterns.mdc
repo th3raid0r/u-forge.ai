@@ -173,8 +173,9 @@ A chunk must be explicitly indexed before it becomes searchable via ANN.
 `EmbeddingPlan::embed_all()` performs the bulk missing-embedding sweep;
 `EmbeddingPlan::rechunk(ids)` replaces one or more nodes' chunks. Both standard
 and available HQ lanes are filled, and each lane records the sorted provider
-fingerprint before semantic search may use it. Never infer compatibility from
-matching dimensions alone.
+fingerprint before semantic search may use it. HQ is additive: never create an
+HQ vector for a chunk that lacks its standard vector. Never infer compatibility
+from matching dimensions alone.
 
 ---
 
@@ -271,14 +272,16 @@ Tool args in `u-forge-agent` are validated against JSON Schema before deserializ
 
 The graph agent applies one model-reconciled `EffectiveAgentBudget` per request.
 It accounts for system/tool definitions, whole-record schema selection,
-retained history, response reserve, every model turn, tool arguments, and
-model-visible tool output through the shared cached token estimator.
+retained history, response reserve, each model turn, tool arguments, and
+model-visible tool output through the shared cached token estimator. Limits
+are fitted independently for every provider call; do not reintroduce a
+cumulative token ceiling across a valid multi-turn request.
 
 - Never concatenate `schema_prompt_summary_all()` into a request. Use
   `bounded_schema_summary`; schema records and JSON are never byte-sliced.
-- Admit every model/tool turn through the request ledger before dispatch.
+- Fit the newest structurally valid history suffix before every model dispatch.
 - Bound tool output at semantic record boundaries and include omission counts
-  or continuation guidance.
+  or continuation guidance. This bound is per result and model-window-aware.
 - Fingerprint the validated tool name + canonical JSON arguments. Identical
   unchanged reads consume the repeat allowance; corrected arguments, changed
   results, and committed graph mutations count as progress.

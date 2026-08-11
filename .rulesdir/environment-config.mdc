@@ -42,6 +42,10 @@ export RUST_LOG=info,u_forge_core::lemonade::management=debug,u_forge_core::lemo
 `~/.cache/u-forge/lemonade/config.json` when `XDG_CACHE_HOME` is unset. Models
 and downloaded backends live under that same cache root; model paths never
 fall back to the global Hugging Face cache.
+The typed `[lemonade].max_loaded_models` u-forge setting defaults to `1` and is
+applied idempotently to the app-owned server through `POST /internal/set` before
+provider activation. Lemonade interprets this as a per-model-type residency
+limit. External servers are operator-owned and are never changed implicitly.
 Set that JSON field to `"debug"` when Lemonade's default informational child
 events are insufficient; u-forge forwards those lines only when the dedicated
 `lemond` tracing target above is enabled and redacts both runtime credentials.

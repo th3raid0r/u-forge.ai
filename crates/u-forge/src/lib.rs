@@ -13,6 +13,7 @@ mod panel_contracts;
 pub mod path_picker;
 pub mod search_panel;
 pub mod selection_model;
+mod settings_view;
 mod setup_panel;
 pub mod startup;
 pub mod text_field;

@@ -499,9 +499,9 @@ pub const ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         OpenSettings,
         "open-settings-item",
         "Settings…",
-        "Open interface settings",
+        "Open application settings",
         shortcut("ctrl-,", "Ctrl+,", None),
-        menu(ActionMenu::View, 1),
+        menu(ActionMenu::File, 4),
         None,
         false,
         Normal,
@@ -985,6 +985,19 @@ mod tests {
         assert!(
             status_descriptors(StatusSide::Right, &context)
                 .any(|descriptor| descriptor.id == ActionId::TogglePerfOverlay)
+        );
+    }
+
+    #[test]
+    fn settings_is_exposed_only_from_the_file_menu() {
+        let context = ActionContext::default();
+        assert!(
+            menu_descriptors(ActionMenu::File, &context)
+                .any(|descriptor| descriptor.id == ActionId::OpenSettings)
+        );
+        assert!(
+            menu_descriptors(ActionMenu::View, &context)
+                .all(|descriptor| descriptor.id != ActionId::OpenSettings)
         );
     }
 

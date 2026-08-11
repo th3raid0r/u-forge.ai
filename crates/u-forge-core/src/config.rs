@@ -13,6 +13,9 @@
 //! # Example file
 //!
 //! ```toml
+//! [lemonade]
+//! max_loaded_models = 3
+//!
 //! [embedding]
 //! npu_enabled  = true
 //! gpu_enabled  = true
@@ -43,6 +46,35 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::lemonade::load::ModelLoadOptions;
+
+/// Lemonade Server runtime settings managed by u-forge for its owned server.
+///
+/// Corresponds to the `[lemonade]` section of `u-forge.toml`. External
+/// Lemonade processes remain operator-owned and are never mutated implicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LemonadeConfig {
+    /// Maximum simultaneously loaded models per model type.
+    ///
+    /// Three permits the standard CPU/GPU embedding model, optional NPU
+    /// embedding model, and high-quality embedding model to remain resident.
+    #[serde(default = "LemonadeConfig::default_max_loaded_models")]
+    pub max_loaded_models: usize,
+}
+
+impl LemonadeConfig {
+    pub const fn default_max_loaded_models() -> usize {
+        1
+    }
+}
+
+impl Default for LemonadeConfig {
+    fn default() -> Self {
+        Self {
+            max_loaded_models: Self::default_max_loaded_models(),
+        }
+    }
+}
 
 // ── EmbeddingDeviceConfig ─────────────────────────────────────────────────────
 
@@ -330,13 +362,19 @@ pub struct AgentBudgetConfig {
     #[serde(default = "AgentBudgetConfig::default_schema_summary_tokens")]
     pub schema_summary_tokens: usize,
 
-    /// Cumulative model input plus response reservations across the request.
-    #[serde(default = "AgentBudgetConfig::default_cumulative_request_tokens")]
-    pub cumulative_request_tokens: usize,
+    /// Legacy cumulative request cap retained only for configuration compatibility.
+    ///
+    /// Per-request cumulative caps proved too aggressive for multi-turn agents.
+    /// The value is accepted from older TOML files but is no longer enforced or
+    /// written by the settings persistence path.
+    #[serde(default, skip_serializing)]
+    pub cumulative_request_tokens: Option<usize>,
 
-    /// Cumulative model-visible output returned by tools.
-    #[serde(default = "AgentBudgetConfig::default_cumulative_tool_output_tokens")]
-    pub cumulative_tool_output_tokens: usize,
+    /// Legacy cumulative tool-output cap retained only for configuration
+    /// compatibility. Individual tool results are now bounded against the active
+    /// model window instead.
+    #[serde(default, skip_serializing)]
+    pub cumulative_tool_output_tokens: Option<usize>,
 
     /// Number of unchanged repeats allowed for one canonical tool call.
     #[serde(default = "AgentBudgetConfig::default_repeated_call_limit")]
@@ -348,14 +386,6 @@ impl AgentBudgetConfig {
         768
     }
 
-    fn default_cumulative_request_tokens() -> usize {
-        16_384
-    }
-
-    fn default_cumulative_tool_output_tokens() -> usize {
-        2_048
-    }
-
     fn default_repeated_call_limit() -> usize {
         1
     }
@@ -365,7 +395,7 @@ impl AgentBudgetConfig {
         &self,
         context: usize,
         response_reserve: usize,
-        max_tool_turns: usize,
+        _max_tool_turns: usize,
     ) -> anyhow::Result<EffectiveAgentBudget> {
         if context < 2 || response_reserve >= context {
             anyhow::bail!("effective context leaves no agent prompt allocation");
@@ -375,15 +405,7 @@ impl AgentBudgetConfig {
                 "chat.agent.schema_summary_tokens must be at least 32 so omission guidance fits"
             );
         }
-        if self.cumulative_request_tokens == 0 {
-            anyhow::bail!("chat.agent.cumulative_request_tokens must be greater than zero");
-        }
-        if self.cumulative_tool_output_tokens == 0 {
-            anyhow::bail!("chat.agent.cumulative_tool_output_tokens must be greater than zero");
-        }
-
         let prompt_window = context - response_reserve;
-        let maximum_cumulative = context.saturating_mul(max_tool_turns.max(1));
         let mut diagnostics = Vec::new();
 
         let schema_summary_tokens = self.schema_summary_tokens.min(prompt_window);
@@ -394,33 +416,18 @@ impl AgentBudgetConfig {
             ));
         }
 
-        let cumulative_request_tokens = self
-            .cumulative_request_tokens
-            .min(maximum_cumulative.max(context));
-        if cumulative_request_tokens != self.cumulative_request_tokens {
-            diagnostics.push(format!(
-                "agent cumulative request budget clamped from {} to {cumulative_request_tokens}",
-                self.cumulative_request_tokens
-            ));
-        }
-
-        let cumulative_tool_output_tokens = self
-            .cumulative_tool_output_tokens
-            .min(cumulative_request_tokens)
-            .min(prompt_window);
-        if cumulative_tool_output_tokens != self.cumulative_tool_output_tokens {
-            diagnostics.push(format!(
-                "agent tool-output budget clamped from {} to {cumulative_tool_output_tokens}",
-                self.cumulative_tool_output_tokens
-            ));
+        if self.cumulative_request_tokens.is_some() || self.cumulative_tool_output_tokens.is_some()
+        {
+            diagnostics.push(
+                "legacy cumulative agent token caps are ignored; each model call is fitted to the active context window"
+                    .to_string(),
+            );
         }
 
         Ok(EffectiveAgentBudget {
             context_tokens: context,
             response_reserve_tokens: response_reserve,
             schema_summary_tokens,
-            cumulative_request_tokens,
-            cumulative_tool_output_tokens,
             repeated_call_limit: self.repeated_call_limit,
             diagnostics,
         })
@@ -431,8 +438,8 @@ impl Default for AgentBudgetConfig {
     fn default() -> Self {
         Self {
             schema_summary_tokens: Self::default_schema_summary_tokens(),
-            cumulative_request_tokens: Self::default_cumulative_request_tokens(),
-            cumulative_tool_output_tokens: Self::default_cumulative_tool_output_tokens(),
+            cumulative_request_tokens: None,
+            cumulative_tool_output_tokens: None,
             repeated_call_limit: Self::default_repeated_call_limit(),
         }
     }
@@ -444,8 +451,6 @@ pub struct EffectiveAgentBudget {
     pub context_tokens: usize,
     pub response_reserve_tokens: usize,
     pub schema_summary_tokens: usize,
-    pub cumulative_request_tokens: usize,
-    pub cumulative_tool_output_tokens: usize,
     pub repeated_call_limit: usize,
     pub diagnostics: Vec<String>,
 }
@@ -810,6 +815,11 @@ pub struct AppConfig {
     /// for first persistence. Never serialized into TOML.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+
+    /// Runtime configuration for the app-owned Lemonade Server.
+    #[serde(default)]
+    pub lemonade: LemonadeConfig,
+
     /// Embedding-specific device settings.
     #[serde(default)]
     pub embedding: EmbeddingDeviceConfig,
@@ -1056,6 +1066,85 @@ impl AppConfig {
         std::fs::rename(temp, &path)?;
         Ok(path)
     }
+
+    /// Persist the complete typed settings model while retaining comments and
+    /// unrelated keys already present in the user's TOML document.
+    ///
+    /// Existing scalar decoration is copied onto replacement values. Tables are
+    /// merged recursively, so application-owned values are updated without
+    /// flattening the file into a generated configuration dump.
+    pub fn persist_settings(&self, settings: &AppConfig) -> Result<PathBuf> {
+        use toml_edit::{DocumentMut, Item};
+
+        fn merge_item(target: &mut Item, source: &Item) {
+            if let (Some(target_table), Some(source_table)) =
+                (target.as_table_mut(), source.as_table())
+            {
+                for (key, source_value) in source_table.iter() {
+                    if let Some(target_value) = target_table.get_mut(key) {
+                        merge_item(target_value, source_value);
+                    } else {
+                        target_table.insert(key, source_value.clone());
+                    }
+                }
+                return;
+            }
+
+            let decor = target.as_value().map(|value| value.decor().clone());
+            *target = source.clone();
+            if let (Some(decor), Some(value)) = (decor, target.as_value_mut()) {
+                *value.decor_mut() = decor;
+            }
+        }
+
+        let path = self
+            .source_path
+            .clone()
+            .or_else(Self::per_user_config_path)
+            .ok_or_else(|| anyhow::anyhow!("cannot determine a configuration path"))?;
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut document = if existing.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            existing.parse::<DocumentMut>()?
+        };
+        let serialized = toml::to_string(settings)?;
+        let desired = serialized.parse::<DocumentMut>()?;
+        for section in [
+            "lemonade",
+            "embedding",
+            "models",
+            "chat",
+            "storage",
+            "data",
+            "ui",
+        ] {
+            if let Some(source) = desired.get(section) {
+                if let Some(target) = document.get_mut(section) {
+                    merge_item(target, source);
+                } else {
+                    document[section] = source.clone();
+                }
+            }
+        }
+        if let Some(agent) = document
+            .get_mut("chat")
+            .and_then(Item::as_table_mut)
+            .and_then(|chat| chat.get_mut("agent"))
+            .and_then(Item::as_table_mut)
+        {
+            agent.remove("cumulative_request_tokens");
+            agent.remove("cumulative_tool_output_tokens");
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp, document.to_string())?;
+        std::fs::rename(temp, &path)?;
+        Ok(path)
+    }
 }
 
 /// Helper: `$HOME` path, if determinable.
@@ -1153,6 +1242,7 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.ui.font_size, 16.0);
         assert_eq!(cfg.ui.interface_size, DEFAULT_UI_INTERFACE_SIZE);
+        assert_eq!(cfg.lemonade.max_loaded_models, 1);
         assert!(!cfg.ui.window_controls_left);
         assert!(cfg.embedding.npu_enabled);
         assert!(cfg.embedding.gpu_enabled);
@@ -1173,8 +1263,8 @@ mod tests {
             PathBuf::from("./defaults/data/memory.jsonl")
         );
         assert_eq!(cfg.chat.agent.schema_summary_tokens, 768);
-        assert_eq!(cfg.chat.agent.cumulative_request_tokens, 16_384);
-        assert_eq!(cfg.chat.agent.cumulative_tool_output_tokens, 2_048);
+        assert_eq!(cfg.chat.agent.cumulative_request_tokens, None);
+        assert_eq!(cfg.chat.agent.cumulative_tool_output_tokens, None);
         assert_eq!(cfg.chat.agent.repeated_call_limit, 1);
         assert_eq!(cfg.chat.fts_limit, 20);
         assert_eq!(cfg.chat.semantic_limit, 20);
@@ -1204,16 +1294,14 @@ mod tests {
     fn agent_budgets_reconcile_with_the_active_context_and_turn_ceiling() {
         let configured = AgentBudgetConfig {
             schema_summary_tokens: 10_000,
-            cumulative_request_tokens: 100_000,
-            cumulative_tool_output_tokens: 50_000,
+            cumulative_request_tokens: None,
+            cumulative_tool_output_tokens: None,
             repeated_call_limit: 2,
         };
         let effective = configured.reconcile(4_096, 1_024, 3).unwrap();
         assert_eq!(effective.schema_summary_tokens, 3_072);
-        assert_eq!(effective.cumulative_request_tokens, 12_288);
-        assert_eq!(effective.cumulative_tool_output_tokens, 3_072);
         assert_eq!(effective.repeated_call_limit, 2);
-        assert_eq!(effective.diagnostics.len(), 3);
+        assert_eq!(effective.diagnostics.len(), 1);
 
         let invalid = AgentBudgetConfig {
             schema_summary_tokens: 31,
@@ -1233,9 +1321,16 @@ mod tests {
         .unwrap();
         let config = AppConfig::load(file.path()).unwrap();
         assert_eq!(config.chat.agent.schema_summary_tokens, 321);
-        assert_eq!(config.chat.agent.cumulative_request_tokens, 4_321);
-        assert_eq!(config.chat.agent.cumulative_tool_output_tokens, 654);
+        assert_eq!(config.chat.agent.cumulative_request_tokens, Some(4_321));
+        assert_eq!(config.chat.agent.cumulative_tool_output_tokens, Some(654));
         assert_eq!(config.chat.agent.repeated_call_limit, 3);
+        let effective = config.chat.agent.reconcile(4_096, 1_024, 5).unwrap();
+        assert!(
+            effective
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("ignored"))
+        );
     }
 
     #[test]
@@ -1334,6 +1429,40 @@ mod tests {
     }
 
     #[test]
+    fn full_settings_persistence_is_typed_lossless_and_removes_legacy_budgets() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# retained header\ncustom_key = 42\n\n[chat]\nfts_limit = 7 # retained scalar comment\n\n[chat.agent]\ncumulative_request_tokens = 1234\ncumulative_tool_output_tokens = 567\n",
+        )
+        .unwrap();
+        let current = AppConfig {
+            source_path: Some(path.clone()),
+            ..AppConfig::default()
+        };
+        let mut desired = current.clone();
+        desired.chat.fts_limit = 37;
+        desired.chat.semantic_limit = 29;
+        desired.ui.font_size = 18.0;
+        desired.embedding.high_quality_embedding = true;
+        desired.lemonade.max_loaded_models = 4;
+
+        let written = current.persist_settings(&desired).unwrap();
+        assert_eq!(written, path);
+        let text = std::fs::read_to_string(written).unwrap();
+        assert!(text.contains("# retained header"));
+        assert!(text.contains("custom_key = 42"));
+        assert!(text.contains("fts_limit = 37 # retained scalar comment"));
+        assert!(text.contains("semantic_limit = 29"));
+        assert!(text.contains("font_size = 18.0"));
+        assert!(text.contains("high_quality_embedding = true"));
+        assert!(text.contains("max_loaded_models = 4"));
+        assert!(!text.contains("cumulative_request_tokens"));
+        assert!(!text.contains("cumulative_tool_output_tokens"));
+    }
+
+    #[test]
     fn test_default_model_load_params() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.models.ctx_size_for("embed-gemma-300m-FLM"), 2048);
@@ -1396,6 +1525,9 @@ npu_weight   = 200
 gpu_weight   = 75
 cpu_weight   = 5
 
+[lemonade]
+max_loaded_models = 2
+
 [storage]
 db_path = "./tmp/kg"
 embedding_dimensions = 1024
@@ -1411,6 +1543,7 @@ high_quality_embedding_dimensions = 2048
         assert_eq!(cfg.embedding.npu_weight, 200);
         assert_eq!(cfg.embedding.gpu_weight, 75);
         assert_eq!(cfg.embedding.cpu_weight, 5);
+        assert_eq!(cfg.lemonade.max_loaded_models, 2);
         assert_eq!(cfg.storage.db_path, PathBuf::from("./tmp/kg"));
         assert_eq!(cfg.storage.embedding_dimensions, 1024);
         assert_eq!(cfg.storage.high_quality_embedding_dimensions, 2048);

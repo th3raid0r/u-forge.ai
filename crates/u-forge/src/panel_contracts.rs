@@ -63,19 +63,6 @@ impl PanelDescriptor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WorkspaceItemId {
-    WorldCanvas,
-}
-
-impl WorkspaceItemId {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::WorldCanvas => "World Canvas",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorldCanvasViewId {
     Connections,
     Settings,

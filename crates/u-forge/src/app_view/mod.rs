@@ -49,6 +49,7 @@ use crate::path_picker::{
 };
 use crate::search_panel::SearchPanel;
 use crate::selection_model::SelectionModel;
+use crate::settings_view::{SettingsRebuildRequested, SettingsSaveRequested, SettingsView};
 use crate::setup_panel::{
     SetupBackendInstallRequested, SetupClosed, SetupDownloadOperation, SetupDownloadRequested,
     SetupPanel, SetupRefreshRequested, SetupRequested,
@@ -165,18 +166,13 @@ pub struct AppView {
     pub(crate) window_control_focus: WindowControlFocusHandles,
     pub(crate) setup_open: bool,
     pub(crate) active_world_canvas_view: WorldCanvasViewId,
-    pub(crate) settings_focus: FocusHandle,
+    pub(crate) settings_view: Option<Entity<SettingsView>>,
+    settings_close_after_save: bool,
+    _settings_subs: Vec<Subscription>,
     pub(crate) ui_font_size: f32,
     pub(crate) ui_interface_size: f32,
     pub(crate) show_advanced_controls: bool,
     pub(crate) window_controls_left: bool,
-    pub(crate) settings_draft_font_size: f32,
-    pub(crate) settings_draft_interface_size: f32,
-    pub(crate) settings_draft_advanced: bool,
-    pub(crate) settings_draft_window_controls_left: bool,
-    pub(crate) settings_draft_fts_limit: usize,
-    pub(crate) settings_draft_semantic_limit: usize,
-    pub(crate) settings_draft_rerank: bool,
     pub(crate) dock_state: DockState,
     /// Last focused descendant per workspace region, used when a dock is
     /// revisited after F6 traversal or a close/reopen cycle.
@@ -286,6 +282,7 @@ enum LemonadeInitState {
 async fn discover_lemonade_metadata(
     existing_connection: Option<Arc<LemonadeConnection>>,
     existing_embedded: Option<Arc<EmbeddedLemonade>>,
+    max_loaded_models: usize,
     startup: StartupTimeline,
 ) -> anyhow::Result<LemonadeMetadata> {
     let (connection, embedded) = {
@@ -296,6 +293,22 @@ async fn discover_lemonade_metadata(
         }
     };
     tracing::debug!(url = %connection.api_base(), "Lemonade server reachable");
+
+    if connection.ownership() == LemonadeOwnership::Embedded {
+        let changed = LemonadeManagement::new(connection.clone())
+            .set_max_loaded_models(max_loaded_models, false)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "could not configure embedded Lemonade max_loaded_models={max_loaded_models}: {error}"
+                )
+            })?;
+        tracing::debug!(
+            max_loaded_models,
+            changed,
+            "Embedded Lemonade residency limit is configured"
+        );
+    }
 
     let catalog_connection = connection.clone();
     let downloads_connection = connection.clone();
@@ -534,13 +547,10 @@ async fn activate_lemonade_capabilities(
         .collect();
 
     let mut build_specs = Vec::new();
-    for selected in embed_models
-        .iter()
-        .filter(|selected| selected.quality_tier == QualityTier::Standard)
-        .filter(|_| {
-            catalog.capacity_for("embedding") > 1 || !app_config.embedding.high_quality_embedding
-        })
-    {
+    // HQ is an additive retrieval lane, never a replacement for the standard
+    // lane. Even a one-slot server must attempt the standard provider first;
+    // HQ may then degrade away if the server cannot host both models.
+    for selected in standard_embedding_models(&embed_models) {
         let weight = match selected.recipe.as_str() {
             "flm" => app_config.embedding.npu_weight,
             "llamacpp" => match selected.backend.as_deref() {
@@ -556,40 +566,33 @@ async fn activate_lemonade_capabilities(
     }
 
     let gpu_manager = GpuResourceManager::new();
-    let provider_futures = build_specs
-        .into_iter()
-        .map(|(selected, capability, weight)| {
-            let connection = connection.clone();
-            let loaded = already_loaded.clone();
-            let gpu_manager = gpu_manager.clone();
-            let timeline = startup.clone();
-            async move {
-                let _phase = timeline.phase(format!(
-                    "provider_build.{capability:?}.{}",
-                    selected.model_id
-                ));
-                ProviderFactory::build_with_connection(
-                    &selected,
-                    capability,
-                    connection,
-                    weight,
-                    Some(gpu_manager),
-                    &loaded,
-                )
-                .await
-            }
-        });
-    let build_results = futures::future::join_all(provider_futures).await;
-    let providers = build_results
-        .into_iter()
-        .filter_map(|result| match result {
-            Ok(provider) => Some(provider),
+    let mut providers = Vec::new();
+    // Lemonade's residency limit is per model type and may be one. Build every
+    // standard embedding provider in selection order before HQ construction so
+    // provider probes never race each other for that single embedding slot.
+    for (selected, capability, weight) in build_specs {
+        let result = {
+            let _phase = startup.phase(format!(
+                "provider_build.{capability:?}.{}",
+                selected.model_id
+            ));
+            ProviderFactory::build_with_connection(
+                &selected,
+                capability,
+                connection.clone(),
+                weight,
+                Some(gpu_manager.clone()),
+                &already_loaded,
+            )
+            .await
+        };
+        match result {
+            Ok(provider) => providers.push(provider),
             Err(error) => {
                 tracing::warn!(%error, "Lemonade capability provider unavailable");
-                None
             }
-        })
-        .collect::<Vec<_>>();
+        }
+    }
 
     let queue = {
         let _phase = startup.phase("standard_inference_queue_build");
@@ -603,9 +606,14 @@ async fn activate_lemonade_capabilities(
         "Standard inference queue ready"
     );
 
-    let hq_queue = {
+    let hq_queue = if queue.has_embedding() {
         let _phase = startup.phase("hq_inference_queue_build");
         build_hq_embed_queue_with_connection(&catalog, &app_config, connection.clone()).await
+    } else {
+        tracing::warn!(
+            "HQ embedding lane skipped because no standard embedding provider is available"
+        );
+        None
     };
 
     let all_llm = selector.select_all_llm_models();
@@ -707,6 +715,14 @@ async fn activate_lemonade_capabilities(
         runtime: Arc::new(LemonadeRuntime::from_connection(connection)),
         effective_limits,
     })
+}
+
+fn standard_embedding_models(
+    models: &[u_forge_core::lemonade::SelectedModel],
+) -> impl Iterator<Item = &u_forge_core::lemonade::SelectedModel> {
+    models
+        .iter()
+        .filter(|selected| selected.quality_tier == QualityTier::Standard)
 }
 
 impl AppView {
@@ -903,77 +919,284 @@ impl AppView {
     }
 
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings_draft_font_size = self.ui_font_size;
-        self.settings_draft_interface_size = self.ui_interface_size;
-        self.settings_draft_advanced = self.show_advanced_controls;
-        self.settings_draft_window_controls_left = self.window_controls_left;
-        self.settings_draft_fts_limit = self.state.app_config.chat.fts_limit;
-        self.settings_draft_semantic_limit = self.state.app_config.chat.semantic_limit;
-        self.settings_draft_rerank = self.state.app_config.chat.rerank;
+        if self.settings_view.is_none() {
+            let settings = cx.new(|cx| SettingsView::new((*self.state.app_config).clone(), cx));
+            let saved = cx.subscribe(
+                &settings,
+                |this, _settings, event: &SettingsSaveRequested, cx| {
+                    this.apply_settings(event.0.clone(), false, cx);
+                },
+            );
+            let rebuild = cx.subscribe(
+                &settings,
+                |this, _settings, event: &SettingsRebuildRequested, cx| {
+                    this.request_rebuild_embedding_index(event.0, cx);
+                },
+            );
+            self.settings_view = Some(settings);
+            self._settings_subs = vec![saved, rebuild];
+        }
         self.remember_current_region_focus(window, cx);
         self.active_world_canvas_view = WorldCanvasViewId::Settings;
-        let focus = self.settings_focus.clone();
+        let focus = self
+            .settings_view
+            .as_ref()
+            .expect("settings entity was just created")
+            .read(cx)
+            .focus_handle(cx);
         window.defer(cx, move |window, _cx| focus.focus(window));
         cx.notify();
     }
 
-    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.active_world_canvas_view = WorldCanvasViewId::Connections;
         self.graph_canvas.read(cx).focus_handle(cx).focus(window);
         cx.notify();
     }
 
-    pub(crate) fn save_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let font_size = self.settings_draft_font_size.clamp(10.0, 28.0);
-        let interface_size = self.settings_draft_interface_size.clamp(14.0, 32.0);
-        let ui_result = self.state.app_config.persist_ui_settings(
-            font_size,
-            interface_size,
-            self.settings_draft_advanced,
-            self.settings_draft_window_controls_left,
-        );
-        let retrieval_result = ui_result.and_then(|path| {
-            self.state
-                .app_config
-                .persist_retrieval_settings(
-                    self.settings_draft_fts_limit.clamp(1, 1_000),
-                    self.settings_draft_semantic_limit.clamp(1, 1_000),
-                    self.settings_draft_rerank,
-                )
-                .map(|_| path)
+    fn close_settings_now(&mut self, cx: &mut Context<Self>) {
+        self.settings_view = None;
+        self._settings_subs.clear();
+        self.settings_close_after_save = false;
+        self.active_world_canvas_view = WorldCanvasViewId::Connections;
+        cx.notify();
+    }
+
+    pub(crate) fn request_close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(settings) = self.settings_view.clone() else {
+            return;
+        };
+        if !settings.read(cx).is_dirty() {
+            self.close_settings_now(cx);
+            self.graph_canvas.read(cx).focus_handle(cx).focus(window);
+            return;
+        }
+
+        let return_focus = settings.read(cx).focus_handle(cx);
+        let modal = cx.new(|cx| {
+            ConfirmationModal::new(
+                "Save settings before closing?".to_string(),
+                "The Settings tab has unsaved changes.".to_string(),
+                "Save Settings".to_string(),
+                return_focus,
+                cx,
+            )
+            .with_alternative("Discard")
+            .non_destructive()
         });
-        match retrieval_result {
+        let accepted = cx.subscribe(&modal, |this, _modal, _event: &ConfirmationAccepted, cx| {
+            this.confirmation = None;
+            this._confirmation_subs.clear();
+            let Some(settings) = this.settings_view.as_ref() else {
+                return;
+            };
+            this.settings_close_after_save = true;
+            let draft = settings.read(cx).draft();
+            this.apply_settings(draft, true, cx);
+        });
+        let discarded = cx.subscribe(
+            &modal,
+            |this, _modal, _event: &ConfirmationAlternative, cx| {
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                this.close_settings_now(cx);
+            },
+        );
+        let cancelled = cx.subscribe(
+            &modal,
+            |this, _modal, _event: &ConfirmationCancelled, cx| {
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                cx.notify();
+            },
+        );
+        self.confirmation = Some(modal);
+        self._confirmation_subs = vec![accepted, discarded, cancelled];
+        cx.notify();
+    }
+
+    fn apply_settings(
+        &mut self,
+        mut next_config: AppConfig,
+        close_after_save: bool,
+        cx: &mut Context<Self>,
+    ) {
+        next_config.source_path = self.state.app_config.source_path.clone();
+        if next_config.lemonade.max_loaded_models == 0 {
+            if let Some(settings) = &self.settings_view {
+                settings.update(cx, |settings, cx| {
+                    settings.set_error(
+                        "Lemonade max_loaded_models must be at least 1.".to_string(),
+                        cx,
+                    )
+                });
+            }
+            return;
+        }
+        if next_config.chat.response_reserve >= next_config.chat.max_context_tokens {
+            if let Some(settings) = &self.settings_view {
+                settings.update(cx, |settings, cx| {
+                    settings.set_error(
+                        "Response reserve must be smaller than the context window.".to_string(),
+                        cx,
+                    )
+                });
+            }
+            return;
+        }
+        if let Err(error) = next_config.chat.agent.reconcile(
+            next_config.chat.max_context_tokens,
+            next_config.chat.response_reserve,
+            next_config.chat.max_tool_turns,
+        ) {
+            if let Some(settings) = &self.settings_view {
+                settings.update(cx, |settings, cx| settings.set_error(error.to_string(), cx));
+            }
+            return;
+        }
+
+        let restart_required = next_config.storage.db_path != self.state.app_config.storage.db_path
+            || next_config.storage.embedding_dimensions
+                != self.state.app_config.storage.embedding_dimensions
+            || next_config.storage.high_quality_embedding_dimensions
+                != self
+                    .state
+                    .app_config
+                    .storage
+                    .high_quality_embedding_dimensions;
+        let external_lemonade_limit_changed = next_config.lemonade.max_loaded_models
+            != self.state.app_config.lemonade.max_loaded_models
+            && self
+                .state
+                .lemonade_connection
+                .as_ref()
+                .is_some_and(|connection| connection.ownership() == LemonadeOwnership::External);
+        match self.state.app_config.persist_settings(&next_config) {
             Ok(path) => {
-                self.ui_font_size = font_size;
-                self.ui_interface_size = interface_size;
-                UiTheme::set_interface_size(cx, interface_size);
+                self.ui_font_size = next_config.ui.font_size.clamp(10.0, 28.0);
+                self.ui_interface_size = next_config.ui.interface_size.clamp(14.0, 32.0);
+                next_config.ui.font_size = self.ui_font_size;
+                next_config.ui.interface_size = self.ui_interface_size;
+                UiTheme::set_interface_size(cx, self.ui_interface_size);
                 self.node_panel.update(cx, |_panel, cx| cx.notify());
                 self.search_panel.update(cx, |_panel, cx| cx.notify());
                 self.node_editor.update(cx, |_panel, cx| cx.notify());
                 self.chat_panel.update(cx, |_panel, cx| cx.notify());
                 self.setup_panel.update(cx, |_panel, cx| cx.notify());
-                self.show_advanced_controls = self.settings_draft_advanced;
-                self.window_controls_left = self.settings_draft_window_controls_left;
-                let mut next_config = (*self.state.app_config).clone();
-                next_config.ui.font_size = font_size;
-                next_config.ui.interface_size = interface_size;
-                next_config.ui.show_advanced_controls = self.settings_draft_advanced;
-                next_config.ui.window_controls_left = self.settings_draft_window_controls_left;
-                next_config.chat.fts_limit = self.settings_draft_fts_limit.clamp(1, 1_000);
-                next_config.chat.semantic_limit =
-                    self.settings_draft_semantic_limit.clamp(1, 1_000);
-                next_config.chat.rerank = self.settings_draft_rerank;
+                self.show_advanced_controls = next_config.ui.show_advanced_controls;
+                self.window_controls_left = next_config.ui.window_controls_left;
+                self.state.data_file = next_config.data.import_file.clone();
+                self.state.schema_dir = next_config.data.schema_dir.clone();
                 let next_config = Arc::new(next_config);
                 self.state.app_config = next_config.clone();
                 self.search_panel
-                    .update(cx, |panel, _cx| panel.set_app_config(next_config));
+                    .update(cx, |panel, _cx| panel.set_app_config(next_config.clone()));
                 self.refresh_native_menus(cx);
-                self.state.data_status = Some(format!("Settings saved to {}", path.display()));
+                let message = if external_lemonade_limit_changed {
+                    format!(
+                        "Settings saved to {}. The external Lemonade server was not changed; manage its max_loaded_models setting on that server.",
+                        path.display()
+                    )
+                } else if restart_required {
+                    format!(
+                        "Settings saved to {}. Restart and rebuild the semantic index to apply storage changes.",
+                        path.display()
+                    )
+                } else {
+                    format!("Settings saved to {}", path.display())
+                };
+                self.state.data_status = Some(message.clone());
+                if let Some(settings) = &self.settings_view {
+                    settings.update(cx, |settings, cx| {
+                        settings.mark_saved((*next_config).clone(), message, cx)
+                    });
+                }
+                if close_after_save || self.settings_close_after_save {
+                    self.close_settings_now(cx);
+                }
+                self.reconfigure_lemonade(cx);
             }
             Err(error) => {
-                self.state.data_status = Some(format!("Could not save settings: {error}"));
+                let message = format!("Could not save settings: {error}");
+                self.state.data_status = Some(message.clone());
+                if let Some(settings) = &self.settings_view {
+                    settings.update(cx, |settings, cx| settings.set_error(message, cx));
+                }
             }
         }
+        cx.notify();
+    }
+
+    fn request_rebuild_embedding_index(
+        &mut self,
+        target: u_forge_core::EmbeddingTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let return_focus = self
+            .settings_view
+            .as_ref()
+            .map(|settings| settings.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| self.graph_canvas.read(cx).focus_handle(cx));
+        let lane = match target {
+            u_forge_core::EmbeddingTarget::Standard => "standard",
+            u_forge_core::EmbeddingTarget::HighQuality => "high-quality",
+        };
+        let modal = cx.new(|cx| {
+            ConfirmationModal::new(
+                "Rebuild semantic index?".to_string(),
+                format!(
+                    "This clears the regenerable {lane} vectors and rebuilds them with the active embedding model. Nodes, chunks, and keyword search are preserved."
+                ),
+                "Rebuild Index".to_string(),
+                return_focus,
+                cx,
+            )
+            .non_destructive()
+        });
+        let accepted = cx.subscribe(
+            &modal,
+            move |this, _modal, _event: &ConfirmationAccepted, cx| {
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                let provider_available = match target {
+                    u_forge_core::EmbeddingTarget::Standard => this
+                        .state
+                        .inference_queue
+                        .as_ref()
+                        .is_some_and(|queue| queue.has_embedding()),
+                    u_forge_core::EmbeddingTarget::HighQuality => this
+                        .state
+                        .hq_queue
+                        .as_ref()
+                        .is_some_and(|queue| queue.has_embedding()),
+                };
+                if !provider_available {
+                    this.state.embedding_status = Some(format!(
+                        "Cannot rebuild the {lane} semantic index until its embedding model is available. Check Settings and the Lemonade connection."
+                    ));
+                    cx.notify();
+                    return;
+                }
+                match this.state.graph.reset_embedding_space(target) {
+                    Ok(()) => this.run_embedding_plan(EmbeddingPlan::embed_all(), cx),
+                    Err(error) => {
+                        this.state.embedding_status =
+                            Some(format!("Could not reset {lane} semantic index: {error:#}"));
+                        cx.notify();
+                    }
+                }
+            },
+        );
+        let cancelled = cx.subscribe(
+            &modal,
+            |this, _modal, _event: &ConfirmationCancelled, cx| {
+                this.confirmation = None;
+                this._confirmation_subs.clear();
+                cx.notify();
+            },
+        );
+        self.confirmation = Some(modal);
+        self._confirmation_subs = vec![accepted, cancelled];
         cx.notify();
     }
 
@@ -1154,9 +1377,6 @@ impl AppView {
         UiTheme::set_interface_size(cx, ui_interface_size);
         let show_advanced_controls = app_config.ui.show_advanced_controls;
         let window_controls_left = app_config.ui.window_controls_left;
-        let settings_draft_fts_limit = app_config.chat.fts_limit;
-        let settings_draft_semantic_limit = app_config.chat.semantic_limit;
-        let settings_draft_rerank = app_config.chat.rerank;
 
         // Build child entities — clone Arc handles before they move into AppState.
         let selection = {
@@ -1362,18 +1582,13 @@ impl AppView {
             },
             setup_open: false,
             active_world_canvas_view: WorldCanvasViewId::Connections,
-            settings_focus: cx.focus_handle(),
+            settings_view: None,
+            settings_close_after_save: false,
+            _settings_subs: vec![],
             ui_font_size,
             ui_interface_size,
             show_advanced_controls,
             window_controls_left,
-            settings_draft_font_size: ui_font_size,
-            settings_draft_interface_size: ui_interface_size,
-            settings_draft_advanced: show_advanced_controls,
-            settings_draft_window_controls_left: window_controls_left,
-            settings_draft_fts_limit,
-            settings_draft_semantic_limit,
-            settings_draft_rerank,
             dock_state,
             last_region_focus: HashMap::new(),
             last_selected_panel: None,
@@ -2753,6 +2968,7 @@ impl AppView {
         cx.notify();
 
         let app_config = self.state.app_config.clone();
+        let max_loaded_models = app_config.lemonade.max_loaded_models;
         let tokio_rt = self.state.tokio_rt.clone();
         let existing_connection = self.state.lemonade_connection.clone();
         let existing_embedded = self.state.embedded_lemonade.clone();
@@ -2768,6 +2984,7 @@ impl AppView {
                         metadata_runtime.block_on(discover_lemonade_metadata(
                             existing_connection,
                             existing_embedded,
+                            max_loaded_models,
                             metadata_timeline,
                         ))
                     }
@@ -2855,6 +3072,14 @@ impl AppView {
             .ok();
         })
         .detach();
+    }
+
+    /// Supersede any activation based on old settings and immediately discover
+    /// capabilities again with the newly persisted configuration.
+    fn reconfigure_lemonade(&mut self, cx: &mut Context<Self>) {
+        self.lemonade_init_generation = self.lemonade_init_generation.wrapping_add(1);
+        self.lemonade_init_state = LemonadeInitState::Offline;
+        self.do_init_lemonade(cx);
     }
 
     fn start_managed_baseline_provisioning(
@@ -3495,5 +3720,20 @@ mod tests {
                 .temperature,
             Some(0.3)
         );
+    }
+
+    #[test]
+    fn hq_selection_never_suppresses_the_standard_embedding_provider() {
+        let mut standard = selected("standard", "llamacpp", Some("vulkan"));
+        standard.quality_tier = QualityTier::Standard;
+        let mut hq = selected("hq", "llamacpp", Some("vulkan"));
+        hq.quality_tier = QualityTier::High;
+
+        let models = [hq, standard];
+        let selected = standard_embedding_models(&models)
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected, ["standard"]);
     }
 }

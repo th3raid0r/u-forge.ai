@@ -367,6 +367,26 @@ impl KnowledgeGraphStorage {
         }
     }
 
+    /// Clear one regenerable vector lane and its provider identity atomically.
+    ///
+    /// Text chunks and the FTS index are intentionally retained. The next
+    /// embedding sweep records the active provider fingerprint before writing
+    /// replacement vectors.
+    pub fn reset_embedding_space(&self, lane: &str) -> Result<()> {
+        let table = match lane {
+            "standard" => "chunks_vec",
+            "high_quality" => "chunks_vec_hq",
+            other => return Err(anyhow::anyhow!("Unknown embedding lane '{other}'")),
+        };
+        let key = format!("{table}_fingerprint");
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute(&format!("DELETE FROM {table}"), [])?;
+        transaction.execute("DELETE FROM schema_metadata WHERE key = ?1", params![key])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     // ── Construction ──────────────────────────────────────────────────────────
 
     /// Open (or create) the knowledge graph database at `<db_path>/knowledge.db`.
@@ -1155,6 +1175,49 @@ mod tests {
         assert!(
             results_old[0].3 > 0.5,
             "old embedding direction should now be far away"
+        );
+    }
+
+    #[test]
+    fn reset_embedding_space_clears_only_the_selected_regenerable_lane() {
+        let (storage, _dir) = create_test_storage();
+        let node = ObjectMetadata::new("location".to_string(), "Terminus".to_string());
+        storage.upsert_node(node.clone()).unwrap();
+        let chunk = TextChunk::new(
+            node.id,
+            "The home of the Foundation.".to_string(),
+            ChunkType::Description,
+        );
+        let chunk_id = chunk.id;
+        storage.upsert_chunk(chunk).unwrap();
+        storage
+            .ensure_embedding_space("standard", "standard-v1")
+            .unwrap();
+        storage
+            .ensure_embedding_space("high_quality", "hq-v1")
+            .unwrap();
+        storage
+            .upsert_chunk_embedding(chunk_id, &one_hot(0, EMBEDDING_DIMENSIONS))
+            .unwrap();
+        storage
+            .upsert_chunk_embedding_hq(chunk_id, &one_hot(0, HIGH_QUALITY_EMBEDDING_DIMENSIONS))
+            .unwrap();
+
+        storage.reset_embedding_space("standard").unwrap();
+
+        let stats = storage.get_stats().unwrap();
+        assert_eq!(stats.chunk_count, 1, "source chunks must be retained");
+        assert_eq!(stats.embedded_count, 0);
+        assert_eq!(stats.embedded_hq_count, 1, "the HQ lane must be retained");
+        assert_eq!(storage.search_chunks_fts("Foundation", 5).unwrap().len(), 1);
+        storage
+            .ensure_embedding_space("standard", "standard-v2")
+            .expect("a cleared lane accepts the replacement provider identity");
+        assert!(
+            storage
+                .ensure_embedding_space("high_quality", "hq-v2")
+                .is_err(),
+            "the untouched HQ provider identity must remain authoritative"
         );
     }
 

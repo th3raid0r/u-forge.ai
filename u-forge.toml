@@ -1,3 +1,8 @@
+[lemonade]
+# Maximum simultaneously resident models per model type. Three allows the
+# standard, optional NPU, and high-quality embedding models to coexist.
+max_loaded_models = 3
+
 [ui]
 # Base content font size in pixels (rem unit). Text scales relative to this:
 #   text_xs (labels, timestamps) = 0.75 × font_size
@@ -32,6 +37,7 @@ cpu_enabled = false
 cpu_weight = 10
 
 [models.load_params]
+## Mostly important for embedding models, but can be used for any text model.
 "embed-gemma-300m-FLM"              = { ctx_size = 2048 }
 "ggml-org/embeddinggemma-300M-GGUF" = { ctx_size = 2048, batch_size = 2048, ubatch_size = 2048 }
 "nomic-embed-text-v1-GGUF"          = { ctx_size = 2048, batch_size = 2048, ubatch_size = 2048 }
@@ -56,15 +62,10 @@ reasoning_control = "request"
 
 [chat.agent]
 schema_summary_tokens = 768          # bounded whole-record schema prompt
-cumulative_request_tokens = 16384   # model input + response reservations across the tool loop
-cumulative_tool_output_tokens = 2048
 repeated_call_limit = 1              # unchanged repeats allowed per canonical call
 
 [chat.gpu]
-#model = "Qwen3.5-27B-GGUF"
 model = "Gemma-4-E4B-it-GGUF"
-# model = "Gemma-4-E4B-it-GGUF"
-# model = "Qwen3.5-122B-A10B-GGUF"
 max_tokens = 262144
 temperature = 0.3               # low for reliable tool calling
 top_p = 0.9                     # nucleus sampling — mild focus
@@ -78,7 +79,7 @@ frequency_penalty = 0.3         # discourage repetitive tool-call loops
 
 [chat.npu]
 model = "gemma4-it-e4b-FLM"
-max_tokens = 32768
+max_tokens = 262144
 temperature = 0.3
 top_p = 0.9
 frequency_penalty = 0.3

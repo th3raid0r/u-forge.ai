@@ -39,8 +39,8 @@ pub use ai::embeddings::{
 pub use builder::ObjectBuilder;
 pub use config::{
     AgentBudgetConfig, AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig,
-    EffectiveAgentBudget, EmbeddingDeviceConfig, ModelConfig, ModelLoadParams, ReasoningControl,
-    StorageConfig, UiConfig,
+    EffectiveAgentBudget, EmbeddingDeviceConfig, LemonadeConfig, ModelConfig, ModelLoadParams,
+    ReasoningControl, StorageConfig, UiConfig,
 };
 pub use error::{EmbeddingDimensionMismatch, EmbeddingSpaceMismatch, UnidentifiedEmbeddingSpace};
 pub use graph::{
@@ -531,6 +531,16 @@ impl KnowledgeGraph {
             EmbeddingTarget::HighQuality => "high_quality",
         };
         self.storage.ensure_embedding_space(lane, fingerprint)
+    }
+
+    /// Clear one regenerable embedding lane so it can be rebuilt with the
+    /// currently selected provider. Nodes, chunks, and FTS content are kept.
+    pub fn reset_embedding_space(&self, target: EmbeddingTarget) -> Result<()> {
+        let lane = match target {
+            EmbeddingTarget::Standard => "standard",
+            EmbeddingTarget::HighQuality => "high_quality",
+        };
+        self.storage.reset_embedding_space(lane)
     }
 
     pub(crate) fn upsert_chunk_embeddings(

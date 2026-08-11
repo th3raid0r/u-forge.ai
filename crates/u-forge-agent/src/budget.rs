@@ -10,7 +10,7 @@ use rig::agent::{
     RequestPatch, StepEventKind, StreamResponseFinish, ToolCall, ToolCallAction, ToolResultAction,
     ToolResultEvent,
 };
-use rig::completion::message::Message;
+use rig::completion::message::{Message, UserContent};
 use tiktoken_rs::CoreBPE;
 use u_forge_core::lemonade::AgentBudgetDiagnostics;
 use u_forge_core::{EffectiveAgentBudget, SchemaDefinition};
@@ -386,19 +386,6 @@ fn admit_completion(
             state.limits.context_tokens
         ));
     }
-    let projected = state
-        .diagnostics
-        .request_tokens
-        .saturating_add(state.diagnostics.reserved_response_tokens)
-        .saturating_add(request_tokens)
-        .saturating_add(reserve);
-    if projected > state.limits.cumulative_request_tokens {
-        return Err(format!(
-            "Agent stopped before model call {turn}: the cumulative request budget would exceed \
-             {} tokens. Continue in a new message to resume with a fresh budget.",
-            state.limits.cumulative_request_tokens
-        ));
-    }
     state.diagnostics.model_calls += 1;
     state.diagnostics.request_tokens += request_tokens;
     state.diagnostics.reserved_response_tokens += reserve;
@@ -450,8 +437,16 @@ impl BudgetController {
     }
 
     fn preamble(&self, recent_tool_results: &str) -> String {
+        let budget = self.lock().limits.schema_summary_tokens;
+        self.preamble_with_schema_budget(recent_tool_results, budget)
+    }
+
+    fn preamble_with_schema_budget(
+        &self,
+        recent_tool_results: &str,
+        schema_budget: usize,
+    ) -> String {
         let schema = self.schema.as_ref().map_or_else(String::new, |schema| {
-            let budget = self.lock().limits.schema_summary_tokens;
             bounded_schema_summary(
                 schema,
                 SchemaPriorityContext {
@@ -459,7 +454,7 @@ impl BudgetController {
                     retained_history: &self.retained_history,
                     recent_tool_results,
                 },
-                budget,
+                schema_budget,
             )
             .text
         });
@@ -483,6 +478,67 @@ impl BudgetController {
 
 fn serialize_message(message: &Message) -> String {
     serde_json::to_string(message).unwrap_or_else(|_| format!("{message:?}"))
+}
+
+fn request_tokens(
+    preamble: &str,
+    prompt: &Message,
+    history: &[Message],
+    tool_definition_tokens: usize,
+) -> TokenEstimate {
+    let mut tokens = tool_definition_tokens;
+    let mut fallback = false;
+    add_estimate(&mut tokens, &mut fallback, preamble);
+    add_estimate(&mut tokens, &mut fallback, &serialize_message(prompt));
+    for message in history {
+        add_estimate(&mut tokens, &mut fallback, &serialize_message(message));
+        tokens = tokens.saturating_add(TOKENS_PER_MESSAGE);
+    }
+    tokens = tokens
+        .saturating_add(TOKENS_PER_MESSAGE)
+        .saturating_add(REPLY_PRIMING_TOKENS)
+        .saturating_add(REQUEST_ENVELOPE_TOKENS);
+    TokenEstimate {
+        tokens,
+        used_fallback: fallback,
+    }
+}
+
+fn is_leading_orphan(message: &Message) -> bool {
+    match message {
+        Message::Assistant { .. } => true,
+        Message::User { content } => content
+            .iter()
+            .all(|item| matches!(item, UserContent::ToolResult(_))),
+        Message::System { .. } => false,
+    }
+}
+
+/// Retain the newest valid history suffix that fits one model request.
+///
+/// Removing leading assistant/tool-result messages avoids splitting a tool
+/// interaction when an older prefix is discarded.
+fn fit_history(
+    preamble: &str,
+    prompt: &Message,
+    history: &[Message],
+    tool_definition_tokens: usize,
+    context_tokens: usize,
+    response_reserve_tokens: usize,
+) -> (Vec<Message>, TokenEstimate) {
+    let mut fitted = history.to_vec();
+    loop {
+        while fitted.first().is_some_and(is_leading_orphan) {
+            fitted.remove(0);
+        }
+        let estimate = request_tokens(preamble, prompt, &fitted, tool_definition_tokens);
+        if estimate.tokens.saturating_add(response_reserve_tokens) <= context_tokens
+            || fitted.is_empty()
+        {
+            return (fitted, estimate);
+        }
+        fitted.remove(0);
+    }
 }
 
 fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
@@ -642,40 +698,48 @@ impl AgentHook for BudgetController {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let preamble = self.preamble(&recent);
-        let mut request_tokens = self.tool_definition_tokens;
-        let mut fallback = false;
-        add_estimate(&mut request_tokens, &mut fallback, &preamble);
-        add_estimate(
-            &mut request_tokens,
-            &mut fallback,
-            &serialize_message(event.prompt),
+        let (context_tokens, reserve, schema_limit) = {
+            let state = self.lock();
+            (
+                state.limits.context_tokens,
+                state.limits.response_reserve_tokens,
+                state.limits.schema_summary_tokens,
+            )
+        };
+        let base_preamble = self.preamble_with_schema_budget(&recent, 0);
+        let base = request_tokens(
+            &base_preamble,
+            event.prompt,
+            &[],
+            self.tool_definition_tokens,
         );
-        for message in event.history {
-            add_estimate(
-                &mut request_tokens,
-                &mut fallback,
-                &serialize_message(message),
-            );
-            request_tokens = request_tokens.saturating_add(TOKENS_PER_MESSAGE);
-        }
-        request_tokens = request_tokens
-            .saturating_add(TOKENS_PER_MESSAGE)
-            .saturating_add(REPLY_PRIMING_TOKENS)
-            .saturating_add(REQUEST_ENVELOPE_TOKENS);
+        let available_schema = context_tokens
+            .saturating_sub(reserve)
+            .saturating_sub(base.tokens);
+        let preamble =
+            self.preamble_with_schema_budget(&recent, schema_limit.min(available_schema));
+        let (history, estimate) = fit_history(
+            &preamble,
+            event.prompt,
+            event.history,
+            self.tool_definition_tokens,
+            context_tokens,
+            reserve,
+        );
 
         let mut state = self.lock();
-        state.diagnostics.estimation_fallback |= fallback;
-        let reserve = state.limits.response_reserve_tokens;
-        if let Err(reason) = admit_completion(&mut state, request_tokens, event.turn) {
+        state.diagnostics.estimation_fallback |= base.used_fallback || estimate.used_fallback;
+        if let Err(reason) = admit_completion(&mut state, estimate.tokens, event.turn) {
             Self::set_termination(&mut state, BudgetTermination::Budget(reason.clone()));
             return CompletionCallAction::stop(reason);
         }
-        CompletionCallAction::patch(
-            RequestPatch::new()
-                .preamble(preamble)
-                .max_tokens(reserve.min(u64::MAX as usize) as u64),
-        )
+        let mut patch = RequestPatch::new()
+            .preamble(preamble)
+            .max_tokens(reserve.min(u64::MAX as usize) as u64);
+        if history.len() != event.history.len() {
+            patch = patch.history(history);
+        }
+        CompletionCallAction::patch(patch)
     }
 
     async fn on_tool_call(&self, _context: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
@@ -686,18 +750,6 @@ impl AgentHook for BudgetController {
             .tool_argument_tokens
             .saturating_add(estimate.tokens);
         state.diagnostics.estimation_fallback |= estimate.used_fallback;
-
-        let remaining_output = state
-            .limits
-            .cumulative_tool_output_tokens
-            .saturating_sub(state.diagnostics.tool_output_tokens);
-        if remaining_output < MIN_TOOL_RESULT_TOKENS {
-            let reason = "Agent stopped before executing a tool because no useful tool-result \
-                          budget remains. Continue in a new message to resume."
-                .to_string();
-            Self::set_termination(&mut state, BudgetTermination::Budget(reason.clone()));
-            return ToolCallAction::stop(reason);
-        }
 
         let Some(call_fingerprint) = fingerprint(event.tool_name, event.args) else {
             return ToolCallAction::run();
@@ -751,14 +803,19 @@ impl AgentHook for BudgetController {
             Self::set_termination(&mut state, BudgetTermination::Repeat(reason));
         }
 
-        let remaining = state
+        let prompt_window = state
             .limits
-            .cumulative_tool_output_tokens
-            .saturating_sub(state.diagnostics.tool_output_tokens);
-        let Some(output) = bounded_tool_output(event.tool_name, &raw_text, remaining) else {
+            .context_tokens
+            .saturating_sub(state.limits.response_reserve_tokens);
+        let per_result_budget = (prompt_window / 2)
+            .max(MIN_TOOL_RESULT_TOKENS)
+            .min(prompt_window)
+            .min(8_192);
+        let Some(output) = bounded_tool_output(event.tool_name, &raw_text, per_result_budget)
+        else {
             let reason = format!(
-                "Agent stopped after `{}` because its complete result cannot fit the remaining \
-                 tool-output budget. Narrow the request and continue in a new message.",
+                "Agent stopped after `{}` because its smallest complete result cannot fit this \
+                 model's context window. Narrow the request or request fewer records.",
                 event.tool_name
             );
             Self::set_termination(&mut state, BudgetTermination::Budget(reason.clone()));
@@ -1010,14 +1067,12 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_budget_stops_before_the_next_model_call() {
+    fn valid_model_calls_are_not_stopped_by_a_cumulative_cap() {
         let mut state = BudgetState {
             limits: EffectiveAgentBudget {
                 context_tokens: 200,
                 response_reserve_tokens: 40,
                 schema_summary_tokens: 20,
-                cumulative_request_tokens: 250,
-                cumulative_tool_output_tokens: 50,
                 repeated_call_limit: 1,
                 diagnostics: Vec::new(),
             },
@@ -1027,9 +1082,24 @@ mod tests {
             recent_tool_results: VecDeque::new(),
         };
         assert!(admit_completion(&mut state, 80, 1).is_ok());
-        let error = admit_completion(&mut state, 100, 2).unwrap_err();
-        assert!(error.contains("cumulative request budget"));
-        assert_eq!(state.diagnostics.model_calls, 1);
+        assert!(admit_completion(&mut state, 100, 2).is_ok());
+        assert_eq!(state.diagnostics.model_calls, 2);
+        assert_eq!(state.diagnostics.request_tokens, 180);
+    }
+
+    #[test]
+    fn per_turn_history_fitting_keeps_a_valid_suffix() {
+        let history = vec![
+            Message::user("old user ".repeat(60)),
+            Message::assistant("old assistant ".repeat(60)),
+            Message::user("recent user"),
+            Message::assistant("recent assistant"),
+        ];
+        let (fitted, estimate) =
+            fit_history("system", &Message::user("now"), &history, 10, 180, 40);
+        assert!(fitted.len() < history.len());
+        assert_eq!(fitted.first(), Some(&Message::user("recent user")));
+        assert!(estimate.tokens + 40 <= 180);
     }
 
     #[test]

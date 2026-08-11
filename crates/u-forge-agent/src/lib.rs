@@ -20,7 +20,8 @@ use serde::Deserialize;
 
 use u_forge_core::ingest::rechunk_and_embed_with_cancellation;
 use u_forge_core::search::{
-    HybridSearchConfig, NodeSearchResult, fts5_sanitize, search_hybrid_with_cancellation,
+    HybridSearchConfig, NodeSearchResult, SearchStageOutcomes, SearchStageStatus, fts5_sanitize,
+    search_hybrid_response_with_cancellation,
 };
 use u_forge_core::types::ObjectMetadata;
 use u_forge_core::{
@@ -382,6 +383,7 @@ pub struct SemanticSearchArgs {
 pub struct SemanticSearchTool {
     graph: Arc<KnowledgeGraph>,
     queue: Arc<InferenceQueue>,
+    hq_queue: Option<Arc<InferenceQueue>>,
     cancellation: CancellationToken,
 }
 
@@ -390,8 +392,14 @@ impl SemanticSearchTool {
         Self {
             graph,
             queue,
+            hq_queue: None,
             cancellation: CancellationToken::new(),
         }
+    }
+
+    pub fn with_hq_queue(mut self, hq_queue: Option<Arc<InferenceQueue>>) -> Self {
+        self.hq_queue = hq_queue;
+        self
     }
 
     fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
@@ -430,77 +438,33 @@ impl Tool for SemanticSearchTool {
                 "deserialization failed after validation (bug): {e}"
             ))
         })?;
-        let limit = args.limit.unwrap_or(5);
+        let config = HybridSearchConfig {
+            alpha: 1.0,
+            semantic_limit: args.limit.unwrap_or(5).saturating_mul(4),
+            rerank: false,
+            limit: args.limit.unwrap_or(5),
+            ..HybridSearchConfig::default()
+        };
+        let response = search_hybrid_response_with_cancellation(
+            &self.graph,
+            &self.queue,
+            self.hq_queue.as_deref(),
+            &args.query,
+            &config,
+            self.cancellation.clone(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(tool = Self::NAME, error = %error, "semantic search tool failed");
+            ToolError(format!("Semantic search failed: {error:#}"))
+        })?;
 
-        let query_vec = self
-            .queue
-            .submit_embed_with_cancellation(&args.query, self.cancellation.clone())
-            .await
-            .map_err(|e| ToolError(format!("Embedding failed: {e:#}")))?;
-
-        let chunks = self
-            .graph
-            .search_chunks_semantic(&query_vec, limit * 4)
-            .map_err(|e| ToolError(format!("Semantic ANN search failed: {e:#}")))?;
-
-        // Group chunks by node, preserving ANN distance order (closest = first).
-        let mut node_order: Vec<ObjectId> = Vec::new();
-        let mut node_chunks: HashMap<ObjectId, Vec<(String, f32)>> = HashMap::new();
-        for (_chunk_id, obj_id, content, distance) in chunks {
-            if !node_chunks.contains_key(&obj_id) {
-                node_order.push(obj_id);
-            }
-            node_chunks
-                .entry(obj_id)
-                .or_default()
-                .push((content, distance));
-        }
-
-        if node_order.is_empty() {
-            return Ok(format!(
-                "Semantic search found no results for \"{}\". \
-                 The graph may not have embeddings yet.",
-                args.query
-            ));
-        }
-
-        let mut output = format!(
-            "Semantic search results for \"{}\" ({} nodes):\n\n",
-            args.query,
-            node_order.len().min(limit)
-        );
-
-        for (i, obj_id) in node_order.into_iter().take(limit).enumerate() {
-            let chunks = node_chunks.remove(&obj_id).unwrap_or_default();
-            let best_dist = chunks.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-            match self
-                .graph
-                .get_object(obj_id)
-                .map_err(|e| ToolError(format!("Node hydration failed: {e:#}")))?
-            {
-                Some(meta) => {
-                    output.push_str(&format!(
-                        "[{}] {} ({}) [id: {}] — distance: {:.4}\n",
-                        i + 1,
-                        meta.name,
-                        meta.object_type,
-                        obj_id,
-                        best_dist
-                    ));
-                    let chunk_refs = chunks
-                        .iter()
-                        .map(|(chunk, _distance)| chunk.as_str())
-                        .collect::<Vec<_>>();
-                    if let Some(summary) = compact_search_content(&chunk_refs) {
-                        output.push_str(&format!("  Matched content: {summary}\n"));
-                    }
-                    output.push('\n');
-                }
-                None => continue,
-            }
-        }
-
-        Ok(output)
+        format_search_response(
+            "Semantic",
+            &args.query,
+            response.results,
+            &response.outcomes,
+        )
     }
 }
 
@@ -531,6 +495,7 @@ pub struct HybridSearchArgs {
 pub struct HybridSearchTool {
     graph: Arc<KnowledgeGraph>,
     queue: Arc<InferenceQueue>,
+    hq_queue: Option<Arc<InferenceQueue>>,
     cancellation: CancellationToken,
 }
 
@@ -539,8 +504,14 @@ impl HybridSearchTool {
         Self {
             graph,
             queue,
+            hq_queue: None,
             cancellation: CancellationToken::new(),
         }
+    }
+
+    pub fn with_hq_queue(mut self, hq_queue: Option<Arc<InferenceQueue>>) -> Self {
+        self.hq_queue = hq_queue;
+        self
     }
 
     fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
@@ -588,10 +559,10 @@ impl Tool for HybridSearchTool {
             ..HybridSearchConfig::default()
         };
 
-        let results = search_hybrid_with_cancellation(
+        let response = search_hybrid_response_with_cancellation(
             &self.graph,
             &self.queue,
-            None,
+            self.hq_queue.as_deref(),
             &args.query,
             &config,
             self.cancellation.clone(),
@@ -599,26 +570,80 @@ impl Tool for HybridSearchTool {
         .await
         .map_err(ToolError::from)?;
 
-        if results.is_empty() {
-            return Ok(format!(
-                "Hybrid search found no results for \"{}\". \
-                 Try rephrasing, or the graph may be empty.",
-                args.query
-            ));
-        }
-
-        let mut output = format!(
-            "Hybrid search results for \"{}\" ({} nodes):\n\n",
-            args.query,
-            results.len()
-        );
-        for (i, result) in results.iter().enumerate() {
-            output.push_str(&format_node_result(result, i));
-            output.push('\n');
-        }
-
-        Ok(output)
+        format_search_response("Hybrid", &args.query, response.results, &response.outcomes)
     }
+}
+
+fn search_stage_diagnostics(outcomes: &SearchStageOutcomes) -> Vec<String> {
+    [
+        ("FTS", &outcomes.fts),
+        ("standard semantic", &outcomes.standard_semantic),
+        ("HQ semantic", &outcomes.high_quality_semantic),
+        ("reranking", &outcomes.reranking),
+    ]
+    .into_iter()
+    .filter(|(_, outcome)| {
+        matches!(
+            outcome.status,
+            SearchStageStatus::Unavailable | SearchStageStatus::Failed
+        )
+    })
+    .map(|(label, outcome)| {
+        format!(
+            "{label}: {}",
+            outcome
+                .diagnostic
+                .as_deref()
+                .unwrap_or("could not complete")
+        )
+    })
+    .collect()
+}
+
+fn format_search_response(
+    label: &str,
+    query: &str,
+    results: Vec<NodeSearchResult>,
+    outcomes: &SearchStageOutcomes,
+) -> Result<String, ToolError> {
+    let diagnostics = search_stage_diagnostics(outcomes);
+    let semantic_applied = outcomes.standard_semantic.status == SearchStageStatus::Applied
+        || outcomes.high_quality_semantic.status == SearchStageStatus::Applied;
+    if results.is_empty() {
+        let mut output = if label == "Semantic" && !semantic_applied {
+            format!("Semantic search is unavailable for \"{query}\".")
+        } else {
+            format!("{label} search found no results for \"{query}\".")
+        };
+        if !diagnostics.is_empty() {
+            output.push_str(" Reasons: ");
+            output.push_str(&diagnostics.join("; "));
+            output.push('.');
+        }
+        if label == "Semantic" && !semantic_applied {
+            output.push_str(
+                " Try keyword search. If the embedding space is incompatible or unidentified, rebuild the semantic index from Settings.",
+            );
+        } else {
+            output.push_str(" Try rephrasing the query or verify that graph content is indexed.");
+        }
+        return Ok(output);
+    }
+
+    let mut output = format!(
+        "{label} search results for \"{query}\" ({} nodes):\n\n",
+        results.len()
+    );
+    for (index, result) in results.iter().enumerate() {
+        output.push_str(&format_node_result(result, index));
+        output.push('\n');
+    }
+    if !diagnostics.is_empty() {
+        output.push_str("Search completed with reduced capabilities: ");
+        output.push_str(&diagnostics.join("; "));
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 // ── UpsertNodeTool ────────────────────────────────────────────────────────────
@@ -1163,13 +1188,21 @@ impl GraphAgent {
             )?,
             definition(
                 SemanticSearchTool::NAME,
-                SemanticSearchTool::new(graph.clone(), queue.clone()).description(),
-                SemanticSearchTool::new(graph.clone(), queue.clone()).parameters(),
+                SemanticSearchTool::new(graph.clone(), queue.clone())
+                    .with_hq_queue(hq_queue.clone())
+                    .description(),
+                SemanticSearchTool::new(graph.clone(), queue.clone())
+                    .with_hq_queue(hq_queue.clone())
+                    .parameters(),
             )?,
             definition(
                 HybridSearchTool::NAME,
-                HybridSearchTool::new(graph.clone(), queue.clone()).description(),
-                HybridSearchTool::new(graph.clone(), queue.clone()).parameters(),
+                HybridSearchTool::new(graph.clone(), queue.clone())
+                    .with_hq_queue(hq_queue.clone())
+                    .description(),
+                HybridSearchTool::new(graph.clone(), queue.clone())
+                    .with_hq_queue(hq_queue.clone())
+                    .parameters(),
             )?,
             definition(
                 UpsertNodeTool::NAME,
@@ -1329,11 +1362,13 @@ impl GraphAgent {
         builder
             .tool(
                 HybridSearchTool::new(self.graph.clone(), self.queue.clone())
+                    .with_hq_queue(self.hq_queue.clone())
                     .with_cancellation(cancellation.clone()),
             )
             .tool(FtsSearchTool::new(self.graph.clone()))
             .tool(
                 SemanticSearchTool::new(self.graph.clone(), self.queue.clone())
+                    .with_hq_queue(self.hq_queue.clone())
                     .with_cancellation(cancellation.clone()),
             )
             .tool(
@@ -1737,10 +1772,42 @@ pub use rig;
 #[cfg(test)]
 mod tests {
     use super::tool_validation::validate_tool_args;
-    use super::{AgentParams, GraphAgent, resolve_node};
+    use super::{AgentParams, GraphAgent, format_search_response, resolve_node};
     use serde_json::json;
     use tempfile::TempDir;
+    use u_forge_core::search::{SearchStageOutcome, SearchStageOutcomes, SearchStageStatus};
     use u_forge_core::{KnowledgeGraph, ObjectMetadata};
+
+    fn stage(status: SearchStageStatus, diagnostic: Option<&str>) -> SearchStageOutcome {
+        SearchStageOutcome {
+            status,
+            diagnostic: diagnostic.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn semantic_search_failure_explains_unavailable_lanes_and_recovery() {
+        let outcomes = SearchStageOutcomes {
+            fts: stage(SearchStageStatus::IntentionallySkipped, None),
+            standard_semantic: stage(
+                SearchStageStatus::Failed,
+                Some("embedding provider rejected the request"),
+            ),
+            high_quality_semantic: stage(
+                SearchStageStatus::Unavailable,
+                Some("HQ embedding queue is not configured"),
+            ),
+            reranking: stage(SearchStageStatus::IntentionallySkipped, None),
+        };
+
+        let message = format_search_response("Semantic", "Z-Rho", Vec::new(), &outcomes)
+            .expect("expected search unavailability is a normal tool response");
+        assert!(message.contains("Semantic search is unavailable"));
+        assert!(message.contains("embedding provider rejected the request"));
+        assert!(message.contains("HQ embedding queue is not configured"));
+        assert!(message.contains("keyword search"));
+        assert!(message.contains("rebuild the semantic index from Settings"));
+    }
 
     #[test]
     fn agent_sampling_uses_current_lemonade_wire_names() {

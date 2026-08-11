@@ -19,12 +19,13 @@ use crate::{
 
 use super::{AppView, ResizeEditorCanvas, ResizeRightPanel, ResizeSidebar};
 use crate::dock_state::RESIZE_HANDLE_SIZE;
-use crate::panel_contracts::{DockPosition, PanelId, WorkspaceItemId, WorldCanvasViewId};
+use crate::panel_contracts::{DockPosition, PanelId, WorldCanvasViewId};
 use crate::search_panel::SearchPanelStatus;
 use crate::startup::StartupMilestone;
 use crate::ui::components::{
-    Button, ButtonStyle, LabelTone, Menu, MenuItem, StatusItem, StatusTone, Tab as UiTab,
+    IconButton, LabelTone, Menu, MenuItem, StatusItem, StatusTone, Tooltip,
 };
+use crate::ui::icons::IconName;
 use crate::ui::theme::UiTheme;
 use crate::window_chrome::{
     ClientWindowFrame, DecorationMode, FrameGeometry, FrameMetrics, WindowChromeAction,
@@ -678,295 +679,104 @@ impl Render for AppView {
                 let active_canvas_view = self.active_world_canvas_view;
                 let open_connections = handle.clone();
                 let open_settings = handle.clone();
-                let decrease = handle.clone();
-                let increase = handle.clone();
-                let decrease_interface = handle.clone();
-                let increase_interface = handle.clone();
-                let toggle_advanced = handle.clone();
-                let toggle_window_controls = handle.clone();
-                let decrease_fts = handle.clone();
-                let increase_fts = handle.clone();
-                let decrease_semantic = handle.clone();
-                let increase_semantic = handle.clone();
-                let toggle_rerank = handle.clone();
-                let save_settings = handle.clone();
-                let settings_snapshot = format!("{:#?}", self.state.app_config);
-                let settings_content = div()
-                    .id("settings-view")
-                    .track_focus(&self.settings_focus)
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w_full()
-                    .h_full()
-                    .p_4()
+                let close_settings_tab = handle.clone();
+                let connections_active = active_canvas_view == WorldCanvasViewId::Connections;
+                let connections_tab = div()
+                    .id("connections-tab")
                     .flex()
-                    .flex_col()
-                    .gap(px(theme.metrics.space_6))
-                    .overflow_y_scroll()
-                    .bg(theme.colors.app_surface)
-                    .text_size(theme.typography.label)
-                    .child(
-                        div()
-                            .text_size(theme.typography.body)
-                            .child("Application Settings"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child("Text size")
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(theme.metrics.space_2))
-                                    .child(
-                                        Button::new("settings-font-smaller", "Smaller").on_click(
-                                            move |_, _, cx| {
-                                                decrease
-                                                    .update(cx, |view, cx| {
-                                                        view.settings_draft_font_size =
-                                                            (view.settings_draft_font_size - 1.0)
-                                                                .max(10.0);
-                                                        cx.notify();
-                                                    })
-                                                    .ok();
-                                            },
-                                        ),
-                                    )
-                                    .child(format!("{:.0} px", self.settings_draft_font_size))
-                                    .child(Button::new("settings-font-larger", "Larger").on_click(
-                                        move |_, _, cx| {
-                                            increase
-                                                .update(cx, |view, cx| {
-                                                    view.settings_draft_font_size =
-                                                        (view.settings_draft_font_size + 1.0)
-                                                            .min(28.0);
-                                                    cx.notify();
-                                                })
-                                                .ok();
-                                        },
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child("Interface size")
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(theme.metrics.space_2))
-                                    .child(
-                                        Button::new("settings-interface-smaller", "Smaller")
-                                            .on_click(move |_, _, cx| {
-                                                decrease_interface
-                                                    .update(cx, |view, cx| {
-                                                        view.settings_draft_interface_size = (view
-                                                            .settings_draft_interface_size
-                                                            - 1.0)
-                                                            .max(14.0);
-                                                        cx.notify();
-                                                    })
-                                                    .ok();
-                                            }),
-                                    )
-                                    .child(format!("{:.0} px", self.settings_draft_interface_size))
-                                    .child(
-                                        Button::new("settings-interface-larger", "Larger")
-                                            .on_click(move |_, _, cx| {
-                                                increase_interface
-                                                    .update(cx, |view, cx| {
-                                                        view.settings_draft_interface_size = (view
-                                                            .settings_draft_interface_size
-                                                            + 1.0)
-                                                            .min(32.0);
-                                                        cx.notify();
-                                                    })
-                                                    .ok();
-                                            }),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        Button::new(
-                            "settings-window-controls-side",
-                            if self.settings_draft_window_controls_left {
-                                "Window controls on left"
-                            } else {
-                                "Window controls on right"
-                            },
-                        )
-                        .selected(self.settings_draft_window_controls_left)
-                        .tooltip("Place client-side minimize, maximize, and close controls")
-                        .on_click(move |_, _, cx| {
-                            toggle_window_controls
-                                .update(cx, |view, cx| {
-                                    view.settings_draft_window_controls_left =
-                                        !view.settings_draft_window_controls_left;
-                                    cx.notify();
-                                })
-                                .ok();
-                        }),
-                    )
-                    .child(
-                        Button::new(
-                            "settings-advanced",
-                            if self.settings_draft_advanced {
-                                "Hide advanced settings"
-                            } else {
-                                "Show advanced settings"
-                            },
-                        )
-                        .selected(self.settings_draft_advanced)
-                        .tooltip("Show the complete active application configuration")
-                        .on_click(move |_, _, cx| {
-                            toggle_advanced
-                                .update(cx, |view, cx| {
-                                    view.settings_draft_advanced = !view.settings_draft_advanced;
-                                    cx.notify();
-                                })
-                                .ok();
-                        }),
-                    )
-                    .when(self.settings_draft_advanced, |settings| {
-                        settings
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child("FTS candidate limit")
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(theme.metrics.space_2))
-                                            .child(Button::new("settings-fts-less", "−").on_click(
-                                                move |_, _, cx| {
-                                                    decrease_fts
-                                                        .update(cx, |view, cx| {
-                                                            view.settings_draft_fts_limit = view
-                                                                .settings_draft_fts_limit
-                                                                .saturating_sub(5)
-                                                                .max(1);
-                                                            cx.notify();
-                                                        })
-                                                        .ok();
-                                                },
-                                            ))
-                                            .child(self.settings_draft_fts_limit.to_string())
-                                            .child(Button::new("settings-fts-more", "+").on_click(
-                                                move |_, _, cx| {
-                                                    increase_fts
-                                                        .update(cx, |view, cx| {
-                                                            view.settings_draft_fts_limit =
-                                                                (view.settings_draft_fts_limit + 5)
-                                                                    .min(1_000);
-                                                            cx.notify();
-                                                        })
-                                                        .ok();
-                                                },
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child("Semantic candidate limit")
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(theme.metrics.space_2))
-                                            .child(
-                                                Button::new("settings-semantic-less", "−")
-                                                    .on_click(move |_, _, cx| {
-                                                        decrease_semantic
-                                                            .update(cx, |view, cx| {
-                                                                view.settings_draft_semantic_limit = view
-                                                                    .settings_draft_semantic_limit
-                                                                    .saturating_sub(5)
-                                                                    .max(1);
-                                                                cx.notify();
-                                                            })
-                                                            .ok();
-                                                    }),
-                                            )
-                                            .child(self.settings_draft_semantic_limit.to_string())
-                                            .child(
-                                                Button::new("settings-semantic-more", "+")
-                                                    .on_click(move |_, _, cx| {
-                                                        increase_semantic
-                                                            .update(cx, |view, cx| {
-                                                                view.settings_draft_semantic_limit =
-                                                                    (view.settings_draft_semantic_limit
-                                                                        + 5)
-                                                                        .min(1_000);
-                                                                cx.notify();
-                                                            })
-                                                            .ok();
-                                                    }),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                Button::new(
-                                    "settings-rerank",
-                                    if self.settings_draft_rerank {
-                                        "Reranking enabled"
-                                    } else {
-                                        "Reranking disabled"
-                                    },
-                                )
-                                .selected(self.settings_draft_rerank)
-                                .on_click(move |_, _, cx| {
-                                    toggle_rerank
-                                        .update(cx, |view, cx| {
-                                            view.settings_draft_rerank =
-                                                !view.settings_draft_rerank;
-                                            cx.notify();
-                                        })
-                                        .ok();
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(theme.metrics.space_3))
-                                    .p_3()
-                                    .rounded(px(theme.metrics.radius_small))
-                                    .bg(theme.colors.input_surface)
-                                    .border_1()
-                                    .border_color(theme.colors.border)
-                                    .child("Complete active configuration")
-                                    .child(
-                                        div()
-                                            .text_size(theme.typography.caption)
-                                            .text_color(theme.colors.text_muted)
-                                            .child(settings_snapshot),
-                                    ),
-                            )
+                    .flex_row()
+                    .flex_none()
+                    .items_center()
+                    .h_full()
+                    .px(px(theme.metrics.space_4))
+                    .text_size(theme.typography.body)
+                    .text_color(if connections_active {
+                        theme.colors.text
+                    } else {
+                        theme.colors.text_muted
                     })
-                    .child(
-                        div().flex().justify_end().child(
-                            Button::new("settings-save", "Save Settings")
-                                .style(ButtonStyle::Filled)
-                                .on_click(move |_, window, cx| {
-                                    save_settings
-                                        .update(cx, |view, cx| view.save_settings(window, cx))
-                                        .ok();
-                                }),
-                        ),
-                    );
+                    .bg(if connections_active {
+                        theme.colors.app_surface
+                    } else {
+                        theme.colors.panel_surface
+                    })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.colors.selected))
+                    .when(connections_active, |tab| {
+                        tab.border_b_2().border_color(theme.colors.accent)
+                    })
+                    .tooltip(Tooltip::text("Show relationships between world items"))
+                    .on_click(move |_, window, cx| {
+                        open_connections
+                            .update(cx, |view, cx| view.show_connections(window, cx))
+                            .ok();
+                    })
+                    .child(WorldCanvasViewId::Connections.title());
+                let settings_active = active_canvas_view == WorldCanvasViewId::Settings;
+                let settings_dirty = self
+                    .settings_view
+                    .as_ref()
+                    .is_some_and(|settings| settings.read(cx).is_dirty());
+                let settings_close = IconButton::new(
+                    "settings-tab-close",
+                    IconName::TabClose,
+                    if settings_dirty {
+                        "Close Settings — unsaved changes will require confirmation"
+                    } else {
+                        "Close Settings"
+                    },
+                )
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    close_settings_tab
+                        .update(cx, |view, cx| view.request_close_settings(window, cx))
+                        .ok();
+                });
+                let settings_tab = div()
+                    .id("settings-tab")
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .items_center()
+                    .h_full()
+                    .px(px(theme.metrics.space_4))
+                    .gap(px(theme.metrics.space_2))
+                    .text_size(theme.typography.body)
+                    .text_color(if settings_active {
+                        theme.colors.text
+                    } else {
+                        theme.colors.text_muted
+                    })
+                    .bg(if settings_active {
+                        theme.colors.app_surface
+                    } else {
+                        theme.colors.panel_surface
+                    })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.colors.selected))
+                    .when(settings_active, |tab| {
+                        tab.border_b_2().border_color(if settings_dirty {
+                            theme.colors.warning
+                        } else {
+                            theme.colors.accent
+                        })
+                    })
+                    .tooltip(Tooltip::text("Configure u-forge"))
+                    .on_click(move |_, window, cx| {
+                        open_settings
+                            .update(cx, |view, cx| view.open_settings(window, cx))
+                            .ok();
+                    })
+                    .child(WorldCanvasViewId::Settings.title())
+                    .when(settings_dirty, |tab| {
+                        tab.child(
+                            div()
+                                .size(px(theme.metrics.space_3))
+                                .rounded_full()
+                                .bg(theme.colors.warning),
+                        )
+                    })
+                    .child(settings_close);
                 let mut graph_pane = div()
                     .id("world-canvas")
                     .flex()
@@ -981,40 +791,11 @@ impl Render for AppView {
                             .flex_none()
                             .items_center()
                             .h(theme.metrics.panel_header_height)
-                            .px_3()
-                            .gap(px(theme.metrics.space_4))
                             .bg(theme.colors.panel_surface)
                             .border_b_1()
                             .border_color(theme.colors.border_subtle)
-                            .text_size(theme.typography.label)
-                            .text_color(theme.colors.text)
-                            .child(WorkspaceItemId::WorldCanvas.title())
-                            .child(
-                                UiTab::new(
-                                    "connections-tab",
-                                    WorldCanvasViewId::Connections.title(),
-                                    active_canvas_view == WorldCanvasViewId::Connections,
-                                )
-                                .tooltip("Show relationships between world items")
-                                .on_click(move |_, window, cx| {
-                                    open_connections
-                                        .update(cx, |view, cx| view.close_settings(window, cx))
-                                        .ok();
-                                }),
-                            )
-                            .child(
-                                UiTab::new(
-                                    "settings-tab",
-                                    WorldCanvasViewId::Settings.title(),
-                                    active_canvas_view == WorldCanvasViewId::Settings,
-                                )
-                                .tooltip("Configure u-forge")
-                                .on_click(move |_, window, cx| {
-                                    open_settings
-                                        .update(cx, |view, cx| view.open_settings(window, cx))
-                                        .ok();
-                                }),
-                            ),
+                            .child(connections_tab)
+                            .when(self.settings_view.is_some(), |bar| bar.child(settings_tab)),
                     )
                     .child({
                         let mut views = div().relative().min_h_0().overflow_hidden().child(
@@ -1035,8 +816,17 @@ impl Render for AppView {
                                 .overflow_hidden()
                                 .child(self.graph_canvas.clone()),
                         );
-                        if active_canvas_view == WorldCanvasViewId::Settings {
-                            views = views.child(settings_content);
+                        if active_canvas_view == WorldCanvasViewId::Settings
+                            && let Some(settings) = &self.settings_view
+                        {
+                            views = views.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .child(settings.clone()),
+                            );
                         }
                         views.style().flex_grow = Some(1.0);
                         views.style().flex_shrink = Some(1.0);

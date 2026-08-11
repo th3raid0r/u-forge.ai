@@ -403,6 +403,33 @@ impl LemonadeManagement {
         Ok(())
     }
 
+    /// Idempotently update Lemonade's per-model-type residency limit.
+    ///
+    /// The runtime API applies and persists this deferred setting atomically.
+    /// External servers retain the same credentials-and-confirmation guard as
+    /// model and backend management operations.
+    pub async fn set_max_loaded_models(
+        &self,
+        max_loaded_models: usize,
+        confirmed_external: bool,
+    ) -> Result<bool> {
+        if max_loaded_models == 0 {
+            return Err(anyhow!("max_loaded_models must be at least 1"));
+        }
+        self.authorize_mutation(confirmed_external).await?;
+        let config: serde_json::Value = self.client.get_admin_json("/config").await?;
+        if configured_max_loaded_models(&config) == Some(max_loaded_models) {
+            return Ok(false);
+        }
+        self.client
+            .post_admin_empty(
+                "/set",
+                &serde_json::json!({ "max_loaded_models": max_loaded_models }),
+            )
+            .await?;
+        Ok(true)
+    }
+
     /// Start a server-owned durable model pull and return its job response.
     pub async fn pull(
         &self,
@@ -498,6 +525,13 @@ impl LemonadeManagement {
             format!("{recipe}:{backend}"),
         ))
     }
+}
+
+fn configured_max_loaded_models(config: &serde_json::Value) -> Option<usize> {
+    config
+        .get("max_loaded_models")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn management_event_stream(
@@ -969,5 +1003,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not confirmed"));
+    }
+
+    #[tokio::test]
+    async fn max_loaded_models_rejects_zero_before_network_access() {
+        let connection = Arc::new(
+            LemonadeConnection::with_credentials(
+                "http://127.0.0.1:1/v1",
+                LemonadeOwnership::Embedded,
+                Some("api".to_string()),
+                Some("admin".to_string()),
+                super::super::LemonadeTimeouts::default(),
+            )
+            .unwrap(),
+        );
+        let error = LemonadeManagement::new(connection)
+            .set_max_loaded_models(0, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn max_loaded_models_is_read_from_the_flat_runtime_config() {
+        assert_eq!(
+            configured_max_loaded_models(&serde_json::json!({"max_loaded_models": 3})),
+            Some(3)
+        );
+        assert_eq!(
+            configured_max_loaded_models(&serde_json::json!({"max_loaded_models": -1})),
+            None
+        );
+        assert_eq!(configured_max_loaded_models(&serde_json::json!({})), None);
     }
 }
