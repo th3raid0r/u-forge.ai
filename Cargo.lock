@@ -10096,7 +10096,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "u-forge"
-version = "0.1.0"
+version = "0.1.1-pre"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10120,7 +10120,7 @@ dependencies = [
 
 [[package]]
 name = "u-forge-agent"
-version = "0.1.0"
+version = "0.1.1-pre"
 dependencies = [
  "anyhow",
  "futures",
@@ -10139,7 +10139,7 @@ dependencies = [
 
 [[package]]
 name = "u-forge-core"
-version = "0.1.0"
+version = "0.1.1-pre"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -10171,7 +10171,7 @@ dependencies = [
 
 [[package]]
 name = "u-forge-graph-view"
-version = "0.1.0"
+version = "0.1.1-pre"
 dependencies = [
  "anyhow",
  "criterion",
@@ -10186,7 +10186,7 @@ dependencies = [
 
 [[package]]
 name = "u-forge-ts-runtime"
-version = "0.1.0"
+version = "0.1.1-pre"
 dependencies = [
  "anyhow",
  "serde",
@@ -10197,7 +10197,7 @@ dependencies = [
 
 [[package]]
 name = "u-forge-ui-traits"
-version = "0.1.0"
+version = "0.1.1-pre"
 dependencies = [
  "glam",
  "u-forge-graph-view",

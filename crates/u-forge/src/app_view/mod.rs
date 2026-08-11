@@ -52,11 +52,12 @@ use crate::selection_model::SelectionModel;
 use crate::settings_view::{SettingsRebuildRequested, SettingsSaveRequested, SettingsView};
 use crate::setup_panel::{
     SetupBackendInstallRequested, SetupClosed, SetupDownloadOperation, SetupDownloadRequested,
-    SetupPanel, SetupRefreshRequested, SetupRequested,
+    SetupPanel, SetupRequested,
 };
 use crate::startup::{LEMONADE_METADATA_READY_MESSAGE, StartupMilestone, StartupTimeline};
 use crate::ui::theme::UiTheme;
 use crate::window_chrome::WindowControlFocusHandles;
+use crate::world_setup::{WorldCreateRequested, WorldSetupClosed, WorldSetupModal};
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -165,6 +166,8 @@ pub struct AppView {
     pub(crate) menu_anchors: Rc<Cell<[Point<Pixels>; 2]>>,
     pub(crate) window_control_focus: WindowControlFocusHandles,
     pub(crate) setup_open: bool,
+    pub(crate) world_setup: Option<Entity<WorldSetupModal>>,
+    _world_setup_subs: Vec<Subscription>,
     pub(crate) active_world_canvas_view: WorldCanvasViewId,
     pub(crate) settings_view: Option<Entity<SettingsView>>,
     settings_close_after_save: bool,
@@ -377,12 +380,14 @@ async fn forward_management_events(
 /// Optional accelerators and chat models remain explicit setup choices.
 async fn provision_managed_baseline(
     connection: Arc<LemonadeConnection>,
-    catalog: LemonadeServerCatalog,
     events: tokio::sync::broadcast::Sender<ManagementProgressEvent>,
+    management_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<bool> {
     if connection.ownership() != LemonadeOwnership::Embedded {
         return Ok(false);
     }
+    let _guard = management_lock.lock().await;
+    let catalog = LemonadeServerCatalog::discover_with_connection(connection.clone()).await?;
     let manager = LemonadeManagement::new(connection);
     let mut changed = false;
     let cpu = catalog
@@ -400,12 +405,10 @@ async fn provision_managed_baseline(
         changed = true;
     }
 
-    for component in initial_setup_components().into_iter().filter(|component| {
-        matches!(
-            component.role,
-            SetupRole::StandardEmbedding | SetupRole::Reranking
-        )
-    }) {
+    for component in initial_setup_components()
+        .into_iter()
+        .filter(|component| component.role == SetupRole::StandardEmbedding)
+    {
         let state = component_state(&catalog, &component);
         if let u_forge_core::lemonade::SetupComponentState::Conflict(message) = state {
             anyhow::bail!(message);
@@ -1434,6 +1437,11 @@ impl AppView {
         } else {
             true
         };
+        let schema_loaded = graph
+            .get_schema_manager()
+            .list_schemas()
+            .map(|names| names.iter().any(|name| name != "default"))
+            .unwrap_or(false);
         let setup_timeline = startup.clone();
         let setup_panel = cx.new(|_cx| {
             SetupPanel::new(
@@ -1445,18 +1453,13 @@ impl AppView {
                 app_config.chat.preferred_device.clone(),
                 app_config.chat.reasoning_control,
             )
+            .with_schema_loaded(schema_loaded)
             .with_startup_timeline(setup_timeline)
         });
         let setup_requested = cx.subscribe(
             &setup_panel,
             |this: &mut Self, _panel, request: &SetupRequested, cx| {
                 this.do_provision_lemonade(request.clone(), cx);
-            },
-        );
-        let setup_refresh = cx.subscribe(
-            &setup_panel,
-            |this: &mut Self, _panel, _event: &SetupRefreshRequested, cx| {
-                this.do_refresh_lemonade_setup(cx);
             },
         );
         let setup_backend_install = cx.subscribe(
@@ -1475,6 +1478,9 @@ impl AppView {
             &setup_panel,
             |this: &mut Self, _panel, _event: &SetupClosed, cx| {
                 this.setup_open = false;
+                if !this.state.schema_loaded {
+                    this.open_world_setup(cx);
+                }
                 cx.notify();
             },
         );
@@ -1527,6 +1533,8 @@ impl AppView {
                 close: cx.focus_handle(),
             },
             setup_open: false,
+            world_setup: None,
+            _world_setup_subs: vec![],
             active_world_canvas_view: WorldCanvasViewId::Connections,
             settings_view: None,
             settings_close_after_save: false,
@@ -1556,7 +1564,6 @@ impl AppView {
                 connect_sub,
                 assistant_zoom_sub,
                 setup_requested,
-                setup_refresh,
                 setup_backend_install,
                 setup_download,
                 setup_closed,
@@ -1660,6 +1667,19 @@ impl AppView {
                             view.active_management_operations
                                 .insert(event.target.clone());
                         }
+                        let progress = event
+                            .progress_percent
+                            .map(|percent| format!(" · {percent:.0}%"))
+                            .unwrap_or_default();
+                        view.state.management_status = Some(match event.kind {
+                            ManagementEventKind::Progress => {
+                                format!("Preparing {}{progress}", event.target)
+                            }
+                            ManagementEventKind::Complete => format!("{} is ready", event.target),
+                            ManagementEventKind::Failed => {
+                                format!("{} failed", event.target)
+                            }
+                        });
                         view.setup_panel.update(cx, |panel, cx| {
                             panel.apply_management_progress(&event);
                             cx.notify();
@@ -2034,6 +2054,162 @@ impl AppView {
                         cx.notify();
                     }
                 }
+            })
+            .ok();
+        });
+        self.import_task = Some(task);
+    }
+
+    fn embedding_prerequisites_ready(&self) -> bool {
+        self.state
+            .inference_queue
+            .as_ref()
+            .is_some_and(|queue| queue.has_embedding())
+            && (!self.state.app_config.embedding.high_quality_embedding
+                || self
+                    .state
+                    .hq_queue
+                    .as_ref()
+                    .is_some_and(|queue| queue.has_embedding()))
+    }
+
+    fn sync_world_setup_readiness(&mut self, cx: &mut Context<Self>) {
+        let ready = self.embedding_prerequisites_ready();
+        if let Some(modal) = &self.world_setup {
+            modal.update(cx, |modal, cx| modal.set_embedding_ready(ready, cx));
+        }
+    }
+
+    fn open_world_setup(&mut self, cx: &mut Context<Self>) {
+        if self.state.schema_loaded || self.world_setup.is_some() {
+            return;
+        }
+        self.setup_open = false;
+        let schema_dir = self.state.schema_dir.to_string_lossy().into_owned();
+        let data_file = self.state.data_file.to_string_lossy().into_owned();
+        let ready = self.embedding_prerequisites_ready();
+        let modal = cx.new(|cx| WorldSetupModal::new(&schema_dir, &data_file, ready, cx));
+        let create = cx.subscribe(
+            &modal,
+            |this: &mut Self, _modal, request: &WorldCreateRequested, cx| {
+                this.do_create_world(request.clone(), cx);
+            },
+        );
+        let close = cx.subscribe(
+            &modal,
+            |this: &mut Self, _modal, _event: &WorldSetupClosed, cx| {
+                this.world_setup = None;
+                this._world_setup_subs.clear();
+                cx.notify();
+            },
+        );
+        self.world_setup = Some(modal);
+        self._world_setup_subs = vec![create, close];
+        cx.notify();
+    }
+
+    fn do_create_world(&mut self, request: WorldCreateRequested, cx: &mut Context<Self>) {
+        if request.data_file.is_some() && !self.embedding_prerequisites_ready() {
+            self.sync_world_setup_readiness(cx);
+            return;
+        }
+        let Some(modal) = self.world_setup.clone() else {
+            return;
+        };
+
+        let mut next_config = (*self.state.app_config).clone();
+        next_config.data.schema_dir = request.schema_dir.clone();
+        if let Some(data_file) = &request.data_file {
+            next_config.data.import_file = data_file.clone();
+        }
+        if let Err(error) = self.state.app_config.persist_settings(&next_config) {
+            modal.update(cx, |modal, cx| {
+                modal.set_busy(false, format!("Could not save world paths: {error}"), cx)
+            });
+            return;
+        }
+        self.state.schema_dir = request.schema_dir.clone();
+        if let Some(data_file) = &request.data_file {
+            self.state.data_file = data_file.clone();
+        }
+        self.state.app_config = Arc::new(next_config);
+
+        if let Some(previous) = self.import_cancellation.take() {
+            previous.supersede();
+        }
+        if let Some(previous) = self.import_task.take() {
+            previous.detach();
+        }
+        self.import_generation = self.import_generation.wrapping_add(1);
+        let generation = self.import_generation;
+        let cancellation = CancellationToken::new();
+        self.import_cancellation = Some(cancellation.clone());
+        let graph = self.state.graph.clone();
+        let schema_dir = request.schema_dir;
+        let data_file = request.data_file;
+        modal.update(cx, |modal, cx| modal.set_busy(true, "Creating world…", cx));
+
+        let task = cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<Option<u_forge_core::SetupResult>> = if let Some(data_file) =
+                data_file.as_ref()
+            {
+                u_forge_core::import_schemas_and_data_with_cancellation(
+                    &graph,
+                    &schema_dir,
+                    data_file,
+                    cancellation.clone(),
+                )
+                .await
+                .map(Some)
+            } else {
+                (|| -> anyhow::Result<Option<u_forge_core::SetupResult>> {
+                    cancellation.check_cancelled()?;
+                    let definition = u_forge_core::SchemaIngestion::load_schemas_from_directory(
+                        &schema_dir,
+                        "imported_schemas",
+                        "1.0.0",
+                    )?;
+                    let manager = graph.get_schema_manager();
+                    let _ = manager.delete_schema("default");
+                    cancellation.check_cancelled()?;
+                    manager.save_schema(&definition)?;
+                    Ok(None)
+                })()
+            };
+            this.update(cx, |view: &mut AppView, cx| {
+                if generation != view.import_generation {
+                    return;
+                }
+                view.import_cancellation = None;
+                match result {
+                    Ok(stats) => {
+                        let imported_data = stats.is_some();
+                        view.state.schema_loaded = true;
+                        view.setup_panel
+                            .update(cx, |panel, _cx| panel.set_schema_loaded(true));
+                        view.world_setup = None;
+                        view._world_setup_subs.clear();
+                        view.refresh_snapshot(cx);
+                        view.state.data_status = Some(match stats {
+                            Some(stats) => format!(
+                                "World created: {} items, {} relationships",
+                                stats.objects_created, stats.relationships_created
+                            ),
+                            None => "World created with an empty schema-backed graph".to_string(),
+                        });
+                        if imported_data {
+                            view.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(modal) = &view.world_setup {
+                            modal.update(cx, |modal, cx| {
+                                modal.set_busy(false, format!("World creation failed: {error}"), cx)
+                            });
+                        }
+                    }
+                }
+                cx.notify();
             })
             .ok();
         });
@@ -2814,7 +2990,7 @@ impl AppView {
         request: SetupRequested,
         cx: &mut Context<Self>,
     ) {
-        let (Some(connection), Some(catalog)) = (
+        let (Some(connection), Some(_catalog)) = (
             self.state.lemonade_connection.clone(),
             self.state.lemonade_catalog.clone(),
         ) else {
@@ -2828,6 +3004,7 @@ impl AppView {
             return;
         };
 
+        let continue_to_world_setup = !self.state.schema_loaded;
         let mut next_config = (*self.state.app_config).clone();
         if let Err(error) = next_config.persist_lemonade_setup(
             request.high_quality_embedding,
@@ -2859,31 +3036,39 @@ impl AppView {
 
         let tokio_rt = self.state.tokio_rt.clone();
         let events = self.state.management_events.clone();
+        let management_lock = self.state.management_lock.clone();
+        let (embedding_ready_tx, embedding_ready_rx) = tokio::sync::oneshot::channel();
         self.setup_panel.update(cx, |panel, cx| {
             panel.set_busy(true, "Starting server-owned provisioning jobs…");
             cx.notify();
         });
+        self.setup_open = false;
+        if continue_to_world_setup {
+            self.open_world_setup(cx);
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     tokio_rt.block_on(provision_lemonade(
                         connection,
-                        catalog,
                         next_config,
                         request,
                         events,
+                        management_lock,
+                        embedding_ready_tx,
                     ))
                 })
                 .await;
             this.update(cx, |view, cx| {
+                let succeeded = result.is_ok();
                 view.setup_panel.update(cx, |panel, cx| {
-                    match result {
+                    match &result {
                         Ok((catalog, downloads, message)) => {
                             view.state.lemonade_catalog = Some(catalog.clone());
-                            panel.refresh_catalog(&catalog);
-                            panel.set_downloads(&downloads);
-                            panel.set_busy(false, message);
+                            panel.refresh_catalog(catalog);
+                            panel.set_downloads(downloads);
+                            panel.set_busy(false, message.clone());
                         }
                         Err(error) => {
                             panel.set_busy(false, format!("Provisioning failed: {error}"));
@@ -2891,6 +3076,24 @@ impl AppView {
                     }
                     cx.notify();
                 });
+                if succeeded {
+                    view.state.management_status = Some("Provisioning complete".to_string());
+                    view.reconfigure_lemonade(cx);
+                } else if let Err(error) = result {
+                    view.state.management_status = Some(format!("Provisioning failed: {error}"));
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            if embedding_ready_rx.await.is_err() {
+                return;
+            }
+            this.update(cx, |view, cx| {
+                view.state.management_status =
+                    Some("Embedding prerequisites downloaded; activating…".to_string());
+                view.activate_world_embedding_prerequisites(cx);
             })
             .ok();
         })
@@ -2949,6 +3152,9 @@ impl AppView {
                         view.chat_panel.update(cx, |panel, _cx| {
                             panel.set_connect_failed(&error.to_string());
                         });
+                        if !view.state.schema_loaded {
+                            view.open_world_setup(cx);
+                        }
                         cx.notify();
                     })
                     .ok();
@@ -3028,10 +3234,44 @@ impl AppView {
         self.do_init_lemonade(cx);
     }
 
+    /// Activate newly downloaded embedding models without reopening setup while
+    /// lower-priority chat and reranking provisioning continues.
+    fn activate_world_embedding_prerequisites(&mut self, cx: &mut Context<Self>) {
+        let Some(connection) = self.state.lemonade_connection.clone() else {
+            return;
+        };
+        let app_config = self.state.app_config.clone();
+        let tokio_rt = self.state.tokio_rt.clone();
+        let startup = self.startup.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(async {
+                        let catalog =
+                            LemonadeServerCatalog::discover_with_connection(connection.clone())
+                                .await?;
+                        activate_lemonade_capabilities(connection, catalog, app_config, startup)
+                            .await
+                    })
+                })
+                .await;
+            this.update(cx, |view, cx| match result {
+                Ok(activation) => view.apply_lemonade_activation(activation, cx),
+                Err(error) => {
+                    view.state.management_status =
+                        Some(format!("Embedding activation failed: {error}"));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn start_managed_baseline_provisioning(
         &mut self,
         connection: Arc<LemonadeConnection>,
-        catalog: LemonadeServerCatalog,
         cx: &mut Context<Self>,
     ) {
         if connection.ownership() != LemonadeOwnership::Embedded {
@@ -3039,19 +3279,23 @@ impl AppView {
         }
         let tokio_rt = self.state.tokio_rt.clone();
         let events = self.state.management_events.clone();
+        let management_lock = self.state.management_lock.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    tokio_rt.block_on(provision_managed_baseline(connection, catalog, events))
+                    tokio_rt.block_on(provision_managed_baseline(
+                        connection,
+                        events,
+                        management_lock,
+                    ))
                 })
                 .await;
             this.update(cx, |view: &mut AppView, cx| match result {
                 Ok(true) => {
-                    // Re-discover the completed artifacts and supersede any
-                    // activation based on the old catalog snapshot.
-                    view.lemonade_init_state = LemonadeInitState::Offline;
-                    view.do_init_lemonade(cx);
+                    view.state.management_status =
+                        Some("Standard embedding model downloaded".to_string());
+                    cx.notify();
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -3133,6 +3377,7 @@ impl AppView {
             self.state.app_config.chat.preferred_device.clone(),
             self.state.app_config.chat.reasoning_control,
         )
+        .with_schema_loaded(self.state.schema_loaded)
         .with_startup_timeline(self.startup.clone());
         match metadata.downloads {
             Ok(downloads) => {
@@ -3162,11 +3407,10 @@ impl AppView {
             cx.notify();
         });
         self.setup_open |= setup_incomplete;
-        self.start_managed_baseline_provisioning(
-            metadata.connection.clone(),
-            metadata.catalog.clone(),
-            cx,
-        );
+        if !setup_incomplete && !self.state.schema_loaded {
+            self.open_world_setup(cx);
+        }
+        self.start_managed_baseline_provisioning(metadata.connection.clone(), cx);
         eprintln!("{LEMONADE_METADATA_READY_MESSAGE}");
         self.startup
             .milestone(StartupMilestone::LemonadeMetadataReady);
@@ -3269,6 +3513,7 @@ impl AppView {
         if has_embedding {
             self.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
         }
+        self.sync_world_setup_readiness(cx);
         self.startup.milestone(StartupMilestone::StartupReady);
         cx.notify();
         if self
@@ -3471,11 +3716,14 @@ fn chat_device_config_for_model<'a>(
 
 async fn provision_lemonade(
     connection: Arc<u_forge_core::lemonade::LemonadeConnection>,
-    catalog: LemonadeServerCatalog,
     config: AppConfig,
     request: SetupRequested,
     events: tokio::sync::broadcast::Sender<ManagementProgressEvent>,
+    management_lock: Arc<tokio::sync::Mutex<()>>,
+    embedding_ready: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<(LemonadeServerCatalog, serde_json::Value, String)> {
+    let _guard = management_lock.lock().await;
+    let catalog = LemonadeServerCatalog::discover_with_connection(connection.clone()).await?;
     let manager = LemonadeManagement::new(connection.clone());
     // Verify that the management plane is available before mutating an
     // external or embedded runtime. Each mutation below remains subscribed to
@@ -3489,14 +3737,34 @@ async fn provision_lemonade(
 
     let mut installed = HashSet::new();
     let mut jobs_started = 0usize;
-    let components = initial_setup_components();
-    for component in components.iter().filter(|component| {
-        component.required
-            || (component.role == u_forge_core::lemonade::SetupRole::NpuEmbedding
-                && config.embedding.npu_enabled)
-            || (component.role == u_forge_core::lemonade::SetupRole::HighQualityEmbedding
-                && request.high_quality_embedding)
-    }) {
+    let mut components = initial_setup_components()
+        .into_iter()
+        .filter(|component| {
+            component.required
+                || (component.role == u_forge_core::lemonade::SetupRole::NpuEmbedding
+                    && config.embedding.npu_enabled)
+                || (component.role == u_forge_core::lemonade::SetupRole::HighQualityEmbedding
+                    && request.high_quality_embedding)
+        })
+        .collect::<Vec<_>>();
+    components.sort_by_key(|component| match component.role {
+        SetupRole::StandardEmbedding => 0,
+        SetupRole::HighQualityEmbedding => 1,
+        SetupRole::NpuEmbedding => 2,
+        SetupRole::Reranking => 3,
+        SetupRole::Chat => 4,
+    });
+    let readiness_index = components
+        .iter()
+        .rposition(|component| {
+            matches!(
+                component.role,
+                SetupRole::StandardEmbedding | SetupRole::HighQualityEmbedding
+            )
+        })
+        .ok_or_else(|| anyhow::anyhow!("standard embedding setup component is missing"))?;
+    let mut embedding_ready = Some(embedding_ready);
+    for (index, component) in components.iter().enumerate() {
         let state = component_state(&catalog, component);
         if let u_forge_core::lemonade::SetupComponentState::Conflict(message) = &state {
             anyhow::bail!(message.clone());
@@ -3543,6 +3811,11 @@ async fn provision_lemonade(
                 .await?;
             forward_management_events(receiver, &events).await?;
             jobs_started += 1;
+        }
+        if index == readiness_index
+            && let Some(sender) = embedding_ready.take()
+        {
+            let _ = sender.send(());
         }
     }
 

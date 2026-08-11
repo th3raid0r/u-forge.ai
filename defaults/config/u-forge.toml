@@ -15,9 +15,10 @@ interface_size = 20.0
 # Reveal low-level runtime diagnostics and maintenance controls in the app.
 # Ordinary worldbuilding and AI choices remain visible when this is false.
 show_advanced_controls = true
+window_controls_left = false
 
 [storage]
-# Path to the SQLite database directory. Defaults to ./data/db if omitted.
+# Launch rewrites this packaged placeholder to the user's XDG data directory.
 db_path = "./data/db"
 # Vector widths must match the configured embedding models. Existing databases
 # must be rebuilt or re-indexed before changing either value.
@@ -25,6 +26,7 @@ embedding_dimensions = 768
 high_quality_embedding_dimensions = 4096
 
 [data]
+# Launch rewrites these packaged placeholders to the seeded XDG data directory.
 import_file = "./defaults/example_data/foundation-example.jsonl"
 schema_dir  = "./defaults/schemas/Sine Nomine"
 
@@ -35,6 +37,7 @@ gpu_enabled = true
 gpu_weight = 40
 cpu_enabled = false
 cpu_weight = 10
+npu_weight = 100
 
 [models.load_params]
 ## Mostly important for embedding models, but can be used for any text model.
@@ -54,6 +57,10 @@ search_limit = 3
 hq_semantic_boost = 3           # RRF weight multiplier for the 4096-dim HQ semantic path (vs 1.0 for 768-dim)
 max_tool_turns = 5              # max tool-call round-trips per user message
 reasoning_control = "request"
+response_reserve = 1024
+fts_limit = 20
+semantic_limit = 20
+rerank = true
 
 [chat.agent]
 schema_summary_tokens = 768          # bounded whole-record schema prompt

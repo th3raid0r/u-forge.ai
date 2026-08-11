@@ -5,7 +5,7 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Status](https://img.shields.io/badge/status-Alpha-yellow.svg)
-![Distribution](https://img.shields.io/badge/distribution-source%20builds-lightgrey.svg)
+![Distribution](https://img.shields.io/badge/distribution-AppImage-6f5bd3.svg)
 
 ![u-forge.ai showing World Canvas, Details, and Assistant](assets/images/u-forge-ai.png)
 
@@ -60,10 +60,31 @@ ambiguous relationships are reported rather than quietly reshaping the setting.
 The included Foundation sample is available as a starting point, or you can
 bring your own schemas and JSONL data.
 
-## Build and run from source
+## Install the AppImage
 
-u-forge.ai is currently available as an Alpha source build. Binary releases
-have not been published yet.
+Linux x86_64 releases are distributed as one AppImage with a companion SHA-256
+checksum. Download both files, verify the checksum, and run the image:
+
+```bash
+sha256sum --check u-forge-0.1.1-pre-x86_64.AppImage.sha256
+chmod +x u-forge-0.1.1-pre-x86_64.AppImage
+./u-forge-0.1.1-pre-x86_64.AppImage
+```
+
+The release is built on Ubuntu 26.04 and targets contemporary x86_64 GNU/Linux
+desktops. The AppImage bundles u-forge, its default schemas and example data,
+and its private Lemonade runtime.
+
+On first launch, u-forge creates its per-user files at the standard XDG paths:
+
+- configuration: `${XDG_CONFIG_HOME:-$HOME/.config}/u-forge/u-forge.toml`
+- database and editable defaults: `${XDG_DATA_HOME:-$HOME/.local/share}/u-forge`
+- downloaded Lemonade models and runtime state: `${XDG_CACHE_HOME:-$HOME/.cache}/u-forge/lemonade`
+
+The shipped defaults are copied only once. Removing or editing a user copy is
+therefore durable across later launches.
+
+## Build and run from source
 
 Install the stable Rust toolchain and a C compiler first. Debian and Ubuntu
 also need the native GPUI development libraries used by CI:
@@ -88,9 +109,8 @@ private runtime automatically and opens Lemonade AI Setup when required
 components are missing. Models and backend executables are downloaded only
 when selected in that setup flow.
 
-For a reproducible optimized build of the distributable application and its
-required embedded runtime, run `make release`. The executable is written to
-`target/release/u-forge` and the runtime to `target/release/lemonade`.
+For a reproducible optimized build of the distributable application, run
+`make release`. The x86_64 AppImage and its checksum are written to `dist/`.
 
 To build without the embedded runtime, set
 `UFORGE_SKIP_EMBEDDED_LEMONADE=1`. On other platforms, or when using an
@@ -99,14 +119,15 @@ independently managed server, run a compatible Lemonade Server and set
 
 ### Start a world
 
-The app opens with an empty local database:
+On a new profile, the app opens a guided world-creation flow. Choose a required
+schema directory and, optionally, an initial JSONL data file. Lemonade discovery
+and downloads continue in the background; schema-only worlds can be created
+without waiting for AI models, while importing initial data waits for the
+selected embedding prerequisites.
 
-1. Use **File → Import Schema…** and select `defaults/schemas` or your own
-   schema directory.
-2. Use **File → Import Data…** and select `defaults/data/memory.jsonl` or a
-   matching JSONL file.
-3. Select items in World or the canvas, edit them in Details, and save changes
-   explicitly.
+The existing **File → Import Schema…** and **File → Import Data…** actions remain
+available for later imports. Select items in World or the canvas, edit them in
+Details, and save changes explicitly.
 
 ## For developers
 

@@ -567,7 +567,16 @@ Standard Rust stable toolchain + a C compiler (`gcc`, `clang`, or MSVC) for
 bundled SQLite compilation. No system SQLite, ONNX Runtime, or RocksDB is
 required.
 
-`cargo run -p u-forge` works with zero environment variables set. On x86_64 Linux with GNU libc, the application package's build step downloads the checksum-pinned upstream Ubuntu x64 Embeddable Lemonade artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, and places `lemonade/lemond` beside the application executable. Arch Linux and CachyOS are the primary development and dogfooding platforms. With no `LEMONADE_URL`, the application launches that private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
+`cargo run -p u-forge` works with zero environment variables set. On x86_64 Linux with GNU libc, the application package's build step downloads the checksum-pinned upstream Ubuntu x64 Embeddable Lemonade artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, and places `lemonade/lemond` beside the application executable. `make release` produces the Ubuntu 26.04-baseline x86_64 AppImage containing that runtime and the packaged defaults tree. With no `LEMONADE_URL`, the application launches its private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
+
+Application-owned persistent state follows the XDG base-directory contract.
+The only desktop configuration is
+`${XDG_CONFIG_HOME:-~/.config}/u-forge/u-forge.toml`; the database and editable
+seeded defaults live under `${XDG_DATA_HOME:-~/.local/share}/u-forge`. The
+packaged config template is transformed to those absolute data paths on first
+launch. Schemas and example data are seeded once behind a revision marker, so
+subsequent launches never overwrite or restore user-managed copies. The current
+working directory is not a configuration source.
 
 Mutable embedded state follows the XDG cache contract at
 `${XDG_CACHE_HOME:-~/.cache}/u-forge/lemonade`. Models, backend executables,

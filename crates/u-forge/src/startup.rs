@@ -255,6 +255,37 @@ pub struct PreparedApp {
     pub schema_manager: Arc<SchemaManager>,
 }
 
+/// Locate the read-only defaults tree staged beside Cargo binaries or in the
+/// standard AppDir share directory used by the AppImage.
+pub fn packaged_defaults_dir() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("locating the u-forge executable")?;
+    packaged_defaults_dir_for(&executable)
+}
+
+fn packaged_defaults_dir_for(executable: &Path) -> Result<PathBuf> {
+    let executable_dir = executable
+        .parent()
+        .context("u-forge executable has no parent directory")?;
+    let profile_dir = match executable_dir.file_name().and_then(|name| name.to_str()) {
+        Some("deps" | "examples") => executable_dir
+            .parent()
+            .context("Cargo executable directory has no profile parent")?,
+        _ => executable_dir,
+    };
+    [
+        profile_dir.join("defaults"),
+        executable_dir.join("../share/u-forge/defaults"),
+    ]
+    .into_iter()
+    .find(|path| path.join("config/u-forge.toml").is_file())
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "u-forge defaults were not found beside {} or in its AppDir share directory",
+            executable.display()
+        )
+    })
+}
+
 pub fn prepare_app(
     config: &Arc<AppConfig>,
     runtime: &Arc<tokio::runtime::Runtime>,
@@ -306,4 +337,45 @@ pub fn prepare_app(
             schema_manager,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_template(defaults: &Path) {
+        let config = defaults.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("u-forge.toml"), "[storage]\n").unwrap();
+    }
+
+    #[test]
+    fn packaged_defaults_resolve_beside_cargo_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("target/debug");
+        create_template(&profile.join("defaults"));
+
+        assert_eq!(
+            packaged_defaults_dir_for(&profile.join("u-forge")).unwrap(),
+            profile.join("defaults")
+        );
+        assert_eq!(
+            packaged_defaults_dir_for(&profile.join("deps/u_forge-test")).unwrap(),
+            profile.join("defaults")
+        );
+    }
+
+    #[test]
+    fn packaged_defaults_resolve_from_appdir_share() {
+        let temp = tempfile::tempdir().unwrap();
+        let appdir = temp.path().join("u-forge.AppDir/usr");
+        let defaults = appdir.join("share/u-forge/defaults");
+        create_template(&defaults);
+        std::fs::create_dir_all(appdir.join("bin")).unwrap();
+
+        assert_eq!(
+            packaged_defaults_dir_for(&appdir.join("bin/u-forge")).unwrap(),
+            appdir.join("bin/../share/u-forge/defaults")
+        );
+    }
 }

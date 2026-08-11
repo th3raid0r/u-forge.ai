@@ -7,7 +7,7 @@ use gpui::{
 use gpui::{WindowBackgroundAppearance, WindowDecorations};
 use u_forge::{
     ActionContext, AppView, Assets, UiTheme, action_key_bindings, native_menus,
-    startup::{StartupTimeline, prepare_app},
+    startup::{StartupTimeline, packaged_defaults_dir, prepare_app},
     window_chrome::{APPLICATION_ID, APPLICATION_NAME},
 };
 use u_forge_core::AppConfig;
@@ -23,7 +23,8 @@ fn main() {
 
     let cfg = {
         let _phase = startup.phase("config_load");
-        Arc::new(AppConfig::load_default())
+        let defaults = packaged_defaults_dir().expect("failed to locate packaged defaults");
+        Arc::new(AppConfig::load_user(&defaults).expect("failed to initialize user profile"))
     };
     let data_file = cfg.data.import_file.clone();
     let schema_dir = cfg.data.schema_dir.clone();

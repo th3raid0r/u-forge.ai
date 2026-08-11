@@ -162,6 +162,7 @@ impl Render for AppView {
         let details_height = self.dock_state.size(DockPosition::Bottom);
         let right_panel_width = self.dock_state.size(DockPosition::Right);
         let embedding_status = self.state.embedding_status.clone();
+        let management_status = self.state.management_status.clone();
         let search_status = self.search_panel.read(cx).status();
         let inference_ready = self.state.inference_queue.is_some();
         let perf_enabled = self.perf_enabled;
@@ -224,6 +225,8 @@ impl Render for AppView {
                 },
             )
             .on_action(cx.listener(|this, _: &OpenLemonadeSetup, _window, cx| {
+                this.world_setup = None;
+                this._world_setup_subs.clear();
                 this.setup_open = true;
                 this.do_refresh_lemonade_setup(cx);
                 cx.notify();
@@ -1056,6 +1059,13 @@ impl Render for AppView {
                                     .tooltip(msg),
                             );
                         }
+                        if let Some(msg) = management_status {
+                            center = center.child(
+                                StatusItem::new("status-management", msg.clone())
+                                    .tone(operation_status_tone(&msg))
+                                    .tooltip(msg),
+                            );
+                        }
                         if let Some(perf) = perf_text {
                             center = center.child(
                                 StatusItem::new("status-performance", perf.clone())
@@ -1177,6 +1187,10 @@ impl Render for AppView {
             })
             // ── Reopenable Lemonade setup ───────────────────────────────────
             .when(setup_open, |root| root.child(self.setup_panel.clone()))
+            // ── Fresh-world schema/data setup ───────────────────────────────
+            .when(self.world_setup.is_some(), |root| {
+                root.child(self.world_setup.as_ref().unwrap().clone())
+            })
             // ── Startup first-paint milestone ────────────────────────────────
             .when(app_first_paint_pending, |root| {
                 root.child(

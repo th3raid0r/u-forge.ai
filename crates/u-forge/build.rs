@@ -20,6 +20,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed={SKIP_ENV}");
     println!("cargo:rerun-if-env-changed={REQUIRE_ENV}");
 
+    if let Err(error) = stage_u_forge_defaults() {
+        panic!("failed to stage u-forge defaults: {error}");
+    }
+
     if env_flag(SKIP_ENV) {
         println!("cargo:warning=skipping Embeddable Lemonade bootstrap ({SKIP_ENV} is set)");
         return;
@@ -43,13 +47,7 @@ fn bootstrap() -> Result<(), Box<dyn Error>> {
         env::var_os("CARGO_MANIFEST_DIR")
             .ok_or("Cargo did not provide CARGO_MANIFEST_DIR to the Lemonade bootstrap")?,
     );
-    let out_dir = PathBuf::from(
-        env::var_os("OUT_DIR").ok_or("Cargo did not provide OUT_DIR to the Lemonade bootstrap")?,
-    );
-    let profile_dir = out_dir
-        .ancestors()
-        .nth(3)
-        .ok_or("Cargo OUT_DIR did not contain the expected target profile directory")?;
+    let profile_dir = profile_dir()?;
     let install_dir = profile_dir.join("lemonade");
     let binary = install_dir.join("lemond");
     let model_manifest = install_dir.join("resources/server_models.json");
@@ -107,6 +105,62 @@ fn bootstrap() -> Result<(), Box<dyn Error>> {
     );
     let _ = remove_staging_dir(&staging);
     result
+}
+
+fn profile_dir() -> Result<PathBuf, Box<dyn Error>> {
+    let out_dir = PathBuf::from(
+        env::var_os("OUT_DIR").ok_or("Cargo did not provide OUT_DIR to the build script")?,
+    );
+    out_dir
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "Cargo OUT_DIR did not contain the expected target profile directory".into())
+}
+
+fn stage_u_forge_defaults() -> Result<(), Box<dyn Error>> {
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR")
+            .ok_or("Cargo did not provide CARGO_MANIFEST_DIR to the build script")?,
+    );
+    let source = manifest_dir.join("../../defaults");
+    emit_rerun_tree(&source)?;
+    let destination = profile_dir()?.join("defaults");
+    let staging = destination.with_extension(format!("stage-{}", std::process::id()));
+    remove_staging_dir(&staging)?;
+    copy_tree(&source, &staging)?;
+    if destination.exists() {
+        fs::remove_dir_all(&destination)?;
+    }
+    fs::rename(staging, destination)?;
+    Ok(())
+}
+
+fn emit_rerun_tree(path: &Path) -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-changed={}", path.display());
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            emit_rerun_tree(&entry.path())?;
+        } else {
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            copy_file(&entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_supported_target() -> Result<(), Box<dyn Error>> {

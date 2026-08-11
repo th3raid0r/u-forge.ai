@@ -50,7 +50,6 @@ pub(crate) enum SetupDownloadOperation {
     Retry,
 }
 
-pub(crate) struct SetupRefreshRequested;
 pub(crate) struct SetupClosed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +185,7 @@ pub(crate) struct SetupPanel {
     downloads: Vec<DownloadJob>,
     status: String,
     busy: bool,
+    has_schema: bool,
     external_confirmation_armed: bool,
     startup: Option<StartupTimeline>,
 }
@@ -193,7 +193,6 @@ pub(crate) struct SetupPanel {
 impl EventEmitter<SetupRequested> for SetupPanel {}
 impl EventEmitter<SetupBackendInstallRequested> for SetupPanel {}
 impl EventEmitter<SetupDownloadRequested> for SetupPanel {}
-impl EventEmitter<SetupRefreshRequested> for SetupPanel {}
 impl EventEmitter<SetupClosed> for SetupPanel {}
 
 impl SetupPanel {
@@ -248,6 +247,7 @@ impl SetupPanel {
             status: "Install the backends you want Lemonade to use, then continue to model configuration."
                 .to_string(),
             busy: false,
+            has_schema: false,
             external_confirmation_armed: false,
             startup: None,
         }
@@ -256,6 +256,15 @@ impl SetupPanel {
     pub(crate) fn with_startup_timeline(mut self, startup: StartupTimeline) -> Self {
         self.startup = Some(startup);
         self
+    }
+
+    pub(crate) fn with_schema_loaded(mut self, has_schema: bool) -> Self {
+        self.has_schema = has_schema;
+        self
+    }
+
+    pub(crate) fn set_schema_loaded(&mut self, has_schema: bool) {
+        self.has_schema = has_schema;
     }
 
     pub(crate) fn is_complete(&self) -> bool {
@@ -1119,12 +1128,14 @@ impl Render for SetupPanel {
         let provision_label = if self.busy {
             "Working…"
         } else if self.page == SetupPage::Backends {
-            "Continue to configuration"
+            "Next"
         } else if self.ownership == LemonadeOwnership::External && self.external_confirmation_armed
         {
             "Confirm external provisioning"
+        } else if self.has_schema {
+            "Save"
         } else {
-            "Save and provision"
+            "Next"
         };
 
         let backend_content = div()
@@ -1477,23 +1488,6 @@ impl Render for SetupPanel {
                                 })
                                 .child(
                                     div()
-                                        .id("setup-refresh")
-                                        .h(px(28.0))
-                                        .px_3()
-                                        .flex()
-                                        .items_center()
-                                        .cursor_pointer()
-                                        .bg(rgb(0x45475a))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_this, _, _, cx| {
-                                                cx.emit(SetupRefreshRequested)
-                                            }),
-                                        )
-                                        .child("Refresh"),
-                                )
-                                .child(
-                                    div()
                                         .id("setup-provision")
                                         .h(px(28.0))
                                         .px_3()
@@ -1511,7 +1505,7 @@ impl Render for SetupPanel {
                                                 if this.page == SetupPage::Backends {
                                                     this.page = SetupPage::Configuration;
                                                     this.external_confirmation_armed = false;
-                                                    this.status = "Choose models and runtime preferences, then save and provision."
+                                                    this.status = "Choose models and runtime preferences, then continue."
                                                         .to_string();
                                                     cx.notify();
                                                 } else {

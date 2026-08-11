@@ -67,7 +67,7 @@ endif
 help:
 	@printf '%s\n' 'u-forge.ai development targets'
 	@printf '%s\n' '  make build      Build the workspace'
-	@printf '%s\n' '  make release    Build the distributable u-forge binary and embedded runtime'
+	@printf '%s\n' '  make release    Build the x86_64 AppImage and checksum in dist/'
 	@printf '%s\n' '  make clean      Remove workspace and vendored crate build outputs'
 	@printf '%s\n' '  make check      Check required targets and run workspace clippy'
 	@printf '%s\n' '  make test       Test serially with one pinned embedded Lemonade server'
@@ -84,6 +84,7 @@ build:
 
 release:
 	$(call run_silent,u-forge release build,env -u UFORGE_SKIP_EMBEDDED_LEMONADE -u UFORGE_LEMOND_PATH UFORGE_REQUIRE_EMBEDDED_LEMONADE=1 $(CARGO) build --locked --release -p u-forge)
+	$(call run_silent,u-forge AppImage package,bash ./scripts/package-appimage.sh)
 
 clean:
 	$(call run_silent,workspace clean,$(CARGO) clean)

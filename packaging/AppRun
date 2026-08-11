@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+app_dir=$(cd "$(dirname "$0")" && pwd)
+library_path="$app_dir/usr/lib:$app_dir/usr/lib/u-forge/lemonade"
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  library_path="$library_path:$LD_LIBRARY_PATH"
+fi
+export LD_LIBRARY_PATH="$library_path"
+
+exec "$app_dir/usr/bin/u-forge" "$@"

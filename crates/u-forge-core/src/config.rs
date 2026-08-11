@@ -1,14 +1,9 @@
 //! Application configuration — devices, model limits, and other tunables.
 //!
-//! Loaded from a TOML file at startup.  All fields have sensible defaults so
-//! the file is entirely optional; the project runs correctly with zero config.
-//!
-//! # File locations (checked in order)
-//!
-//! 1. `./u-forge.toml` (working directory)
-//! 2. `$XDG_CONFIG_HOME/u-forge/config.toml`
-//!    (falls back to `$HOME/.config/u-forge/config.toml` on Linux)
-//! 3. Built-in defaults (NPU weight=100, GPU weight=50, CPU weight=10)
+//! The desktop application creates and loads one canonical per-user file at
+//! `$XDG_CONFIG_HOME/u-forge/u-forge.toml` (falling back to
+//! `$HOME/.config/u-forge/u-forge.toml`). Durable application data follows
+//! `XDG_DATA_HOME`; regenerable Lemonade state follows `XDG_CACHE_HOME`.
 //!
 //! # Example file
 //!
@@ -41,11 +36,173 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::lemonade::load::ModelLoadOptions;
+
+const DEFAULTS_REVISION: u32 = 1;
+
+/// Canonical per-user paths used by the desktop application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPaths {
+    pub config_dir: PathBuf,
+    pub data_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub config_file: PathBuf,
+    pub defaults_dir: PathBuf,
+    pub db_dir: PathBuf,
+}
+
+impl UserPaths {
+    /// Resolve the XDG bases. Relative XDG values are invalid and therefore
+    /// fall back to the corresponding directory below an absolute `$HOME`.
+    pub fn discover() -> Result<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| anyhow!("cannot determine an absolute HOME for u-forge user data"))?;
+        let config_base =
+            absolute_env_path("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+        let data_base =
+            absolute_env_path("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"));
+        let cache_base = absolute_env_path("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"));
+        Ok(Self::from_bases(config_base, data_base, cache_base))
+    }
+
+    fn from_bases(config_base: PathBuf, data_base: PathBuf, cache_base: PathBuf) -> Self {
+        let config_dir = config_base.join("u-forge");
+        let data_dir = data_base.join("u-forge");
+        let cache_dir = cache_base.join("u-forge");
+        Self {
+            config_file: config_dir.join("u-forge.toml"),
+            defaults_dir: data_dir.join("defaults"),
+            db_dir: data_dir.join("db"),
+            config_dir,
+            data_dir,
+            cache_dir,
+        }
+    }
+
+    fn initialize(&self, packaged_defaults: &Path) -> Result<()> {
+        if !packaged_defaults.is_dir() {
+            bail!(
+                "packaged defaults directory is missing: {}",
+                packaged_defaults.display()
+            );
+        }
+        std::fs::create_dir_all(&self.config_dir)
+            .with_context(|| format!("creating {}", self.config_dir.display()))?;
+        std::fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("creating {}", self.data_dir.display()))?;
+        std::fs::create_dir_all(&self.db_dir)
+            .with_context(|| format!("creating {}", self.db_dir.display()))?;
+        std::fs::create_dir_all(self.cache_dir.join("lemonade"))
+            .with_context(|| format!("creating {}", self.cache_dir.display()))?;
+
+        self.seed_defaults(packaged_defaults)?;
+        if !self.config_file.exists() {
+            self.write_config_template(packaged_defaults)?;
+        }
+        Ok(())
+    }
+
+    fn seed_defaults(&self, packaged_defaults: &Path) -> Result<()> {
+        let marker = self.data_dir.join(".defaults-revision");
+        if marker.exists() {
+            let revision = std::fs::read_to_string(&marker)
+                .with_context(|| format!("reading {}", marker.display()))?
+                .trim()
+                .parse::<u32>()
+                .with_context(|| format!("parsing {}", marker.display()))?;
+            if revision > DEFAULTS_REVISION {
+                bail!(
+                    "user defaults revision {revision} is newer than supported revision {DEFAULTS_REVISION}"
+                );
+            }
+            // Every future revision must add an explicit migration here.
+            if revision == DEFAULTS_REVISION {
+                return Ok(());
+            }
+            bail!("no defaults migration is defined from revision {revision}");
+        }
+
+        for name in ["schemas", "example_data"] {
+            let source = packaged_defaults.join(name);
+            if !source.is_dir() {
+                bail!("packaged defaults are missing {}", source.display());
+            }
+            copy_missing_tree(&source, &self.defaults_dir.join(name))?;
+        }
+        atomic_write(&marker, format!("{DEFAULTS_REVISION}\n").as_bytes())
+    }
+
+    fn write_config_template(&self, packaged_defaults: &Path) -> Result<()> {
+        use toml_edit::value;
+
+        let template = packaged_defaults.join("config/u-forge.toml");
+        let text = std::fs::read_to_string(&template)
+            .with_context(|| format!("reading config template {}", template.display()))?;
+        let mut document = text
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("parsing config template {}", template.display()))?;
+        document["storage"]["db_path"] = value(path_text(&self.db_dir));
+        document["data"]["import_file"] = value(path_text(
+            &self
+                .defaults_dir
+                .join("example_data/foundation-example.jsonl"),
+        ));
+        document["data"]["schema_dir"] =
+            value(path_text(&self.defaults_dir.join("schemas/Sine Nomine")));
+        atomic_write(&self.config_file, document.to_string().as_bytes())
+    }
+}
+
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn copy_missing_tree(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("creating {}", destination.display()))?;
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("reading {}", source.display()))?
+    {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_missing_tree(&entry.path(), &target)?;
+        } else if !target.exists() {
+            let bytes = std::fs::read(entry.path())?;
+            atomic_write(&target, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("u-forge"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(&temp, path)?;
+    Ok(())
+}
 
 /// Lemonade Server runtime settings managed by u-forge for its owned server.
 ///
@@ -790,7 +947,7 @@ impl Default for UiConfig {
 
 /// Top-level application configuration.
 ///
-/// Loaded from `u-forge.toml` by [`AppConfig::load_default`].
+/// Loaded from the canonical XDG `u-forge.toml` by [`AppConfig::load_user`].
 /// Use [`AppConfig::default`] when no config file is present or required.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -851,73 +1008,17 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Load from the canonical search path, returning defaults if nothing is found.
-    ///
-    /// Search order:
-    /// 1. `./u-forge.toml`
-    /// 2. `$XDG_CONFIG_HOME/u-forge/config.toml`
-    ///    (or `$HOME/.config/u-forge/config.toml` on Linux)
-    /// 3. Built-in defaults
-    pub fn load_default() -> Self {
-        if let Some(config) = Self::load_from_candidates(Self::candidate_paths()) {
-            return config;
-        }
-
-        info!("AppConfig: no config file found — using defaults");
-        Self {
-            source_path: Self::per_user_config_path(),
-            ..Self::default()
-        }
-    }
-
-    /// Load the first existing, valid config in an ordered list of candidates.
-    /// Missing files must be skipped here because [`Self::load`] deliberately
-    /// maps a missing explicitly-requested path to the default configuration.
-    fn load_from_candidates(paths: impl IntoIterator<Item = PathBuf>) -> Option<Self> {
-        for path in paths {
-            if !path.exists() {
-                continue;
-            }
-            match Self::load(&path) {
-                Ok(cfg) => return Some(cfg),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "AppConfig: failed to load — skipping"
-                    );
-                }
-            }
-        }
-        None
-    }
-
-    /// Ordered list of paths to check when loading the default config.
-    fn candidate_paths() -> Vec<PathBuf> {
-        let mut paths = vec![PathBuf::from("u-forge.toml")];
-
-        // XDG_CONFIG_HOME / fallback to $HOME/.config
-        let xdg_base = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs_or_home()
-                    .map(|h| h.join(".config"))
-                    .unwrap_or_default()
-            });
-
-        if !xdg_base.as_os_str().is_empty() {
-            paths.push(xdg_base.join("u-forge").join("config.toml"));
-        }
-
-        paths
+    /// Create the canonical XDG profile from packaged defaults when necessary,
+    /// then load its single authoritative configuration file.
+    pub fn load_user(packaged_defaults: &Path) -> Result<Self> {
+        let paths = UserPaths::discover()?;
+        paths.initialize(packaged_defaults)?;
+        Self::load(&paths.config_file)
+            .with_context(|| format!("loading user configuration {}", paths.config_file.display()))
     }
 
     fn per_user_config_path() -> Option<PathBuf> {
-        let xdg_base = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .ok()
-            .or_else(|| dirs_or_home().map(|home| home.join(".config")))?;
-        Some(xdg_base.join("u-forge/config.toml"))
+        UserPaths::discover().ok().map(|paths| paths.config_file)
     }
 
     /// Persist setup choices while preserving comments and unknown keys.
@@ -1131,11 +1232,6 @@ impl AppConfig {
     }
 }
 
-/// Helper: `$HOME` path, if determinable.
-fn dirs_or_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
-}
-
 // ── Default value helpers ─────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -1315,14 +1411,63 @@ mod tests {
     }
 
     #[test]
-    fn test_candidate_search_skips_missing_paths() {
+    fn user_profile_seeds_and_transforms_packaged_defaults_once() {
         let temp = tempfile::tempdir().unwrap();
-        let missing = temp.path().join("missing.toml");
-        let present = temp.path().join("config.toml");
-        std::fs::write(&present, "[embedding]\nnpu_weight = 321\n").unwrap();
+        let packaged = temp.path().join("package/defaults");
+        std::fs::create_dir_all(packaged.join("config")).unwrap();
+        std::fs::create_dir_all(packaged.join("schemas/Sine Nomine")).unwrap();
+        std::fs::create_dir_all(packaged.join("example_data")).unwrap();
+        std::fs::write(
+            packaged.join("config/u-forge.toml"),
+            "# retained\n[storage]\ndb_path = \"template\"\n[data]\nimport_file = \"template\"\nschema_dir = \"template\"\n",
+        )
+        .unwrap();
+        let schema = packaged.join("schemas/Sine Nomine/location.schema.json");
+        std::fs::write(&schema, "{}\n").unwrap();
+        std::fs::write(
+            packaged.join("example_data/foundation-example.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
 
-        let cfg = AppConfig::load_from_candidates([missing, present]).unwrap();
-        assert_eq!(cfg.embedding.npu_weight, 321);
+        let paths = UserPaths::from_bases(
+            temp.path().join("config"),
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        );
+        paths.initialize(&packaged).unwrap();
+
+        let text = std::fs::read_to_string(&paths.config_file).unwrap();
+        assert!(text.contains("# retained"));
+        assert!(text.contains(&path_text(&paths.db_dir)));
+        assert!(
+            text.contains(&path_text(
+                &paths
+                    .defaults_dir
+                    .join("example_data/foundation-example.jsonl")
+            ))
+        );
+        let copied_schema = paths
+            .defaults_dir
+            .join("schemas/Sine Nomine/location.schema.json");
+        assert!(copied_schema.is_file());
+        assert_eq!(
+            std::fs::read_to_string(paths.data_dir.join(".defaults-revision")).unwrap(),
+            "1\n"
+        );
+
+        std::fs::remove_file(&copied_schema).unwrap();
+        std::fs::write(&paths.config_file, "[storage]\ndb_path = \"custom\"\n").unwrap();
+        paths.initialize(&packaged).unwrap();
+        assert!(
+            !copied_schema.exists(),
+            "deleted defaults must stay deleted"
+        );
+        assert!(
+            std::fs::read_to_string(&paths.config_file)
+                .unwrap()
+                .contains("custom")
+        );
     }
 
     #[test]

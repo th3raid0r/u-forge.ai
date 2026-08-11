@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=u-forge.ai
+Comment=Build, explore, and search connected TTRPG worlds
+Exec=u-forge
+Icon=ai.u-forge.u-forge
+Terminal=false
+Categories=Game;
+StartupWMClass=ai.u-forge.u-forge
+X-AppImage-Name=u-forge.ai

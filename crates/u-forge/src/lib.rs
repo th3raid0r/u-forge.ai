@@ -19,6 +19,7 @@ pub mod startup;
 pub mod text_field;
 pub mod ui;
 pub mod window_chrome;
+mod world_setup;
 
 #[cfg(test)]
 mod startup_tests;

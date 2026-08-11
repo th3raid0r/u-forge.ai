@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="background" x1="72" y1="56" x2="440" y2="456" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#26243d"/>
+      <stop offset="1" stop-color="#11111d"/>
+    </linearGradient>
+    <linearGradient id="world" x1="126" y1="112" x2="392" y2="408" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#b9a7ff"/>
+      <stop offset="1" stop-color="#73d8d2"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#background)"/>
+  <circle cx="256" cy="256" r="164" fill="none" stroke="url(#world)" stroke-width="28"/>
+  <path d="M104 230c32-15 57-17 73-6 23 17 26 67 68 42 42-26-18-36-5-73 13-38 55-9 59-50 3-27-29-37-97-31" fill="none" stroke="url(#world)" stroke-width="25" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M357 124c-48 42-65 68-50 77 22 13 32-6 59 0 27 5 21 41 7 41s-87-9-84 33c4 43 48 49 48 73 0 16-10 40-29 73" fill="none" stroke="url(#world)" stroke-width="25" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M122 330c8-3 14-6 18-7 33-13 57-16 73-9 28 12 17 37 26 46 9 10 31 7 31 25 0 12-4 25-12 40" fill="none" stroke="url(#world)" stroke-width="25" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

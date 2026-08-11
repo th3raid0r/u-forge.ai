@@ -40,7 +40,7 @@ pub use builder::ObjectBuilder;
 pub use config::{
     AgentBudgetConfig, AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig,
     EffectiveAgentBudget, EmbeddingDeviceConfig, LemonadeConfig, ModelConfig, ModelLoadParams,
-    ReasoningControl, StorageConfig, UiConfig,
+    ReasoningControl, StorageConfig, UiConfig, UserPaths,
 };
 pub use error::{EmbeddingDimensionMismatch, EmbeddingSpaceMismatch, UnidentifiedEmbeddingSpace};
 pub use graph::{

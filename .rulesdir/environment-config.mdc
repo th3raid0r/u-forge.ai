@@ -21,6 +21,18 @@ export UFORGE_SKIP_EMBEDDED_LEMONADE=1   # Skip automatic runtime provisioning
 export UFORGE_LEMOND_PATH="/path/to/lemonade/lemond" # Owned-development binary override
 ```
 
+The desktop application has one canonical user profile:
+
+- `$XDG_CONFIG_HOME/u-forge/u-forge.toml` (fallback: `~/.config/u-forge/u-forge.toml`)
+- `$XDG_DATA_HOME/u-forge` (fallback: `~/.local/share/u-forge`) for databases and editable seeded defaults
+- `$XDG_CACHE_HOME/u-forge/lemonade` (fallback: `~/.cache/u-forge/lemonade`) for expendable Lemonade state
+
+The current working directory is never searched for `u-forge.toml`. At first
+launch, the packaged config template is transformed to absolute XDG data paths,
+and packaged schemas/example data are copied into the data directory. A defaults
+revision marker makes that seed one-time: user edits and deletions are not
+restored implicitly. A later defaults revision requires an explicit migration.
+
 ### Why env vars are overrides, not requirements
 
 `cargo run -p u-forge` must work with zero env vars set. An unset env
@@ -52,9 +64,9 @@ events are insufficient; u-forge forwards those lines only when the dedicated
 
 ## Import Path Resolution
 
-The desktop app reads `[data].schema_dir` and `[data].import_file` from
-`u-forge.toml` to pre-populate its explicit import dialogs. It does not import
-either path automatically. The lower-level
+The desktop app reads `[data].schema_dir` and `[data].import_file` from its XDG
+configuration to pre-populate the new-world flow and explicit import dialogs.
+The lower-level
 `SchemaIngestion::load_default_schemas()` helper checks `UFORGE_SCHEMA_DIR`
 and otherwise uses `./defaults/schemas`.
 
@@ -77,10 +89,10 @@ The desktop app uses the persistent path from `[storage].db_path`.
 Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
 TTS) via an OpenAI-compatible HTTP API. On x86_64 Linux with GNU libc, building
 the desktop UI downloads the checksum-pinned upstream Ubuntu x64 Embeddable
-Lemonade release into `target/` and places its runtime beside the application
-executable. Arch Linux and CachyOS are the primary development and dogfooding
-platforms. The build adds the `reasoning` catalog label to built-in Gemma 4 GGUF
-models before installation. If provisioning is skipped or unavailable, AI
+Lemonade release into `target/`. `make release` packages that runtime, the
+desktop executable, and the complete defaults tree into an AppImage built on
+Ubuntu 26.04. The build adds the `reasoning` catalog label to built-in Gemma 4
+GGUF models before installation. If provisioning is skipped or unavailable, AI
 features degrade gracefully and the knowledge graph remains usable.
 
 ### Setup

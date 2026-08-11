@@ -506,7 +506,17 @@ fn embedded_binary_path_for(executable: &Path) -> Result<PathBuf> {
             .context("Cargo executable directory has no profile parent")?,
         _ => executable_dir,
     };
-    Ok(profile_dir.join("lemonade/lemond"))
+    let cargo_layout = profile_dir.join("lemonade/lemond");
+    if cargo_layout.is_file() {
+        return Ok(cargo_layout);
+    }
+    let appdir_layout = executable_dir.join("../lib/u-forge/lemonade/lemond");
+    if appdir_layout.is_file() {
+        return Ok(appdir_layout);
+    }
+    // Preserve the historical path in diagnostics when neither packaged
+    // layout is present.
+    Ok(cargo_layout)
 }
 
 fn private_cache_root() -> Result<PathBuf> {
@@ -898,6 +908,21 @@ mod tests {
                 PathBuf::from("/workspace/target/debug/lemonade/lemond")
             );
         }
+    }
+
+    #[test]
+    fn embedded_artifact_is_resolved_from_appdir_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let appdir = temp.path().join("u-forge.AppDir/usr");
+        let lemond = appdir.join("lib/u-forge/lemonade/lemond");
+        std::fs::create_dir_all(lemond.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(appdir.join("bin")).unwrap();
+        std::fs::write(&lemond, "").unwrap();
+
+        assert_eq!(
+            embedded_binary_path_for(&appdir.join("bin/u-forge")).unwrap(),
+            appdir.join("bin/../lib/u-forge/lemonade/lemond")
+        );
     }
 
     #[test]

@@ -34,12 +34,17 @@ pub(crate) struct AppState {
     /// backend/model SSE streams owned by the root lifecycle.
     pub(crate) management_events:
         tokio::sync::broadcast::Sender<u_forge_core::lemonade::ManagementProgressEvent>,
+    /// Serializes catalog mutations so automatic baseline pulls and guided
+    /// setup cannot start duplicate server jobs from stale snapshots.
+    pub(crate) management_lock: Arc<tokio::sync::Mutex<()>>,
     /// True when at least one non-default schema is present in the graph DB.
     pub(crate) schema_loaded: bool,
     /// Status message displayed in the status bar during/after data operations.
     pub(crate) data_status: Option<String>,
     /// Embedding progress/completion message shown in the status bar.
     pub(crate) embedding_status: Option<String>,
+    /// Backend/model provisioning progress shown independently of setup UI.
+    pub(crate) management_status: Option<String>,
     /// Single authority for which embedding plan may update UI progress.
     pub(crate) embedding_plan: EmbeddingPlanAuthority,
     /// Number of broadcast receive points that observed dropped graph events.
@@ -122,8 +127,10 @@ impl AppState {
             lemonade_connection: None,
             lemonade_catalog: None,
             management_events,
+            management_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_status: None,
             embedding_status: None,
+            management_status: None,
             embedding_plan: EmbeddingPlanAuthority::default(),
             graph_event_lag_events: 0,
             graph_event_lagged_messages: 0,
