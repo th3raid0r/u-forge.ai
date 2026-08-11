@@ -67,6 +67,12 @@ fn assistant_controls_locked(
     streaming
 }
 
+struct QueuedSend {
+    text: String,
+    history: Vec<HistoryMessage>,
+    cancellation: CancellationToken,
+}
+
 pub(crate) struct ChatPanel {
     focus: FocusHandle,
     zoomed: bool,
@@ -127,6 +133,11 @@ pub(crate) struct ChatPanel {
     /// Rig agent with graph search tools (None until Lemonade + graph are wired up).
     /// When present, messages are routed through the agent loop instead of direct streaming.
     agent: Option<Arc<GraphAgent>>,
+    /// Metadata makes the chrome usable immediately, but sends wait here until
+    /// retrieval and reranking finish activating so tool-capable models do not
+    /// accidentally fall back to direct chat during startup.
+    capabilities_loading: bool,
+    queued_send: Option<QueuedSend>,
     /// System prompt from config.
     system_prompt: String,
     /// Total context-window token budget (from `[chat] max_context_tokens`).
@@ -356,6 +367,8 @@ impl ChatPanel {
             connecting: false,
             connect_error: None,
             agent: None,
+            capabilities_loading: false,
+            queued_send: None,
             system_prompt,
             max_context_tokens,
             response_reserve,
@@ -518,6 +531,21 @@ impl ChatPanel {
     /// are all available. Enables the agent tool-calling path.
     pub(crate) fn set_agent(&mut self, agent: GraphAgent) {
         self.agent = Some(Arc::new(agent));
+    }
+
+    pub(crate) fn begin_capability_initialization(&mut self) {
+        self.capabilities_loading = true;
+    }
+
+    pub(crate) fn finish_capability_initialization(&mut self, cx: &mut Context<Self>) {
+        self.capabilities_loading = false;
+        let Some(queued) = self.queued_send.take() else {
+            return;
+        };
+        if queued.cancellation.is_cancelled() {
+            return;
+        }
+        self.start_profile_acquisition(queued.text, queued.history, queued.cancellation, cx);
     }
 
     pub(crate) fn set_connecting(&mut self, b: bool) {
@@ -793,6 +821,25 @@ impl ChatPanel {
         self.streaming = true;
         cx.notify();
 
+        if self.capabilities_loading {
+            self.queued_send = Some(QueuedSend {
+                text,
+                history,
+                cancellation,
+            });
+            return;
+        }
+
+        self.start_profile_acquisition(text, history, cancellation, cx);
+    }
+
+    fn start_profile_acquisition(
+        &mut self,
+        text: String,
+        history: Vec<HistoryMessage>,
+        cancellation: CancellationToken,
+        cx: &mut Context<Self>,
+    ) {
         let Some(runtime) = self.runtime.clone() else {
             self.start_send_with_text(text, history, None, cancellation, cx);
             return;
@@ -2572,6 +2619,39 @@ mod tests {
 
         assert!(cx.update(|_window, app| panel.read(app).model_dropdown_open));
         assert!(cx.debug_bounds("model-dropdown").is_some());
+    }
+
+    #[gpui::test]
+    fn send_renders_immediately_while_capabilities_finish_loading(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (panel, cx) = cx.add_window_view(move |_window, cx| {
+            let mut panel = ChatPanel::new(
+                "Test assistant".into(),
+                4096,
+                512,
+                &db_path,
+                runtime,
+                false,
+                cx,
+            );
+            panel.begin_capability_initialization();
+            panel
+        });
+
+        cx.update(|_window, app| {
+            panel.update(app, |panel, cx| {
+                panel.send_with_text("hello".into(), cx);
+                assert!(panel.streaming);
+                assert!(panel.queued_send.is_some());
+                assert_eq!(panel.messages.len(), 2);
+                assert_eq!(panel.messages[0].read(cx).role, ChatMessageRole::User);
+                assert_eq!(panel.messages[1].read(cx).role, ChatMessageRole::Assistant);
+                panel.stop_stream(cx);
+            });
+        });
     }
 
     #[test]

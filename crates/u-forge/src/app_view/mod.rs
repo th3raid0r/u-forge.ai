@@ -2845,6 +2845,9 @@ impl AppView {
                         view.state.embedding_status = Some(format!(
                             "Assistant connected; retrieval AI is unavailable: {error}"
                         ));
+                        view.chat_panel.update(cx, |panel, cx| {
+                            panel.finish_capability_initialization(cx);
+                        });
                         cx.notify();
                     }
                 }
@@ -2927,6 +2930,7 @@ impl AppView {
                     chat.runtime,
                     self.state.app_config.chat.reasoning_control,
                 );
+                panel.begin_capability_initialization();
             });
         } else {
             self.chat_panel.update(cx, |panel, _cx| {
@@ -3088,6 +3092,9 @@ impl AppView {
                 panel.set_connect_failed("No downloaded LLM models available");
             });
         }
+        self.chat_panel.update(cx, |panel, cx| {
+            panel.finish_capability_initialization(cx);
+        });
         if has_embedding {
             self.run_embedding_plan(EmbeddingPlan::embed_all(), cx);
         }
