@@ -11,7 +11,7 @@ High-level architecture, data model, storage schema, inference design, and desig
 | `u-forge-core` | lib | Complete | Storage, AI traits, Lemonade integration, queue, search, schema, ingest |
 | `u-forge-graph-view` | lib | Complete | Graph view model + force-directed layout + R-tree spatial index |
 | `u-forge-ui-traits` | lib | Complete | Framework-agnostic rendering contracts (`DrawCommands`, `Viewport`, `generate_draw_commands`) |
-| `u-forge-ui-gpui` | lib + bin | Alpha | GPUI native desktop app — DM workspace, World Canvas, Details editing, search, chat, and managed setup |
+| `u-forge` | lib + bin | Alpha | Authoritative application package; currently the GPUI native desktop app — DM workspace, World Canvas, Details editing, search, chat, and managed setup |
 | `u-forge-agent` | lib | Complete | Rig-based LLM agent with five graph tools and streaming event loop |
 | `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox — not started |
 
@@ -39,7 +39,8 @@ after storage commits. `subscribe_changes()` drives incremental UI snapshots,
 including agent and import writes. Import node and edge batches are atomic per
 phase.
 
-**Constructor:** `KnowledgeGraph::new(db_path: &Path)` — one argument. Creates `<db_path>/knowledge.db` automatically.
+**Constructor:** `KnowledgeGraph::new(db_path: impl AsRef<Path>)` — one
+path-like argument. Creates `<db_path>/knowledge.db` automatically.
 
 **Bulk access methods** (added for UI performance):
 - `get_all_edges()` — single `SELECT * FROM edges`; use instead of repeated `get_relationships()` when building a snapshot.
@@ -98,7 +99,7 @@ Populated via `upsert_chunk_embedding()`. Not every chunk has an entry immediate
 ```
 rowid INTEGER (maps to chunks.rowid), embedding float[4096] distance_metric=cosine
 ```
-Optional — populated only when a high-quality embedding model (e.g. `Qwen3-Embedding-8B-GGUF`) is available and `embedding.high_quality_embedding: true` in config.
+Optional — populated only when a high-quality embedding model (e.g. `Qwen3-Embedding-8B-GGUF`) is available, `embedding.high_quality_embedding: true` in config, and the corresponding chunk already has a standard embedding. HQ augments the standard retrieval signal; it does not replace the standard lane.
 
 **`node_positions`** — canvas layout positions.
 ```
@@ -130,6 +131,9 @@ Holds `chunks_vec_dims` and `chunks_vec_hq_dims`. `check_or_init_embedding_dims`
 ### Catalog-Driven Selection Flow
 
 ```
+LemonadeManagement::set_max_loaded_models(config.lemonade.max_loaded_models)
+  └─ POST /internal/set     (owned embedded runtime only, idempotent)
+
 LemonadeServerCatalog::discover(connection)
   ├─ GET /v1/models       (required catalog + download status)
   ├─ GET /v1/system-info  (optional installed recipe backends)
@@ -169,7 +173,29 @@ InferenceQueueBuilder::new()
 
 ### InferenceQueue Design
 
-MPMC work queue built from `parking_lot::Mutex<VecDeque<T>> + tokio::sync::Notify` per capability channel — no extra crate dependencies. Generation and generation streaming both use workers; streaming workers remain occupied until completion or receiver cancellation.
+MPMC work queue built from `parking_lot::Mutex<VecDeque<T>> +
+tokio::sync::Notify` per capability channel. Generation and generation
+streaming both use workers; streaming workers remain occupied until completion
+or cancellation.
+
+Every capability has an await-only convenience method plus an explicit
+submission API. `InferenceJob<T>` carries a `CancellationToken` and awaitable
+`JobCompletion<T>`; streaming uses `StreamingInferenceJob<T>` with a receiver
+and termination future. Parent operations clone one token across all child
+jobs. Cancellation is observed while pending, in retry backoff, during model
+activation and provider futures, before the first token, during stream reads,
+and across bounded embedding fan-out.
+
+Terminal results use `InferenceError`: cancelled, superseded, timed out with a
+stable `TimeoutClass`, provider failed, worker dropped, or capability
+unavailable. Cancelled work performs no later graph/vector writes and does not
+train the embedding EWMA.
+
+`QueueStats` combines current per-capability pending counts with race-safe,
+content-free lifecycle counters and bounded queue-wait/service-time summaries.
+Per-job spans record worker choice, steals, retries, cancellation point,
+timeout class, and outcome. Lemonade remains authoritative for server metrics
+through its Prometheus/OTLP surfaces.
 
 **Weighted embedding dispatch** (`src/queue/weighted.rs`):
 - Each worker tracks an EWMA (α=0.5) of job duration in microseconds.
@@ -202,19 +228,36 @@ Implementation: `parking_lot::Mutex<GpuWorkload>` (never held across `.await`) +
 
 ### Hybrid Search (`src/search/`)
 
-`search_hybrid(graph, queue, hq_queue, query, config)` — five-stage pipeline:
+`search_hybrid_response_with_cancellation(graph, queue, hq_queue, query,
+config, token)` is the full response/cancellation boundary:
 
 1. **FTS5** — `graph.search_chunks_fts(fts5_sanitize(query), fts_limit)`. Skipped when `alpha == 1.0`.
-2. **Embed** — `queue.embed(query)`. Skipped when `alpha == 0.0` or no embedding worker.
-3. **Semantic ANN** — `search_chunks_ann` (768-dim) or `search_chunks_ann_hq` (4096-dim when available). Skipped if step 2 was skipped or failed.
-4. **RRF merge** — Reciprocal Rank Fusion (`score = weight / (k + rank)`, k=60). Deduplicates by `chunk_id`, sums contributions from both paths, caps at `config.limit`. Chunks found by both paths naturally outscore single-path results.
-5. **Rerank** — `queue.rerank(query, docs, top_n)` if `config.rerank` and a reranker is registered. Replaces RRF scores with cross-encoder scores.
+2. **Embed** — submit cancellable standard and/or HQ query embeddings. Skipped
+   when `alpha == 0.0` or the compatible lane is unavailable.
+3. **Semantic ANN** — query `chunks_vec` (standard) and `chunks_vec_hq` (HQ)
+   independently. A lane is skipped if embedding was skipped/failed or its
+   provider fingerprint does not match stored vectors.
+4. **RRF merge** — Reciprocal Rank Fusion (`score = weight / (k + rank)`,
+   k=60). Deduplicates by `chunk_id` and sums contributions from all requested
+   paths. Chunks found through multiple paths naturally outscore single-path
+   results.
+5. **Node aggregation** — group chunk scores by parent object and rank the
+   winning node IDs.
+6. **Hydration** — load winning metadata, chunks, edges, and connected-node
+   summaries.
+7. **Rerank** — submit cancellable node documents when requested and a
+   reranker is registered. Successful cross-encoder scores replace RRF order.
 
-Graceful degradation at every stage: missing worker → skip that stage with `info!`; runtime failure → skip that stage with `warn!`. Never returns an error due to a missing AI capability.
+`SearchResponse` carries results plus a `SearchStageOutcome` for FTS, standard
+semantic, HQ semantic, and reranking: applied, intentionally skipped,
+unavailable, or failed with a safe diagnostic. Missing capability and stage
+failure preserve successful fallback results; parent cancellation terminates
+the operation instead of becoming a degraded response. The older
+`search_hybrid` convenience returns results only.
 
 `fts5_sanitize` strips characters illegal in FTS5 query syntax before `MATCH`; the original query is passed verbatim to `embed()` and `rerank()` where punctuation is meaningful. Returns `None` for all-punctuation input (FTS stage cleanly skipped).
 
-The standard and high-quality vector spaces are independently configurable and incompatible — do not mix model families within a lane. Their configured dimensions are recorded in `schema_metadata`; changing either dimension requires rebuilding the database and is rejected at open time (`EmbeddingDimensionMismatch`) rather than silently corrupting the vector index.
+The standard and high-quality vector spaces are independently configured and incompatible — do not mix model families within a lane. The standard lane is the required baseline; the optional HQ lane is populated only after standard coverage is complete. Their configured dimensions are recorded in `schema_metadata`; changing either dimension requires rebuilding the database and is rejected at open time (`EmbeddingDimensionMismatch`) rather than silently corrupting the vector index.
 
 Each lane also records its sorted embedding-provider fingerprint on first use.
 Populated legacy lanes without identity and lanes whose provider set changed
@@ -227,18 +270,25 @@ FTS5 instead of querying incompatible vectors.
 
 `SchemaDefinition` holds named maps of `ObjectTypeSchema` and `EdgeTypeSchema`. `prompt_summary()` generates a compact markdown block (node types with property names/types/required flags + edge types) for system prompt injection.
 
-`SchemaManager` caches schemas in `parking_lot::RwLock<HashMap>`. Validation helpers (`is_valid_object_type`, `all_object_type_names`, etc.) read from the in-memory cache without touching SQLite. `validate_and_coerce_properties` coerces compatible primitive strings in-place and returns `Vec<PropertyIssue>` for type mismatches and invalid enum values. The JSONL import boundary is stricter: it drops undeclared properties and skips records that reference unknown types, omit required properties, or use invalid edge endpoints.
+`SchemaManager` caches schemas in `parking_lot::RwLock<HashMap>`. Validation
+helpers (`is_valid_object_type`, `all_object_type_names`, etc.) read from the
+in-memory cache without touching SQLite. `validate_and_coerce_properties`
+coerces compatible primitive strings in-place and returns `Vec<PropertyIssue>`
+for missing required values, unknown properties, type mismatches, and invalid
+enum values. With persisted schemas, the JSONL import boundary is stricter: it
+drops undeclared properties and skips records that reference unknown types,
+omit required properties, or use invalid edge endpoints.
 
 `KnowledgeGraph::merged_schema_definition()` merges all persisted schemas into
 the structured definition consumed by `GraphAgent`; the legacy
 `schema_prompt_summary_all()` convenience method still returns the complete
 unbounded text summary.
 
-Agent schema injection is request-bounded. `u-forge-agent::budget` selects
-complete object/edge records under `[chat.agent].schema_summary_tokens`, with
-types named in the current request or retained history first, recent tool-result
-types second, and the remainder in stable name order. Omitted records are
-reported explicitly; schema records and JSON are never sliced to fit.
+Agent schema injection uses whatever room remains in the active model context.
+`u-forge-agent::budget` selects complete object/edge records, with types named
+in the current request or retained history first, recent tool-result types
+second, and the remainder in stable name order. Omitted records are reported
+explicitly; schema records and JSON are never sliced to fit.
 
 ---
 
@@ -248,25 +298,49 @@ Tool arguments emitted by the LLM are validated against each tool's JSON Schema 
 
 `SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and derives edge schemas from declared relationship fields, including their allowed target types.
 
-The Rig loop carries a per-request ledger through lifecycle hooks. Every model
-call is checked against the active context window, response reserve, and
-cumulative request budget before dispatch. Validated tool calls use canonical
-name/JSON fingerprints; unchanged results consume a configurable repeat
-allowance while changed arguments/results and successful mutations count as
-progress. Tool results are bounded at semantic record boundaries. Deliberate
-budget and repeat stops are distinct `ChatEvent` outcomes, not provider errors,
-and aggregate token/turn diagnostics are emitted without prompt content.
+The Rig loop carries request state through lifecycle hooks. Before each model
+call, it fits the newest structurally valid history suffix to the configured
+per-load Lemonade `ctx_size`, quietly capped by the model-specific catalog
+`max_context_window`. That catalog value is a capability ceiling, not a second
+application-wide budget. If neither value is available, Lemonade owns automatic
+context resolution and u-forge imposes no finite token ceiling. There is no
+cumulative token ceiling across valid tool turns. When older history is removed,
+the model receives an explicit notice that it is seeing the newest portion of a
+longer conversation. Validated tool calls use canonical name/JSON fingerprints;
+unchanged results consume a configurable repeat allowance while changed
+arguments/results and successful mutations count as progress. Tool results are
+preserved intact; older conversation history yields first when a later model
+turn needs room. Deliberate fit and repeat stops are distinct `ChatEvent`
+outcomes, not provider errors, and aggregate token/turn diagnostics are emitted
+without prompt content.
 
 ---
 
 ## Data Ingestion (`src/ingest/`)
 
-**Strict two-pass JSONL import** (`data.rs`): validate and collect nodes → create accepted objects with a name→ID map → validate and resolve edges → create accepted edges. Existing objects are preloaded for cross-session references. Unknown types, missing required fields, undeclared properties, invalid endpoint pairs, and unresolved endpoints are counted and written to a `.u-forge-import-diagnostics` JSONL sidecar rather than silently widening the graph shape.
+**Schema-aware two-pass JSONL import** (`data.rs`): validate and collect nodes
+→ create accepted objects with candidate indexes → validate and resolve edges
+→ create accepted edges. Existing objects are preloaded for cross-session
+references. With persisted schemas, unknown types, missing required fields,
+undeclared properties, invalid endpoint pairs, and unresolved endpoints are
+counted and written to a `.u-forge-import-diagnostics` JSONL sidecar rather
+than silently widening the loaded schema.
+
+The low-level `DataIngestion` type also retains a schema-less compatibility
+mode for empty graphs, mapping known node kinds through `ObjectBuilder` and
+accepting open properties. The desktop UI disables data import until a
+non-default schema is persisted; strict core callers have the same precondition.
 
 **Three ingestion entry points:**
 - `setup_and_index(graph, schema_dir, data_file)` — loads schemas AND imports data. Used for a full fresh setup only.
 - `import_data_only(graph, data_file)` — strict data import against schemas already loaded in the graph, with **no schema side-effects**.
-- `import_schemas_and_data(graph, schema_files, data_files)` — explicit schema import followed by strict data import; used by the UI's combined import workflow.
+- `import_schemas_and_data(graph, schema_files, data_files)` — library helper
+  for explicit schema import followed by strict data import. The current UI
+  presents schema and data import as separate actions.
+
+Each entry point has a `_with_cancellation` counterpart. Import indexing shares
+one parent token with its embedding children and checks it before graph/vector
+writes.
 
 **Separate clear operations on `KnowledgeGraph`:**
 - `clear_data()` — deletes nodes/edges/chunks/vectors; schemas intact. Used by "Clear Data".
@@ -275,11 +349,18 @@ and aggregate token/turn diagnostics are emitted without prompt content.
 
 **Per-node re-chunking** (`embedding.rs`): `rechunk_and_embed(graph, queue, hq_queue, object_id)` — delete old chunks (cascades FTS5 + vector indexes) → flatten via `flatten_for_embedding()` → create new chunks → embed standard (768-dim) → embed HQ (4096-dim) if `hq_queue` provided. Blocks until all embeddings are stored. Write tools and UI save both call this to guarantee immediate searchability after the call returns.
 
-`EmbeddingPlan` is the declarative UI entry point: `EmbeddingPlan::rechunk(ids)` for per-node re-chunk + embed, `EmbeddingPlan::embed_all()` for bulk unembedded sweep. `AppView::run_embedding_plan(plan, cx)` is the single UI call site — owns status formatting, epoch-based poller cancellation, and the background tokio task. The spawned future is attached to an `info_span!("embedding_plan", plan_kind)` before detaching; `do_init_lemonade` uses the same `.instrument(info_span!(...))` pattern.
+`EmbeddingPlan` is the declarative UI entry point:
+`EmbeddingPlan::rechunk(ids)` performs per-node re-chunk + embed and
+`EmbeddingPlan::embed_all()` performs the bulk missing-embedding sweep.
+`AppView::run_embedding_plan(plan, cx)` owns status formatting, the GPUI task,
+one parent cancellation token, and stale-presentation guards. Superseded work
+is cancelled through the token and observed through termination; child
+embedding jobs and pre-write checks share that token. The spawned future is
+instrumented with `info_span!("embedding_plan", plan_kind)`.
 
 ---
 
-## Desktop Workspace (`u-forge-ui-gpui`)
+## Desktop Workspace (`u-forge`)
 
 `AppView` composes a permanent World Canvas with four behavioral dock panels:
 World and Search on the left, Assistant on the right, and Details at the
@@ -297,10 +378,10 @@ context actions, enabled state, and status toggles.
 
 The permanent World Canvas currently hosts Connections. `GraphCanvas` retains
 the force-directed layout, culling, local-coordinate paint path, spatial index,
-selection, saved node positions, and Fit Connections behavior without making
-Connections the only possible future center item.
+selection, saved node positions, and Fit Connections behavior behind a center
+item boundary that does not encode Connections as the only valid item type.
 
-## Chat UI Component Model (`u-forge-ui-gpui`)
+## Chat UI Component Model (`u-forge`)
 
 ### Component hierarchy
 
@@ -308,7 +389,8 @@ Connections the only possible future center item.
 AppView
   └─ ChatPanel  (Entity<ChatPanel>)
        ├─ messages: Vec<Entity<ChatMessageView>>
-       ├─ stream_task: Option<gpui::Task<()>>   — stored (not detached) for cancellation
+       ├─ stream_task: Option<gpui::Task<()>>   — stored UI owner
+       ├─ stream_cancellation: Option<CancellationToken> — backend parent token
        ├─ connecting: bool                       — true while do_init_lemonade is in-flight
        └─ list_state: ListState                 — virtualized list; reset() on any structural change
             └─ item builder closure (render-site action bar)
@@ -318,7 +400,12 @@ AppView
 
 ### Key design rules
 
-**`stream_task` must be stored, never detached.** Dropping the `Task<()>` cancels the outer GPUI spawn, which drops the `mpsc::Receiver`, causing `tx.send().await` inside `prompt_stream` to return `Err` and break the stream loop. `finalize_stream` sets it back to `None`. This is the Stop button's cancellation mechanism.
+**Chat owns both UI and inference lifetime.** `stream_task` is stored rather
+than detached, and `stream_cancellation` parents the direct or Rig stream plus
+its model activation, graph tools, search, and queue jobs. Stop/close cancels
+the token; replacing work supersedes it. Receiver drop remains a defensive
+fallback. Generation checks reject stale UI events while termination is still
+observed so runtime/device guards are known to be released.
 
 **Action bar lives in the list item builder, not in `ChatMessageView`.** The ⟳ retry, × delete, and ⎘ copy buttons are rendered by the closure in `chat_panel.rs` that builds each list item — not inside `ChatMessageView::render`. This eliminates per-message `gpui::Subscription` vectors. See `.rulesdir/gpui-patterns.mdc` — "Render-site action bar pattern".
 
@@ -367,6 +454,23 @@ keeping low-level model and queue controls behind advanced disclosure.
 
 ---
 
+## Window Decoration Boundary
+
+Linux windows request client-side decorations at creation, then
+`DecorationMode::negotiated(Window::window_decorations())` follows GPUI's
+reported result. Client mode composes `ClientWindowFrame` and
+`WindowTitleBar`; server mode renders the existing workspace root directly.
+No desktop-name environment variable participates in the decision.
+
+`window_chrome.rs` owns compositor-capability filtering, minimize/
+maximize/restore/close actions, title-bar move/double-click/native menu,
+interface-scaled metrics, and tiling-aware free edge/corner resize geometry.
+Fullscreen suppresses client chrome. The `[ui].window_controls_left` setting is
+persisted through Settings. Supported-session validation covers GNOME Wayland
+and server-decorated Linux; GNOME X11 is unsupported.
+
+---
+
 ## Current Design Boundaries
 
 - **Chat uses two intentional adapters** — direct chat uses hand-crafted HTTP
@@ -379,25 +483,29 @@ keeping low-level model and queue controls behind advanced disclosure.
   identity. A runtime execution lease covers live comparison, any required
   load/reload, and the complete direct stream or Rig tool loop. Request-scoped
   reasoning remains the default; the reload strategy is an explicit fallback.
-- **`properties` as JSON text** — stored as an opaque string. Filtering inside the blob requires deserializing at the Rust layer, or using `json_set`/`json_extract` for targeted mutations. Acceptable for now; revisit if query patterns demand indexed property access.
+- **`properties` as JSON text** — stored as an opaque string. Filtering inside
+  the blob requires deserializing at the Rust layer or using
+  `json_set`/`json_extract`; there is no general typed/indexed-property layer.
 - **Schema naming `add_npc` vs `npc`** — `.schema.json` files are named after MCP tool actions. `SchemaIngestion` strips the `add_` prefix, but the file names leak an external convention.
 - **`embedding_manager` not in `KnowledgeGraph`** — embedding is now a caller concern. Simplifies the core struct but means callers must manage the embedding lifecycle separately from storage.
 - **Panel behavior is GPUI-local** — `DockState` and GPUI panel contracts own
   placement, resizing, activation, and focus. `u-forge-ui-traits` remains
   limited to framework-agnostic graph drawing contracts.
-- **Queue cancellation is not yet a job contract** — GPUI task ownership and
-  dropped streaming receivers stop UI work cooperatively, but pending/retrying
-  inference jobs do not yet expose parent cancellation tokens or explicit
-  cancellation outcomes.
-- **Agent context has fixed ceilings but no cumulative request ledger** — chat
-  history windowing, tool JSON-schema validation, and a max-turn limit exist;
-  schema-summary, cumulative token/tool-output, and repeat-call budgets do not.
-- **Linux client decorations are not drawn by the app** — server-decorated
-  sessions are usable, but compositors such as GNOME Wayland can negotiate
-  client-side decorations that the current root view does not render.
+- **Inference lifetime is explicit** — queue submissions return typed job
+  handles, and multi-step operations share a parent token. UI task ownership
+  prevents stale presentation; the inference token stops pending and active
+  backend work. Dropped receivers remain fallback cleanup only.
+- **Agent requests are fitted per turn** — model-aware limits bound whole-record
+  schema summaries, retained history, individual tool results, and unchanged
+  tool repeats while preserving the independent max-turn ceiling.
+- **Linux decorations are negotiated** — the app requests client decorations
+  on Linux and renders title bar/frame/resize geometry only when GPUI reports
+  client-side mode. Server-decorated geometry remains unchanged; GNOME X11 is
+  outside the supported configuration set.
 - **The TypeScript runtime is a stub** — `u-forge-ts-runtime` has no V8 or
   `deno_core` implementation and participates in the workspace only as a
-  placeholder crate.
+  placeholder crate. Its approved-design gate is
+  `.plans/feature_TS-Agent-Sandbox.md`.
 
 ---
 
@@ -408,11 +516,11 @@ keeping low-level model and queue controls behind advanced disclosure.
 | `rusqlite` | 0.40.1 | SQLite storage (`bundled` + `vtab` features) |
 | `sqlite-vec` | 0.1.9 | ANN vector search via `vec0` virtual table |
 | `tokio` | 1.53.1 | Async runtime |
+| `tokio-util` | 0.7.18 | Cancellation token primitive used by queue lifecycle wrappers |
 | `serde` / `serde_json` | 1.0.229 / 1.0.151 | Serialization (all layers) |
 | `reqwest` | 0.13.4 | HTTP client — all Lemonade endpoints |
 | `async-openai` | 0.41.3 | OpenAI-compatible embedding, TTS, and STT client |
 | `parking_lot` | 0.12.5 | Non-async mutex (storage, queue, GPU manager) |
-| `dashmap` | 6.2.1 | Concurrent maps (SchemaManager) |
 | `uuid` | 1.24.0 | ID generation |
 | `anyhow` / `thiserror` | 1.0.104 / 2.0.19 | Error handling |
 | `async-trait` | 0.1.91 | Trait-object async methods |
@@ -447,37 +555,28 @@ separately.
 GPUI) introduced the same `VecDeque` plan cache. GPUI CE 0.3.3 still depends on
 the 0.14 line, so the local backport remains active.
 
-**Maintenance — how to check for an upstream fix:**
-
-1. Check whether a new `gpui-ce` version has been published to crates.io:
-   ```sh
-   cargo search gpui-ce
-   ```
-   Inspect its `Cargo.toml` for the `cosmic-text` version. If it depends on
-   `cosmic-text >= 0.17`, the local cache backport is no longer needed.
-
-2. Alternatively, check the `cosmic-text` version pulled in by `gpui`:
-   ```sh
-   cargo tree -p gpui-ce --depth 1 | rg cosmic
-   ```
-   If the resolved version is `>= 0.17`, the upstream fix is present and the patch can be dropped.
-
-**Maintenance — how to remove the patch once upstream is fixed:**
-
-1. Delete the vendored `crates/cosmic-text-patched/` crate.
-2. Remove the `[patch.crates-io]` block and its comment from `Cargo.toml`.
-3. Remove its workspace `exclude` entry and the standalone Makefile
-   formatting/test commands.
-4. Run the canonical build and test targets, then profile a chat scroll under
-   `samply` to confirm the `find_language_feature` hotspot is gone.
+The removal criteria and profiling procedure live in
+`.rulesdir/gpui-patterns.mdc` beside the rendering rules that depend on the
+patch.
 
 ---
 
 ## Build Requirements
 
-Standard Rust stable toolchain + a C compiler (`gcc`, `clang`, or MSVC) for bundled SQLite compilation. No system SQLite, no ONNX Runtime, no RocksDB. `source env.sh` is not required.
+Standard Rust stable toolchain + a C compiler (`gcc`, `clang`, or MSVC) for
+bundled SQLite compilation. No system SQLite, ONNX Runtime, or RocksDB is
+required.
 
-`cargo run -p u-forge-ui-gpui` works with zero environment variables set. On Ubuntu x64, the UI crate's build step downloads the checksum-pinned Embeddable Lemonade artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, and places `lemonade/lemond` beside the application executable. With no `LEMONADE_URL`, the application launches that private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
+`cargo run -p u-forge` works with zero environment variables set. On x86_64 Linux with GNU libc, the application package's build step downloads the checksum-pinned upstream Ubuntu x64 Embeddable Lemonade artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, and places `lemonade/lemond` beside the application executable. `make release` produces the Ubuntu 26.04-baseline x86_64 AppImage containing that runtime and the packaged defaults tree. With no `LEMONADE_URL`, the application launches its private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
+
+Application-owned persistent state follows the XDG base-directory contract.
+The only desktop configuration is
+`${XDG_CONFIG_HOME:-~/.config}/u-forge/u-forge.toml`; the database and editable
+seeded defaults live under `${XDG_DATA_HOME:-~/.local/share}/u-forge`. The
+packaged config template is transformed to those absolute data paths on first
+launch. Schemas and example data are seeded once behind a revision marker, so
+subsequent launches never overwrite or restore user-managed copies. The current
+working directory is not a configuration source.
 
 Mutable embedded state follows the XDG cache contract at
 `${XDG_CACHE_HOME:-~/.cache}/u-forge/lemonade`. Models, backend executables,
@@ -485,9 +584,15 @@ and generated Lemonade configuration share that application-scoped cache;
 model resolution does not use the global Hugging Face cache. Older u-forge
 cache entries under XDG data storage or a build profile's `lemonade/models`
 directory are moved into this location on the next owned launch.
+Before discovery or model activation, u-forge reconciles the owned runtime's
+per-model-type `max_loaded_models` value with `[lemonade].max_loaded_models`
+(default `1`) through Lemonade's atomic runtime configuration API. External
+servers remain operator-owned and are not mutated by this setting.
 
-The canonical `make test` target prebuilds against that same pinned artifact,
-launches one owned instance for all test binaries, and exports its private
-connection rather than probing or adopting an external server. Shutdown first
-unloads models and requests `lemond` exit, then terminates the private Unix
-process group so backend grandchildren cannot survive the suite.
+Owned shutdown first unloads models and requests `lemond` exit, then terminates
+the private Unix process group so backend grandchildren cannot survive. The
+desktop root invokes that path both on application quit and as an idempotent
+entity-drop fallback when the last window closes. The canonical `make test`
+target prebuilds against the same pinned artifact, launches one owned instance
+for all test binaries, exports its private connection rather than probing or
+adopting an external server, and invokes the same awaited shutdown path.

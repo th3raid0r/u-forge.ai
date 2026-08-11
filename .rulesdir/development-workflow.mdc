@@ -8,32 +8,32 @@ description: Development workflow and setup guide
 
 ```bash
 make build                                                     # Build all crates
+make release                                                   # Build the distributable app and embedded runtime
 make test                                                      # Run all tests with one pinned embedded server
-cargo run -p u-forge-ui-gpui                                   # Run the desktop app
+cargo run -p u-forge                                           # Run the desktop app
 ```
 
-> **No `source env.sh` required.** Bundled SQLite compiles with any standard C
-> compiler on PATH. Lemonade Server on `localhost:13305` is auto-discovered.
-> See [environment-config.mdc](mdc:.rulesdir/environment-config.mdc) for env
-> vars and server setup.
+Bundled SQLite compiles with a standard C compiler on `PATH`. Environment
+variables are optional overrides; see
+[environment-config.mdc](mdc:.rulesdir/environment-config.mdc).
 
 ---
 
 ## First Time Setup
 
-1. Install Rust stable ([rustup.rs](https://rustup.rs)) and a C compiler
-   (`gcc`, `clang`, or MSVC) — needed for `openssl-sys` (reqwest TLS).
-2. `make build` — the first Ubuntu x64 build also downloads the pinned
-   Embeddable Lemonade artifact. Set `UFORGE_SKIP_EMBEDDED_LEMONADE=1` to skip
-   automatic provisioning; without an existing artifact the app stays
-   graph-only.
+1. Install Rust stable ([rustup.rs](https://rustup.rs)), a C compiler (`gcc`,
+   `clang`, or MSVC), and the platform GPUI libraries listed in `README.md`.
+2. `make build` — the first x86_64 Linux GNU build also downloads the pinned
+   upstream Ubuntu x64 Embeddable Lemonade artifact. Set
+   `UFORGE_SKIP_EMBEDDED_LEMONADE=1` to skip automatic provisioning; without an
+   existing artifact the app stays graph-only.
 3. Optionally install a standalone
    [Lemonade Server](https://github.com/lemonade-sdk/lemonade) when developing
    against an externally managed service.
 4. `make test` — provisions and owns one checksum-pinned embedded server for
    the complete suite, then tears down its process tree. No external server or
    environment configuration is required.
-5. `cargo run -p u-forge-ui-gpui` — launch the desktop app.
+5. `cargo run -p u-forge` — launch the desktop app.
 
 ---
 
@@ -75,8 +75,11 @@ schema, inference design, design decisions.
 ## Adding a new schema type
 
 1. Create `{type}.schema.json` in `defaults/schemas/`.
-2. Restart — schemas are auto-loaded by
-   `SchemaIngestion::load_schemas_from_directory`.
+2. Import that schema explicitly through **File → Import Schema…**, or call
+   `SchemaIngestion::load_schemas_from_directory` and persist the returned
+   `SchemaDefinition` with `SchemaManager::save_schema`.
+3. Import data only after the schema is persisted; import never infers a type
+   or widens the accepted fields from observed JSONL.
 
 ## Working with SQLite storage
 
@@ -109,9 +112,9 @@ control variable.
 
 ```bash
 make fmt-check
+make check
 make clippy
 make test-ci
-cargo doc --no-deps --workspace
 ```
 
 CI exports `UFORGE_SKIP_EMBEDDED_LEMONADE=1` for every Cargo step and uses
@@ -124,7 +127,6 @@ verification continues to use `make test` with the owned embedded runtime.
 
 | Problem | Fix |
 |---|---|
-| `openssl-sys` build error | `apt install pkg-config libssl-dev` (Ubuntu) / `brew install openssl` (macOS) |
 | Tests fail after adding SQLite column | Run against a fresh `TempDir` — tests never share state |
 | `database is locked` | Only one writer at a time; check for stale processes |
 

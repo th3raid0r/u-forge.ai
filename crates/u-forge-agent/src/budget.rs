@@ -10,7 +10,7 @@ use rig::agent::{
     RequestPatch, StepEventKind, StreamResponseFinish, ToolCall, ToolCallAction, ToolResultAction,
     ToolResultEvent,
 };
-use rig::completion::message::Message;
+use rig::completion::message::{AssistantContent, Message, UserContent};
 use tiktoken_rs::CoreBPE;
 use u_forge_core::lemonade::AgentBudgetDiagnostics;
 use u_forge_core::{EffectiveAgentBudget, SchemaDefinition};
@@ -20,8 +20,7 @@ use crate::{HistoryMessage, tool_validation};
 const TOKENS_PER_MESSAGE: usize = 4;
 const REPLY_PRIMING_TOKENS: usize = 3;
 const REQUEST_ENVELOPE_TOKENS: usize = 32;
-const MIN_TOOL_RESULT_TOKENS: usize = 16;
-const MAX_RECENT_TOOL_RESULTS: usize = 4;
+const HISTORY_OMISSION_NOTICE: &str = "[Conversation context: earlier messages were omitted because this request reached the active model's context window. Treat the visible messages as the most recent portion of a longer conversation.]";
 
 static O200K_BPE: LazyLock<Result<CoreBPE, String>> = LazyLock::new(|| {
     tiktoken_rs::o200k_harmony().map_err(|error| format!("o200k tokenizer unavailable: {error}"))
@@ -296,7 +295,6 @@ pub(crate) fn select_history_window(
     current_message: &str,
     tool_definition_tokens: usize,
     context_tokens: usize,
-    response_reserve_tokens: usize,
 ) -> Vec<HistoryMessage> {
     let current_message = serialize_message(&Message::user(current_message));
     let fixed = count_tokens(preamble)
@@ -305,26 +303,54 @@ pub(crate) fn select_history_window(
         .saturating_add(TOKENS_PER_MESSAGE * 2)
         .saturating_add(REPLY_PRIMING_TOKENS)
         .saturating_add(REQUEST_ENVELOPE_TOKENS);
-    let available = context_tokens
-        .saturating_sub(response_reserve_tokens)
-        .saturating_sub(fixed);
-    let mut selected = Vec::new();
-    let mut used = 0usize;
-    for message in history.iter().rev() {
-        let rig_message = if message.role == "assistant" {
-            Message::assistant(&message.content)
-        } else {
-            Message::user(&message.content)
-        };
-        let cost =
-            count_tokens(&serialize_message(&rig_message)).saturating_add(TOKENS_PER_MESSAGE);
-        if used.saturating_add(cost) > available {
-            break;
+    let available = context_tokens.saturating_sub(fixed);
+    let select = |budget: usize| {
+        let mut selected = Vec::new();
+        let mut used = 0usize;
+        for message in history.iter().rev() {
+            let rig_message = match message.role.as_str() {
+                "assistant" => Message::assistant(&message.content),
+                "system" => Message::system(&message.content),
+                _ => Message::user(&message.content),
+            };
+            let cost =
+                count_tokens(&serialize_message(&rig_message)).saturating_add(TOKENS_PER_MESSAGE);
+            if used.saturating_add(cost) > budget {
+                break;
+            }
+            used += cost;
+            selected.push(message.clone());
         }
-        used += cost;
-        selected.push(message.clone());
+        selected.reverse();
+        while selected
+            .first()
+            .is_some_and(|message| message.role == "assistant")
+        {
+            selected.remove(0);
+        }
+        selected
+    };
+
+    let selected = select(available);
+    if selected.len() == history.len() {
+        return selected;
     }
-    selected.reverse();
+
+    let notice_cost = count_tokens(&serialize_message(&Message::system(
+        HISTORY_OMISSION_NOTICE,
+    )))
+    .saturating_add(TOKENS_PER_MESSAGE);
+    if notice_cost > available {
+        return Vec::new();
+    }
+    let mut selected = select(available - notice_cost);
+    selected.insert(
+        0,
+        HistoryMessage {
+            role: "system".into(),
+            content: HISTORY_OMISSION_NOTICE.into(),
+        },
+    );
     selected
 }
 
@@ -377,39 +403,23 @@ fn admit_completion(
     request_tokens: usize,
     turn: usize,
 ) -> Result<(), String> {
-    let reserve = state.limits.response_reserve_tokens;
-    if request_tokens.saturating_add(reserve) > state.limits.context_tokens {
+    if request_tokens > state.limits.context_tokens {
         return Err(format!(
-            "Agent stopped before model call {turn}: the estimated request ({request_tokens} input + \
-             {reserve} reserved response tokens) exceeds the {}-token context window. \
-             Shorten the request/history or reduce schema and response budgets.",
+            "Agent stopped before model call {turn}: the estimated {request_tokens}-token input \
+             exceeds the active model's {}-token context window even after older history was \
+             removed.",
             state.limits.context_tokens
-        ));
-    }
-    let projected = state
-        .diagnostics
-        .request_tokens
-        .saturating_add(state.diagnostics.reserved_response_tokens)
-        .saturating_add(request_tokens)
-        .saturating_add(reserve);
-    if projected > state.limits.cumulative_request_tokens {
-        return Err(format!(
-            "Agent stopped before model call {turn}: the cumulative request budget would exceed \
-             {} tokens. Continue in a new message to resume with a fresh budget.",
-            state.limits.cumulative_request_tokens
         ));
     }
     state.diagnostics.model_calls += 1;
     state.diagnostics.request_tokens += request_tokens;
-    state.diagnostics.reserved_response_tokens += reserve;
     Ok(())
 }
 
 impl BudgetController {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        mut limits: EffectiveAgentBudget,
-        response_reserve_tokens: usize,
+        limits: EffectiveAgentBudget,
         schema: Option<SchemaDefinition>,
         base_prompt: String,
         tool_guidance: String,
@@ -417,9 +427,6 @@ impl BudgetController {
         retained_history: String,
         tool_definition_tokens: TokenEstimate,
     ) -> Self {
-        limits.response_reserve_tokens = limits
-            .response_reserve_tokens
-            .min(response_reserve_tokens.max(1));
         let diagnostics = AgentBudgetDiagnostics {
             estimation_fallback: tool_definition_tokens.used_fallback,
             ..AgentBudgetDiagnostics::default()
@@ -450,8 +457,16 @@ impl BudgetController {
     }
 
     fn preamble(&self, recent_tool_results: &str) -> String {
+        let budget = self.lock().limits.context_tokens;
+        self.preamble_with_schema_budget(recent_tool_results, budget)
+    }
+
+    fn preamble_with_schema_budget(
+        &self,
+        recent_tool_results: &str,
+        schema_budget: usize,
+    ) -> String {
         let schema = self.schema.as_ref().map_or_else(String::new, |schema| {
-            let budget = self.lock().limits.schema_summary_tokens;
             bounded_schema_summary(
                 schema,
                 SchemaPriorityContext {
@@ -459,7 +474,7 @@ impl BudgetController {
                     retained_history: &self.retained_history,
                     recent_tool_results,
                 },
-                budget,
+                schema_budget,
             )
             .text
         });
@@ -483,6 +498,110 @@ impl BudgetController {
 
 fn serialize_message(message: &Message) -> String {
     serde_json::to_string(message).unwrap_or_else(|_| format!("{message:?}"))
+}
+
+fn request_tokens(
+    preamble: &str,
+    prompt: &Message,
+    history: &[Message],
+    tool_definition_tokens: usize,
+) -> TokenEstimate {
+    let mut tokens = tool_definition_tokens;
+    let mut fallback = false;
+    add_estimate(&mut tokens, &mut fallback, preamble);
+    add_estimate(&mut tokens, &mut fallback, &serialize_message(prompt));
+    for message in history {
+        add_estimate(&mut tokens, &mut fallback, &serialize_message(message));
+        tokens = tokens.saturating_add(TOKENS_PER_MESSAGE);
+    }
+    tokens = tokens
+        .saturating_add(TOKENS_PER_MESSAGE)
+        .saturating_add(REPLY_PRIMING_TOKENS)
+        .saturating_add(REQUEST_ENVELOPE_TOKENS);
+    TokenEstimate {
+        tokens,
+        used_fallback: fallback,
+    }
+}
+
+fn is_leading_orphan(message: &Message) -> bool {
+    match message {
+        Message::Assistant { .. } => true,
+        Message::User { content } => content
+            .iter()
+            .all(|item| matches!(item, UserContent::ToolResult(_))),
+        Message::System { .. } => false,
+    }
+}
+
+/// Locate the assistant tool-call message required to interpret a tool-result
+/// prompt. Rig moves the newly committed tool result into `prompt` and leaves
+/// its matching call in `history` for the following model turn.
+fn required_tool_call_history_start(prompt: &Message, history: &[Message]) -> Option<usize> {
+    let Message::User { content } = prompt else {
+        return None;
+    };
+    let result_ids = content
+        .iter()
+        .filter_map(|item| match item {
+            UserContent::ToolResult(result) => Some(result.id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if result_ids.is_empty() {
+        return None;
+    }
+
+    history.iter().rposition(|message| {
+        let Message::Assistant { content, .. } = message else {
+            return false;
+        };
+        result_ids.iter().all(|result_id| {
+            content.iter().any(
+                |item| matches!(item, AssistantContent::ToolCall(call) if call.id == *result_id),
+            )
+        })
+    })
+}
+
+/// Retain the newest valid history suffix that fits one model request.
+///
+/// Removing leading assistant/tool-result messages avoids splitting a tool
+/// interaction when an older prefix is discarded. When the current prompt is
+/// itself a tool result, its matching assistant tool call is the oldest message
+/// that must remain to preserve the provider-visible transaction.
+fn fit_history(
+    preamble: &str,
+    prompt: &Message,
+    history: &[Message],
+    tool_definition_tokens: usize,
+    context_tokens: usize,
+) -> (Vec<Message>, TokenEstimate, bool) {
+    let required_start = required_tool_call_history_start(prompt, history);
+    let mut start = 0;
+    loop {
+        while start < history.len()
+            && Some(start) != required_start
+            && is_leading_orphan(&history[start])
+        {
+            start += 1;
+        }
+        let fitted = &history[start..];
+        let history_was_omitted = start > 0;
+        let effective_preamble = if history_was_omitted {
+            format!("{preamble}\n\n{HISTORY_OMISSION_NOTICE}")
+        } else {
+            preamble.to_string()
+        };
+        let estimate = request_tokens(&effective_preamble, prompt, fitted, tool_definition_tokens);
+        if estimate.tokens <= context_tokens
+            || fitted.is_empty()
+            || required_start.is_some_and(|required| start >= required)
+        {
+            return (fitted.to_vec(), estimate, history_was_omitted);
+        }
+        start += 1;
+    }
 }
 
 fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
@@ -572,54 +691,6 @@ fn record_fingerprint_result(
         && tracked.unchanged_repeats >= repeated_call_limit
 }
 
-fn bounded_tool_output(tool_name: &str, text: &str, budget: usize) -> Option<String> {
-    if count_tokens(text) <= budget {
-        return Some(text.to_string());
-    }
-
-    let records = text
-        .split("\n\n")
-        .filter(|record| !record.trim().is_empty())
-        .collect::<Vec<_>>();
-    if tool_name.starts_with("search_") && records.len() > 1 {
-        let result_count = records.len() - 1;
-        let mut kept = Vec::new();
-        for record in &records {
-            let omitted = records.len() - kept.len() - 1;
-            let notice = format!(
-                "\n\n[Tool output truncated at record boundaries: omitted {omitted} record(s) \
-                 of {result_count}. Refine the query or request continuation using the returned IDs.]"
-            );
-            let mut trial = kept.join("\n\n");
-            if !trial.is_empty() {
-                trial.push_str("\n\n");
-            }
-            trial.push_str(record);
-            if omitted > 0 {
-                trial.push_str(&notice);
-            }
-            if count_tokens(&trial) <= budget {
-                kept.push(*record);
-            }
-        }
-        let omitted = records.len().saturating_sub(kept.len());
-        let mut output = kept.join("\n\n");
-        if omitted > 0 {
-            output.push_str(&format!(
-                "\n\n[Tool output truncated at record boundaries: omitted {omitted} record(s) \
-                 of {result_count}. Refine the query or request continuation using the returned IDs.]"
-            ));
-        }
-        if !output.is_empty() && count_tokens(&output) <= budget {
-            return Some(output);
-        }
-    }
-
-    let notice = "[Tool output omitted because its complete record exceeds the remaining output \
-                  budget. Narrow the query or request fewer records, then continue.]";
-    (count_tokens(notice) <= budget).then(|| notice.to_string())
-}
-
 impl AgentHook for BudgetController {
     async fn on_completion_call(
         &self,
@@ -642,40 +713,44 @@ impl AgentHook for BudgetController {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let preamble = self.preamble(&recent);
-        let mut request_tokens = self.tool_definition_tokens;
-        let mut fallback = false;
-        add_estimate(&mut request_tokens, &mut fallback, &preamble);
-        add_estimate(
-            &mut request_tokens,
-            &mut fallback,
-            &serialize_message(event.prompt),
+        let context_tokens = self.lock().limits.context_tokens;
+        let base_preamble = self.preamble_with_schema_budget(&recent, 0);
+        let (base_history, base, base_history_was_omitted) = fit_history(
+            &base_preamble,
+            event.prompt,
+            event.history,
+            self.tool_definition_tokens,
+            context_tokens,
         );
-        for message in event.history {
-            add_estimate(
-                &mut request_tokens,
-                &mut fallback,
-                &serialize_message(message),
-            );
-            request_tokens = request_tokens.saturating_add(TOKENS_PER_MESSAGE);
+        let available_schema = context_tokens.saturating_sub(base.tokens);
+        let mut preamble = self.preamble_with_schema_budget(&recent, available_schema);
+        if base_history_was_omitted {
+            preamble.push_str("\n\n");
+            preamble.push_str(HISTORY_OMISSION_NOTICE);
         }
-        request_tokens = request_tokens
-            .saturating_add(TOKENS_PER_MESSAGE)
-            .saturating_add(REPLY_PRIMING_TOKENS)
-            .saturating_add(REQUEST_ENVELOPE_TOKENS);
+        let (history, estimate, additional_history_was_omitted) = fit_history(
+            &preamble,
+            event.prompt,
+            &base_history,
+            self.tool_definition_tokens,
+            context_tokens,
+        );
+        if additional_history_was_omitted && !base_history_was_omitted {
+            preamble.push_str("\n\n");
+            preamble.push_str(HISTORY_OMISSION_NOTICE);
+        }
 
         let mut state = self.lock();
-        state.diagnostics.estimation_fallback |= fallback;
-        let reserve = state.limits.response_reserve_tokens;
-        if let Err(reason) = admit_completion(&mut state, request_tokens, event.turn) {
+        state.diagnostics.estimation_fallback |= base.used_fallback || estimate.used_fallback;
+        if let Err(reason) = admit_completion(&mut state, estimate.tokens, event.turn) {
             Self::set_termination(&mut state, BudgetTermination::Budget(reason.clone()));
             return CompletionCallAction::stop(reason);
         }
-        CompletionCallAction::patch(
-            RequestPatch::new()
-                .preamble(preamble)
-                .max_tokens(reserve.min(u64::MAX as usize) as u64),
-        )
+        let mut patch = RequestPatch::new().preamble(preamble);
+        if history.len() != event.history.len() {
+            patch = patch.history(history);
+        }
+        CompletionCallAction::patch(patch)
     }
 
     async fn on_tool_call(&self, _context: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
@@ -686,18 +761,6 @@ impl AgentHook for BudgetController {
             .tool_argument_tokens
             .saturating_add(estimate.tokens);
         state.diagnostics.estimation_fallback |= estimate.used_fallback;
-
-        let remaining_output = state
-            .limits
-            .cumulative_tool_output_tokens
-            .saturating_sub(state.diagnostics.tool_output_tokens);
-        if remaining_output < MIN_TOOL_RESULT_TOKENS {
-            let reason = "Agent stopped before executing a tool because no useful tool-result \
-                          budget remains. Continue in a new message to resume."
-                .to_string();
-            Self::set_termination(&mut state, BudgetTermination::Budget(reason.clone()));
-            return ToolCallAction::stop(reason);
-        }
 
         let Some(call_fingerprint) = fingerprint(event.tool_name, event.args) else {
             return ToolCallAction::run();
@@ -751,35 +814,14 @@ impl AgentHook for BudgetController {
             Self::set_termination(&mut state, BudgetTermination::Repeat(reason));
         }
 
-        let remaining = state
-            .limits
-            .cumulative_tool_output_tokens
-            .saturating_sub(state.diagnostics.tool_output_tokens);
-        let Some(output) = bounded_tool_output(event.tool_name, &raw_text, remaining) else {
-            let reason = format!(
-                "Agent stopped after `{}` because its complete result cannot fit the remaining \
-                 tool-output budget. Narrow the request and continue in a new message.",
-                event.tool_name
-            );
-            Self::set_termination(&mut state, BudgetTermination::Budget(reason.clone()));
-            return ToolResultAction::stop(reason);
-        };
-        let estimate = estimate_tokens(&output);
+        let estimate = estimate_tokens(&raw_text);
         state.diagnostics.tool_output_tokens = state
             .diagnostics
             .tool_output_tokens
             .saturating_add(estimate.tokens);
         state.diagnostics.estimation_fallback |= estimate.used_fallback;
-        state.recent_tool_results.push_back(output.clone());
-        if state.recent_tool_results.len() > MAX_RECENT_TOOL_RESULTS {
-            state.recent_tool_results.pop_front();
-        }
-
-        if output == raw_text {
-            ToolResultAction::keep()
-        } else {
-            ToolResultAction::rewrite(output)
-        }
+        state.recent_tool_results.push_back(raw_text);
+        ToolResultAction::keep()
     }
 
     async fn on_stream_response_finish(
@@ -813,6 +855,9 @@ impl AgentHook for BudgetController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig::OneOrMany;
+    use rig::completion::message::{ToolCall as MessageToolCall, ToolFunction};
+    use serde_json::json;
     use u_forge_core::{EdgeTypeSchema, ObjectTypeSchema, PropertySchema};
 
     fn schema() -> SchemaDefinition {
@@ -912,18 +957,6 @@ mod tests {
     }
 
     #[test]
-    fn output_truncation_uses_record_boundaries_and_guidance() {
-        let long_body = "details ".repeat(100);
-        let output =
-            format!("results\n\nrecord one\n\nrecord two {long_body}\n\nrecord three {long_body}");
-        let budget = count_tokens("results\n\nrecord one") + 35;
-        let bounded = bounded_tool_output("search_fts", &output, budget).unwrap();
-        assert!(count_tokens(&bounded) <= budget);
-        assert!(bounded.contains("record boundaries"));
-        assert!(!bounded.contains("record two details"));
-    }
-
-    #[test]
     fn canonical_fingerprint_ignores_object_key_order() {
         let left = fingerprint("search_fts", r#"{"query":"x","limit":2}"#).unwrap();
         let right = fingerprint("search_fts", r#"{"limit":2,"query":"x"}"#).unwrap();
@@ -1010,14 +1043,10 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_budget_stops_before_the_next_model_call() {
+    fn valid_model_calls_are_not_stopped_by_a_cumulative_cap() {
         let mut state = BudgetState {
             limits: EffectiveAgentBudget {
                 context_tokens: 200,
-                response_reserve_tokens: 40,
-                schema_summary_tokens: 20,
-                cumulative_request_tokens: 250,
-                cumulative_tool_output_tokens: 50,
                 repeated_call_limit: 1,
                 diagnostics: Vec::new(),
             },
@@ -1027,9 +1056,61 @@ mod tests {
             recent_tool_results: VecDeque::new(),
         };
         assert!(admit_completion(&mut state, 80, 1).is_ok());
-        let error = admit_completion(&mut state, 100, 2).unwrap_err();
-        assert!(error.contains("cumulative request budget"));
-        assert_eq!(state.diagnostics.model_calls, 1);
+        assert!(admit_completion(&mut state, 100, 2).is_ok());
+        assert_eq!(state.diagnostics.model_calls, 2);
+        assert_eq!(state.diagnostics.request_tokens, 180);
+    }
+
+    #[test]
+    fn per_turn_history_fitting_keeps_a_valid_suffix() {
+        let history = vec![
+            Message::user("old user ".repeat(60)),
+            Message::assistant("old assistant ".repeat(60)),
+            Message::user("recent user"),
+            Message::assistant("recent assistant"),
+        ];
+        let (fitted, estimate, omitted) =
+            fit_history("system", &Message::user("now"), &history, 10, 180);
+        assert!(fitted.len() < history.len());
+        assert_eq!(fitted.first(), Some(&Message::user("recent user")));
+        assert!(omitted);
+        assert!(estimate.tokens <= 180);
+    }
+
+    #[test]
+    fn tool_result_prompt_keeps_its_matching_assistant_call() {
+        let matching_call = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(MessageToolCall::new(
+                "search-call-1".into(),
+                ToolFunction::new("search_semantic".into(), json!({"query": "Z-Rho"})),
+            ))),
+        };
+        let prompt = Message::tool_result(
+            "search-call-1",
+            format!("Semantic search results:\n\n{}", "Z-Rho lore ".repeat(180)),
+        );
+        let history = vec![
+            Message::user("old user context ".repeat(160)),
+            Message::assistant("old assistant context ".repeat(160)),
+            Message::user("Find everything about Z-Rho"),
+            matching_call.clone(),
+        ];
+        let required_preamble = format!("system\n\n{HISTORY_OMISSION_NOTICE}");
+        let required_estimate = request_tokens(
+            &required_preamble,
+            &prompt,
+            std::slice::from_ref(&matching_call),
+            10,
+        );
+        let context = required_estimate.tokens;
+
+        let (fitted, estimate, omitted) = fit_history("system", &prompt, &history, 10, context);
+
+        assert!(fitted.len() < history.len());
+        assert_eq!(fitted.last(), Some(&matching_call));
+        assert!(omitted);
+        assert!(estimate.tokens <= context);
     }
 
     #[test]
@@ -1041,22 +1122,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let context = 300;
-        let reserve = 60;
         let preamble = "system prompt and schema";
         let current = "current request";
         let tool_tokens = 40;
-        let selected =
-            select_history_window(&history, preamble, current, tool_tokens, context, reserve);
+        let selected = select_history_window(&history, preamble, current, tool_tokens, context);
         let estimated = count_tokens(preamble)
             + count_tokens(&serialize_message(&Message::user(current)))
             + tool_tokens
             + selected
                 .iter()
                 .map(|message| {
-                    let rig_message = if message.role == "assistant" {
-                        Message::assistant(&message.content)
-                    } else {
-                        Message::user(&message.content)
+                    let rig_message = match message.role.as_str() {
+                        "assistant" => Message::assistant(&message.content),
+                        "system" => Message::system(&message.content),
+                        _ => Message::user(&message.content),
                     };
                     count_tokens(&serialize_message(&rig_message)) + TOKENS_PER_MESSAGE
                 })
@@ -1064,7 +1143,12 @@ mod tests {
             + TOKENS_PER_MESSAGE * 2
             + REPLY_PRIMING_TOKENS
             + REQUEST_ENVELOPE_TOKENS;
-        assert!(estimated + reserve <= context);
+        assert!(estimated <= context);
         assert!(selected.len() < history.len());
+        assert_eq!(
+            selected.first().map(|message| message.role.as_str()),
+            Some("system")
+        );
+        assert!(selected[0].content.contains("longer conversation"));
     }
 }

@@ -1,0 +1,461 @@
+//! Per-message view entity for the chat panel.
+//!
+//! Each chat message is its own `Entity<ChatMessageView>`. Streaming token
+//! deltas update only the target entity, so the parent `ChatPanel`'s header,
+//! input field, dropdowns, and sibling messages don't re-render per token.
+
+use gpui::{
+    App, Context, Entity, Hsla, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
+    SharedString, Styled, Window, div, prelude::*, px, rgb, rgba,
+};
+use tracing::trace_span;
+
+use crate::chat_history::{StoredChatMessage, StoredRole, StoredToolCall};
+use crate::text_field::TextFieldView;
+use crate::ui::components::Tooltip;
+use crate::ui::icons::{Icon, IconName, IconSize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatMessageRole {
+    User,
+    Assistant,
+    /// Model thinking/reasoning — rendered separately from content.
+    Thinking,
+    /// A tool call made by the agent during the response loop.
+    ToolCall,
+}
+
+/// A single message in the chat, backed by its own GPUI entity.
+pub(crate) struct ChatMessageView {
+    pub(crate) role: ChatMessageRole,
+    /// Main text content (or tool name for `ToolCall` entries).
+    /// Stored as SharedString so render clones are O(1) Arc refcount bumps
+    /// rather than O(n) heap allocations per frame during streaming.
+    text: SharedString,
+    /// For `ToolCall` entries: the pretty-printed JSON arguments.
+    tool_args: Option<String>,
+    /// For `ToolCall` entries: the tool result text (filled in when available).
+    tool_result: Option<String>,
+    /// Stable ID correlating a `ToolCall` entry with its result event.
+    tool_internal_id: Option<String>,
+    /// Whether the block body is collapsed. Defaults true for Thinking blocks.
+    collapsed: bool,
+    /// Read-only selectable body for User/Assistant/Thinking messages.
+    /// ToolCall messages keep plain div rendering and have no body entity.
+    body: Option<Entity<TextFieldView>>,
+}
+
+impl ChatMessageView {
+    pub(crate) fn new_text(role: ChatMessageRole, text: String, cx: &mut Context<Self>) -> Self {
+        let is_thinking = role == ChatMessageRole::Thinking;
+        let body_color = if is_thinking {
+            Hsla::from(rgba(0x6c7086ff))
+        } else {
+            Hsla::from(rgba(0xcdd6f4ff))
+        };
+        let body = cx.new(|cx| TextFieldView::new_read_only(&text, body_color, cx));
+        Self {
+            role,
+            text: SharedString::new(text),
+            tool_args: None,
+            tool_result: None,
+            tool_internal_id: None,
+            collapsed: is_thinking,
+            body: Some(body),
+        }
+    }
+
+    pub(crate) fn new_tool_call(
+        internal_id: String,
+        name: String,
+        args: String,
+        _cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            role: ChatMessageRole::ToolCall,
+            text: SharedString::new(name),
+            tool_args: Some(args),
+            tool_result: None,
+            tool_internal_id: Some(internal_id),
+            collapsed: true,
+            body: None,
+        }
+    }
+
+    pub(crate) fn from_stored(msg: StoredChatMessage, cx: &mut Context<Self>) -> Self {
+        let role = match msg.role {
+            StoredRole::User => ChatMessageRole::User,
+            StoredRole::Assistant => ChatMessageRole::Assistant,
+            StoredRole::Thinking => ChatMessageRole::Thinking,
+            StoredRole::ToolCall => ChatMessageRole::ToolCall,
+        };
+        let (tool_args, tool_result, tool_internal_id, collapsed) = if let Some(tc) = msg.tool_call
+        {
+            (Some(tc.args), tc.result, Some(tc.internal_id), tc.collapsed)
+        } else {
+            (None, None, None, role == ChatMessageRole::Thinking)
+        };
+        let body = if role != ChatMessageRole::ToolCall {
+            let body_color = if role == ChatMessageRole::Thinking {
+                Hsla::from(rgba(0x6c7086ff))
+            } else {
+                Hsla::from(rgba(0xcdd6f4ff))
+            };
+            Some(cx.new(|cx| TextFieldView::new_read_only(&msg.text, body_color, cx)))
+        } else {
+            None
+        };
+        Self {
+            role,
+            text: SharedString::new(msg.text),
+            tool_args,
+            tool_result,
+            tool_internal_id,
+            collapsed,
+            body,
+        }
+    }
+
+    pub(crate) fn to_stored(&self) -> StoredChatMessage {
+        let stored_role = match self.role {
+            ChatMessageRole::User => StoredRole::User,
+            ChatMessageRole::Assistant => StoredRole::Assistant,
+            ChatMessageRole::Thinking => StoredRole::Thinking,
+            ChatMessageRole::ToolCall => StoredRole::ToolCall,
+        };
+        let tool_call = if self.role == ChatMessageRole::ToolCall {
+            Some(StoredToolCall {
+                internal_id: self.tool_internal_id.clone().unwrap_or_default(),
+                args: self.tool_args.clone().unwrap_or_default(),
+                result: self.tool_result.clone(),
+                collapsed: self.collapsed,
+            })
+        } else {
+            None
+        };
+        StoredChatMessage {
+            role: stored_role,
+            text: self.text.to_string(),
+            tool_call,
+        }
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn copy_text(&self) -> String {
+        match self.role {
+            ChatMessageRole::ToolCall => {
+                let mut buf = self.text.to_string();
+                if let Some(args) = &self.tool_args {
+                    buf.push_str("\nArgs:\n");
+                    buf.push_str(args);
+                }
+                if let Some(result) = &self.tool_result {
+                    buf.push_str("\nResult:\n");
+                    buf.push_str(result);
+                }
+                buf
+            }
+            _ => self.text.to_string(),
+        }
+    }
+
+    /// Hot path: called on every streamed token. Only this entity notifies.
+    /// Rebuilds the SharedString once here so render's clone is O(1).
+    pub(crate) fn append_text(&mut self, delta: &str, cx: &mut Context<Self>) {
+        let _span = trace_span!(
+            "chat_message::append_text",
+            delta_len = delta.len(),
+            prev_len = self.text.len(),
+        )
+        .entered();
+        let mut buf = String::with_capacity(self.text.len() + delta.len());
+        buf.push_str(&self.text);
+        buf.push_str(delta);
+        self.text = SharedString::new(buf.clone());
+        if let Some(ref body) = self.body {
+            body.update(cx, |tf, cx| {
+                tf.replace_content_preserving_selection(&buf, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Replace the complete message body. Used by the pending Assistant row so
+    /// model-readiness progress can turn into the first streamed response
+    /// without inserting a second message.
+    pub(crate) fn replace_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        let text = text.into();
+        self.text = SharedString::new(text.clone());
+        if let Some(ref body) = self.body {
+            body.update(cx, |field, cx| {
+                field.replace_content_preserving_selection(&text, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_tool_result(&mut self, result: String, cx: &mut Context<Self>) {
+        self.tool_result = Some(result);
+        cx.notify();
+    }
+
+    pub(crate) fn append_error(&mut self, msg: &str, cx: &mut Context<Self>) {
+        let mut buf = String::with_capacity(self.text.len() + msg.len());
+        buf.push_str(&self.text);
+        buf.push_str(msg);
+        self.text = SharedString::new(buf.clone());
+        if let Some(ref body) = self.body {
+            body.update(cx, |tf, cx| {
+                tf.replace_content_preserving_selection(&buf, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Returns selected text from the body if any, otherwise the full copyable text.
+    pub(crate) fn copy_text_for_context(&self, cx: &App) -> String {
+        if let Some(ref body) = self.body
+            && let Some(sel) = body.read(cx).selected_text()
+        {
+            return sel;
+        }
+        self.copy_text()
+    }
+
+    fn toggle_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.collapsed = !self.collapsed;
+        cx.notify();
+    }
+
+    fn render_text(&self, _cx: &mut Context<Self>) -> gpui::Div {
+        let (bg, label_color, label, text_color) = match self.role {
+            ChatMessageRole::User => (rgb(0x313244), rgba(0x89b4faff), "You", rgba(0xcdd6f4ff)),
+            ChatMessageRole::Assistant => (
+                rgb(0x1e1e2e),
+                rgba(0xa6e3a1ff),
+                "Assistant",
+                rgba(0xcdd6f4ff),
+            ),
+            ChatMessageRole::Thinking | ChatMessageRole::ToolCall => unreachable!(),
+        };
+
+        let body_el = self
+            .body
+            .clone()
+            .map(|b| b.into_any_element())
+            .unwrap_or_else(|| {
+                div()
+                    .text_base()
+                    .text_color(text_color)
+                    .child(self.text.clone())
+                    .into_any_element()
+            });
+
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .px_2()
+            .py_1()
+            .bg(bg)
+            .child(
+                div()
+                    .text_base()
+                    .text_color(label_color)
+                    .pb(px(2.0))
+                    .child(label),
+            )
+            .child(body_el)
+    }
+
+    /// Collapsible thinking block. Collapsed by default so the virtual list
+    /// measures only a single header line when scrolling past it, avoiding the
+    /// full text-layout cost of a potentially large reasoning block. When
+    /// expanded, the body grows to its natural height and the outer list
+    /// scrolls normally — matches Zed's agent-panel UX (no inner scrollbar).
+    fn render_thinking(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let _span = trace_span!(
+            "chat_message::render_thinking",
+            text_len = self.text.len(),
+            collapsed = self.collapsed,
+        )
+        .entered();
+        let collapsed = self.collapsed;
+        let chevron = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+
+        let mut el = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .px_2()
+            .py_1()
+            .bg(rgb(0x181825))
+            .child(
+                div()
+                    .id("thinking-hdr")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(if collapsed {
+                        "Expand thinking"
+                    } else {
+                        "Collapse thinking"
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.toggle_collapsed(cx);
+                        }),
+                    )
+                    .child(Icon::new(chevron, IconSize::Small, rgba(0xf9e2afff)))
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgba(0xf9e2afff))
+                            .child("Thinking"),
+                    ),
+            );
+
+        if !collapsed {
+            let body_el = self
+                .body
+                .clone()
+                .map(|b| b.into_any_element())
+                .unwrap_or_else(|| {
+                    div()
+                        .text_base()
+                        .text_color(rgba(0x6c7086ff))
+                        .mt_1()
+                        .child(self.text.clone())
+                        .into_any_element()
+                });
+            el = el.child(body_el);
+        }
+
+        el
+    }
+
+    fn render_tool_call(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let collapsed = self.collapsed;
+        let has_result = self.tool_result.is_some();
+        let chevron = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+
+        let mut el = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .px_2()
+            .py_1()
+            .bg(rgb(0x1e1e2e))
+            .border_l_1()
+            .border_color(rgba(0xcba6f7aa))
+            .child(
+                div()
+                    .id("tc-hdr")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(if collapsed {
+                        "Expand tool details"
+                    } else {
+                        "Collapse tool details"
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.toggle_collapsed(cx);
+                        }),
+                    )
+                    .child(Icon::new(chevron, IconSize::Small, rgba(0xcba6f7ff)))
+                    .child(Icon::new(IconName::Tool, IconSize::Small, rgba(0xcba6f7ff)))
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgba(0xcba6f7ff))
+                            .child(self.text.clone()),
+                    )
+                    .when(has_result, |row| {
+                        row.child(Icon::new(
+                            IconName::Check,
+                            IconSize::Small,
+                            rgba(0xa6e3a188),
+                        ))
+                    }),
+            );
+
+        if !collapsed {
+            let tool_args: SharedString = self.tool_args.clone().unwrap_or_default().into();
+            el = el.child(
+                div()
+                    .mt_1()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(0x181825))
+                    .rounded(px(3.0))
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgba(0x6c7086ff))
+                            .child("Args:"),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgba(0xcdd6f4cc))
+                            .child(tool_args),
+                    ),
+            );
+            if let Some(result) = self.tool_result.clone() {
+                let result: SharedString = result.into();
+                el = el.child(
+                    div()
+                        .mt_1()
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(0x181825))
+                        .rounded(px(3.0))
+                        .child(
+                            div()
+                                .text_base()
+                                .text_color(rgba(0x6c7086ff))
+                                .child("Result:"),
+                        )
+                        .child(div().text_base().text_color(rgba(0xa6e3a1cc)).child(result)),
+                );
+            }
+        }
+        el
+    }
+}
+
+impl Render for ChatMessageView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = trace_span!(
+            "chat_message::render",
+            role = ?self.role,
+            text_len = self.text.len(),
+            collapsed = self.collapsed,
+        )
+        .entered();
+        match self.role {
+            ChatMessageRole::ToolCall => self.render_tool_call(cx),
+            ChatMessageRole::Thinking => self.render_thinking(cx),
+            _ => self.render_text(cx),
+        }
+    }
+}

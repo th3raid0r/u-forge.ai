@@ -61,7 +61,7 @@ pub async fn import_data_only_with_cancellation<P: AsRef<Path>>(
     let data_file = data_file.as_ref();
     info!(
         data_file = %data_file.display(),
-        "Importing data (schema-independent)"
+        "Importing data (schema loading omitted)"
     );
     import_loaded_data(graph, data_file, &cancellation).await
 }

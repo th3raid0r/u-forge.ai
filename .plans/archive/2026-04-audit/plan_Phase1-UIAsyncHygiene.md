@@ -11,7 +11,7 @@ improve UI consistency but do not close the remaining findings in this plan.
 **Why this is its own branch:** All four findings are GPUI-side and
 cluster around the same theme: hold async/state correctly so paint stays
 fast, results don't clobber each other, and the chat panel's epoch logic
-stops racing. They all live under `crates/u-forge-ui-gpui/`.
+stops racing. They all live under `crates/u-forge/`.
 
 **Branch name suggestion:** `fix/phase1-ui-async-hygiene`
 
@@ -21,10 +21,10 @@ stops racing. They all live under `crates/u-forge-ui-gpui/`.
 
 | ID | What | Where |
 |----|------|-------|
-| C4 | `paint_entity.update(...)` called inside canvas paint closure | `crates/u-forge-ui-gpui/src/text_field.rs:808-810`, `:833-840` |
-| H4 | Detached search task leaks results across rapid re-queries | `crates/u-forge-ui-gpui/src/search_panel.rs:236`, `path_picker.rs:97` |
-| H7 | Chat embedding-plan epoch + cancel-flag two-poller window | `crates/u-forge-ui-gpui/src/app_view/mod.rs:655-701` |
-| M10 | List-state helpers for `chat_panel` reset/append | `crates/u-forge-ui-gpui/src/chat_panel.rs:242-258, 271, 286, 343, 785, 815, 838` |
+| C4 | `paint_entity.update(...)` called inside canvas paint closure | `crates/u-forge/src/text_field.rs:808-810`, `:833-840` |
+| H4 | Detached search task leaks results across rapid re-queries | `crates/u-forge/src/search_panel.rs:236`, `path_picker.rs:97` |
+| H7 | Chat embedding-plan epoch + cancel-flag two-poller window | `crates/u-forge/src/app_view/mod.rs:655-701` |
+| M10 | List-state helpers for `chat_panel` reset/append | `crates/u-forge/src/chat_panel.rs:242-258, 271, 286, 343, 785, 815, 838` |
 
 ---
 

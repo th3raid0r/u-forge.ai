@@ -16,10 +16,12 @@ sqlite-vec ANN indexes. Lemonade Server provides optional embedding, STT, TTS,
 LLM, and reranking capabilities through `InferenceQueue`; `KnowledgeGraph`
 itself must remain usable without a running inference server.
 
-Schemas are strict and authoritative. Data import must not infer or widen a
-schema from JSONL input. Unknown object types, edge types, fields, endpoint
-pairs, and missing required properties are import diagnostics. Widening the
-accepted shape requires an explicit schema change.
+Persisted schemas are strict and authoritative. The desktop import flow requires
+them; unknown object types, edge types, fields, endpoint pairs, and missing
+required properties become import diagnostics. The low-level `DataIngestion`
+API retains a schema-less compatibility mode for an empty graph, so callers
+that require strict import must load schemas first. Import never infers or
+mutates a persisted schema from JSONL records.
 
 ## Workflow
 

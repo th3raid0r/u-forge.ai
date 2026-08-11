@@ -2,7 +2,7 @@
 //!
 //! [`ModelSelector`] consumes a [`LemonadeServerCatalog`] and the application
 //! config to produce ordered lists of [`SelectedModel`] values, ready for
-//! `ProviderFactory::build` (Phase 4).
+//! `ProviderFactory::build_with_connection`.
 //!
 //! No hardcoded model IDs appear here — all defaults live in `ModelConfig` as
 //! configurable preference lists.  Selection methods filter to **downloaded**
@@ -50,6 +50,7 @@ pub struct SelectedModel {
     /// non-embedding capabilities.
     pub quality_tier: QualityTier,
     pub checkpoint: String,
+    /// Maximum model-supported context advertised by Lemonade's catalog.
     pub max_context_window: Option<usize>,
     pub tool_capable: bool,
     pub reasoning_capable: bool,
@@ -61,65 +62,38 @@ pub struct SelectedModel {
 pub struct EffectiveChatLimits {
     pub load_context: Option<usize>,
     pub context: usize,
-    pub response_reserve: usize,
     pub direct_generation: usize,
     pub agent_generation: usize,
-    pub history_budget: usize,
     pub diagnostics: Vec<String>,
 }
 
 impl SelectedModel {
-    /// Reconcile every chat budget against the catalog model window and the
-    /// explicitly loaded context. Direct and agent paths consume this one result.
+    /// Resolve chat limits from the configured load context and the model's
+    /// advertised capability. Catalog metadata is a quiet safety ceiling, not
+    /// a user-facing global budget.
     pub fn reconcile_chat_limits(
         &self,
-        configured_context: usize,
-        configured_reserve: usize,
         direct_generation: usize,
         agent_generation: usize,
     ) -> anyhow::Result<EffectiveChatLimits> {
-        let mut diagnostics = self.diagnostics.clone();
         let load_context = match (self.load_opts.ctx_size, self.max_context_window) {
-            (Some(configured), Some(maximum)) if configured > maximum => {
-                diagnostics.push(format!(
-                    "load context clamped from {configured} to catalog maximum {maximum}"
-                ));
-                Some(maximum)
-            }
+            (Some(configured), Some(maximum)) => Some(configured.min(maximum)),
             (configured, _) => configured,
         };
-        let authority = load_context.or(self.max_context_window);
-        let context = authority
-            .map(|maximum| configured_context.min(maximum))
-            .unwrap_or(configured_context);
-        if context != configured_context {
-            diagnostics.push(format!(
-                "chat context clamped from {configured_context} to {context}"
-            ));
-        } else if authority.is_none() {
-            diagnostics.push("catalog context limit unavailable; configured limit retained".into());
-        }
+        let context = load_context
+            .or(self.max_context_window)
+            .unwrap_or(usize::MAX);
         if context < 2 {
             return Err(anyhow::anyhow!(
-                "effective context leaves no prompt/response allocation"
+                "effective model context is too small for a chat request"
             ));
         }
-        let response_reserve = configured_reserve.min(context - 1);
-        if response_reserve != configured_reserve {
-            diagnostics.push(format!(
-                "response reserve clamped from {configured_reserve} to {response_reserve}"
-            ));
-        }
-        let direct_generation = direct_generation.min(response_reserve);
-        let agent_generation = agent_generation.min(response_reserve);
         Ok(EffectiveChatLimits {
             load_context,
             context,
-            response_reserve,
-            direct_generation,
-            agent_generation,
-            history_budget: context - response_reserve,
-            diagnostics,
+            direct_generation: direct_generation.min(context),
+            agent_generation: agent_generation.min(context),
+            diagnostics: self.diagnostics.clone(),
         })
     }
 }
@@ -210,7 +184,7 @@ impl<'a> ModelSelector<'a> {
                     model_id: m.id.clone(),
                     recipe: m.recipe.clone(),
                     backend,
-                    load_opts: self.config.load_options_for(&m.id),
+                    load_opts: self.load_options_for(m),
                     quality_tier,
                     checkpoint: m.checkpoint.clone(),
                     max_context_window: m.max_context_window,
@@ -258,7 +232,7 @@ impl<'a> ModelSelector<'a> {
             model_id: m.id.clone(),
             recipe: m.recipe.clone(),
             backend,
-            load_opts: self.config.load_options_for(&m.id),
+            load_opts: self.load_options_for(m),
             quality_tier,
             checkpoint: m.checkpoint.clone(),
             max_context_window: m.max_context_window,
@@ -281,7 +255,7 @@ impl<'a> ModelSelector<'a> {
             model_id: m.id.clone(),
             recipe: m.recipe.clone(),
             backend: self.resolve_llamacpp_backend(&m.recipe),
-            load_opts: self.config.load_options_for(&m.id),
+            load_opts: self.load_options_for(m),
             quality_tier: QualityTier::NotApplicable,
             checkpoint: m.checkpoint.clone(),
             max_context_window: m.max_context_window,
@@ -321,7 +295,7 @@ impl<'a> ModelSelector<'a> {
                 model_id: m.id.clone(),
                 recipe: m.recipe.clone(),
                 backend: self.resolve_llamacpp_backend(&m.recipe),
-                load_opts: self.config.load_options_for(&m.id),
+                load_opts: self.load_options_for(m),
                 quality_tier: QualityTier::NotApplicable,
                 checkpoint: m.checkpoint.clone(),
                 max_context_window: m.max_context_window,
@@ -371,7 +345,7 @@ impl<'a> ModelSelector<'a> {
                 model_id: m.id.clone(),
                 recipe: m.recipe.clone(),
                 backend: self.resolve_llamacpp_backend(&m.recipe),
-                load_opts: self.config.load_options_for(&m.id),
+                load_opts: self.load_options_for(m),
                 quality_tier: QualityTier::NotApplicable,
                 checkpoint: m.checkpoint.clone(),
                 max_context_window: m.max_context_window,
@@ -417,7 +391,7 @@ impl<'a> ModelSelector<'a> {
                 model_id: m.id.clone(),
                 recipe: m.recipe.clone(),
                 backend: self.resolve_llamacpp_backend(&m.recipe),
-                load_opts: self.config.load_options_for(&m.id),
+                load_opts: self.load_options_for(m),
                 quality_tier: QualityTier::NotApplicable,
                 checkpoint: m.checkpoint.clone(),
                 max_context_window: m.max_context_window,
@@ -452,7 +426,7 @@ impl<'a> ModelSelector<'a> {
             model_id: m.id.clone(),
             recipe: m.recipe.clone(),
             backend: None, // TTS is always CPU via kokoro; no backend param needed
-            load_opts: self.config.load_options_for(&m.id),
+            load_opts: self.load_options_for(m),
             quality_tier: QualityTier::NotApplicable,
             checkpoint: m.checkpoint.clone(),
             max_context_window: m.max_context_window,
@@ -466,6 +440,16 @@ impl<'a> ModelSelector<'a> {
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Resolve configured load options without asking Lemonade to exceed the
+    /// selected model's advertised capability.
+    fn load_options_for(&self, model: &CatalogModel) -> ModelLoadOptions {
+        let mut options = self.config.load_options_for(&model.id);
+        if let (Some(configured), Some(maximum)) = (options.ctx_size, model.max_context_window) {
+            options.ctx_size = Some(configured.min(maximum));
+        }
+        options
+    }
 
     /// Resolve the llamacpp backend for a model.
     ///
@@ -543,7 +527,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::config::{EmbeddingDeviceConfig, ModelConfig};
+    use crate::config::{EmbeddingDeviceConfig, ModelConfig, ModelLoadParams};
     use crate::lemonade::catalog::{CatalogModel, InstalledBackend, LemonadeServerCatalog};
 
     // ── Test helpers ──────────────────────────────────────────────────────────
@@ -617,32 +601,74 @@ mod tests {
     }
 
     #[test]
-    fn reconciles_all_chat_limits_against_catalog_window() {
+    fn catalog_context_quietly_caps_invalid_load_and_generation_sizes() {
         let selected = SelectedModel {
             model_id: "chat".into(),
             recipe: "llamacpp".into(),
             backend: Some("vulkan".into()),
             load_opts: ModelLoadOptions {
-                ctx_size: Some(16_384),
+                ctx_size: Some(262_144),
                 ..Default::default()
             },
             quality_tier: QualityTier::NotApplicable,
             checkpoint: String::new(),
-            max_context_window: Some(8192),
+            max_context_window: Some(131_072),
             tool_capable: true,
             reasoning_capable: true,
             diagnostics: Vec::new(),
         };
-        let limits = selected
-            .reconcile_chat_limits(12_000, 10_000, 9000, 7000)
+        let limits = selected.reconcile_chat_limits(262_144, 131_072).unwrap();
+        assert_eq!(limits.load_context, Some(131_072));
+        assert_eq!(limits.context, 131_072);
+        assert_eq!(limits.direct_generation, 131_072);
+        assert_eq!(limits.agent_generation, 131_072);
+        assert!(limits.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selector_caps_the_runtime_load_option_to_catalog_context() {
+        let mut chat = model("chat", "llamacpp", &[]);
+        chat.max_context_window = Some(131_072);
+        let catalog = catalog_with(
+            vec![chat],
+            vec![installed_backend("llamacpp", "vulkan", &["gpu"])],
+        );
+        let mut config = ModelConfig::default();
+        config.llamacpp_backend_preference = vec!["vulkan".into()];
+        config.load_params.insert(
+            "chat".into(),
+            ModelLoadParams {
+                ctx_size: Some(262_144),
+                ..Default::default()
+            },
+        );
+        let embedding = EmbeddingDeviceConfig::default();
+        let selected = ModelSelector::new(&catalog, &config, &embedding)
+            .model_by_id("chat", QualityTier::NotApplicable)
             .unwrap();
-        assert_eq!(limits.load_context, Some(8192));
-        assert_eq!(limits.context, 8192);
-        assert_eq!(limits.response_reserve, 8191);
-        assert_eq!(limits.direct_generation, 8191);
-        assert_eq!(limits.agent_generation, 7000);
-        assert_eq!(limits.history_budget, 1);
-        assert!(limits.diagnostics.len() >= 3);
+
+        assert_eq!(selected.load_opts.ctx_size, Some(131_072));
+        assert!(selected.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn automatic_server_context_has_no_u_forge_ceiling() {
+        let selected = SelectedModel {
+            model_id: "chat".into(),
+            recipe: "llamacpp".into(),
+            backend: Some("vulkan".into()),
+            load_opts: ModelLoadOptions::default(),
+            quality_tier: QualityTier::NotApplicable,
+            checkpoint: String::new(),
+            max_context_window: None,
+            tool_capable: true,
+            reasoning_capable: true,
+            diagnostics: Vec::new(),
+        };
+        let limits = selected.reconcile_chat_limits(262_144, 131_072).unwrap();
+        assert_eq!(limits.load_context, None);
+        assert_eq!(limits.context, usize::MAX);
+        assert!(limits.diagnostics.is_empty());
     }
 
     #[test]

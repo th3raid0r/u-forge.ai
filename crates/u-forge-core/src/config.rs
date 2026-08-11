@@ -1,18 +1,16 @@
 //! Application configuration — devices, model limits, and other tunables.
 //!
-//! Loaded from a TOML file at startup.  All fields have sensible defaults so
-//! the file is entirely optional; the project runs correctly with zero config.
-//!
-//! # File locations (checked in order)
-//!
-//! 1. `./u-forge.toml` (working directory)
-//! 2. `$XDG_CONFIG_HOME/u-forge/config.toml`
-//!    (falls back to `$HOME/.config/u-forge/config.toml` on Linux)
-//! 3. Built-in defaults (NPU weight=100, GPU weight=50, CPU weight=10)
+//! The desktop application creates and loads one canonical per-user file at
+//! `$XDG_CONFIG_HOME/u-forge/u-forge.toml` (falling back to
+//! `$HOME/.config/u-forge/u-forge.toml`). Durable application data follows
+//! `XDG_DATA_HOME`; regenerable Lemonade state follows `XDG_CACHE_HOME`.
 //!
 //! # Example file
 //!
 //! ```toml
+//! [lemonade]
+//! max_loaded_models = 3
+//!
 //! [embedding]
 //! npu_enabled  = true
 //! gpu_enabled  = true
@@ -21,9 +19,9 @@
 //! gpu_weight   = 50
 //! cpu_weight   = 10
 //!
-//! [models.context_limits]
-//! "embed-gemma-300m-FLM"                = 2048
-//! "some-new-model-FLM"                  = 4096
+//! [models.load_params]
+//! "embed-gemma-300m-FLM" = { ctx_size = 2048 }
+//! "some-new-model-FLM"   = { ctx_size = 4096 }
 //! ```
 //!
 //! # Typical use-cases for disabling a device
@@ -38,11 +36,202 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::lemonade::load::ModelLoadOptions;
+
+const DEFAULTS_REVISION: u32 = 1;
+
+/// Canonical per-user paths used by the desktop application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPaths {
+    pub config_dir: PathBuf,
+    pub data_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub config_file: PathBuf,
+    pub defaults_dir: PathBuf,
+    pub db_dir: PathBuf,
+}
+
+impl UserPaths {
+    /// Resolve the XDG bases. Relative XDG values are invalid and therefore
+    /// fall back to the corresponding directory below an absolute `$HOME`.
+    pub fn discover() -> Result<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| anyhow!("cannot determine an absolute HOME for u-forge user data"))?;
+        let config_base =
+            absolute_env_path("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+        let data_base =
+            absolute_env_path("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"));
+        let cache_base = absolute_env_path("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"));
+        Ok(Self::from_bases(config_base, data_base, cache_base))
+    }
+
+    fn from_bases(config_base: PathBuf, data_base: PathBuf, cache_base: PathBuf) -> Self {
+        let config_dir = config_base.join("u-forge");
+        let data_dir = data_base.join("u-forge");
+        let cache_dir = cache_base.join("u-forge");
+        Self {
+            config_file: config_dir.join("u-forge.toml"),
+            defaults_dir: data_dir.join("defaults"),
+            db_dir: data_dir.join("db"),
+            config_dir,
+            data_dir,
+            cache_dir,
+        }
+    }
+
+    fn initialize(&self, packaged_defaults: &Path) -> Result<()> {
+        if !packaged_defaults.is_dir() {
+            bail!(
+                "packaged defaults directory is missing: {}",
+                packaged_defaults.display()
+            );
+        }
+        std::fs::create_dir_all(&self.config_dir)
+            .with_context(|| format!("creating {}", self.config_dir.display()))?;
+        std::fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("creating {}", self.data_dir.display()))?;
+        std::fs::create_dir_all(&self.db_dir)
+            .with_context(|| format!("creating {}", self.db_dir.display()))?;
+        std::fs::create_dir_all(self.cache_dir.join("lemonade"))
+            .with_context(|| format!("creating {}", self.cache_dir.display()))?;
+
+        self.seed_defaults(packaged_defaults)?;
+        if !self.config_file.exists() {
+            self.write_config_template(packaged_defaults)?;
+        }
+        Ok(())
+    }
+
+    fn seed_defaults(&self, packaged_defaults: &Path) -> Result<()> {
+        let marker = self.data_dir.join(".defaults-revision");
+        if marker.exists() {
+            let revision = std::fs::read_to_string(&marker)
+                .with_context(|| format!("reading {}", marker.display()))?
+                .trim()
+                .parse::<u32>()
+                .with_context(|| format!("parsing {}", marker.display()))?;
+            if revision > DEFAULTS_REVISION {
+                bail!(
+                    "user defaults revision {revision} is newer than supported revision {DEFAULTS_REVISION}"
+                );
+            }
+            // Every future revision must add an explicit migration here.
+            if revision == DEFAULTS_REVISION {
+                return Ok(());
+            }
+            bail!("no defaults migration is defined from revision {revision}");
+        }
+
+        for name in ["schemas", "example_data"] {
+            let source = packaged_defaults.join(name);
+            if !source.is_dir() {
+                bail!("packaged defaults are missing {}", source.display());
+            }
+            copy_missing_tree(&source, &self.defaults_dir.join(name))?;
+        }
+        atomic_write(&marker, format!("{DEFAULTS_REVISION}\n").as_bytes())
+    }
+
+    fn write_config_template(&self, packaged_defaults: &Path) -> Result<()> {
+        use toml_edit::value;
+
+        let template = packaged_defaults.join("config/u-forge.toml");
+        let text = std::fs::read_to_string(&template)
+            .with_context(|| format!("reading config template {}", template.display()))?;
+        let mut document = text
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("parsing config template {}", template.display()))?;
+        document["storage"]["db_path"] = value(path_text(&self.db_dir));
+        document["data"]["import_file"] = value(path_text(
+            &self
+                .defaults_dir
+                .join("example_data/foundation-example.jsonl"),
+        ));
+        document["data"]["schema_dir"] =
+            value(path_text(&self.defaults_dir.join("schemas/Sine Nomine")));
+        atomic_write(&self.config_file, document.to_string().as_bytes())
+    }
+}
+
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn copy_missing_tree(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("creating {}", destination.display()))?;
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("reading {}", source.display()))?
+    {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_missing_tree(&entry.path(), &target)?;
+        } else if !target.exists() {
+            let bytes = std::fs::read(entry.path())?;
+            atomic_write(&target, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("u-forge"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(&temp, path)?;
+    Ok(())
+}
+
+/// Lemonade Server runtime settings managed by u-forge for its owned server.
+///
+/// Corresponds to the `[lemonade]` section of `u-forge.toml`. External
+/// Lemonade processes remain operator-owned and are never mutated implicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LemonadeConfig {
+    /// Maximum simultaneously loaded models per model type.
+    ///
+    /// Three permits the standard CPU/GPU embedding model, optional NPU
+    /// embedding model, and high-quality embedding model to remain resident.
+    #[serde(default = "LemonadeConfig::default_max_loaded_models")]
+    pub max_loaded_models: usize,
+}
+
+impl LemonadeConfig {
+    pub const fn default_max_loaded_models() -> usize {
+        1
+    }
+}
+
+impl Default for LemonadeConfig {
+    fn default() -> Self {
+        Self {
+            max_loaded_models: Self::default_max_loaded_models(),
+        }
+    }
+}
 
 // ── EmbeddingDeviceConfig ─────────────────────────────────────────────────────
 
@@ -66,10 +255,9 @@ pub struct EmbeddingDeviceConfig {
 
     /// Enable high-quality 4096-dim embedding via `Qwen3-Embedding-8B-GGUF`.
     ///
-    /// When `true`, the registry includes the Qwen3 model and embeddings are
-    /// stored in the `chunks_vec_hq` 4096-dim index alongside the standard
-    /// 768-dim `chunks_vec` index.  NPU embedding should typically be disabled
-    /// when this is active (the NPU model only produces 768-dim vectors).
+    /// When `true`, downloaded configured HQ models are eligible and embeddings
+    /// are stored in the `chunks_vec_hq` 4096-dim index alongside the standard
+    /// 768-dim `chunks_vec` index.
     #[serde(default)]
     pub high_quality_embedding: bool,
 
@@ -129,6 +317,9 @@ pub struct ModelLoadParams {
     /// When `None` and `ctx_size` is set, `--ubatch-size` is auto-injected to
     /// match `ctx_size`.  Set this explicitly to use a different value.
     pub ubatch_size: Option<usize>,
+
+    /// Additional safe arguments forwarded to llama-server.
+    pub llamacpp_args: Option<String>,
 }
 
 // ── ModelConfig ───────────────────────────────────────────────────────────────
@@ -137,9 +328,8 @@ pub struct ModelLoadParams {
 ///
 /// Corresponds to the `[models]` section of `u-forge.toml`.
 ///
-/// Built-in defaults cover all models shipped with u-forge.  Add entries to
-/// `u-forge.toml` under `[models.load_params]` to tune new models without
-/// recompiling.
+/// Built-in defaults cover the preferred Lemonade catalog models. Additional
+/// entries under `[models.load_params]` configure models without recompiling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
@@ -197,6 +387,7 @@ impl ModelConfig {
                 ctx_size: p.ctx_size,
                 batch_size: p.batch_size,
                 ubatch_size: p.ubatch_size,
+                llamacpp_args: p.llamacpp_args.clone(),
                 ..Default::default()
             },
             None => ModelLoadOptions::default(),
@@ -241,8 +432,8 @@ impl Default for ModelConfig {
 pub enum ChatDevice {
     /// Let u-forge choose based on available hardware.
     ///
-    /// Currently resolves to `gpu`.  A smarter selection policy (latency,
-    /// model quality, task complexity) will be added in a future release.
+    /// Currently resolves to `gpu`; automatic selection does not score latency,
+    /// model quality, or task complexity.
     #[default]
     Auto,
     /// AMD/Nvidia GPU — llamacpp GGUF models via ROCm / Vulkan / CUDA.
@@ -324,17 +515,29 @@ pub struct ChatDeviceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentBudgetConfig {
-    /// Maximum tokens used by the schema summary injected into the preamble.
-    #[serde(default = "AgentBudgetConfig::default_schema_summary_tokens")]
+    /// Legacy schema-summary cap retained for configuration compatibility.
+    ///
+    /// Schema records are now admitted against the active model context rather
+    /// than an independent static ceiling.
+    #[serde(
+        default = "AgentBudgetConfig::default_schema_summary_tokens",
+        skip_serializing
+    )]
     pub schema_summary_tokens: usize,
 
-    /// Cumulative model input plus response reservations across the request.
-    #[serde(default = "AgentBudgetConfig::default_cumulative_request_tokens")]
-    pub cumulative_request_tokens: usize,
+    /// Legacy cumulative request cap retained only for configuration compatibility.
+    ///
+    /// Per-request cumulative caps proved too aggressive for multi-turn agents.
+    /// The value is accepted from older TOML files but is no longer enforced or
+    /// written by the settings persistence path.
+    #[serde(default, skip_serializing)]
+    pub cumulative_request_tokens: Option<usize>,
 
-    /// Cumulative model-visible output returned by tools.
-    #[serde(default = "AgentBudgetConfig::default_cumulative_tool_output_tokens")]
-    pub cumulative_tool_output_tokens: usize,
+    /// Legacy cumulative tool-output cap retained only for configuration
+    /// compatibility. Individual tool results are now bounded against the active
+    /// model window instead.
+    #[serde(default, skip_serializing)]
+    pub cumulative_tool_output_tokens: Option<usize>,
 
     /// Number of unchanged repeats allowed for one canonical tool call.
     #[serde(default = "AgentBudgetConfig::default_repeated_call_limit")]
@@ -346,14 +549,6 @@ impl AgentBudgetConfig {
         768
     }
 
-    fn default_cumulative_request_tokens() -> usize {
-        16_384
-    }
-
-    fn default_cumulative_tool_output_tokens() -> usize {
-        2_048
-    }
-
     fn default_repeated_call_limit() -> usize {
         1
     }
@@ -362,63 +557,23 @@ impl AgentBudgetConfig {
     pub fn reconcile(
         &self,
         context: usize,
-        response_reserve: usize,
-        max_tool_turns: usize,
+        _max_tool_turns: usize,
     ) -> anyhow::Result<EffectiveAgentBudget> {
-        if context < 2 || response_reserve >= context {
-            anyhow::bail!("effective context leaves no agent prompt allocation");
+        if context < 2 {
+            anyhow::bail!("effective model context is too small for an agent request");
         }
-        if self.schema_summary_tokens < 32 {
-            anyhow::bail!(
-                "chat.agent.schema_summary_tokens must be at least 32 so omission guidance fits"
-            );
-        }
-        if self.cumulative_request_tokens == 0 {
-            anyhow::bail!("chat.agent.cumulative_request_tokens must be greater than zero");
-        }
-        if self.cumulative_tool_output_tokens == 0 {
-            anyhow::bail!("chat.agent.cumulative_tool_output_tokens must be greater than zero");
-        }
-
-        let prompt_window = context - response_reserve;
-        let maximum_cumulative = context.saturating_mul(max_tool_turns.max(1));
         let mut diagnostics = Vec::new();
 
-        let schema_summary_tokens = self.schema_summary_tokens.min(prompt_window);
-        if schema_summary_tokens != self.schema_summary_tokens {
-            diagnostics.push(format!(
-                "agent schema budget clamped from {} to {schema_summary_tokens}",
-                self.schema_summary_tokens
-            ));
-        }
-
-        let cumulative_request_tokens = self
-            .cumulative_request_tokens
-            .min(maximum_cumulative.max(context));
-        if cumulative_request_tokens != self.cumulative_request_tokens {
-            diagnostics.push(format!(
-                "agent cumulative request budget clamped from {} to {cumulative_request_tokens}",
-                self.cumulative_request_tokens
-            ));
-        }
-
-        let cumulative_tool_output_tokens = self
-            .cumulative_tool_output_tokens
-            .min(cumulative_request_tokens)
-            .min(prompt_window);
-        if cumulative_tool_output_tokens != self.cumulative_tool_output_tokens {
-            diagnostics.push(format!(
-                "agent tool-output budget clamped from {} to {cumulative_tool_output_tokens}",
-                self.cumulative_tool_output_tokens
-            ));
+        if self.cumulative_request_tokens.is_some() || self.cumulative_tool_output_tokens.is_some()
+        {
+            diagnostics.push(
+                "legacy cumulative agent token caps are ignored; each model call is fitted to the active context window"
+                    .to_string(),
+            );
         }
 
         Ok(EffectiveAgentBudget {
             context_tokens: context,
-            response_reserve_tokens: response_reserve,
-            schema_summary_tokens,
-            cumulative_request_tokens,
-            cumulative_tool_output_tokens,
             repeated_call_limit: self.repeated_call_limit,
             diagnostics,
         })
@@ -429,8 +584,8 @@ impl Default for AgentBudgetConfig {
     fn default() -> Self {
         Self {
             schema_summary_tokens: Self::default_schema_summary_tokens(),
-            cumulative_request_tokens: Self::default_cumulative_request_tokens(),
-            cumulative_tool_output_tokens: Self::default_cumulative_tool_output_tokens(),
+            cumulative_request_tokens: None,
+            cumulative_tool_output_tokens: None,
             repeated_call_limit: Self::default_repeated_call_limit(),
         }
     }
@@ -440,10 +595,6 @@ impl Default for AgentBudgetConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveAgentBudget {
     pub context_tokens: usize,
-    pub response_reserve_tokens: usize,
-    pub schema_summary_tokens: usize,
-    pub cumulative_request_tokens: usize,
-    pub cumulative_tool_output_tokens: usize,
     pub repeated_call_limit: usize,
     pub diagnostics: Vec<String>,
 }
@@ -451,7 +602,7 @@ pub struct EffectiveAgentBudget {
 impl Default for EffectiveAgentBudget {
     fn default() -> Self {
         AgentBudgetConfig::default()
-            .reconcile(4_096, 1_024, 5)
+            .reconcile(usize::MAX, 5)
             .expect("default agent budget is valid")
     }
 }
@@ -488,24 +639,21 @@ pub struct ChatConfig {
 
     /// Maximum number of prior turns (user + assistant pairs) kept in context.
     ///
-    /// Used as a coarse fallback when token counting is unavailable (e.g. the
-    /// direct streaming path). Prefer `max_context_tokens` for the agent path.
+    /// Retained for persisted-config compatibility. Active chat requests use
+    /// token fitting against an explicit Lemonade load context when present.
     #[serde(default = "ChatConfig::default_max_history_turns")]
     pub max_history_turns: usize,
 
-    /// Total context-window budget in tokens.
-    ///
-    /// History is trimmed to the most-recent messages that fit inside
-    /// `max_context_tokens - response_reserve` tokens (see `response_reserve`).
-    /// Set this to match your model's actual context window (e.g. 8192 for an
-    /// 8 k model). Defaults to 4096 — conservative enough for most local models.
-    #[serde(default = "ChatConfig::default_max_context_tokens")]
+    /// Legacy application-side context limit, retained only so older configs
+    /// deserialize. Lemonade owns automatic context sizing when `ctx_size` is
+    /// omitted, so this value is never an active request ceiling.
+    #[serde(default = "ChatConfig::default_max_context_tokens", skip_serializing)]
     pub max_context_tokens: usize,
 
-    /// Number of tokens reserved for the model's response.
+    /// Legacy fallback generation maximum.
     ///
-    /// Deducted from `max_context_tokens` when computing how much history fits.
-    /// Defaults to 1024.
+    /// Per-device `max_tokens` is used when configured. This value is no longer
+    /// subtracted from the model's input context.
     #[serde(default = "ChatConfig::default_response_reserve")]
     pub response_reserve: usize,
 
@@ -520,6 +668,18 @@ pub struct ChatConfig {
     /// Number of knowledge-graph nodes returned per query.
     #[serde(default = "ChatConfig::default_search_limit")]
     pub search_limit: usize,
+
+    /// Maximum lexical candidates gathered before fusion.
+    #[serde(default = "ChatConfig::default_candidate_limit")]
+    pub fts_limit: usize,
+
+    /// Maximum semantic candidates gathered before fusion.
+    #[serde(default = "ChatConfig::default_candidate_limit")]
+    pub semantic_limit: usize,
+
+    /// Apply the configured cross-encoder reranker in hybrid searches.
+    #[serde(default = "default_true")]
+    pub rerank: bool,
 
     /// RRF score multiplier for the high-quality 4096-dim semantic path.
     ///
@@ -576,6 +736,10 @@ impl ChatConfig {
         3
     }
 
+    fn default_candidate_limit() -> usize {
+        20
+    }
+
     fn default_hq_semantic_boost() -> f32 {
         3.0
     }
@@ -600,6 +764,9 @@ impl Default for ChatConfig {
             agent: AgentBudgetConfig::default(),
             alpha: Self::default_alpha(),
             search_limit: Self::default_search_limit(),
+            fts_limit: Self::default_candidate_limit(),
+            semantic_limit: Self::default_candidate_limit(),
+            rerank: true,
             hq_semantic_boost: Self::default_hq_semantic_boost(),
             max_tool_turns: Self::default_max_tool_turns(),
         }
@@ -780,7 +947,7 @@ impl Default for UiConfig {
 
 /// Top-level application configuration.
 ///
-/// Loaded from `u-forge.toml` by [`AppConfig::load_default`].
+/// Loaded from the canonical XDG `u-forge.toml` by [`AppConfig::load_user`].
 /// Use [`AppConfig::default`] when no config file is present or required.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -789,6 +956,11 @@ pub struct AppConfig {
     /// for first persistence. Never serialized into TOML.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+
+    /// Runtime configuration for the app-owned Lemonade Server.
+    #[serde(default)]
+    pub lemonade: LemonadeConfig,
+
     /// Embedding-specific device settings.
     #[serde(default)]
     pub embedding: EmbeddingDeviceConfig,
@@ -836,73 +1008,17 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Load from the canonical search path, returning defaults if nothing is found.
-    ///
-    /// Search order:
-    /// 1. `./u-forge.toml`
-    /// 2. `$XDG_CONFIG_HOME/u-forge/config.toml`
-    ///    (or `$HOME/.config/u-forge/config.toml` on Linux)
-    /// 3. Built-in defaults
-    pub fn load_default() -> Self {
-        if let Some(config) = Self::load_from_candidates(Self::candidate_paths()) {
-            return config;
-        }
-
-        info!("AppConfig: no config file found — using defaults");
-        Self {
-            source_path: Self::per_user_config_path(),
-            ..Self::default()
-        }
-    }
-
-    /// Load the first existing, valid config in an ordered list of candidates.
-    /// Missing files must be skipped here because [`Self::load`] deliberately
-    /// maps a missing explicitly-requested path to the default configuration.
-    fn load_from_candidates(paths: impl IntoIterator<Item = PathBuf>) -> Option<Self> {
-        for path in paths {
-            if !path.exists() {
-                continue;
-            }
-            match Self::load(&path) {
-                Ok(cfg) => return Some(cfg),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "AppConfig: failed to load — skipping"
-                    );
-                }
-            }
-        }
-        None
-    }
-
-    /// Ordered list of paths to check when loading the default config.
-    fn candidate_paths() -> Vec<PathBuf> {
-        let mut paths = vec![PathBuf::from("u-forge.toml")];
-
-        // XDG_CONFIG_HOME / fallback to $HOME/.config
-        let xdg_base = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs_or_home()
-                    .map(|h| h.join(".config"))
-                    .unwrap_or_default()
-            });
-
-        if !xdg_base.as_os_str().is_empty() {
-            paths.push(xdg_base.join("u-forge").join("config.toml"));
-        }
-
-        paths
+    /// Create the canonical XDG profile from packaged defaults when necessary,
+    /// then load its single authoritative configuration file.
+    pub fn load_user(packaged_defaults: &Path) -> Result<Self> {
+        let paths = UserPaths::discover()?;
+        paths.initialize(packaged_defaults)?;
+        Self::load(&paths.config_file)
+            .with_context(|| format!("loading user configuration {}", paths.config_file.display()))
     }
 
     fn per_user_config_path() -> Option<PathBuf> {
-        let xdg_base = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .ok()
-            .or_else(|| dirs_or_home().map(|home| home.join(".config")))?;
-        Some(xdg_base.join("u-forge/config.toml"))
+        UserPaths::discover().ok().map(|paths| paths.config_file)
     }
 
     /// Persist setup choices while preserving comments and unknown keys.
@@ -999,11 +1115,121 @@ impl AppConfig {
         std::fs::rename(temp, &path)?;
         Ok(path)
     }
-}
 
-/// Helper: `$HOME` path, if determinable.
-fn dirs_or_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    /// Persist retrieval controls revealed by the advanced Settings view.
+    pub fn persist_retrieval_settings(
+        &self,
+        fts_limit: usize,
+        semantic_limit: usize,
+        rerank: bool,
+    ) -> Result<PathBuf> {
+        use toml_edit::{DocumentMut, Item, Table, value};
+
+        let path = self
+            .source_path
+            .clone()
+            .or_else(Self::per_user_config_path)
+            .ok_or_else(|| anyhow::anyhow!("cannot determine a configuration path"))?;
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut document = if text.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            text.parse::<DocumentMut>()?
+        };
+        if document.get("chat").is_none_or(|item| !item.is_table()) {
+            document["chat"] = Item::Table(Table::new());
+        }
+        document["chat"]["fts_limit"] = value(fts_limit as i64);
+        document["chat"]["semantic_limit"] = value(semantic_limit as i64);
+        document["chat"]["rerank"] = value(rerank);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp, document.to_string())?;
+        std::fs::rename(temp, &path)?;
+        Ok(path)
+    }
+
+    /// Persist the complete typed settings model while retaining comments and
+    /// unrelated keys already present in the user's TOML document.
+    ///
+    /// Existing scalar decoration is copied onto replacement values. Tables are
+    /// merged recursively, so application-owned values are updated without
+    /// flattening the file into a generated configuration dump.
+    pub fn persist_settings(&self, settings: &AppConfig) -> Result<PathBuf> {
+        use toml_edit::{DocumentMut, Item};
+
+        fn merge_item(target: &mut Item, source: &Item) {
+            if let (Some(target_table), Some(source_table)) =
+                (target.as_table_mut(), source.as_table())
+            {
+                for (key, source_value) in source_table.iter() {
+                    if let Some(target_value) = target_table.get_mut(key) {
+                        merge_item(target_value, source_value);
+                    } else {
+                        target_table.insert(key, source_value.clone());
+                    }
+                }
+                return;
+            }
+
+            let decor = target.as_value().map(|value| value.decor().clone());
+            *target = source.clone();
+            if let (Some(decor), Some(value)) = (decor, target.as_value_mut()) {
+                *value.decor_mut() = decor;
+            }
+        }
+
+        let path = self
+            .source_path
+            .clone()
+            .or_else(Self::per_user_config_path)
+            .ok_or_else(|| anyhow::anyhow!("cannot determine a configuration path"))?;
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut document = if existing.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            existing.parse::<DocumentMut>()?
+        };
+        let serialized = toml::to_string(settings)?;
+        let desired = serialized.parse::<DocumentMut>()?;
+        for section in [
+            "lemonade",
+            "embedding",
+            "models",
+            "chat",
+            "storage",
+            "data",
+            "ui",
+        ] {
+            if let Some(source) = desired.get(section) {
+                if let Some(target) = document.get_mut(section) {
+                    merge_item(target, source);
+                } else {
+                    document[section] = source.clone();
+                }
+            }
+        }
+        if let Some(agent) = document
+            .get_mut("chat")
+            .and_then(Item::as_table_mut)
+            .and_then(|chat| chat.get_mut("agent"))
+            .and_then(Item::as_table_mut)
+        {
+            agent.remove("cumulative_request_tokens");
+            agent.remove("cumulative_tool_output_tokens");
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp, document.to_string())?;
+        std::fs::rename(temp, &path)?;
+        Ok(path)
+    }
 }
 
 // ── Default value helpers ─────────────────────────────────────────────────────
@@ -1096,6 +1322,7 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.ui.font_size, 16.0);
         assert_eq!(cfg.ui.interface_size, DEFAULT_UI_INTERFACE_SIZE);
+        assert_eq!(cfg.lemonade.max_loaded_models, 1);
         assert!(!cfg.ui.window_controls_left);
         assert!(cfg.embedding.npu_enabled);
         assert!(cfg.embedding.gpu_enabled);
@@ -1116,23 +1343,23 @@ mod tests {
             PathBuf::from("./defaults/data/memory.jsonl")
         );
         assert_eq!(cfg.chat.agent.schema_summary_tokens, 768);
-        assert_eq!(cfg.chat.agent.cumulative_request_tokens, 16_384);
-        assert_eq!(cfg.chat.agent.cumulative_tool_output_tokens, 2_048);
+        assert_eq!(cfg.chat.agent.cumulative_request_tokens, None);
+        assert_eq!(cfg.chat.agent.cumulative_tool_output_tokens, None);
         assert_eq!(cfg.chat.agent.repeated_call_limit, 1);
+        assert_eq!(cfg.chat.fts_limit, 20);
+        assert_eq!(cfg.chat.semantic_limit, 20);
+        assert!(cfg.chat.rerank);
     }
 
     #[test]
-    fn default_agent_budgets_do_not_require_clamping() {
+    fn default_agent_budget_has_no_application_context_ceiling() {
         let chat = ChatConfig::default();
         let effective = chat
             .agent
-            .reconcile(
-                chat.max_context_tokens,
-                chat.response_reserve,
-                chat.max_tool_turns,
-            )
+            .reconcile(usize::MAX, chat.max_tool_turns)
             .unwrap();
 
+        assert_eq!(effective.context_tokens, usize::MAX);
         assert!(
             effective.diagnostics.is_empty(),
             "default agent budgets should be valid without adjustment: {:?}",
@@ -1141,25 +1368,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_budgets_reconcile_with_the_active_context_and_turn_ceiling() {
+    fn legacy_agent_caps_do_not_limit_the_active_context() {
         let configured = AgentBudgetConfig {
             schema_summary_tokens: 10_000,
-            cumulative_request_tokens: 100_000,
-            cumulative_tool_output_tokens: 50_000,
+            cumulative_request_tokens: None,
+            cumulative_tool_output_tokens: None,
             repeated_call_limit: 2,
         };
-        let effective = configured.reconcile(4_096, 1_024, 3).unwrap();
-        assert_eq!(effective.schema_summary_tokens, 3_072);
-        assert_eq!(effective.cumulative_request_tokens, 12_288);
-        assert_eq!(effective.cumulative_tool_output_tokens, 3_072);
+        let effective = configured.reconcile(4_096, 3).unwrap();
+        assert_eq!(effective.context_tokens, 4_096);
         assert_eq!(effective.repeated_call_limit, 2);
-        assert_eq!(effective.diagnostics.len(), 3);
+        assert!(effective.diagnostics.is_empty());
 
         let invalid = AgentBudgetConfig {
             schema_summary_tokens: 31,
             ..AgentBudgetConfig::default()
         };
-        assert!(invalid.reconcile(4_096, 1_024, 5).is_err());
+        assert!(invalid.reconcile(4_096, 5).is_ok());
     }
 
     #[test]
@@ -1173,20 +1398,76 @@ mod tests {
         .unwrap();
         let config = AppConfig::load(file.path()).unwrap();
         assert_eq!(config.chat.agent.schema_summary_tokens, 321);
-        assert_eq!(config.chat.agent.cumulative_request_tokens, 4_321);
-        assert_eq!(config.chat.agent.cumulative_tool_output_tokens, 654);
+        assert_eq!(config.chat.agent.cumulative_request_tokens, Some(4_321));
+        assert_eq!(config.chat.agent.cumulative_tool_output_tokens, Some(654));
         assert_eq!(config.chat.agent.repeated_call_limit, 3);
+        let effective = config.chat.agent.reconcile(4_096, 5).unwrap();
+        assert!(
+            effective
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("ignored"))
+        );
     }
 
     #[test]
-    fn test_candidate_search_skips_missing_paths() {
+    fn user_profile_seeds_and_transforms_packaged_defaults_once() {
         let temp = tempfile::tempdir().unwrap();
-        let missing = temp.path().join("missing.toml");
-        let present = temp.path().join("config.toml");
-        std::fs::write(&present, "[embedding]\nnpu_weight = 321\n").unwrap();
+        let packaged = temp.path().join("package/defaults");
+        std::fs::create_dir_all(packaged.join("config")).unwrap();
+        std::fs::create_dir_all(packaged.join("schemas/Sine Nomine")).unwrap();
+        std::fs::create_dir_all(packaged.join("example_data")).unwrap();
+        std::fs::write(
+            packaged.join("config/u-forge.toml"),
+            "# retained\n[storage]\ndb_path = \"template\"\n[data]\nimport_file = \"template\"\nschema_dir = \"template\"\n",
+        )
+        .unwrap();
+        let schema = packaged.join("schemas/Sine Nomine/location.schema.json");
+        std::fs::write(&schema, "{}\n").unwrap();
+        std::fs::write(
+            packaged.join("example_data/foundation-example.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
 
-        let cfg = AppConfig::load_from_candidates([missing, present]).unwrap();
-        assert_eq!(cfg.embedding.npu_weight, 321);
+        let paths = UserPaths::from_bases(
+            temp.path().join("config"),
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        );
+        paths.initialize(&packaged).unwrap();
+
+        let text = std::fs::read_to_string(&paths.config_file).unwrap();
+        assert!(text.contains("# retained"));
+        assert!(text.contains(&path_text(&paths.db_dir)));
+        assert!(
+            text.contains(&path_text(
+                &paths
+                    .defaults_dir
+                    .join("example_data/foundation-example.jsonl")
+            ))
+        );
+        let copied_schema = paths
+            .defaults_dir
+            .join("schemas/Sine Nomine/location.schema.json");
+        assert!(copied_schema.is_file());
+        assert_eq!(
+            std::fs::read_to_string(paths.data_dir.join(".defaults-revision")).unwrap(),
+            "1\n"
+        );
+
+        std::fs::remove_file(&copied_schema).unwrap();
+        std::fs::write(&paths.config_file, "[storage]\ndb_path = \"custom\"\n").unwrap();
+        paths.initialize(&packaged).unwrap();
+        assert!(
+            !copied_schema.exists(),
+            "deleted defaults must stay deleted"
+        );
+        assert!(
+            std::fs::read_to_string(&paths.config_file)
+                .unwrap()
+                .contains("custom")
+        );
     }
 
     #[test]
@@ -1253,6 +1534,61 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_persistence_round_trips_advanced_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "# retained\n[ui]\nfont_size = 17.0\n").unwrap();
+        let config = AppConfig {
+            source_path: Some(path.clone()),
+            ..AppConfig::default()
+        };
+
+        config.persist_retrieval_settings(35, 45, false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# retained"));
+        assert!(text.contains("font_size = 17.0"));
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        assert_eq!(reloaded.chat.fts_limit, 35);
+        assert_eq!(reloaded.chat.semantic_limit, 45);
+        assert!(!reloaded.chat.rerank);
+    }
+
+    #[test]
+    fn full_settings_persistence_is_typed_lossless_and_removes_legacy_budgets() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# retained header\ncustom_key = 42\n\n[chat]\nfts_limit = 7 # retained scalar comment\n\n[chat.agent]\ncumulative_request_tokens = 1234\ncumulative_tool_output_tokens = 567\n",
+        )
+        .unwrap();
+        let current = AppConfig {
+            source_path: Some(path.clone()),
+            ..AppConfig::default()
+        };
+        let mut desired = current.clone();
+        desired.chat.fts_limit = 37;
+        desired.chat.semantic_limit = 29;
+        desired.ui.font_size = 18.0;
+        desired.embedding.high_quality_embedding = true;
+        desired.lemonade.max_loaded_models = 4;
+
+        let written = current.persist_settings(&desired).unwrap();
+        assert_eq!(written, path);
+        let text = std::fs::read_to_string(written).unwrap();
+        assert!(text.contains("# retained header"));
+        assert!(text.contains("custom_key = 42"));
+        assert!(text.contains("fts_limit = 37 # retained scalar comment"));
+        assert!(text.contains("semantic_limit = 29"));
+        assert!(text.contains("font_size = 18.0"));
+        assert!(text.contains("high_quality_embedding = true"));
+        assert!(text.contains("max_loaded_models = 4"));
+        assert!(!text.contains("cumulative_request_tokens"));
+        assert!(!text.contains("cumulative_tool_output_tokens"));
+    }
+
+    #[test]
     fn test_default_model_load_params() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.models.ctx_size_for("embed-gemma-300m-FLM"), 2048);
@@ -1315,6 +1651,9 @@ npu_weight   = 200
 gpu_weight   = 75
 cpu_weight   = 5
 
+[lemonade]
+max_loaded_models = 2
+
 [storage]
 db_path = "./tmp/kg"
 embedding_dimensions = 1024
@@ -1330,6 +1669,7 @@ high_quality_embedding_dimensions = 2048
         assert_eq!(cfg.embedding.npu_weight, 200);
         assert_eq!(cfg.embedding.gpu_weight, 75);
         assert_eq!(cfg.embedding.cpu_weight, 5);
+        assert_eq!(cfg.lemonade.max_loaded_models, 2);
         assert_eq!(cfg.storage.db_path, PathBuf::from("./tmp/kg"));
         assert_eq!(cfg.storage.embedding_dimensions, 1024);
         assert_eq!(cfg.storage.high_quality_embedding_dimensions, 2048);
@@ -1344,7 +1684,7 @@ high_quality_embedding_dimensions = 2048
 [models.load_params]
 "embed-gemma-300m-FLM"    = {{ ctx_size = 1024 }}
 "my-custom-model-FLM"     = {{ ctx_size = 8192 }}
-"bge-reranker-v2-m3-GGUF" = {{ ctx_size = 8192, batch_size = 512, ubatch_size = 512 }}
+"bge-reranker-v2-m3-GGUF" = {{ ctx_size = 8192, batch_size = 512, ubatch_size = 512, llamacpp_args = "--threads 6" }}
 "#
         )
         .unwrap();
@@ -1357,6 +1697,7 @@ high_quality_embedding_dimensions = 2048
         assert_eq!(rerank_opts.ctx_size, Some(8192));
         assert_eq!(rerank_opts.batch_size, Some(512));
         assert_eq!(rerank_opts.ubatch_size, Some(512));
+        assert_eq!(rerank_opts.llamacpp_args.as_deref(), Some("--threads 6"));
     }
 
     #[test]

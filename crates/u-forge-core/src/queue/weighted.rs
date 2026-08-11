@@ -66,9 +66,7 @@ struct WeightedWorkerSlot {
     /// Human-readable device name (e.g. "NPU", "GPU").  Emitted as a span
     /// field (`selected_worker_id`) by [`WeightedEmbedDispatcher::submit`].
     name: String,
-    /// Idle flag shared with the worker task.  Retained for future work-stealing
-    /// enhancements — e.g. preferring to steal *to* idle workers rather than
-    /// relying purely on EWMA cost comparison.
+    /// Idle flag shared with and owned alongside the worker task.
     #[allow(dead_code)]
     idle: Arc<AtomicBool>,
     /// EWMA job duration in microseconds.  `0` = no completed job yet.

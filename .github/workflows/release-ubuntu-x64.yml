@@ -1,4 +1,4 @@
-name: Draft Ubuntu x64 release
+name: Draft Linux x86_64 AppImage release
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   package:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +29,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
+            desktop-file-utils patchelf \
             libasound2-dev libfontconfig1-dev libudev-dev libwayland-dev \
             libx11-xcb-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev
 
@@ -38,27 +39,23 @@ jobs:
 
       - name: Build u-forge
         env:
-          UFORGE_REQUIRE_EMBEDDED_LEMONADE: "1"
-        run: cargo build --locked --release -p u-forge-ui-gpui
+          RELEASE_VERSION: ${{ inputs.release_tag }}
+        run: make release V=1
 
-      - name: Assemble stable bundle layout
+      - name: Verify AppImage artifact
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          bundle="u-forge-${RELEASE_TAG}-ubuntu-x64"
-          mkdir -p "$bundle"
-          install -m 0755 target/release/u-forge-ui-gpui "$bundle/u-forge-ui-gpui"
-          cp -a target/release/lemonade "$bundle/lemonade"
-          test -x "$bundle/u-forge-ui-gpui"
-          test -x "$bundle/lemonade/lemond"
-          "$bundle/lemonade/lemond" --version
-          if ldd "$bundle/lemonade/lemond" | grep -q 'not found'; then
-            ldd "$bundle/lemonade/lemond"
-            exit 1
-          fi
-          tar -czf "$bundle.tar.gz" "$bundle"
-          sha256sum "$bundle.tar.gz" > "$bundle.tar.gz.sha256"
+          version=${RELEASE_TAG#v}
+          artifact="dist/u-forge-${version}-x86_64.AppImage"
+          test -x "$artifact"
+          (cd dist && sha256sum --check "$(basename "$artifact").sha256")
+          "$artifact" --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/u-forge
+          test -x squashfs-root/usr/lib/u-forge/lemonade/lemond
+          test -f squashfs-root/usr/share/u-forge/defaults/config/u-forge.toml
+          test -f squashfs-root/usr/share/u-forge/defaults/schemas/Sine\ Nomine/npc.schema.json
 
       - name: Create draft GitHub release
         env:
@@ -66,10 +63,11 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
-          bundle="u-forge-${RELEASE_TAG}-ubuntu-x64.tar.gz"
+          version=${RELEASE_TAG#v}
+          artifact="dist/u-forge-${version}-x86_64.AppImage"
           gh release create "$RELEASE_TAG" \
             --draft \
             --target "$SOURCE_REF" \
             --title "u-forge ${RELEASE_TAG}" \
             --generate-notes \
-            "$bundle" "$bundle.sha256"
+            "$artifact" "$artifact.sha256"

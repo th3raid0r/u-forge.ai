@@ -120,9 +120,12 @@ impl EmbeddingPlan {
             EmbeddingTask::Rechunk(ids) => Ok(!ids.is_empty()),
             EmbeddingTask::EmbedAll => {
                 let stats = graph.get_stats()?;
+                let standard_complete = stats.embedded_count == stats.chunk_count;
                 Ok(
                     (standard_enabled && stats.chunk_count > stats.embedded_count)
-                        || (hq_enabled && stats.chunk_count > stats.embedded_hq_count),
+                        || (hq_enabled
+                            && standard_complete
+                            && stats.chunk_count > stats.embedded_hq_count),
                 )
             }
         }
@@ -224,7 +227,11 @@ impl EmbeddingPlan {
                     cancellation.clone(),
                 )
                 .await;
-                let hq_result = if let Some(hq) = hq_queue.filter(|_| !cancellation.is_cancelled())
+                let standard_complete = graph
+                    .get_stats()
+                    .is_ok_and(|stats| stats.embedded_count == stats.chunk_count);
+                let hq_result = if let Some(hq) =
+                    hq_queue.filter(|_| !cancellation.is_cancelled() && standard_complete)
                 {
                     Some(
                         embed_all_chunks_with_cancellation(
@@ -236,6 +243,11 @@ impl EmbeddingPlan {
                         .await,
                     )
                 } else {
+                    if hq_queue.is_some() && !standard_complete && !cancellation.is_cancelled() {
+                        warn!(
+                            "HQ embedding skipped because the standard embedding lane is incomplete"
+                        );
+                    }
                     None
                 };
 
@@ -247,10 +259,14 @@ impl EmbeddingPlan {
                         (0, 0, 0)
                     }
                 };
-                let hq_stored = hq_result
-                    .and_then(|r| r.ok())
-                    .map(|r| r.stored)
-                    .unwrap_or(0);
+                let hq_stored = match hq_result {
+                    Some(Ok(result)) => result.stored,
+                    Some(Err(error)) => {
+                        warn!(%error, "embed_all_chunks (HQ) failed");
+                        0
+                    }
+                    None => 0,
+                };
 
                 // embed_many uses (workers * 2).max(4) as its concurrency cap.
                 let concurrency_cap = (queue.embedding_worker_count() * 2).max(4);
@@ -316,8 +332,10 @@ pub async fn rechunk_and_embed_with_cancellation(
 
     let has_standard = queue.has_embedding();
     let hq_queue = hq_queue.filter(|queue| queue.has_embedding());
-    if !has_standard && hq_queue.is_none() {
-        anyhow::bail!("No embedding-capable provider is available");
+    if !has_standard {
+        anyhow::bail!(
+            "A standard embedding provider is required before high-quality embeddings can be added"
+        );
     }
 
     if has_standard {
@@ -437,12 +455,18 @@ pub async fn embed_all_chunks_with_cancellation(
             total: 0,
         });
     }
+    let stats = graph.get_stats()?;
+    if target == EmbeddingTarget::HighQuality && stats.embedded_count < stats.chunk_count {
+        anyhow::bail!(
+            "High-quality embeddings require a complete standard embedding lane ({} of {} chunks are standard-embedded)",
+            stats.embedded_count,
+            stats.chunk_count
+        );
+    }
     let fingerprint = queue
         .embedding_space_fingerprint()
         .ok_or_else(|| anyhow::anyhow!("Embedding queue has no model fingerprint"))?;
     graph.ensure_embedding_space(target, fingerprint)?;
-
-    let stats = graph.get_stats()?;
 
     let needs_embedding = match target {
         EmbeddingTarget::Standard => stats.chunk_count > stats.embedded_count,
@@ -844,28 +868,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rechunk_accepts_an_hq_only_embedding_lane() {
+    async fn rechunk_rejects_an_hq_only_embedding_lane_without_deleting_source_chunks() {
         let (graph, _tmp) = make_graph();
         let standard_queue = InferenceQueueBuilder::new().build();
         let hq_queue = make_embed_queue_with_dimensions(HIGH_QUALITY_EMBEDDING_DIMENSIONS);
         let object_id = ObjectBuilder::character("HQ-only character".to_string())
             .add_to_graph(&graph)
             .unwrap();
-
-        let chunks = rechunk_and_embed(&graph, &standard_queue, Some(&hq_queue), object_id)
-            .await
+        graph
+            .add_text_chunk(
+                object_id,
+                "Existing searchable text".to_string(),
+                ChunkType::Description,
+            )
             .unwrap();
 
-        assert_eq!(chunks, 1);
+        let error = rechunk_and_embed(&graph, &standard_queue, Some(&hq_queue), object_id)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("standard embedding provider"));
         let stats = graph.get_stats().unwrap();
         assert_eq!(stats.chunk_count, 1);
         assert_eq!(stats.embedded_count, 0);
-        assert_eq!(stats.embedded_hq_count, 1);
+        assert_eq!(stats.embedded_hq_count, 0);
         assert!(
             !EmbeddingPlan::embed_all()
                 .has_pending_work(&graph, false, true)
                 .unwrap(),
-            "a disabled standard lane must not keep an HQ-only sweep pending"
+            "HQ work must wait until the standard lane can be populated"
         );
         assert!(
             EmbeddingPlan::embed_all()
@@ -873,5 +904,34 @@ mod tests {
                 .unwrap(),
             "the same graph still needs work when a standard lane is active"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_hq_sweep_requires_standard_embeddings_for_every_chunk() {
+        let (graph, _tmp) = make_graph();
+        let hq_queue = make_embed_queue_with_dimensions(HIGH_QUALITY_EMBEDDING_DIMENSIONS);
+        let object_id = ObjectBuilder::character("Unembedded character".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        graph
+            .add_text_chunk(
+                object_id,
+                "Standard must be written first".to_string(),
+                ChunkType::Description,
+            )
+            .unwrap();
+
+        let error = embed_all_chunks(&graph, &hq_queue, EmbeddingTarget::HighQuality)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("complete standard embedding lane")
+        );
+        let stats = graph.get_stats().unwrap();
+        assert_eq!(stats.embedded_count, 0);
+        assert_eq!(stats.embedded_hq_count, 0);
     }
 }

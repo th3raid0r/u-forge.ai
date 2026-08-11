@@ -1,6 +1,6 @@
 [package]
 name = "u-forge-core"
-version = "0.1.0"
+version = "0.1.1-pre"
 edition = "2024"
 description = "Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs"
 license = "MIT"

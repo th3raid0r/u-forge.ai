@@ -1988,7 +1988,7 @@ mod tests {
 
         let config = HybridSearchConfig {
             alpha: 0.5,
-            rerank: true, // requested but will be silently skipped
+            rerank: true, // requested; unavailable reranking leaves RRF scores
             limit: 4,
             ..Default::default()
         };

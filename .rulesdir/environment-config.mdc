@@ -1,33 +1,41 @@
 ---
-globs: env.sh,dev.sh,*.toml,*.yaml,*.yml,config.*
+globs: *.toml,*.yaml,*.yml,config.*
 ---
 
 # Environment and Configuration
-
-## env.sh is optional
-
-`env.sh` no longer sets compiler variables — bundled SQLite compiles with any
-standard C compiler on PATH. Source it only if you want the convenience path
-exports.
 
 ## Environment Variables
 
 ```bash
 # All optional — the app runs with nothing set.
 export LEMONADE_URL="http://localhost:13305/api/v1"  # Only needed for non-default server URL
-export UFORGE_SCHEMA_DIR="./defaults/schemas"        # Override schema directory
-export UFORGE_DATA_FILE="./defaults/data/memory.jsonl" # Override data file
+export LEMONADE_API_KEY="..."                        # Optional inference key override
+export LEMONADE_ADMIN_API_KEY="..."                  # Optional management key override
+export UFORGE_SCHEMA_DIR="./defaults/schemas"        # load_default_schemas() override
 export RUST_LOG=info                                 # Log verbosity
 
 # Direct `cargo test` integration control (canonical `make test` overrides this)
 export UFORGE_INTEGRATION_TESTS=require  # Panic instead of skip when server unreachable
 export UFORGE_INTEGRATION_TESTS=skip     # Force-skip even when a server is present
 export UFORGE_SKIP_EMBEDDED_LEMONADE=1   # Skip automatic runtime provisioning
+export UFORGE_LEMOND_PATH="/path/to/lemonade/lemond" # Owned-development binary override
 ```
+
+The desktop application has one canonical user profile:
+
+- `$XDG_CONFIG_HOME/u-forge/u-forge.toml` (fallback: `~/.config/u-forge/u-forge.toml`)
+- `$XDG_DATA_HOME/u-forge` (fallback: `~/.local/share/u-forge`) for databases and editable seeded defaults
+- `$XDG_CACHE_HOME/u-forge/lemonade` (fallback: `~/.cache/u-forge/lemonade`) for expendable Lemonade state
+
+The current working directory is never searched for `u-forge.toml`. At first
+launch, the packaged config template is transformed to absolute XDG data paths,
+and packaged schemas/example data are copied into the data directory. A defaults
+revision marker makes that seed one-time: user edits and deletions are not
+restored implicitly. A later defaults revision requires an explicit migration.
 
 ### Why env vars are overrides, not requirements
 
-`cargo run -p u-forge-ui-gpui` must work with zero env vars set. An unset env
+`cargo run -p u-forge` must work with zero env vars set. An unset env
 var must never be a hard error for core functionality.
 `lemonade::resolve_lemonade_url()` encodes this — never `env::var(...).unwrap()`
 at the top level.
@@ -46,21 +54,21 @@ export RUST_LOG=info,u_forge_core::lemonade::management=debug,u_forge_core::lemo
 `~/.cache/u-forge/lemonade/config.json` when `XDG_CACHE_HOME` is unset. Models
 and downloaded backends live under that same cache root; model paths never
 fall back to the global Hugging Face cache.
+The typed `[lemonade].max_loaded_models` u-forge setting defaults to `1` and is
+applied idempotently to the app-owned server through `POST /internal/set` before
+provider activation. Lemonade interprets this as a per-model-type residency
+limit. External servers are operator-owned and are never changed implicitly.
 Set that JSON field to `"debug"` when Lemonade's default informational child
 events are insufficient; u-forge forwards those lines only when the dedicated
 `lemond` tracing target above is enabled and redacts both runtime credentials.
 
-## Path Resolution
+## Import Path Resolution
 
-### Schema Directory (checked in order)
-1. `$UFORGE_SCHEMA_DIR`
-2. `./defaults/schemas`
-3. `../defaults/schemas`
-
-### Data File (checked in order)
-1. `$UFORGE_DATA_FILE`
-2. `./defaults/data/memory.jsonl`
-3. `../defaults/data/memory.jsonl`
+The desktop app reads `[data].schema_dir` and `[data].import_file` from its XDG
+configuration to pre-populate the new-world flow and explicit import dialogs.
+The lower-level
+`SchemaIngestion::load_default_schemas()` helper checks `UFORGE_SCHEMA_DIR`
+and otherwise uses `./defaults/schemas`.
 
 ## Database Location
 
@@ -72,20 +80,20 @@ events are insufficient; u-forge forwards those lines only when the dedicated
 lanes (defaults: 768 and 4096). Dimensions are persisted in database metadata;
 changing either value requires rebuilding the database.
 
-The desktop app uses a persistent database. Set `UFORGE_DATA_FILE` /
-`UFORGE_SCHEMA_DIR` to customise import sources.
+The desktop app uses the persistent path from `[storage].db_path`.
 
 ---
 
 ## Lemonade Server
 
 Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
-TTS) via an OpenAI-compatible HTTP API. On Ubuntu x64, building the desktop UI
-downloads the checksum-pinned Embeddable Lemonade release into `target/` and
-places its runtime beside the application executable. The build adds the
-`reasoning` catalog label to built-in Gemma 4 GGUF models before installation.
-If provisioning is skipped or unavailable, AI features degrade gracefully and
-the knowledge graph remains usable.
+TTS) via an OpenAI-compatible HTTP API. On x86_64 Linux with GNU libc, building
+the desktop UI downloads the checksum-pinned upstream Ubuntu x64 Embeddable
+Lemonade release into `target/`. `make release` packages that runtime, the
+desktop executable, and the complete defaults tree into an AppImage built on
+Ubuntu 26.04. The build adds the `reasoning` catalog label to built-in Gemma 4
+GGUF models before installation. If provisioning is skipped or unavailable, AI
+features degrade gracefully and the knowledge graph remains usable.
 
 ### Setup
 

@@ -356,7 +356,8 @@ impl<'a> DataIngestion<'a> {
                     }
                 };
 
-                // Dedup: check by source_id first, then by (type, name).
+                // Persisted dedup is `(type, name)`. The source ID becomes an
+                // alias for this import's relationship phase after reuse/create.
                 let existing_id =
                     self.find_existing(&source_id, &node_type, &name, &existing_by_type_name);
                 if existing_id.len() > 1 {
@@ -463,9 +464,8 @@ impl<'a> DataIngestion<'a> {
 
     /// Check for pre-existing objects by `(type, name)`.
     ///
-    /// The `source_id` parameter is accepted for forward-compatibility but is not yet
-    /// queryable — a property-index lookup can be added once `find_by_property` exists
-    /// on `KnowledgeGraph`.
+    /// `source_id` is not a persisted dedup key. It is mapped to the selected
+    /// graph ID separately for this import's relationship phase.
     fn find_existing(
         &self,
         _source_id: &str,

@@ -67,9 +67,10 @@ pub use load::{
     reload_model_with_connection,
 };
 pub use management::{
-    DownloadAction, LemonadeManagement, SetupBackendChoice, SetupComponent, SetupComponentState,
-    SetupRole, chat_component_state, component_state, initial_setup_components,
-    select_setup_backend, setup_chat_models,
+    DownloadAction, LemonadeManagement, ManagementEventKind, ManagementOperationKind,
+    ManagementProgressEvent, ManagementProgressReceiver, SetupBackendChoice, SetupComponent,
+    SetupComponentState, SetupRole, chat_component_state, component_state,
+    initial_setup_components, select_setup_backend, setup_chat_models,
 };
 pub use provider_factory::{
     BuiltProvider, Capability, CoordinatedChatProvider, ProviderFactory, ProviderSlot,

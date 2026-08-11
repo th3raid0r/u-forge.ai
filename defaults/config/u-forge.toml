@@ -1,0 +1,92 @@
+[lemonade]
+# Maximum simultaneously resident models per model type. Three allows the
+# standard, optional NPU, and high-quality embedding models to coexist.
+max_loaded_models = 3
+
+[ui]
+# Base content font size in pixels (rem unit). Text scales relative to this:
+#   text_xs (labels, timestamps) = 0.75 × font_size
+#   text_sm (body, menus)        = 0.875 × font_size
+# Default: 16.0. Adjust text without resizing interface chrome or icons.
+font_size = 16.0
+# Independent baseline for controls, panel chrome, spacing, and icons.
+# Default: 22.0. This does not alter content text size.
+interface_size = 20.0
+# Reveal low-level runtime diagnostics and maintenance controls in the app.
+# Ordinary worldbuilding and AI choices remain visible when this is false.
+show_advanced_controls = true
+window_controls_left = false
+
+[storage]
+# Launch rewrites this packaged placeholder to the user's XDG data directory.
+db_path = "./data/db"
+# Vector widths must match the configured embedding models. Existing databases
+# must be rebuilt or re-indexed before changing either value.
+embedding_dimensions = 768
+high_quality_embedding_dimensions = 4096
+
+[data]
+# Launch rewrites these packaged placeholders to the seeded XDG data directory.
+import_file = "./defaults/example_data/foundation-example.jsonl"
+schema_dir  = "./defaults/schemas/Sine Nomine"
+
+[embedding]
+npu_enabled = true
+high_quality_embedding = true
+gpu_enabled = true
+gpu_weight = 40
+cpu_enabled = false
+cpu_weight = 10
+npu_weight = 100
+
+[models.load_params]
+## Mostly important for embedding models, but can be used for any text model.
+"embed-gemma-300m-FLM"             = { ctx_size = 2048 }
+"ggml-org/embeddinggemma-300M-GGUF" = { ctx_size = 2048, batch_size = 2048, ubatch_size = 2048 }
+"nomic-embed-text-v1-GGUF"         = { ctx_size = 2048, batch_size = 2048, ubatch_size = 2048 }
+"Qwen3-Embedding-4B-GGUF"          = { ctx_size = 16384, batch_size = 2048, ubatch_size = 2048 }
+"Qwen3-Embedding-8B-GGUF"          = { ctx_size = 32768, batch_size = 2048, ubatch_size = 2048 }
+"bge-reranker-v2-m3-GGUF"          = { ctx_size = 8192, batch_size = 2048, ubatch_size = 2048 }
+
+[chat]
+preferred_device = "gpu"
+system_prompt = "You are a knowledgeable assistant for a TTRPG worldbuilding tool. Answer questions accurately based on the provided knowledge graph context. Be concise and informative."
+max_history_turns = 10
+alpha = 0.5                     # 0.0 = FTS5-only, 1.0 = semantic-only
+search_limit = 3
+hq_semantic_boost = 3           # RRF weight multiplier for the 4096-dim HQ semantic path (vs 1.0 for 768-dim)
+max_tool_turns = 5              # max tool-call round-trips per user message
+reasoning_control = "request"
+response_reserve = 1024
+fts_limit = 20
+semantic_limit = 20
+rerank = true
+
+[chat.agent]
+schema_summary_tokens = 768          # bounded whole-record schema prompt
+repeated_call_limit = 1              # unchanged repeats allowed per canonical call
+
+[chat.gpu]
+model = "Gemma-4-E4B-it-GGUF"
+max_tokens = 262144
+temperature = 0.3               # low for reliable tool calling
+top_p = 0.9                     # nucleus sampling — mild focus
+frequency_penalty = 0.3         # discourage repetitive tool-call loops
+# top_k = 40                    # top-k sampling (llama.cpp only)
+# min_p = 0.05                  # min-p sampling (llama.cpp only)
+# presence_penalty = 0.0        # encourage topic diversity
+# repetition_penalty = 1.1      # llama.cpp style (1.0 = off, 1.1–1.3 typical)
+# seed = 42                     # reproducible output (backend-dependent)
+# stop = ["<|end|>"]            # custom stop sequences
+
+[chat.npu]
+model = "gemma4-it-e4b-FLM"
+max_tokens = 262144
+temperature = 0.3
+top_p = 0.9
+frequency_penalty = 0.3
+
+# [chat.cpu]
+# model = "some-cpu-model-GGUF"
+# max_tokens = 256
+# temperature = 0.3

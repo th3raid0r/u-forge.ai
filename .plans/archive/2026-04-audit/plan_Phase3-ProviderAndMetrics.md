@@ -27,7 +27,7 @@ dead-code review (D4) ride along because they live in the same
 | F8 | No metrics export | Cross-cutting; `tracing::debug!` is the current proxy |
 | L7 | `GraphEvent` carries no delta info — subscribers refetch full node | `crates/u-forge-core/src/graph/observable.rs:14-22` |
 | L8 | Broadcast channel capacity fixed at 64; `Lagged` falls back without telemetry | `crates/u-forge-core/src/graph/observable.rs:36` |
-| D4 | `selection_model.rs` may be UI-internal only — review public surface | `crates/u-forge-ui-gpui/src/selection_model.rs` |
+| D4 | `selection_model.rs` may be UI-internal only — review public surface | `crates/u-forge/src/selection_model.rs` |
 
 ---
 
@@ -81,7 +81,7 @@ impl (e.g. Ollama, since it's local), then UI surface.
 
 ### D4 — `selection_model.rs` surface review
 
-- Search the workspace for usages outside `u-forge-ui-gpui`.
+- Search the workspace for usages outside `u-forge`.
 - If none, change the visibility to `pub(crate)`.
 - Document the decision in a doc comment on the module.
 
