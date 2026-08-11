@@ -9,8 +9,9 @@ use gpui::{
 use u_forge_core::{
     ChatDevice, ReasoningControl,
     lemonade::{
-        DownloadAction, LemonadeOwnership, LemonadeServerCatalog, SetupComponentState,
-        component_state, initial_setup_components, setup_chat_models,
+        DownloadAction, LemonadeOwnership, LemonadeServerCatalog, ManagementEventKind,
+        ManagementProgressEvent, SetupComponentState, component_state, initial_setup_components,
+        setup_chat_models,
     },
 };
 
@@ -283,6 +284,26 @@ impl SetupPanel {
     pub(crate) fn set_busy(&mut self, busy: bool, status: impl Into<String>) {
         self.busy = busy;
         self.status = status.into();
+    }
+
+    pub(crate) fn apply_management_progress(&mut self, event: &ManagementProgressEvent) {
+        let progress = event
+            .progress_percent
+            .map(|percent| format!(" {percent:.0}%"))
+            .unwrap_or_default();
+        let detail = event
+            .message
+            .as_deref()
+            .map(|message| format!(": {message}"))
+            .unwrap_or_default();
+        self.busy = !event.is_terminal();
+        self.status = match event.kind {
+            ManagementEventKind::Progress => {
+                format!("Preparing {}{progress}{detail}", event.target)
+            }
+            ManagementEventKind::Complete => format!("{} is ready{detail}", event.target),
+            ManagementEventKind::Failed => format!("{} failed{detail}", event.target),
+        };
     }
 
     fn cycle_chat(&mut self, direction: isize, cx: &mut Context<Self>) {

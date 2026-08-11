@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use futures::StreamExt;
 use serde::Serialize;
+use tokio::sync::mpsc;
 
 use super::{
     CatalogModel, InstalledBackend, LemonadeConnection, LemonadeHttpClient, LemonadeOwnership,
@@ -333,6 +335,42 @@ pub enum DownloadAction {
     Remove,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagementOperationKind {
+    ModelPull,
+    BackendInstall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagementEventKind {
+    Progress,
+    Complete,
+    Failed,
+}
+
+/// Normalized event emitted by Lemonade's management SSE endpoints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagementProgressEvent {
+    pub operation: ManagementOperationKind,
+    pub target: String,
+    pub kind: ManagementEventKind,
+    pub progress_percent: Option<f32>,
+    pub transferred_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub message: Option<String>,
+}
+
+impl ManagementProgressEvent {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.kind,
+            ManagementEventKind::Complete | ManagementEventKind::Failed
+        )
+    }
+}
+
+pub type ManagementProgressReceiver = mpsc::UnboundedReceiver<Result<ManagementProgressEvent>>;
+
 #[derive(Clone)]
 pub struct LemonadeManagement {
     connection: Arc<LemonadeConnection>,
@@ -379,6 +417,28 @@ impl LemonadeManagement {
         self.client.post_json_load("/pull", &body).await
     }
 
+    /// Pull a model with a client-owned SSE subscription. The receiver owns
+    /// progress until a terminal event or transport failure; dropping it ends
+    /// observation and allows the request task to stop naturally.
+    pub async fn pull_stream(
+        &self,
+        model_name: &str,
+        checkpoint: Option<&str>,
+        recipe: Option<&str>,
+        embedding: Option<bool>,
+        confirmed_external: bool,
+    ) -> Result<ManagementProgressReceiver> {
+        self.authorize_mutation(confirmed_external).await?;
+        let mut body = pull_body(model_name, checkpoint, recipe, embedding);
+        body["subscribe"] = serde_json::Value::Bool(true);
+        let response = self.client.post_stream("/pull", &body).await?;
+        Ok(management_event_stream(
+            response,
+            ManagementOperationKind::ModelPull,
+            model_name.to_string(),
+        ))
+    }
+
     pub async fn downloads(&self) -> Result<serde_json::Value> {
         self.client.get_json("/downloads").await
     }
@@ -413,6 +473,163 @@ impl LemonadeManagement {
             )
             .await
     }
+
+    pub async fn install_backend_stream(
+        &self,
+        recipe: &str,
+        backend: &str,
+        confirmed_external: bool,
+    ) -> Result<ManagementProgressReceiver> {
+        self.authorize_mutation(confirmed_external).await?;
+        let response = self
+            .client
+            .post_stream(
+                "/install",
+                &serde_json::json!({
+                    "recipe": recipe,
+                    "backend": backend,
+                    "stream": true,
+                }),
+            )
+            .await?;
+        Ok(management_event_stream(
+            response,
+            ManagementOperationKind::BackendInstall,
+            format!("{recipe}:{backend}"),
+        ))
+    }
+}
+
+fn management_event_stream(
+    response: reqwest::Response,
+    operation: ManagementOperationKind,
+    target: String,
+) -> ManagementProgressReceiver {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut bytes = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut terminal = false;
+        while let Some(chunk) = bytes.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = tx.send(Err(anyhow!("management SSE transport failed: {error}")));
+                    return;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(end) = find_sse_boundary(&buffer) {
+                let frame = buffer.drain(..end).collect::<Vec<_>>();
+                let boundary_len = if buffer.starts_with(b"\r\n\r\n") {
+                    4
+                } else {
+                    2
+                };
+                buffer.drain(..boundary_len);
+                match decode_management_event(&frame, operation, &target) {
+                    Ok(Some(event)) => {
+                        terminal |= event.is_terminal();
+                        if tx.send(Ok(event)).is_err() || terminal {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        }
+        if !terminal {
+            let _ = tx.send(Err(anyhow!("management SSE ended before a terminal event")));
+        }
+    });
+    rx
+}
+
+fn find_sse_boundary(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .or_else(|| bytes.windows(2).position(|window| window == b"\n\n"))
+}
+
+fn decode_management_event(
+    frame: &[u8],
+    operation: ManagementOperationKind,
+    target: &str,
+) -> Result<Option<ManagementProgressEvent>> {
+    let text = std::str::from_utf8(frame)?;
+    let mut event_name = None;
+    let mut data = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(':') || line.is_empty() {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            event_name = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.trim_start());
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let payload_text = data.join("\n");
+    let payload = serde_json::from_str::<serde_json::Value>(&payload_text)
+        .unwrap_or_else(|_| serde_json::Value::String(payload_text.clone()));
+    let normalized_name = event_name.unwrap_or("progress").to_ascii_lowercase();
+    let kind = if matches!(normalized_name.as_str(), "complete" | "completed" | "done") {
+        ManagementEventKind::Complete
+    } else if matches!(normalized_name.as_str(), "error" | "failed" | "failure") {
+        ManagementEventKind::Failed
+    } else {
+        ManagementEventKind::Progress
+    };
+    let number = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| payload.get(*name).and_then(serde_json::Value::as_f64))
+    };
+    let integer = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| payload.get(*name).and_then(serde_json::Value::as_u64))
+    };
+    let mut progress_percent = number(&["progress", "percent", "percentage"]).map(|value| {
+        let value = if value <= 1.0 { value * 100.0 } else { value };
+        value.clamp(0.0, 100.0) as f32
+    });
+    let transferred_bytes = integer(&[
+        "transferred_bytes",
+        "downloaded_bytes",
+        "downloaded",
+        "completed",
+    ]);
+    let total_bytes = integer(&["total_bytes", "total", "size"]);
+    if progress_percent.is_none()
+        && let (Some(transferred), Some(total)) = (transferred_bytes, total_bytes)
+        && total > 0
+    {
+        progress_percent = Some((transferred as f64 * 100.0 / total as f64) as f32);
+    }
+    let message = ["message", "status", "detail", "error"]
+        .into_iter()
+        .find_map(|name| payload.get(name).and_then(serde_json::Value::as_str))
+        .map(ToString::to_string)
+        .or_else(|| payload.as_str().map(ToString::to_string));
+    Ok(Some(ManagementProgressEvent {
+        operation,
+        target: target.to_string(),
+        kind,
+        progress_percent,
+        transferred_bytes,
+        total_bytes,
+        message,
+    }))
 }
 
 fn pull_body(
@@ -664,6 +881,50 @@ mod tests {
             download_control_body("model:test", DownloadAction::Pause),
             serde_json::json!({"id": "model:test", "action": "pause"})
         );
+    }
+
+    #[test]
+    fn management_sse_normalizes_progress_and_terminal_events() {
+        let progress = decode_management_event(
+            b"event: progress\ndata: {\"downloaded_bytes\":25,\"total_bytes\":100,\"message\":\"pulling\"}",
+            ManagementOperationKind::ModelPull,
+            "test-model",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(progress.kind, ManagementEventKind::Progress);
+        assert_eq!(progress.progress_percent, Some(25.0));
+        assert_eq!(progress.transferred_bytes, Some(25));
+        assert!(!progress.is_terminal());
+
+        let complete = decode_management_event(
+            b"event: complete\r\ndata: {\"status\":\"ready\"}",
+            ManagementOperationKind::BackendInstall,
+            "llamacpp:cpu",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(complete.kind, ManagementEventKind::Complete);
+        assert_eq!(complete.message.as_deref(), Some("ready"));
+        assert!(complete.is_terminal());
+    }
+
+    #[test]
+    fn management_sse_accepts_multiline_data_and_keepalives() {
+        assert!(
+            decode_management_event(b": keepalive", ManagementOperationKind::ModelPull, "model",)
+                .unwrap()
+                .is_none()
+        );
+        let failed = decode_management_event(
+            b"event: error\ndata: download\ndata: interrupted",
+            ManagementOperationKind::ModelPull,
+            "model",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(failed.kind, ManagementEventKind::Failed);
+        assert_eq!(failed.message.as_deref(), Some("download\ninterrupted"));
     }
 
     #[tokio::test]

@@ -15,9 +15,9 @@ use u_forge_core::{
     lemonade::{
         Capability, EffectiveChatLimits, EmbeddedLemonade, GpuResourceManager,
         LemonadeChatProvider, LemonadeConnection, LemonadeManagement, LemonadeOwnership,
-        LemonadeRuntime, LemonadeServerCatalog, ModelSelector, ProviderFactory, QualityTier,
-        chat_component_state, component_state, initial_setup_components,
-        resolve_runtime_connection, select_setup_backend,
+        LemonadeRuntime, LemonadeServerCatalog, ManagementProgressEvent, ModelSelector,
+        ProviderFactory, QualityTier, SetupRole, chat_component_state, component_state,
+        initial_setup_components, resolve_runtime_connection, select_setup_backend,
     },
     queue::{CancellationToken, InferenceQueueBuilder},
     types::ObjectId,
@@ -139,6 +139,10 @@ pub struct AppView {
     pub(crate) node_editor: Entity<NodeEditorPanel>,
     pub(crate) chat_panel: Entity<ChatPanel>,
     pub(crate) setup_panel: Entity<SetupPanel>,
+    /// Single-flight lifecycle for Lemonade discovery and capability loading.
+    lemonade_init_state: LemonadeInitState,
+    /// Rejects late UI writes from superseded discovery attempts.
+    lemonade_init_generation: u64,
     /// Process-wide launch clock shared with startup work and paint callbacks.
     pub(crate) startup: StartupTimeline,
     #[allow(dead_code)]
@@ -191,6 +195,10 @@ pub struct AppView {
     _lemonade_signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Coalesces core mutation events into incremental graph refreshes.
     _graph_change_task: Option<gpui::Task<()>>,
+    /// Delivers Lemonade backend/model SSE progress independently of setup UI.
+    _management_event_task: Option<gpui::Task<()>>,
+    /// Targets with an active client-owned transfer, used by the exit guard.
+    active_management_operations: HashSet<String>,
     // ── Perf overlay ──────────────────────────────────────────────────────────
     /// Whether the perf overlay is visible.
     pub(crate) perf_enabled: bool,
@@ -247,6 +255,23 @@ struct LemonadeActivation {
     effective_limits: Option<EffectiveChatLimits>,
 }
 
+struct LemonadeChatActivation {
+    provider: Option<LemonadeChatProvider>,
+    models: Vec<AvailableModel>,
+    preferred_idx: usize,
+    runtime: Arc<LemonadeRuntime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LemonadeInitState {
+    Offline,
+    Discovering,
+    CapabilitiesLoading,
+    Ready,
+    Degraded,
+    Failed,
+}
+
 async fn discover_lemonade_metadata(
     existing_connection: Option<Arc<LemonadeConnection>>,
     existing_embedded: Option<Arc<EmbeddedLemonade>>,
@@ -290,6 +315,179 @@ async fn discover_lemonade_metadata(
         catalog,
         downloads,
     })
+}
+
+async fn forward_management_events(
+    mut receiver: u_forge_core::lemonade::ManagementProgressReceiver,
+    events: &tokio::sync::broadcast::Sender<ManagementProgressEvent>,
+) -> anyhow::Result<()> {
+    while let Some(event) = receiver.recv().await {
+        let event = event?;
+        let terminal = event.is_terminal();
+        let failed = event.kind == u_forge_core::lemonade::ManagementEventKind::Failed;
+        let message = event.message.clone();
+        let _ = events.send(event);
+        if failed {
+            anyhow::bail!(message.unwrap_or_else(|| "Lemonade management operation failed".into()));
+        }
+        if terminal {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Lemonade management stream closed without completion")
+}
+
+/// Ensure the small CPU retrieval baseline for the runtime owned by u-forge.
+/// Optional accelerators and chat models remain explicit setup choices.
+async fn provision_managed_baseline(
+    connection: Arc<LemonadeConnection>,
+    catalog: LemonadeServerCatalog,
+    events: tokio::sync::broadcast::Sender<ManagementProgressEvent>,
+) -> anyhow::Result<bool> {
+    if connection.ownership() != LemonadeOwnership::Embedded {
+        return Ok(false);
+    }
+    let manager = LemonadeManagement::new(connection);
+    let mut changed = false;
+    if let Some(cpu) = catalog
+        .backends
+        .iter()
+        .find(|backend| backend.recipe == "llamacpp" && backend.backend == "cpu")
+        && cpu.state != "installed"
+    {
+        let receiver = manager
+            .install_backend_stream("llamacpp", "cpu", true)
+            .await?;
+        forward_management_events(receiver, &events).await?;
+        changed = true;
+    }
+
+    for component in initial_setup_components().into_iter().filter(|component| {
+        matches!(
+            component.role,
+            SetupRole::StandardEmbedding | SetupRole::Reranking
+        )
+    }) {
+        let state = component_state(&catalog, &component);
+        if let u_forge_core::lemonade::SetupComponentState::Conflict(message) = state {
+            anyhow::bail!(message);
+        }
+        if state.needs_pull() {
+            let pull = component.pull_spec();
+            let receiver = manager
+                .pull_stream(
+                    pull.model_name,
+                    pull.checkpoint,
+                    pull.recipe,
+                    pull.embedding,
+                    true,
+                )
+                .await?;
+            forward_management_events(receiver, &events).await?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Build chat-facing catalog/profile state without loading a model. This is
+/// deliberately synchronous so the Assistant chrome is usable as soon as
+/// metadata arrives, while embedding and reranking providers continue loading.
+fn prepare_lemonade_chat(
+    connection: Arc<LemonadeConnection>,
+    catalog: &LemonadeServerCatalog,
+    app_config: &AppConfig,
+) -> LemonadeChatActivation {
+    let selector = ModelSelector::new(catalog, &app_config.models, &app_config.embedding);
+    let all_llm = selector.select_all_llm_models();
+    let preferred_model_id = app_config.chat.active_device_config().model.clone();
+    let (preferred_idx, selection_diagnostic) = select_preferred_llm_index(
+        &all_llm,
+        app_config.chat.preferred_device.clone(),
+        preferred_model_id.as_deref(),
+    );
+    let models = all_llm
+        .iter()
+        .enumerate()
+        .map(|(index, selected)| {
+            let device_config = chat_device_config_for_model(&app_config.chat, selected).clone();
+            let configured_generation = device_config
+                .max_tokens
+                .map(|value| value as usize)
+                .unwrap_or(app_config.chat.response_reserve);
+            let mut effective_limits = selected
+                .reconcile_chat_limits(
+                    app_config.chat.max_context_tokens,
+                    app_config.chat.response_reserve,
+                    configured_generation,
+                    configured_generation,
+                )
+                .map_err(|error| tracing::warn!(%error, "chat context is unusable"))
+                .ok();
+            let context = effective_limits
+                .as_ref()
+                .map_or(app_config.chat.max_context_tokens, |limits| limits.context)
+                .max(2);
+            let reserve = effective_limits.as_ref().map_or_else(
+                || {
+                    app_config
+                        .chat
+                        .response_reserve
+                        .min(context.saturating_sub(1))
+                },
+                |limits| limits.response_reserve,
+            );
+            let (agent_budget, invalid_agent_budget) = match app_config.chat.agent.reconcile(
+                context,
+                reserve,
+                app_config.chat.max_tool_turns,
+            ) {
+                Ok(budget) => (budget, None),
+                Err(error) => {
+                    tracing::warn!(%error, "agent budget configuration is unusable");
+                    let fallback = u_forge_core::AgentBudgetConfig::default()
+                        .reconcile(context, reserve, app_config.chat.max_tool_turns)
+                        .expect("safe fallback agent budget reconciles");
+                    (
+                        fallback,
+                        Some(format!(
+                            "invalid agent budget configuration ({error}); safe defaults applied"
+                        )),
+                    )
+                }
+            };
+            if let Some(limits) = &mut effective_limits {
+                limits.diagnostics.extend(agent_budget.diagnostics.clone());
+                limits.diagnostics.extend(invalid_agent_budget);
+            }
+            if index == preferred_idx
+                && let (Some(limits), Some(diagnostic)) =
+                    (&mut effective_limits, &selection_diagnostic)
+            {
+                limits.diagnostics.push(diagnostic.clone());
+            }
+            AvailableModel::from(selected).with_chat_profile(
+                device_config,
+                effective_limits,
+                app_config.chat.max_tool_turns,
+                agent_budget,
+            )
+        })
+        .collect::<Vec<_>>();
+    let gpu_manager = GpuResourceManager::new();
+    let provider = all_llm.get(preferred_idx).map(|selected| {
+        let gpu = all_llm
+            .iter()
+            .any(|model| selected_model_device(model) == "gpu")
+            .then(|| Arc::clone(&gpu_manager));
+        LemonadeChatProvider::from_connection(connection.clone(), &selected.model_id, gpu)
+    });
+    LemonadeChatActivation {
+        provider,
+        models,
+        preferred_idx,
+        runtime: Arc::new(LemonadeRuntime::from_connection(connection)),
+    }
 }
 
 async fn activate_lemonade_capabilities(
@@ -1047,6 +1245,8 @@ impl AppView {
             node_editor,
             chat_panel,
             setup_panel,
+            lemonade_init_state: LemonadeInitState::Offline,
+            lemonade_init_generation: 0,
             startup,
             selection,
             file_menu_open: false,
@@ -1100,6 +1300,8 @@ impl AppView {
             _app_quit_sub: app_quit_sub,
             _lemonade_signal_task: None,
             _graph_change_task: None,
+            _management_event_task: None,
+            active_management_operations: HashSet::new(),
             perf_enabled: false,
             last_frame_cost_us: 0,
             frame_times_us: FrameTimeRing::default(),
@@ -1166,6 +1368,39 @@ impl AppView {
                                 "Graph event lag recovered by full snapshot refresh"
                             );
                         }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
+
+        let mut management_events = view.state.management_events.subscribe();
+        view._management_event_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let event = match management_events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "Lemonade management UI event receiver lagged");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
+                let Some(this) = this.upgrade() else { return };
+                if this
+                    .update(cx, |view: &mut AppView, cx| {
+                        if event.is_terminal() {
+                            view.active_management_operations.remove(&event.target);
+                        } else {
+                            view.active_management_operations
+                                .insert(event.target.clone());
+                        }
+                        view.setup_panel.update(cx, |panel, cx| {
+                            panel.apply_management_progress(&event);
+                            cx.notify();
+                        });
+                        cx.notify();
                     })
                     .is_err()
                 {
@@ -2393,6 +2628,21 @@ impl AppView {
     }
 
     pub(crate) fn do_init_lemonade(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.lemonade_init_state,
+            LemonadeInitState::Discovering | LemonadeInitState::CapabilitiesLoading
+        ) {
+            tracing::debug!("Lemonade initialization is already in flight");
+            return;
+        }
+        self.lemonade_init_generation = self.lemonade_init_generation.wrapping_add(1);
+        let generation = self.lemonade_init_generation;
+        self.lemonade_init_state = LemonadeInitState::Discovering;
+        self.chat_panel.update(cx, |panel, _cx| {
+            panel.set_connecting(true);
+        });
+        cx.notify();
+
         let app_config = self.state.app_config.clone();
         let tokio_rt = self.state.tokio_rt.clone();
         let existing_connection = self.state.lemonade_connection.clone();
@@ -2419,7 +2669,11 @@ impl AppView {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     this.update(cx, |view: &mut AppView, cx| {
+                        if view.lemonade_init_generation != generation {
+                            return;
+                        }
                         eprintln!("Lemonade init skipped: {error}");
+                        view.lemonade_init_state = LemonadeInitState::Failed;
                         view.chat_panel.update(cx, |panel, _cx| {
                             panel.set_connect_failed(&error.to_string());
                         });
@@ -2433,7 +2687,11 @@ impl AppView {
             let metadata_for_ui = metadata.clone();
             if this
                 .update(cx, move |view: &mut AppView, cx| {
+                    if view.lemonade_init_generation != generation {
+                        return;
+                    }
                     view.apply_lemonade_metadata(metadata_for_ui, cx);
+                    view.lemonade_init_state = LemonadeInitState::CapabilitiesLoading;
                 })
                 .is_err()
             {
@@ -2463,13 +2721,60 @@ impl AppView {
                 )
                 .await;
 
-            this.update(cx, move |view: &mut AppView, cx| match activation_result {
-                Ok(activation) => view.apply_lemonade_activation(activation, cx),
+            this.update(cx, move |view: &mut AppView, cx| {
+                if view.lemonade_init_generation != generation {
+                    return;
+                }
+                match activation_result {
+                    Ok(activation) => {
+                        view.apply_lemonade_activation(activation, cx);
+                        view.lemonade_init_state = LemonadeInitState::Ready;
+                    }
+                    Err(error) => {
+                        eprintln!("Lemonade capability activation failed: {error}");
+                        view.lemonade_init_state = LemonadeInitState::Degraded;
+                        view.state.embedding_status = Some(format!(
+                            "Assistant connected; retrieval AI is unavailable: {error}"
+                        ));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_managed_baseline_provisioning(
+        &mut self,
+        connection: Arc<LemonadeConnection>,
+        catalog: LemonadeServerCatalog,
+        cx: &mut Context<Self>,
+    ) {
+        if connection.ownership() != LemonadeOwnership::Embedded {
+            return;
+        }
+        let tokio_rt = self.state.tokio_rt.clone();
+        let events = self.state.management_events.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio_rt.block_on(provision_managed_baseline(connection, catalog, events))
+                })
+                .await;
+            this.update(cx, |view: &mut AppView, cx| match result {
+                Ok(true) => {
+                    // Re-discover the completed artifacts and supersede any
+                    // activation based on the old catalog snapshot.
+                    view.lemonade_init_state = LemonadeInitState::Offline;
+                    view.do_init_lemonade(cx);
+                }
+                Ok(false) => {}
                 Err(error) => {
-                    eprintln!("Lemonade capability activation failed: {error}");
-                    view.chat_panel.update(cx, |panel, _cx| {
-                        panel.set_connect_failed(&error.to_string());
-                    });
+                    view.state.embedding_status = Some(format!(
+                        "Default retrieval model provisioning failed: {error}"
+                    ));
                     cx.notify();
                 }
             })
@@ -2499,6 +2804,26 @@ impl AppView {
         }
         self.state.lemonade_connection = Some(metadata.connection.clone());
         self.state.lemonade_catalog = Some(metadata.catalog.clone());
+        let chat = prepare_lemonade_chat(
+            metadata.connection.clone(),
+            &metadata.catalog,
+            &self.state.app_config,
+        );
+        if let Some(provider) = chat.provider {
+            self.chat_panel.update(cx, |panel, _cx| {
+                panel.set_provider(
+                    provider,
+                    chat.models,
+                    chat.preferred_idx,
+                    chat.runtime,
+                    self.state.app_config.chat.reasoning_control,
+                );
+            });
+        } else {
+            self.chat_panel.update(cx, |panel, _cx| {
+                panel.set_connect_failed("No downloaded LLM models available");
+            });
+        }
         let setup_hq_default = if self
             .state
             .app_config
@@ -2553,6 +2878,11 @@ impl AppView {
             cx.notify();
         });
         self.setup_open |= setup_incomplete;
+        self.start_managed_baseline_provisioning(
+            metadata.connection.clone(),
+            metadata.catalog.clone(),
+            cx,
+        );
         eprintln!("{LEMONADE_METADATA_READY_MESSAGE}");
         self.startup
             .milestone(StartupMilestone::LemonadeMetadataReady);

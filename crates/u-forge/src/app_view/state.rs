@@ -30,6 +30,10 @@ pub(crate) struct AppState {
     pub(crate) lemonade_connection: Option<Arc<LemonadeConnection>>,
     /// Last live catalog snapshot used to explain setup/readiness state.
     pub(crate) lemonade_catalog: Option<LemonadeServerCatalog>,
+    /// App-level management bus. Setup can close/reopen without interrupting
+    /// backend/model SSE streams owned by the root lifecycle.
+    pub(crate) management_events:
+        tokio::sync::broadcast::Sender<u_forge_core::lemonade::ManagementProgressEvent>,
     /// True when at least one non-default schema is present in the graph DB.
     pub(crate) schema_loaded: bool,
     /// Status message displayed in the status bar during/after data operations.
@@ -103,6 +107,7 @@ impl AppState {
             .list_schemas()
             .map(|names| names.iter().any(|n| n != "default"))
             .unwrap_or(false);
+        let (management_events, _) = tokio::sync::broadcast::channel(128);
         Self {
             graph,
             snapshot,
@@ -116,6 +121,7 @@ impl AppState {
             embedded_lemonade: None,
             lemonade_connection: None,
             lemonade_catalog: None,
+            management_events,
             data_status: None,
             embedding_status: None,
             embedding_plan: EmbeddingPlanAuthority::default(),
