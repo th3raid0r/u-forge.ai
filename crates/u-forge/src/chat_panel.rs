@@ -61,10 +61,10 @@ impl ProfileReloadState {
 
 fn assistant_controls_locked(
     streaming: bool,
-    connecting: bool,
-    reload_state: &ProfileReloadState,
+    _connecting: bool,
+    _reload_state: &ProfileReloadState,
 ) -> bool {
-    streaming || connecting || reload_state.is_reloading()
+    streaming
 }
 
 pub(crate) struct ChatPanel {
@@ -93,6 +93,11 @@ pub(crate) struct ChatPanel {
     /// appended to (lazily created on the first TextDelta / Content token; reset
     /// after each tool call so the next text creates a new message).
     streaming_assistant: Option<Entity<ChatMessageView>>,
+    /// Assistant row shown immediately while model/capability readiness is
+    /// being awaited. The first semantic event reuses or removes this row.
+    pending_assistant: Option<Entity<ChatMessageView>>,
+    /// Drives the lightweight dot animation in the pending Assistant row.
+    pending_animation_task: Option<gpui::Task<()>>,
     /// During streaming: tool-call entities indexed by their internal_id, so
     /// `ToolResult` events can target the right entry directly.
     streaming_tool_calls: HashMap<String, Entity<ChatMessageView>>,
@@ -335,6 +340,8 @@ impl ChatPanel {
             stream_cancellation: None,
             streaming_thinking: None,
             streaming_assistant: None,
+            pending_assistant: None,
+            pending_animation_task: None,
             streaming_tool_calls: HashMap::new(),
             available_models: Vec::new(),
             selected_model_idx: 0,
@@ -459,9 +466,9 @@ impl ChatPanel {
         assistant_controls_locked(self.streaming, self.connecting, &self.profile_reload_state)
     }
 
-    /// Activate the currently selected model/reasoning profile immediately.
-    /// This makes a selector change observable at the point of interaction,
-    /// rather than deferring an activation failure until the user sends text.
+    /// Explicitly activate the currently selected model/reasoning profile.
+    /// Ordinary selector and thinking-toggle changes are intentionally lazy;
+    /// the send path acquires the desired profile without locking the chrome.
     fn reload_selected_profile(&mut self, cx: &mut Context<Self>) {
         if self.controls_locked() {
             return;
@@ -578,6 +585,12 @@ impl ChatPanel {
 
     /// Finalize streaming state and persist the session.
     fn finalize_stream(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_assistant.take() {
+            pending.update(cx, |message, cx| {
+                message.replace_text("No response was received.", cx);
+            });
+        }
+        self.pending_animation_task.take();
         self.streaming = false;
         self.stream_task = None;
         self.stream_cancellation = None;
@@ -593,10 +606,81 @@ impl ChatPanel {
             cancellation.cancel();
         }
         self.stream_task.take();
-        if let Some(msg) = self.streaming_assistant.clone() {
+        if let Some(msg) = self.pending_assistant.take() {
+            msg.update(cx, |message, cx| message.replace_text("[Cancelled]", cx));
+        } else if let Some(msg) = self.streaming_assistant.clone() {
             msg.update(cx, |m, cx| m.append_text("\n[Cancelled]", cx));
         }
+        self.pending_animation_task.take();
         self.finalize_stream(cx);
+    }
+
+    fn start_pending_assistant(&mut self, cx: &mut Context<Self>) {
+        let message = self.push_text_message(
+            ChatMessageRole::Assistant,
+            "Preparing response…".to_string(),
+            cx,
+        );
+        let pending_id = message.entity_id();
+        self.pending_assistant = Some(message.clone());
+        self.pending_animation_task = Some(cx.spawn(async move |this, cx| {
+            let frames = [
+                "Preparing response",
+                "Preparing response.",
+                "Preparing response..",
+                "Preparing response…",
+            ];
+            let mut frame = 0usize;
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(350))
+                    .await;
+                let Some(this) = this.upgrade() else { return };
+                let keep_running = this
+                    .update(cx, |view: &mut ChatPanel, cx| {
+                        let Some(pending) = view.pending_assistant.as_ref() else {
+                            return false;
+                        };
+                        if pending.entity_id() != pending_id {
+                            return false;
+                        }
+                        frame = (frame + 1) % frames.len();
+                        message.update(cx, |message, cx| {
+                            message.replace_text(frames[frame], cx);
+                        });
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Consume the pending row. Text responses can reuse it; reasoning and
+    /// tool events remove it so chronological message ordering stays exact.
+    fn take_pending_assistant(
+        &mut self,
+        reuse_for_text: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ChatMessageView>> {
+        let pending = self.pending_assistant.take();
+        self.pending_animation_task.take();
+        let Some(pending) = pending else { return None };
+        if reuse_for_text {
+            pending.update(cx, |message, cx| message.replace_text("", cx));
+            return Some(pending);
+        }
+        if let Some(index) = self
+            .messages
+            .iter()
+            .position(|message| message.entity_id() == pending.entity_id())
+        {
+            self.messages.remove(index);
+            self.list_state.reset(self.messages.len());
+        }
+        None
     }
 
     /// Re-run the user turn at or before `msg_entity_id`.
@@ -676,17 +760,48 @@ impl ChatPanel {
         }
         let cancellation = CancellationToken::new();
         self.stream_cancellation = Some(cancellation.clone());
+
+        // Capture prior history before inserting the current turn, then update
+        // the UI synchronously. Model/profile acquisition happens afterwards.
+        let raw_history: Vec<HistoryMessage> = self
+            .messages
+            .iter()
+            .filter_map(|message| {
+                let message = message.read(cx);
+                match message.role {
+                    ChatMessageRole::User => Some(HistoryMessage {
+                        role: "user".to_string(),
+                        content: message.text().to_string(),
+                    }),
+                    ChatMessageRole::Assistant => Some(HistoryMessage {
+                        role: "assistant".to_string(),
+                        content: message.text().to_string(),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+        let history = select_history_window(
+            &raw_history,
+            &self.system_prompt,
+            &text,
+            self.max_context_tokens,
+            self.response_reserve,
+        );
+        self.push_text_message(ChatMessageRole::User, text.clone(), cx);
+        self.start_pending_assistant(cx);
+        self.streaming = true;
+        cx.notify();
+
         let Some(runtime) = self.runtime.clone() else {
-            self.start_send_with_text(text, None, cancellation, cx);
+            self.start_send_with_text(text, history, None, cancellation, cx);
             return;
         };
         let Some(profile) = self.selected_runtime_profile() else {
-            self.start_send_with_text(text, None, cancellation, cx);
+            self.start_send_with_text(text, history, None, cancellation, cx);
             return;
         };
         let tokio_rt = self.tokio_rt.clone();
-        self.streaming = true;
-        cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let acquire_cancellation = cancellation.clone();
             let lease = cx
@@ -704,17 +819,21 @@ impl ChatPanel {
                 })
                 .await;
             this.update(cx, |view: &mut ChatPanel, cx| match lease {
-                Some(Ok(lease)) => view.start_send_with_text(text, Some(lease), cancellation, cx),
+                Some(Ok(lease)) => {
+                    view.start_send_with_text(text, history, Some(lease), cancellation, cx)
+                }
                 Some(Err(error)) => {
                     view.profile_reload_state = ProfileReloadState::Failed(format!(
                         "Could not load the selected Assistant model: {error:#}"
                     ));
-                    view.push_text_message(ChatMessageRole::User, text, cx);
-                    view.push_text_message(
-                        ChatMessageRole::Assistant,
-                        format!("Runtime profile reload failed: {error:#}"),
-                        cx,
-                    );
+                    if let Some(message) = view.take_pending_assistant(true, cx) {
+                        message.update(cx, |message, cx| {
+                            message.replace_text(
+                                format!("Runtime profile reload failed: {error:#}"),
+                                cx,
+                            );
+                        });
+                    }
                     view.finalize_stream(cx);
                 }
                 None => {}
@@ -727,45 +846,11 @@ impl ChatPanel {
     fn start_send_with_text(
         &mut self,
         text: String,
+        history: Vec<HistoryMessage>,
         runtime_lease: Option<LemonadeRuntimeLease>,
         cancellation: CancellationToken,
         cx: &mut Context<Self>,
     ) {
-        // Build token-windowed history from prior User/Assistant turns before
-        // recording the current prompt. GraphAgent receives the current prompt
-        // separately, so including it here would send it twice.
-        // each message entity once up-front so we don't need cx access later.
-        let raw_history: Vec<HistoryMessage> = self
-            .messages
-            .iter()
-            .filter_map(|h| {
-                let m = h.read(cx);
-                match m.role {
-                    ChatMessageRole::User => Some(HistoryMessage {
-                        role: "user".to_string(),
-                        content: m.text().to_string(),
-                    }),
-                    ChatMessageRole::Assistant => Some(HistoryMessage {
-                        role: "assistant".to_string(),
-                        content: m.text().to_string(),
-                    }),
-                    _ => None,
-                }
-            })
-            .collect();
-        let history = select_history_window(
-            &raw_history,
-            &self.system_prompt,
-            &text,
-            self.max_context_tokens,
-            self.response_reserve,
-        );
-
-        // Record the user message immediately after history has been captured.
-        self.push_text_message(ChatMessageRole::User, text.clone(), cx);
-        self.streaming = true;
-        cx.notify();
-
         // ── Agent path ────────────────────────────────────────────────────────
         // When a GraphAgent is wired up, route through the tool-calling loop
         // with streaming output. Tool calls appear as collapsible entries.
@@ -824,6 +909,7 @@ impl ChatPanel {
                         }
                         Some(AgentStreamEvent::ReasoningDelta(delta)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
+                                view.take_pending_assistant(false, cx);
                                 let msg = view.streaming_thinking.clone().unwrap_or_else(|| {
                                     let m = view.push_text_message(
                                         ChatMessageRole::Thinking,
@@ -840,11 +926,13 @@ impl ChatPanel {
                         Some(AgentStreamEvent::TextDelta(delta)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                    let m = view.push_text_message(
-                                        ChatMessageRole::Assistant,
-                                        String::new(),
-                                        cx,
-                                    );
+                                    let m = view.take_pending_assistant(true, cx).unwrap_or_else(|| {
+                                        view.push_text_message(
+                                            ChatMessageRole::Assistant,
+                                            String::new(),
+                                            cx,
+                                        )
+                                    });
                                     view.streaming_assistant = Some(m.clone());
                                     m
                                 });
@@ -858,6 +946,7 @@ impl ChatPanel {
                             args_display,
                         }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
+                                view.take_pending_assistant(false, cx);
                                 let msg = view.push_tool_call_message(
                                     internal_id.clone(),
                                     name,
@@ -868,6 +957,7 @@ impl ChatPanel {
                                 // Reset the current assistant so the next text
                                 // delta creates a fresh message after the tool.
                                 view.streaming_assistant = None;
+                                view.streaming_thinking = None;
                                 cx.notify();
                             })
                             .ok();
@@ -893,10 +983,14 @@ impl ChatPanel {
                         }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                    let message = view.push_text_message(
-                                        ChatMessageRole::Assistant,
-                                        String::new(),
-                                        cx,
+                                    let message = view.take_pending_assistant(true, cx).unwrap_or_else(
+                                        || {
+                                            view.push_text_message(
+                                                ChatMessageRole::Assistant,
+                                                String::new(),
+                                                cx,
+                                            )
+                                        },
                                     );
                                     view.streaming_assistant = Some(message.clone());
                                     message
@@ -924,10 +1018,14 @@ impl ChatPanel {
                         }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                    let message = view.push_text_message(
-                                        ChatMessageRole::Assistant,
-                                        String::new(),
-                                        cx,
+                                    let message = view.take_pending_assistant(true, cx).unwrap_or_else(
+                                        || {
+                                            view.push_text_message(
+                                                ChatMessageRole::Assistant,
+                                                String::new(),
+                                                cx,
+                                            )
+                                        },
                                     );
                                     view.streaming_assistant = Some(message.clone());
                                     message
@@ -956,11 +1054,13 @@ impl ChatPanel {
                         Some(AgentStreamEvent::FatalError(e)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
                                 let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                    let m = view.push_text_message(
-                                        ChatMessageRole::Assistant,
-                                        String::new(),
-                                        cx,
-                                    );
+                                    let m = view.take_pending_assistant(true, cx).unwrap_or_else(|| {
+                                        view.push_text_message(
+                                            ChatMessageRole::Assistant,
+                                            String::new(),
+                                            cx,
+                                        )
+                                    });
                                     view.streaming_assistant = Some(m.clone());
                                     m
                                 });
@@ -1060,11 +1160,14 @@ impl ChatPanel {
                     Some(Ok(StreamToken::Content(text))) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
                             let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                let m = view.push_text_message(
-                                    ChatMessageRole::Assistant,
-                                    String::new(),
-                                    cx,
-                                );
+                                let m =
+                                    view.take_pending_assistant(true, cx).unwrap_or_else(|| {
+                                        view.push_text_message(
+                                            ChatMessageRole::Assistant,
+                                            String::new(),
+                                            cx,
+                                        )
+                                    });
                                 view.streaming_assistant = Some(m.clone());
                                 m
                             });
@@ -1074,6 +1177,7 @@ impl ChatPanel {
                     }
                     Some(Ok(StreamToken::Thinking(text))) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
+                            view.take_pending_assistant(false, cx);
                             let msg = view.streaming_thinking.clone().unwrap_or_else(|| {
                                 let m = view.push_text_message(
                                     ChatMessageRole::Thinking,
@@ -1092,11 +1196,14 @@ impl ChatPanel {
                     Some(Err(e)) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
                             let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                let m = view.push_text_message(
-                                    ChatMessageRole::Assistant,
-                                    String::new(),
-                                    cx,
-                                );
+                                let m =
+                                    view.take_pending_assistant(true, cx).unwrap_or_else(|| {
+                                        view.push_text_message(
+                                            ChatMessageRole::Assistant,
+                                            String::new(),
+                                            cx,
+                                        )
+                                    });
                                 view.streaming_assistant = Some(m.clone());
                                 m
                             });
@@ -1671,10 +1778,9 @@ impl Render for ChatPanel {
                                 }
                                 this.model_dropdown_open = false;
                                 if changed {
-                                    this.reload_selected_profile(cx);
-                                } else {
-                                    cx.notify();
+                                    this.profile_reload_state = ProfileReloadState::Ready;
                                 }
+                                cx.notify();
                             }),
                         )
                         .child(label)
@@ -1776,71 +1882,6 @@ impl Render for ChatPanel {
                                     })
                                     .child(history_label),
                             )
-                            .child({
-                                let mut spacer = div();
-                                spacer.style().flex_grow = Some(1.0);
-                                spacer
-                            })
-                            .child(
-                                div()
-                                    .id("assistant-zoom-btn")
-                                    .flex()
-                                    .flex_none()
-                                    .items_center()
-                                    .justify_center()
-                                    .px_2()
-                                    .h(theme.metrics.control_height_small)
-                                    .rounded(px(3.0))
-                                    .text_sm()
-                                    .text_color(rgba(0xa6adc8ff))
-                                    .cursor_pointer()
-                                    .tooltip(Tooltip::text(if self.zoomed {
-                                        "Restore Assistant panel"
-                                    } else {
-                                        "Maximize Assistant panel"
-                                    }))
-                                    .hover(|style| style.bg(rgba(0x45475a88)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
-                                            cx.emit(ToggleAssistantZoomRequested);
-                                        }),
-                                    )
-                                    .child(Icon::new(
-                                        IconName::Maximize,
-                                        IconSize::Medium,
-                                        rgba(0xa6adc8ff),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("assistant-options-btn")
-                                    .flex()
-                                    .flex_none()
-                                    .items_center()
-                                    .justify_center()
-                                    .px_2()
-                                    .h(theme.metrics.control_height_small)
-                                    .rounded(px(3.0))
-                                    .text_color(rgba(0xa6adc8ff))
-                                    .cursor_pointer()
-                                    .tooltip(Tooltip::text("More Assistant actions"))
-                                    .hover(|style| style.bg(rgba(0x45475a88)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.toolbar_menu_open = !this.toolbar_menu_open;
-                                            this.history_dropdown_open = false;
-                                            this.model_dropdown_open = false;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(Icon::new(
-                                        IconName::MoreHorizontal,
-                                        IconSize::Medium,
-                                        rgba(0xa6adc8ff),
-                                    )),
-                            )
                             .child(
                                 div()
                                     .id("new-chat-btn")
@@ -1875,6 +1916,71 @@ impl Render for ChatPanel {
                                         } else {
                                             rgba(0x1e1e2eff)
                                         },
+                                    )),
+                            )
+                            .child({
+                                let mut spacer = div();
+                                spacer.style().flex_grow = Some(1.0);
+                                spacer
+                            })
+                            .child(
+                                div()
+                                    .id("assistant-options-btn")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .px_2()
+                                    .h(theme.metrics.control_height_small)
+                                    .rounded(px(3.0))
+                                    .text_color(rgba(0xa6adc8ff))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text("More Assistant actions"))
+                                    .hover(|style| style.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.toolbar_menu_open = !this.toolbar_menu_open;
+                                            this.history_dropdown_open = false;
+                                            this.model_dropdown_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(Icon::new(
+                                        IconName::MoreHorizontal,
+                                        IconSize::Medium,
+                                        rgba(0xa6adc8ff),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("assistant-zoom-btn")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .px_2()
+                                    .h(theme.metrics.control_height_small)
+                                    .rounded(px(3.0))
+                                    .text_sm()
+                                    .text_color(rgba(0xa6adc8ff))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text(if self.zoomed {
+                                        "Restore Assistant panel"
+                                    } else {
+                                        "Maximize Assistant panel"
+                                    }))
+                                    .hover(|style| style.bg(rgba(0x45475a88)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_this, _: &MouseDownEvent, _window, cx| {
+                                            cx.emit(ToggleAssistantZoomRequested);
+                                        }),
+                                    )
+                                    .child(Icon::new(
+                                        IconName::Maximize,
+                                        IconSize::Medium,
+                                        rgba(0xa6adc8ff),
                                     )),
                             ),
                     )
@@ -1953,37 +2059,6 @@ impl Render for ChatPanel {
                                             "Reloading model…"
                                         } else {
                                             "Reload selected model"
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .id("assistant-options-zoom")
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .h(theme.metrics.control_height)
-                                        .px_2()
-                                        .text_sm()
-                                        .text_color(rgba(0xcdd6f4ff))
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgba(0x45475a88)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                                this.toolbar_menu_open = false;
-                                                cx.emit(ToggleAssistantZoomRequested);
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(Icon::new(
-                                            IconName::Maximize,
-                                            IconSize::Medium,
-                                            rgba(0xa6adc8ff),
-                                        ))
-                                        .child(if self.zoomed {
-                                            "Restore Assistant"
-                                        } else {
-                                            "Maximize Assistant"
                                         }),
                                 ),
                         )
@@ -2203,7 +2278,7 @@ impl Render for ChatPanel {
                                     .flex_none()
                                     .items_center()
                                     .justify_center()
-                                    .w(px(88.0))
+                                    .w(theme.metrics.control_height_small * 2.0)
                                     .h(theme.metrics.control_height)
                                     .bg(bg)
                                     .rounded(px(3.0))
@@ -2353,15 +2428,9 @@ impl Render for ChatPanel {
                                                         |this, _: &MouseDownEvent, _window, cx| {
                                                             this.reasoning_enabled =
                                                                 !this.reasoning_enabled;
-                                                            if this.reasoning_control
-                                                                == ReasoningControl::Reload
-                                                            {
-                                                                this.reload_selected_profile(cx);
-                                                            } else {
-                                                                this.profile_reload_state =
-                                                                    ProfileReloadState::Ready;
-                                                                cx.notify();
-                                                            }
+                                                            this.profile_reload_state =
+                                                                ProfileReloadState::Ready;
+                                                            cx.notify();
                                                         },
                                                     ),
                                                 )
@@ -2547,7 +2616,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_controls_lock_during_connection_streaming_and_profile_reload() {
+    fn assistant_controls_only_lock_during_an_active_response() {
         assert!(!assistant_controls_locked(
             false,
             false,
@@ -2558,12 +2627,12 @@ mod tests {
             false,
             &ProfileReloadState::Ready
         ));
-        assert!(assistant_controls_locked(
+        assert!(!assistant_controls_locked(
             false,
             true,
             &ProfileReloadState::Ready
         ));
-        assert!(assistant_controls_locked(
+        assert!(!assistant_controls_locked(
             false,
             false,
             &ProfileReloadState::Reloading

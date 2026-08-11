@@ -183,6 +183,20 @@ impl ChatMessageView {
         cx.notify();
     }
 
+    /// Replace the complete message body. Used by the pending Assistant row so
+    /// model-readiness progress can turn into the first streamed response
+    /// without inserting a second message.
+    pub(crate) fn replace_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        let text = text.into();
+        self.text = SharedString::new(text.clone());
+        if let Some(ref body) = self.body {
+            body.update(cx, |field, cx| {
+                field.replace_content_preserving_selection(&text, cx);
+            });
+        }
+        cx.notify();
+    }
+
     pub(crate) fn set_tool_result(&mut self, result: String, cx: &mut Context<Self>) {
         self.tool_result = Some(result);
         cx.notify();
