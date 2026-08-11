@@ -695,7 +695,7 @@ impl ChatPanel {
     ) -> Option<Entity<ChatMessageView>> {
         let pending = self.pending_assistant.take();
         self.pending_animation_task.take();
-        let Some(pending) = pending else { return None };
+        let pending = pending?;
         if reuse_for_text {
             pending.update(cx, |message, cx| message.replace_text("", cx));
             return Some(pending);
