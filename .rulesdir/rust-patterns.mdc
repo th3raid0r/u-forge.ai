@@ -272,16 +272,20 @@ Tool args in `u-forge-agent` are validated against JSON Schema before deserializ
 
 The graph agent applies one model-reconciled `EffectiveAgentBudget` per request.
 It accounts for system/tool definitions, whole-record schema selection,
-retained history, response reserve, each model turn, tool arguments, and
-model-visible tool output through the shared cached token estimator. Limits
-are fitted independently for every provider call; do not reintroduce a
-cumulative token ceiling across a valid multi-turn request.
+retained history, each model turn, tool arguments, and model-visible tool output
+through the shared cached token estimator. Lemonade's model-specific catalog
+`max_context_window` quietly caps an invalid configured `ctx_size`; it is a
+capability ceiling, not a separate application-wide budget. When neither value
+is known, Lemonade owns automatic context sizing and u-forge imposes no finite
+ceiling. Requests are fitted independently for every provider call; do not
+reintroduce a cumulative or per-element token ceiling.
 
 - Never concatenate `schema_prompt_summary_all()` into a request. Use
   `bounded_schema_summary`; schema records and JSON are never byte-sliced.
-- Fit the newest structurally valid history suffix before every model dispatch.
-- Bound tool output at semantic record boundaries and include omission counts
-  or continuation guidance. This bound is per result and model-window-aware.
+- Fit the newest structurally valid history suffix before every model dispatch,
+  and explicitly tell the model when earlier conversation history was omitted.
+- Preserve complete tool results. Reclaim context from older conversation
+  history instead of imposing an independent tool-output budget.
 - Fingerprint the validated tool name + canonical JSON arguments. Identical
   unchanged reads consume the repeat allowance; corrected arguments, changed
   results, and committed graph mutations count as progress.

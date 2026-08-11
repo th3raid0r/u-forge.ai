@@ -558,55 +558,6 @@ impl Render for SettingsView {
                 ),
             ))
             .child(row(
-                "Context window",
-                stepper(
-                    "settings-context",
-                    self.draft.chat.max_context_tokens.to_string(),
-                    Box::new(|v| {
-                        v.draft.chat.max_context_tokens = v
-                            .draft
-                            .chat
-                            .max_context_tokens
-                            .saturating_sub(1_024)
-                            .max(2_048)
-                    }),
-                    Box::new(|v| {
-                        v.draft.chat.max_context_tokens =
-                            v.draft.chat.max_context_tokens.saturating_add(1_024)
-                    }),
-                ),
-            ))
-            .child(row(
-                "Response reserve",
-                stepper(
-                    "settings-reserve",
-                    self.draft.chat.response_reserve.to_string(),
-                    Box::new(|v| {
-                        v.draft.chat.response_reserve =
-                            v.draft.chat.response_reserve.saturating_sub(256).max(256)
-                    }),
-                    Box::new(|v| {
-                        v.draft.chat.response_reserve = (v.draft.chat.response_reserve + 256)
-                            .min(v.draft.chat.max_context_tokens.saturating_sub(1))
-                    }),
-                ),
-            ))
-            .child(row(
-                "History turns",
-                stepper(
-                    "settings-history",
-                    self.draft.chat.max_history_turns.to_string(),
-                    Box::new(|v| {
-                        v.draft.chat.max_history_turns =
-                            v.draft.chat.max_history_turns.saturating_sub(1)
-                    }),
-                    Box::new(|v| {
-                        v.draft.chat.max_history_turns =
-                            (v.draft.chat.max_history_turns + 1).min(100)
-                    }),
-                ),
-            ))
-            .child(row(
                 "Tool turns",
                 stepper(
                     "settings-tool-turns",
@@ -617,26 +568,6 @@ impl Render for SettingsView {
                     }),
                     Box::new(|v| {
                         v.draft.chat.max_tool_turns = (v.draft.chat.max_tool_turns + 1).min(32)
-                    }),
-                ),
-            ))
-            .child(row(
-                "Schema context maximum",
-                stepper(
-                    "settings-schema-budget",
-                    self.draft.chat.agent.schema_summary_tokens.to_string(),
-                    Box::new(|v| {
-                        v.draft.chat.agent.schema_summary_tokens = v
-                            .draft
-                            .chat
-                            .agent
-                            .schema_summary_tokens
-                            .saturating_sub(256)
-                            .max(32)
-                    }),
-                    Box::new(|v| {
-                        v.draft.chat.agent.schema_summary_tokens =
-                            v.draft.chat.agent.schema_summary_tokens.saturating_add(256)
                     }),
                 ),
             ))

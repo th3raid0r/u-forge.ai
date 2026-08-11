@@ -284,11 +284,11 @@ the structured definition consumed by `GraphAgent`; the legacy
 `schema_prompt_summary_all()` convenience method still returns the complete
 unbounded text summary.
 
-Agent schema injection is request-bounded. `u-forge-agent::budget` selects
-complete object/edge records under `[chat.agent].schema_summary_tokens`, with
-types named in the current request or retained history first, recent tool-result
-types second, and the remainder in stable name order. Omitted records are
-reported explicitly; schema records and JSON are never sliced to fit.
+Agent schema injection uses whatever room remains in the active model context.
+`u-forge-agent::budget` selects complete object/edge records, with types named
+in the current request or retained history first, recent tool-result types
+second, and the remainder in stable name order. Omitted records are reported
+explicitly; schema records and JSON are never sliced to fit.
 
 ---
 
@@ -299,15 +299,20 @@ Tool arguments emitted by the LLM are validated against each tool's JSON Schema 
 `SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and derives edge schemas from declared relationship fields, including their allowed target types.
 
 The Rig loop carries request state through lifecycle hooks. Before each model
-call, it fits the newest structurally valid history suffix to the active context
-window and response reserve; there is no cumulative token ceiling across valid
-tool turns. Validated tool calls use canonical name/JSON fingerprints;
+call, it fits the newest structurally valid history suffix to the configured
+per-load Lemonade `ctx_size`, quietly capped by the model-specific catalog
+`max_context_window`. That catalog value is a capability ceiling, not a second
+application-wide budget. If neither value is available, Lemonade owns automatic
+context resolution and u-forge imposes no finite token ceiling. There is no
+cumulative token ceiling across valid tool turns. When older history is removed,
+the model receives an explicit notice that it is seeing the newest portion of a
+longer conversation. Validated tool calls use canonical name/JSON fingerprints;
 unchanged results consume a configurable repeat allowance while changed
-arguments/results and successful mutations count as progress. Each tool result
-is independently bounded at semantic record boundaries against the model
-window. Deliberate fit and repeat stops are distinct `ChatEvent` outcomes, not
-provider errors, and aggregate token/turn diagnostics are emitted without
-prompt content.
+arguments/results and successful mutations count as progress. Tool results are
+preserved intact; older conversation history yields first when a later model
+turn needs room. Deliberate fit and repeat stops are distinct `ChatEvent`
+outcomes, not provider errors, and aggregate token/turn diagnostics are emitted
+without prompt content.
 
 ---
 

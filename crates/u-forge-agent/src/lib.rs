@@ -49,11 +49,9 @@ pub struct HistoryMessage {
 
 /// Return the subset of `history` that fits inside the available token budget.
 ///
-/// Budget is computed as:
-/// ```text
-/// max_context_tokens - response_reserve - tokens(system_prompt) - tokens(current_msg) - 3
-/// ```
-/// (The trailing 3 accounts for the assistant reply-priming tokens in OpenAI format.)
+/// The active model context is the only ceiling. If older messages do not fit,
+/// they are replaced by an explicit notice that the visible messages are the
+/// most recent portion of a longer conversation.
 ///
 /// Messages are evaluated newest-first; the returned `Vec` is in chronological
 /// order (oldest first), ready to pass directly to `history()`.
@@ -62,16 +60,8 @@ pub fn select_history_window(
     system_prompt: &str,
     current_msg: &str,
     max_context_tokens: usize,
-    response_reserve: usize,
 ) -> Vec<HistoryMessage> {
-    budget::select_history_window(
-        history,
-        system_prompt,
-        current_msg,
-        0,
-        max_context_tokens,
-        response_reserve,
-    )
+    budget::select_history_window(history, system_prompt, current_msg, 0, max_context_tokens)
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -220,24 +210,19 @@ fn format_node_result(result: &NodeSearchResult, index: usize) -> String {
             .collect()
     };
 
-    if let Some(summary) = compact_search_content(&content_chunks) {
+    if let Some(summary) = first_matched_search_content(&content_chunks) {
         s.push_str(&format!("  Matched content: {summary}\n"));
     }
     s
 }
 
-/// Keep search results ID/summary-oriented instead of duplicating full nodes.
-fn compact_search_content(chunks: &[&str]) -> Option<String> {
-    let first = chunks.first()?;
-    if count_tokens(first) <= 128 {
-        Some((*first).to_string())
-    } else {
-        Some(format!(
-            "{} complete matching chunk(s); content omitted because the first chunk is over 128 \
-             tokens. Refine the query to retrieve a narrower match.",
-            chunks.len()
-        ))
-    }
+/// Return the best complete matching chunk for a search result.
+///
+/// Tool results remain intact after formatting. The request fitter makes room
+/// by evicting older conversation history, so imposing a separate cap here
+/// would discard the very content the search was asked to retrieve.
+fn first_matched_search_content(chunks: &[&str]) -> Option<String> {
+    chunks.first().map(|first| (*first).to_string())
 }
 
 // ── FtsSearchTool ─────────────────────────────────────────────────────────────
@@ -348,7 +333,7 @@ impl Tool for FtsSearchTool {
                         obj_id
                     ));
                     let chunk_refs = chunks.iter().map(String::as_str).collect::<Vec<_>>();
-                    if let Some(summary) = compact_search_content(&chunk_refs) {
+                    if let Some(summary) = first_matched_search_content(&chunk_refs) {
                         output.push_str(&format!("  Matched content: {summary}\n"));
                     }
                     output.push('\n');
@@ -1288,18 +1273,13 @@ impl GraphAgent {
         history: &[HistoryMessage],
         params: &AgentParams,
     ) -> (budget::BudgetController, Vec<HistoryMessage>) {
-        let response_reserve = params
-            .max_tokens
-            .map(|tokens| tokens.min(usize::MAX as u64) as usize)
-            .unwrap_or(params.budget.response_reserve_tokens);
         let history_text = history
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let preliminary = budget::BudgetController::new(
+        let controller = budget::BudgetController::new(
             params.budget.clone(),
-            response_reserve,
             self.schema.clone(),
             self.base_prompt.clone(),
             self.tool_guidance.clone(),
@@ -1307,30 +1287,7 @@ impl GraphAgent {
             history_text,
             self.tool_definition_tokens,
         );
-        let selected = budget::select_history_window(
-            history,
-            &preliminary.initial_preamble(),
-            user_message,
-            self.tool_definition_tokens.tokens,
-            params.budget.context_tokens,
-            response_reserve,
-        );
-        let retained_history = selected
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let controller = budget::BudgetController::new(
-            params.budget.clone(),
-            response_reserve,
-            self.schema.clone(),
-            self.base_prompt.clone(),
-            self.tool_guidance.clone(),
-            user_message.to_string(),
-            retained_history,
-            self.tool_definition_tokens,
-        );
-        (controller, selected)
+        (controller, history.to_vec())
     }
 
     fn build_agent_with_params(
@@ -1495,12 +1452,10 @@ impl GraphAgent {
         // Convert HistoryMessage → rig::completion::message::Message.
         let rig_history: Vec<rig::completion::message::Message> = selected_history
             .iter()
-            .map(|m| {
-                if m.role == "assistant" {
-                    rig::completion::message::Message::assistant(&m.content)
-                } else {
-                    rig::completion::message::Message::user(&m.content)
-                }
+            .map(|m| match m.role.as_str() {
+                "assistant" => rig::completion::message::Message::assistant(&m.content),
+                "system" => rig::completion::message::Message::system(&m.content),
+                _ => rig::completion::message::Message::user(&m.content),
             })
             .collect();
 
@@ -1651,7 +1606,6 @@ impl GraphAgent {
                         tracing::info!(
                             model_calls = diagnostics.model_calls,
                             request_tokens = diagnostics.request_tokens,
-                            reserved_response_tokens = diagnostics.reserved_response_tokens,
                             assistant_output_tokens = diagnostics.assistant_output_tokens,
                             tool_argument_tokens = diagnostics.tool_argument_tokens,
                             tool_output_tokens = diagnostics.tool_output_tokens,
@@ -1742,12 +1696,10 @@ impl GraphAgent {
         );
         let rig_history: Vec<rig::completion::message::Message> = selected_history
             .iter()
-            .map(|m| {
-                if m.role == "assistant" {
-                    rig::completion::message::Message::assistant(&m.content)
-                } else {
-                    rig::completion::message::Message::user(&m.content)
-                }
+            .map(|m| match m.role.as_str() {
+                "assistant" => rig::completion::message::Message::assistant(&m.content),
+                "system" => rig::completion::message::Message::system(&m.content),
+                _ => rig::completion::message::Message::user(&m.content),
             })
             .collect();
         agent
@@ -1772,7 +1724,9 @@ pub use rig;
 #[cfg(test)]
 mod tests {
     use super::tool_validation::validate_tool_args;
-    use super::{AgentParams, GraphAgent, format_search_response, resolve_node};
+    use super::{
+        AgentParams, GraphAgent, first_matched_search_content, format_search_response, resolve_node,
+    };
     use serde_json::json;
     use tempfile::TempDir;
     use u_forge_core::search::{SearchStageOutcome, SearchStageOutcomes, SearchStageStatus};
@@ -1807,6 +1761,16 @@ mod tests {
         assert!(message.contains("HQ embedding queue is not configured"));
         assert!(message.contains("keyword search"));
         assert!(message.contains("rebuild the semantic index from Settings"));
+    }
+
+    #[test]
+    fn search_content_is_not_discarded_at_128_tokens() {
+        let content = "Z-Rho lore detail ".repeat(180);
+        assert!(super::count_tokens(&content) > 128);
+        assert_eq!(
+            first_matched_search_content(&[content.as_str()]),
+            Some(content)
+        );
     }
 
     #[test]

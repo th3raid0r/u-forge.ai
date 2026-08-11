@@ -454,37 +454,22 @@ fn prepare_lemonade_chat(
                 .map(|value| value as usize)
                 .unwrap_or(app_config.chat.response_reserve);
             let mut effective_limits = selected
-                .reconcile_chat_limits(
-                    app_config.chat.max_context_tokens,
-                    app_config.chat.response_reserve,
-                    configured_generation,
-                    configured_generation,
-                )
+                .reconcile_chat_limits(configured_generation, configured_generation)
                 .map_err(|error| tracing::warn!(%error, "chat context is unusable"))
                 .ok();
             let context = effective_limits
                 .as_ref()
-                .map_or(app_config.chat.max_context_tokens, |limits| limits.context)
-                .max(2);
-            let reserve = effective_limits.as_ref().map_or_else(
-                || {
-                    app_config
-                        .chat
-                        .response_reserve
-                        .min(context.saturating_sub(1))
-                },
-                |limits| limits.response_reserve,
-            );
-            let (agent_budget, invalid_agent_budget) = match app_config.chat.agent.reconcile(
-                context,
-                reserve,
-                app_config.chat.max_tool_turns,
-            ) {
+                .map_or(usize::MAX, |limits| limits.context);
+            let (agent_budget, invalid_agent_budget) = match app_config
+                .chat
+                .agent
+                .reconcile(context, app_config.chat.max_tool_turns)
+            {
                 Ok(budget) => (budget, None),
                 Err(error) => {
                     tracing::warn!(%error, "agent budget configuration is unusable");
                     let fallback = u_forge_core::AgentBudgetConfig::default()
-                        .reconcile(context, reserve, app_config.chat.max_tool_turns)
+                        .reconcile(context, app_config.chat.max_tool_turns)
                         .expect("safe fallback agent budget reconciles");
                     (
                         fallback,
@@ -633,37 +618,22 @@ async fn activate_lemonade_capabilities(
                 .map(|value| value as usize)
                 .unwrap_or(app_config.chat.response_reserve);
             let mut effective_limits = selected
-                .reconcile_chat_limits(
-                    app_config.chat.max_context_tokens,
-                    app_config.chat.response_reserve,
-                    configured_generation,
-                    configured_generation,
-                )
+                .reconcile_chat_limits(configured_generation, configured_generation)
                 .map_err(|error| tracing::warn!(%error, "chat context is unusable"))
                 .ok();
             let context = effective_limits
                 .as_ref()
-                .map_or(app_config.chat.max_context_tokens, |limits| limits.context)
-                .max(2);
-            let reserve = effective_limits.as_ref().map_or_else(
-                || {
-                    app_config
-                        .chat
-                        .response_reserve
-                        .min(context.saturating_sub(1))
-                },
-                |limits| limits.response_reserve,
-            );
-            let (agent_budget, invalid_agent_budget) = match app_config.chat.agent.reconcile(
-                context,
-                reserve,
-                app_config.chat.max_tool_turns,
-            ) {
+                .map_or(usize::MAX, |limits| limits.context);
+            let (agent_budget, invalid_agent_budget) = match app_config
+                .chat
+                .agent
+                .reconcile(context, app_config.chat.max_tool_turns)
+            {
                 Ok(budget) => (budget, None),
                 Err(error) => {
                     tracing::warn!(%error, "agent budget configuration is unusable");
                     let fallback = u_forge_core::AgentBudgetConfig::default()
-                        .reconcile(context, reserve, app_config.chat.max_tool_turns)
+                        .reconcile(context, app_config.chat.max_tool_turns)
                         .expect("safe fallback agent budget reconciles");
                     (
                         fallback,
@@ -1033,28 +1003,6 @@ impl AppView {
             }
             return;
         }
-        if next_config.chat.response_reserve >= next_config.chat.max_context_tokens {
-            if let Some(settings) = &self.settings_view {
-                settings.update(cx, |settings, cx| {
-                    settings.set_error(
-                        "Response reserve must be smaller than the context window.".to_string(),
-                        cx,
-                    )
-                });
-            }
-            return;
-        }
-        if let Err(error) = next_config.chat.agent.reconcile(
-            next_config.chat.max_context_tokens,
-            next_config.chat.response_reserve,
-            next_config.chat.max_tool_turns,
-        ) {
-            if let Some(settings) = &self.settings_view {
-                settings.update(cx, |settings, cx| settings.set_error(error.to_string(), cx));
-            }
-            return;
-        }
-
         let restart_required = next_config.storage.db_path != self.state.app_config.storage.db_path
             || next_config.storage.embedding_dimensions
                 != self.state.app_config.storage.embedding_dimensions
@@ -1451,8 +1399,6 @@ impl AppView {
             cx.new(|cx| {
                 ChatPanel::new(
                     app_config.chat.system_prompt.clone(),
-                    app_config.chat.max_context_tokens,
-                    app_config.chat.response_reserve,
                     &db_path,
                     tokio_rt.clone(),
                     assistant_zoomed,

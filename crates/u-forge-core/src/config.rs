@@ -358,8 +358,14 @@ pub struct ChatDeviceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentBudgetConfig {
-    /// Maximum tokens used by the schema summary injected into the preamble.
-    #[serde(default = "AgentBudgetConfig::default_schema_summary_tokens")]
+    /// Legacy schema-summary cap retained for configuration compatibility.
+    ///
+    /// Schema records are now admitted against the active model context rather
+    /// than an independent static ceiling.
+    #[serde(
+        default = "AgentBudgetConfig::default_schema_summary_tokens",
+        skip_serializing
+    )]
     pub schema_summary_tokens: usize,
 
     /// Legacy cumulative request cap retained only for configuration compatibility.
@@ -394,27 +400,12 @@ impl AgentBudgetConfig {
     pub fn reconcile(
         &self,
         context: usize,
-        response_reserve: usize,
         _max_tool_turns: usize,
     ) -> anyhow::Result<EffectiveAgentBudget> {
-        if context < 2 || response_reserve >= context {
-            anyhow::bail!("effective context leaves no agent prompt allocation");
+        if context < 2 {
+            anyhow::bail!("effective model context is too small for an agent request");
         }
-        if self.schema_summary_tokens < 32 {
-            anyhow::bail!(
-                "chat.agent.schema_summary_tokens must be at least 32 so omission guidance fits"
-            );
-        }
-        let prompt_window = context - response_reserve;
         let mut diagnostics = Vec::new();
-
-        let schema_summary_tokens = self.schema_summary_tokens.min(prompt_window);
-        if schema_summary_tokens != self.schema_summary_tokens {
-            diagnostics.push(format!(
-                "agent schema budget clamped from {} to {schema_summary_tokens}",
-                self.schema_summary_tokens
-            ));
-        }
 
         if self.cumulative_request_tokens.is_some() || self.cumulative_tool_output_tokens.is_some()
         {
@@ -426,8 +417,6 @@ impl AgentBudgetConfig {
 
         Ok(EffectiveAgentBudget {
             context_tokens: context,
-            response_reserve_tokens: response_reserve,
-            schema_summary_tokens,
             repeated_call_limit: self.repeated_call_limit,
             diagnostics,
         })
@@ -449,8 +438,6 @@ impl Default for AgentBudgetConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveAgentBudget {
     pub context_tokens: usize,
-    pub response_reserve_tokens: usize,
-    pub schema_summary_tokens: usize,
     pub repeated_call_limit: usize,
     pub diagnostics: Vec<String>,
 }
@@ -458,7 +445,7 @@ pub struct EffectiveAgentBudget {
 impl Default for EffectiveAgentBudget {
     fn default() -> Self {
         AgentBudgetConfig::default()
-            .reconcile(4_096, 1_024, 5)
+            .reconcile(usize::MAX, 5)
             .expect("default agent budget is valid")
     }
 }
@@ -495,24 +482,21 @@ pub struct ChatConfig {
 
     /// Maximum number of prior turns (user + assistant pairs) kept in context.
     ///
-    /// Used as a coarse fallback when token counting is unavailable (e.g. the
-    /// direct streaming path). Prefer `max_context_tokens` for the agent path.
+    /// Retained for persisted-config compatibility. Active chat requests use
+    /// token fitting against an explicit Lemonade load context when present.
     #[serde(default = "ChatConfig::default_max_history_turns")]
     pub max_history_turns: usize,
 
-    /// Total context-window budget in tokens.
-    ///
-    /// History is trimmed to the most-recent messages that fit inside
-    /// `max_context_tokens - response_reserve` tokens (see `response_reserve`).
-    /// Set this to match your model's actual context window (e.g. 8192 for an
-    /// 8 k model). Defaults to 4096 — conservative enough for most local models.
-    #[serde(default = "ChatConfig::default_max_context_tokens")]
+    /// Legacy application-side context limit, retained only so older configs
+    /// deserialize. Lemonade owns automatic context sizing when `ctx_size` is
+    /// omitted, so this value is never an active request ceiling.
+    #[serde(default = "ChatConfig::default_max_context_tokens", skip_serializing)]
     pub max_context_tokens: usize,
 
-    /// Number of tokens reserved for the model's response.
+    /// Legacy fallback generation maximum.
     ///
-    /// Deducted from `max_context_tokens` when computing how much history fits.
-    /// Defaults to 1024.
+    /// Per-device `max_tokens` is used when configured. This value is no longer
+    /// subtracted from the model's input context.
     #[serde(default = "ChatConfig::default_response_reserve")]
     pub response_reserve: usize,
 
@@ -1272,17 +1256,14 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_budgets_do_not_require_clamping() {
+    fn default_agent_budget_has_no_application_context_ceiling() {
         let chat = ChatConfig::default();
         let effective = chat
             .agent
-            .reconcile(
-                chat.max_context_tokens,
-                chat.response_reserve,
-                chat.max_tool_turns,
-            )
+            .reconcile(usize::MAX, chat.max_tool_turns)
             .unwrap();
 
+        assert_eq!(effective.context_tokens, usize::MAX);
         assert!(
             effective.diagnostics.is_empty(),
             "default agent budgets should be valid without adjustment: {:?}",
@@ -1291,23 +1272,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_budgets_reconcile_with_the_active_context_and_turn_ceiling() {
+    fn legacy_agent_caps_do_not_limit_the_active_context() {
         let configured = AgentBudgetConfig {
             schema_summary_tokens: 10_000,
             cumulative_request_tokens: None,
             cumulative_tool_output_tokens: None,
             repeated_call_limit: 2,
         };
-        let effective = configured.reconcile(4_096, 1_024, 3).unwrap();
-        assert_eq!(effective.schema_summary_tokens, 3_072);
+        let effective = configured.reconcile(4_096, 3).unwrap();
+        assert_eq!(effective.context_tokens, 4_096);
         assert_eq!(effective.repeated_call_limit, 2);
-        assert_eq!(effective.diagnostics.len(), 1);
+        assert!(effective.diagnostics.is_empty());
 
         let invalid = AgentBudgetConfig {
             schema_summary_tokens: 31,
             ..AgentBudgetConfig::default()
         };
-        assert!(invalid.reconcile(4_096, 1_024, 5).is_err());
+        assert!(invalid.reconcile(4_096, 5).is_ok());
     }
 
     #[test]
@@ -1324,7 +1305,7 @@ mod tests {
         assert_eq!(config.chat.agent.cumulative_request_tokens, Some(4_321));
         assert_eq!(config.chat.agent.cumulative_tool_output_tokens, Some(654));
         assert_eq!(config.chat.agent.repeated_call_limit, 3);
-        let effective = config.chat.agent.reconcile(4_096, 1_024, 5).unwrap();
+        let effective = config.chat.agent.reconcile(4_096, 5).unwrap();
         assert!(
             effective
                 .diagnostics

@@ -140,10 +140,6 @@ pub(crate) struct ChatPanel {
     queued_send: Option<QueuedSend>,
     /// System prompt from config.
     system_prompt: String,
-    /// Total context-window token budget (from `[chat] max_context_tokens`).
-    max_context_tokens: usize,
-    /// Tokens reserved for the model's response (from `[chat] response_reserve`).
-    response_reserve: usize,
     /// Tokio runtime for async chat calls.
     tokio_rt: Arc<tokio::runtime::Runtime>,
     /// Subscription for the Enter-submit event from the input field.
@@ -192,9 +188,6 @@ impl From<&SelectedModel> for AvailableModel {
         let mut load_options = sel.load_opts.clone();
         if sel.recipe == "llamacpp" {
             load_options.llamacpp_backend = sel.backend.clone();
-        }
-        if let (Some(configured), Some(maximum)) = (load_options.ctx_size, sel.max_context_window) {
-            load_options.ctx_size = Some(configured.min(maximum));
         }
         Self {
             model_id: sel.model_id.clone(),
@@ -292,8 +285,6 @@ impl AvailableModel {
 impl ChatPanel {
     pub(crate) fn new(
         system_prompt: String,
-        max_context_tokens: usize,
-        response_reserve: usize,
         db_path: &Path,
         tokio_rt: Arc<tokio::runtime::Runtime>,
         zoomed: bool,
@@ -370,8 +361,6 @@ impl ChatPanel {
             capabilities_loading: false,
             queued_send: None,
             system_prompt,
-            max_context_tokens,
-            response_reserve,
             tokio_rt,
             submit_sub,
             list_state: ListState::new(msg_count, ListAlignment::Bottom, px(200.0)),
@@ -420,8 +409,6 @@ impl ChatPanel {
             "Selected model does not advertise tool calling; using direct chat.".to_string()
         });
         if let Some(limits) = limits {
-            self.max_context_tokens = limits.context;
-            self.response_reserve = limits.response_reserve;
             if let Some(provider) = &mut self.chat_provider {
                 provider.default_max_tokens =
                     limits.direct_generation.min(u32::MAX as usize) as u32;
@@ -809,13 +796,7 @@ impl ChatPanel {
                 }
             })
             .collect();
-        let history = select_history_window(
-            &raw_history,
-            &self.system_prompt,
-            &text,
-            self.max_context_tokens,
-            self.response_reserve,
-        );
+        let history = raw_history;
         self.push_text_message(ChatMessageRole::User, text.clone(), cx);
         self.start_pending_assistant(cx);
         self.streaming = true;
@@ -1141,6 +1122,13 @@ impl ChatPanel {
             }
         };
 
+        let selected_model = self.available_models.get(self.selected_model_idx).cloned();
+        let active_context = selected_model
+            .as_ref()
+            .and_then(|model| model.effective_limits.as_ref())
+            .map_or(usize::MAX, |limits| limits.context);
+        let history = select_history_window(&history, &self.system_prompt, &text, active_context);
+
         // Build the message list for the API (system prompt + windowed history).
         let mut api_messages = Vec::new();
         if !self.system_prompt.is_empty() {
@@ -1149,14 +1137,13 @@ impl ChatPanel {
         for msg in &history {
             match msg.role.as_str() {
                 "user" => api_messages.push(ChatMessage::user(&msg.content)),
+                "system" => api_messages.push(ChatMessage::system(&msg.content)),
                 _ => api_messages.push(ChatMessage::assistant(&msg.content)),
             }
         }
         api_messages.push(ChatMessage::user(&text));
 
         // Determine model override if user selected a different model.
-        let selected_model = self.available_models.get(self.selected_model_idx).cloned();
-
         let mut req =
             ChatRequest::new(api_messages).with_thinking(self.selected_reasoning_enabled());
         if let Some(model) = selected_model {
@@ -2593,15 +2580,7 @@ mod tests {
         let db_path = temp_dir.path().to_path_buf();
         let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
         let (panel, cx) = cx.add_window_view(move |_window, cx| {
-            let mut panel = ChatPanel::new(
-                "Test assistant".into(),
-                4096,
-                512,
-                &db_path,
-                runtime,
-                false,
-                cx,
-            );
+            let mut panel = ChatPanel::new("Test assistant".into(), &db_path, runtime, false, cx);
             panel.available_models = vec![picker_test_model("publisher/Gemma-4-E4B-it-GGUF")];
             panel.chat_provider = Some(LemonadeChatProvider::new(
                 "http://127.0.0.1:1/v1",
@@ -2628,15 +2607,7 @@ mod tests {
         let db_path = temp_dir.path().to_path_buf();
         let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
         let (panel, cx) = cx.add_window_view(move |_window, cx| {
-            let mut panel = ChatPanel::new(
-                "Test assistant".into(),
-                4096,
-                512,
-                &db_path,
-                runtime,
-                false,
-                cx,
-            );
+            let mut panel = ChatPanel::new("Test assistant".into(), &db_path, runtime, false, cx);
             panel.begin_capability_initialization();
             panel
         });
@@ -2674,15 +2645,13 @@ mod tests {
             effective_limits: Some(EffectiveChatLimits {
                 load_context: Some(4096),
                 context: 4096,
-                response_reserve: 512,
                 direct_generation: 400,
                 agent_generation: 300,
-                history_budget: 3584,
                 diagnostics: Vec::new(),
             }),
             max_tool_turns: 7,
             agent_budget: u_forge_core::AgentBudgetConfig::default()
-                .reconcile(4096, 512, 7)
+                .reconcile(4096, 7)
                 .unwrap(),
         };
         let params = model.agent_params();

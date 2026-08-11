@@ -141,7 +141,6 @@ pub enum ChatTerminalReason {
 pub struct AgentBudgetDiagnostics {
     pub model_calls: usize,
     pub request_tokens: usize,
-    pub reserved_response_tokens: usize,
     pub assistant_output_tokens: usize,
     pub tool_argument_tokens: usize,
     pub tool_output_tokens: usize,
