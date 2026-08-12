@@ -1,5 +1,6 @@
 /target
 /.fastembed_cache
+/.fossil
 /dist
 /src-tauri/default-project
 /node_modules
