@@ -9,10 +9,20 @@ use std::{
 
 const LEMONADE_VERSION: &str = "11.5.2";
 const INSTALL_REVISION: &str = "ubuntu-x64-minimal-v1";
-const PATCH_REVISION: &str = "gemma4-gguf-reasoning-v1";
+const PATCH_REVISION: &str = "gemma4-reasoning-llamacpp-11.5.1-v1";
 const CHECKSUM_FILE: &str = "../../packaging/lemonade-embeddable.sha256";
 const SKIP_ENV: &str = "UFORGE_SKIP_EMBEDDED_LEMONADE";
 const REQUIRE_ENV: &str = "UFORGE_REQUIRE_EMBEDDED_LEMONADE";
+// Keep the 11.5.2 control plane while rolling only its llama.cpp downloads
+// back to the pins in Lemonade's v11.5.1 backend_versions.json.
+const LLAMACPP_11_5_1_PINS: [(&str, &str); 6] = [
+    ("vulkan", "b9747"),
+    ("rocm-stable", "b9752"),
+    ("rocm-nightly", "b1292"),
+    ("cuda", "b9851"),
+    ("metal", "b9747"),
+    ("cpu", "b9747"),
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -79,6 +89,7 @@ fn bootstrap() -> Result<(), Box<dyn Error>> {
             license.as_path(),
         ],
         &model_manifest,
+        &backend_versions,
         &marker,
         &expected_marker,
     ) {
@@ -200,6 +211,7 @@ fn artifact_is_current(
     install_dir: &Path,
     required_files: [&Path; 5],
     model_manifest: &Path,
+    backend_versions: &Path,
     marker: &Path,
     expected_marker: &str,
 ) -> bool {
@@ -210,6 +222,7 @@ fn artifact_is_current(
         return false;
     }
     verify_reasoning_patch(model_manifest).is_ok()
+        && verify_llamacpp_11_5_1_pins(backend_versions).is_ok()
 }
 
 fn ensure_archive(
@@ -317,6 +330,8 @@ fn install_archive(
 
     let patched = patch_reasoning_labels(&model_manifest)?;
     verify_reasoning_patch(&model_manifest)?;
+    patch_llamacpp_11_5_1_pins(&backend_versions)?;
+    verify_llamacpp_11_5_1_pins(&backend_versions)?;
 
     let prepared = staging.join("lemonade");
     fs::create_dir_all(prepared.join("resources"))?;
@@ -336,7 +351,7 @@ fn install_archive(
     }
     fs::rename(&prepared, install_dir)?;
     println!(
-        "cargo:warning=provisioned Embeddable Lemonade {LEMONADE_VERSION}; added reasoning to {patched} Gemma 4 GGUF models"
+        "cargo:warning=provisioned Embeddable Lemonade {LEMONADE_VERSION}; added reasoning to {patched} Gemma 4 GGUF models and pinned llama.cpp backends to Lemonade 11.5.1"
     );
     Ok(())
 }
@@ -404,6 +419,42 @@ fn verify_reasoning_patch(path: &Path) -> Result<(), Box<dyn Error>> {
             });
         if !has_reasoning {
             return Err(format!("Lemonade model {name} is missing reasoning").into());
+        }
+    }
+    Ok(())
+}
+
+fn patch_llamacpp_11_5_1_pins(path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    let llamacpp = manifest
+        .get_mut("llamacpp")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("Lemonade backend_versions.json must contain a llamacpp object")?;
+    for (backend, version) in LLAMACPP_11_5_1_PINS {
+        llamacpp.insert(
+            backend.to_owned(),
+            serde_json::Value::String(version.to_owned()),
+        );
+    }
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn verify_llamacpp_11_5_1_pins(path: &Path) -> Result<(), Box<dyn Error>> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    let llamacpp = manifest
+        .get("llamacpp")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("Lemonade backend_versions.json must contain a llamacpp object")?;
+    for (backend, expected) in LLAMACPP_11_5_1_PINS {
+        let actual = llamacpp.get(backend).and_then(serde_json::Value::as_str);
+        if actual != Some(expected) {
+            return Err(format!(
+                "Lemonade llama.cpp backend {backend} is pinned to {actual:?}, expected {expected} from 11.5.1"
+            )
+            .into());
         }
     }
     Ok(())
