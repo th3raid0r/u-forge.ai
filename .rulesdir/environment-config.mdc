@@ -89,11 +89,12 @@ The desktop app uses the persistent path from `[storage].db_path`.
 Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
 TTS) via an OpenAI-compatible HTTP API. On x86_64 Linux with GNU libc, building
 the desktop UI downloads the checksum-pinned upstream Ubuntu x64 Embeddable
-Lemonade release into `target/`. `make release` packages that runtime, the
-desktop executable, and the complete defaults tree into an AppImage built on
-Ubuntu 26.04. The build adds the `reasoning` catalog label to built-in Gemma 4
-GGUF models before installation. If provisioning is skipped or unavailable, AI
-features degrade gracefully and the knowledge graph remains usable.
+Lemonade 11.5.2 release into `target/`. `make release` packages that runtime,
+the desktop executable, and the complete defaults tree into an AppImage built
+on Ubuntu 26.04. The build adds the `reasoning` catalog label to built-in Gemma
+4 GGUF models and pins llama.cpp backend downloads to Lemonade 11.5.1 before
+installation. If provisioning is skipped or unavailable, AI features degrade
+gracefully and the knowledge graph remains usable.
 
 ### Setup
 
