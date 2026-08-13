@@ -39,8 +39,9 @@ pub use ai::embeddings::{
 pub use builder::ObjectBuilder;
 pub use config::{
     AgentBudgetConfig, AppConfig, ChatConfig, ChatDevice, ChatDeviceConfig, DataConfig,
-    EffectiveAgentBudget, EmbeddingDeviceConfig, LemonadeConfig, ModelConfig, ModelLoadParams,
-    ReasoningControl, StorageConfig, UiConfig, UserPaths,
+    EffectiveAgentBudget, EmbeddingDeviceConfig, EmbeddingLaneConfig, GpuRuntimePreference,
+    LemonadeConfig, LlamaCppDevice, ModelConfig, ModelLoadParams, ReasoningControl,
+    RerankingConfig, StorageConfig, UiConfig, UserPaths,
 };
 pub use error::{EmbeddingDimensionMismatch, EmbeddingSpaceMismatch, UnidentifiedEmbeddingSpace};
 pub use graph::{

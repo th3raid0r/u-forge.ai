@@ -243,7 +243,7 @@ impl AvailableModel {
 
     fn uses_gpu(&self) -> bool {
         self.recipe == "llamacpp"
-            && matches!(self.backend.as_deref(), Some("rocm" | "vulkan" | "metal"))
+            && u_forge_core::lemonade::selector::is_gpu_backend(self.backend.as_deref())
     }
 
     /// Keep registry identifiers recognizable while removing packaging noise
@@ -264,7 +264,7 @@ impl AvailableModel {
         match self.recipe.as_str() {
             "flm" => "NPU",
             "llamacpp" => match self.backend.as_deref() {
-                Some("rocm" | "vulkan" | "metal") => "GPU",
+                Some("cuda" | "rocm" | "vulkan" | "metal") => "GPU",
                 _ => "CPU",
             },
             _ => "",
@@ -429,7 +429,7 @@ impl ChatPanel {
         let device = match model.recipe.as_str() {
             "flm" => Some("npu".to_string()),
             "llamacpp" => Some(match model.backend.as_deref() {
-                Some("rocm" | "vulkan" | "metal") => "gpu".to_string(),
+                Some("cuda" | "rocm" | "vulkan" | "metal") => "gpu".to_string(),
                 _ => "cpu".to_string(),
             }),
             _ => None,
@@ -614,6 +614,39 @@ impl ChatPanel {
         self.streaming_tool_calls.clear();
         self.save_current_session(cx);
         cx.notify();
+    }
+
+    /// Apply terminal aggregate text only when no deltas produced the current
+    /// assistant row. Some OpenAI-compatible streams deliver useful text only
+    /// in Rig's final aggregate response.
+    fn finish_agent_stream(&mut self, full_text: Option<String>, cx: &mut Context<Self>) {
+        let fallback = full_text.filter(|text| !text.trim().is_empty());
+        let used_fallback = self.streaming_assistant.is_none() && fallback.is_some();
+        if self.streaming_assistant.is_none()
+            && let Some(text) = fallback
+        {
+            let message = self.take_pending_assistant(true, cx).unwrap_or_else(|| {
+                self.push_text_message(ChatMessageRole::Assistant, String::new(), cx)
+            });
+            message.update(cx, |message, cx| message.replace_text(text, cx));
+            self.streaming_assistant = Some(message);
+        }
+        tracing::info!(
+            model = self
+                .available_models
+                .get(self.selected_model_idx)
+                .map(|model| model.model_id.as_str())
+                .unwrap_or("unknown"),
+            backend = self
+                .available_models
+                .get(self.selected_model_idx)
+                .and_then(|model| model.backend.as_deref())
+                .unwrap_or("implicit"),
+            streamed_text = !used_fallback && self.streaming_assistant.is_some(),
+            terminal_fallback = used_fallback,
+            "Assistant agent stream reached a successful terminal event"
+        );
+        self.finalize_stream(cx);
     }
 
     fn stop_stream(&mut self, cx: &mut Context<Self>) {
@@ -1072,9 +1105,9 @@ impl ChatPanel {
                             .ok();
                             break;
                         }
-                        Some(AgentStreamEvent::Finished { .. }) => {
+                        Some(AgentStreamEvent::Finished { full_text, .. }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                view.finalize_stream(cx);
+                                view.finish_agent_stream(full_text, cx);
                             })
                             .ok();
                             break;
@@ -2621,6 +2654,56 @@ mod tests {
                 assert_eq!(panel.messages[0].read(cx).role, ChatMessageRole::User);
                 assert_eq!(panel.messages[1].read(cx).role, ChatMessageRole::Assistant);
                 panel.stop_stream(cx);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_agent_text_replaces_pending_row_when_no_deltas_arrive(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (panel, cx) = cx.add_window_view(move |_window, cx| {
+            ChatPanel::new("Test assistant".into(), &db_path, runtime, false, cx)
+        });
+
+        cx.update(|_window, app| {
+            panel.update(app, |panel, cx| {
+                panel.streaming = true;
+                panel.start_pending_assistant(cx);
+                panel.finish_agent_stream(Some("CUDA answer".into()), cx);
+
+                assert!(!panel.streaming);
+                assert_eq!(panel.messages.len(), 1);
+                assert_eq!(panel.messages[0].read(cx).text(), "CUDA answer");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_agent_text_does_not_duplicate_streamed_deltas(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (panel, cx) = cx.add_window_view(move |_window, cx| {
+            ChatPanel::new("Test assistant".into(), &db_path, runtime, false, cx)
+        });
+
+        cx.update(|_window, app| {
+            panel.update(app, |panel, cx| {
+                panel.streaming = true;
+                let message = panel.push_text_message(
+                    ChatMessageRole::Assistant,
+                    "streamed answer".into(),
+                    cx,
+                );
+                panel.streaming_assistant = Some(message);
+                panel.finish_agent_stream(Some("streamed answer".into()), cx);
+
+                assert_eq!(panel.messages.len(), 1);
+                assert_eq!(panel.messages[0].read(cx).text(), "streamed answer");
             });
         });
     }

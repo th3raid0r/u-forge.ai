@@ -581,11 +581,16 @@ pub async fn build_hq_embed_queue_with_connection(
         .map(|m| m.model_name.clone())
         .collect();
 
+    let weight = if crate::lemonade::selector::is_gpu_backend(hq_model.backend.as_deref()) {
+        app_cfg.embedding.gpu_weight
+    } else {
+        app_cfg.embedding.cpu_weight
+    };
     let built: BuiltProvider = match ProviderFactory::build_with_connection(
         &hq_model,
         Capability::Embedding,
         connection,
-        app_cfg.embedding.gpu_weight,
+        weight,
         None,
         &already_loaded,
     )

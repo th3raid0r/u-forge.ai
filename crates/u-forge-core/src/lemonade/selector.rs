@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use crate::config::{EmbeddingDeviceConfig, ModelConfig};
+use crate::config::{EmbeddingDeviceConfig, LlamaCppDevice, ModelConfig};
 use crate::lemonade::catalog::{CatalogModel, LemonadeServerCatalog};
 use crate::lemonade::load::ModelLoadOptions;
 
@@ -39,7 +39,8 @@ pub struct SelectedModel {
     pub model_id: String,
     /// Recipe name: `"llamacpp"`, `"flm"`, `"whispercpp"`, `"kokoro"`, etc.
     pub recipe: String,
-    /// Resolved llamacpp backend: `"rocm"`, `"vulkan"`, or `"cpu"`.
+    /// Resolved llamacpp backend: `"cuda"`, `"rocm"`, `"metal"`,
+    /// `"vulkan"`, or `"cpu"`.
     ///
     /// `None` for non-llamacpp recipes where the backend is implicit in the
     /// recipe (FLM → NPU, whispercpp → Vulkan/CPU, kokoro → CPU).
@@ -105,17 +106,19 @@ impl SelectedModel {
 /// Used by all selector methods to enforce at-most-one-worker-per-slot:
 ///
 /// - `flm` recipe → `"npu"` (AMD NPU via FLM runtime)
-/// - `llamacpp` + rocm/vulkan/metal → `"gpu"`
+/// - `llamacpp` + cuda/rocm/vulkan/metal → `"gpu"`
 /// - `llamacpp` + cpu (or unresolved) → `"cpu"`
 /// - Any other recipe (e.g. `"whispercpp"`, `"kokoro"`) → the recipe name
 ///   itself, giving each recipe its own shared slot.
+pub fn is_gpu_backend(backend: Option<&str>) -> bool {
+    matches!(backend, Some("cuda" | "rocm" | "vulkan" | "metal"))
+}
+
 fn model_device_slot(sel: &SelectedModel) -> String {
     match sel.recipe.as_str() {
         "flm" => "npu".to_string(),
-        "llamacpp" => match sel.backend.as_deref() {
-            Some("rocm") | Some("vulkan") | Some("metal") => "gpu".to_string(),
-            _ => "cpu".to_string(),
-        },
+        "llamacpp" if is_gpu_backend(sel.backend.as_deref()) => "gpu".to_string(),
+        "llamacpp" => "cpu".to_string(),
         recipe => recipe.to_string(),
     }
 }
@@ -158,7 +161,7 @@ impl<'a> ModelSelector<'a> {
     /// - Ordered by `ModelConfig::embedding_model_preferences`, then any
     ///   remaining downloaded embedding models.
     /// - **At most one worker per (device slot, quality tier).**  Device slots
-    ///   are `"npu"` (FLM), `"gpu"` (llamacpp + rocm/vulkan/metal), and `"cpu"`
+    ///   are `"npu"` (FLM), `"gpu"` (llamacpp + cuda/rocm/vulkan/metal), and `"cpu"`
     ///   (llamacpp + cpu).  The first (highest-preference) model wins each slot;
     ///   all later candidates for the same slot are dropped.  This prevents
     ///   spawning multiple NPU workers or mixing incompatible model families
@@ -171,29 +174,36 @@ impl<'a> ModelSelector<'a> {
         let mut result: Vec<SelectedModel> = ordered
             .into_iter()
             .filter_map(|m| {
-                let backend = self.resolve_llamacpp_backend(&m.recipe);
-                if !self.is_embedding_backend_enabled(&m.recipe, backend.as_deref()) {
-                    return None;
-                }
                 let quality_tier = if self.config.high_quality_embedding_models.contains(&m.id) {
                     QualityTier::High
                 } else {
                     QualityTier::Standard
                 };
+                let lane = match quality_tier {
+                    QualityTier::High => &self.embedding.high_quality,
+                    _ => &self.embedding.standard,
+                };
+                let backend = match m.recipe.as_str() {
+                    "flm" if lane.npu_enabled => None,
+                    "flm" => return None,
+                    "llamacpp" => self.resolve_llamacpp_device(lane.llamacpp_device)?,
+                    _ => self.resolve_llamacpp_backend(&m.recipe),
+                };
                 Some(SelectedModel {
                     model_id: m.id.clone(),
                     recipe: m.recipe.clone(),
-                    backend,
+                    backend: backend.clone(),
                     load_opts: self.load_options_for(m),
                     quality_tier,
                     checkpoint: m.checkpoint.clone(),
                     max_context_window: m.max_context_window,
                     tool_capable: m.supports_tool_calling(),
                     reasoning_capable: m.supports_reasoning(),
-                    diagnostics: self.backend_diagnostics(
-                        &m.recipe,
-                        self.resolve_llamacpp_backend(&m.recipe).as_deref(),
-                    ),
+                    diagnostics: if lane.llamacpp_device == LlamaCppDevice::Gpu {
+                        self.backend_diagnostics(&m.recipe, backend.as_deref())
+                    } else {
+                        Vec::new()
+                    },
                 })
             })
             .collect();
@@ -246,25 +256,32 @@ impl<'a> ModelSelector<'a> {
     }
 
     /// Returns the best available reranker (label `"reranking"`).
-    pub fn select_reranker(&self) -> Option<SelectedModel> {
+    pub fn select_reranker(&self, device: LlamaCppDevice) -> Option<SelectedModel> {
         let candidates = self.catalog.downloaded_models_with_label("reranking");
         let ordered =
             self.apply_preference_order(&candidates, &self.config.reranker_model_preferences);
 
-        ordered.into_iter().next().map(|m| SelectedModel {
-            model_id: m.id.clone(),
-            recipe: m.recipe.clone(),
-            backend: self.resolve_llamacpp_backend(&m.recipe),
-            load_opts: self.load_options_for(m),
-            quality_tier: QualityTier::NotApplicable,
-            checkpoint: m.checkpoint.clone(),
-            max_context_window: m.max_context_window,
-            tool_capable: m.supports_tool_calling(),
-            reasoning_capable: m.supports_reasoning(),
-            diagnostics: self.backend_diagnostics(
-                &m.recipe,
-                self.resolve_llamacpp_backend(&m.recipe).as_deref(),
-            ),
+        ordered.into_iter().find_map(|m| {
+            let backend = match m.recipe.as_str() {
+                "llamacpp" => self.resolve_llamacpp_device(device)?,
+                _ => self.resolve_llamacpp_backend(&m.recipe),
+            };
+            Some(SelectedModel {
+                model_id: m.id.clone(),
+                recipe: m.recipe.clone(),
+                backend: backend.clone(),
+                load_opts: self.load_options_for(m),
+                quality_tier: QualityTier::NotApplicable,
+                checkpoint: m.checkpoint.clone(),
+                max_context_window: m.max_context_window,
+                tool_capable: m.supports_tool_calling(),
+                reasoning_capable: m.supports_reasoning(),
+                diagnostics: if device == LlamaCppDevice::Gpu {
+                    self.backend_diagnostics(&m.recipe, backend.as_deref())
+                } else {
+                    Vec::new()
+                },
+            })
         })
     }
 
@@ -453,9 +470,9 @@ impl<'a> ModelSelector<'a> {
 
     /// Resolve the llamacpp backend for a model.
     ///
-    /// For `llamacpp` models, iterates `ModelConfig::llamacpp_backend_preference`
-    /// and returns the first entry that is actually installed on the server.
-    /// Falls back to `"cpu"` when no preference matches (always available).
+    /// For `llamacpp` models, applies the configured logical GPU policy and
+    /// returns its first installed backend. Falls back to `"cpu"` when none
+    /// matches (always available).
     ///
     /// Returns `None` for non-llamacpp recipes (FLM, whispercpp, kokoro) where
     /// the backend is implicit in the recipe.
@@ -463,40 +480,32 @@ impl<'a> ModelSelector<'a> {
         if recipe != "llamacpp" {
             return None;
         }
-        for backend in &self.config.llamacpp_backend_preference {
-            if self.catalog.has_installed_backend("llamacpp", backend) {
-                return Some(backend.clone());
+        for backend in self.config.gpu_backend_preference(self.catalog) {
+            if self.catalog.has_installed_backend("llamacpp", &backend) {
+                return Some(backend);
             }
         }
         Some("cpu".to_string())
+    }
+
+    fn resolve_llamacpp_device(&self, device: LlamaCppDevice) -> Option<Option<String>> {
+        match device {
+            LlamaCppDevice::Disabled => None,
+            LlamaCppDevice::Cpu => Some(Some("cpu".to_string())),
+            LlamaCppDevice::Gpu => Some(self.resolve_llamacpp_backend("llamacpp")),
+        }
     }
 
     fn backend_diagnostics(&self, recipe: &str, backend: Option<&str>) -> Vec<String> {
         if recipe != "llamacpp" {
             return Vec::new();
         }
-        match (self.config.llamacpp_backend_preference.first(), backend) {
+        let preferred = self.config.gpu_backend_preference(self.catalog);
+        match (preferred.first(), backend) {
             (Some(preferred), Some(selected)) if preferred != selected => vec![format!(
                 "preferred backend {preferred} unavailable; selected {selected} and rebuilt the profile"
             )],
             _ => Vec::new(),
-        }
-    }
-
-    /// Returns `true` if the resolved device path is enabled in the embedding config.
-    ///
-    /// - FLM recipe → `npu_enabled`
-    /// - llamacpp with rocm/vulkan backend → `gpu_enabled`
-    /// - llamacpp with cpu backend (or unresolved) → `cpu_enabled`
-    /// - Any other recipe → always enabled
-    fn is_embedding_backend_enabled(&self, recipe: &str, backend: Option<&str>) -> bool {
-        match recipe {
-            "flm" => self.embedding.npu_enabled,
-            "llamacpp" => match backend {
-                Some("rocm") | Some("vulkan") => self.embedding.gpu_enabled,
-                _ => self.embedding.cpu_enabled,
-            },
-            _ => true,
         }
     }
 
@@ -527,7 +536,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::config::{EmbeddingDeviceConfig, ModelConfig, ModelLoadParams};
+    use crate::config::{
+        EmbeddingDeviceConfig, GpuRuntimePreference, LlamaCppDevice, ModelConfig, ModelLoadParams,
+    };
     use crate::lemonade::catalog::{CatalogModel, InstalledBackend, LemonadeServerCatalog};
 
     // ── Test helpers ──────────────────────────────────────────────────────────
@@ -577,7 +588,11 @@ mod tests {
     }
 
     fn default_embedding_cfg() -> EmbeddingDeviceConfig {
-        EmbeddingDeviceConfig::default()
+        let mut config = EmbeddingDeviceConfig::default();
+        config.standard.npu_enabled = true;
+        config.standard.llamacpp_device = LlamaCppDevice::Gpu;
+        config.high_quality.llamacpp_device = LlamaCppDevice::Gpu;
+        config
     }
 
     // ── Embedding selection ───────────────────────────────────────────────────
@@ -592,7 +607,7 @@ mod tests {
             vec![installed_backend("flm", "npu", &["amd_npu"])],
         );
         let cfg = ModelConfig::default();
-        let emb = EmbeddingDeviceConfig::default();
+        let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         let results = selector.select_embedding_models();
@@ -634,7 +649,7 @@ mod tests {
             vec![installed_backend("llamacpp", "vulkan", &["gpu"])],
         );
         let mut config = ModelConfig::default();
-        config.llamacpp_backend_preference = vec!["vulkan".into()];
+        config.default_gpu_runtime = GpuRuntimePreference::Vulkan;
         config.load_params.insert(
             "chat".into(),
             ModelLoadParams {
@@ -642,7 +657,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let embedding = EmbeddingDeviceConfig::default();
+        let embedding = default_embedding_cfg();
         let selected = ModelSelector::new(&catalog, &config, &embedding)
             .model_by_id("chat", QualityTier::NotApplicable)
             .unwrap();
@@ -678,26 +693,22 @@ mod tests {
             vec![installed_backend("flm", "npu", &["amd_npu"])],
         );
         let cfg = ModelConfig::default();
-        let emb = EmbeddingDeviceConfig {
-            npu_enabled: false,
-            ..Default::default()
-        };
+        let mut emb = default_embedding_cfg();
+        emb.standard.npu_enabled = false;
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         assert!(selector.select_embedding_models().is_empty());
     }
 
     #[test]
-    fn test_select_embedding_respects_gpu_disabled() {
+    fn test_select_embedding_respects_llamacpp_disabled() {
         let catalog = catalog_with(
             vec![model("embed-gguf", "llamacpp", &["embeddings"])],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );
         let cfg = ModelConfig::default();
-        let emb = EmbeddingDeviceConfig {
-            gpu_enabled: false,
-            ..Default::default()
-        };
+        let mut emb = default_embedding_cfg();
+        emb.standard.llamacpp_device = LlamaCppDevice::Disabled;
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         assert!(selector.select_embedding_models().is_empty());
@@ -764,6 +775,10 @@ mod tests {
         );
         let cfg = ModelConfig::default();
         let emb = default_embedding_cfg();
+        assert_eq!(
+            cfg.gpu_backend_preference(&catalog),
+            vec!["rocm".to_string(), "vulkan".to_string()]
+        );
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
         let results = selector.select_embedding_models();
@@ -859,6 +874,78 @@ mod tests {
     }
 
     #[test]
+    fn test_amd_device_keeps_rocm_preference_when_only_vulkan_is_available() {
+        let catalog = catalog_with(
+            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![installed_backend("llamacpp", "vulkan", &["amd_igpu"])],
+        );
+        let cfg = ModelConfig::default();
+        let emb = default_embedding_cfg();
+
+        assert_eq!(
+            cfg.gpu_backend_preference(&catalog),
+            vec!["rocm".to_string(), "vulkan".to_string()]
+        );
+        let results = ModelSelector::new(&catalog, &cfg, &emb).select_llm_models();
+        assert_eq!(results[0].backend.as_deref(), Some("vulkan"));
+        assert!(results[0].diagnostics[0].contains("preferred backend rocm"));
+    }
+
+    #[test]
+    fn test_llamacpp_backend_prefers_cuda_over_vulkan() {
+        let catalog = catalog_with(
+            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![
+                installed_backend("llamacpp", "cuda", &["nvidia_gpu"]),
+                installed_backend("llamacpp", "vulkan", &["nvidia_gpu"]),
+            ],
+        );
+        let cfg = ModelConfig::default();
+        let emb = default_embedding_cfg();
+        assert_eq!(
+            cfg.gpu_backend_preference(&catalog),
+            vec!["cuda".to_string(), "vulkan".to_string()]
+        );
+        let results = ModelSelector::new(&catalog, &cfg, &emb).select_llm_models();
+
+        assert_eq!(results[0].backend.as_deref(), Some("cuda"));
+        assert!(is_gpu_backend(results[0].backend.as_deref()));
+    }
+
+    #[test]
+    fn test_nvidia_device_keeps_cuda_preference_when_only_vulkan_is_available() {
+        let catalog = catalog_with(
+            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![installed_backend("llamacpp", "vulkan", &["nvidia_gpu"])],
+        );
+        let cfg = ModelConfig::default();
+
+        assert_eq!(
+            cfg.gpu_backend_preference(&catalog),
+            vec!["cuda".to_string(), "vulkan".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_explicit_vulkan_runtime_overrides_cuda() {
+        let catalog = catalog_with(
+            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![
+                installed_backend("llamacpp", "cuda", &["nvidia_gpu"]),
+                installed_backend("llamacpp", "vulkan", &["nvidia_gpu"]),
+            ],
+        );
+        let cfg = ModelConfig {
+            default_gpu_runtime: GpuRuntimePreference::Vulkan,
+            ..Default::default()
+        };
+        let emb = default_embedding_cfg();
+        let results = ModelSelector::new(&catalog, &cfg, &emb).select_llm_models();
+
+        assert_eq!(results[0].backend.as_deref(), Some("vulkan"));
+    }
+
+    #[test]
     fn test_llamacpp_backend_falls_back_to_cpu_when_nothing_installed() {
         let catalog = catalog_with(
             vec![model("llm-gguf", "llamacpp", &["reasoning"])],
@@ -902,7 +989,7 @@ mod tests {
         let emb = default_embedding_cfg();
         let selector = ModelSelector::new(&catalog, &cfg, &emb);
 
-        let result = selector.select_reranker().unwrap();
+        let result = selector.select_reranker(LlamaCppDevice::Gpu).unwrap();
         assert_eq!(result.model_id, "bge-reranker-v2-m3-GGUF");
         assert_eq!(result.quality_tier, QualityTier::NotApplicable);
     }
@@ -914,7 +1001,7 @@ mod tests {
         let emb = default_embedding_cfg();
         assert!(
             ModelSelector::new(&catalog, &cfg, &emb)
-                .select_reranker()
+                .select_reranker(LlamaCppDevice::Gpu)
                 .is_none()
         );
     }

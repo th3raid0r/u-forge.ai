@@ -2,6 +2,7 @@
 # Maximum simultaneously resident models per model type. Three allows the
 # standard, optional NPU, and high-quality embedding models to coexist.
 max_loaded_models = 3
+hardware_profile_initialized = false
 
 [ui]
 # Base content font size in pixels (rem unit). Text scales relative to this:
@@ -31,13 +32,24 @@ import_file = "./defaults/example_data/foundation-example.jsonl"
 schema_dir  = "./defaults/schemas/Sine Nomine"
 
 [embedding]
-npu_enabled = true
-high_quality_embedding = true
-gpu_enabled = true
+high_quality_embedding = false
 gpu_weight = 40
-cpu_enabled = false
 cpu_weight = 10
 npu_weight = 100
+
+[embedding.standard]
+npu_enabled = false
+llamacpp_device = "cpu"
+
+[embedding.high_quality]
+npu_enabled = false
+llamacpp_device = "disabled"
+
+[reranking]
+llamacpp_device = "cpu"
+
+[models]
+default_gpu_runtime = "vendor"
 
 [models.load_params]
 ## Mostly important for embedding models, but can be used for any text model.

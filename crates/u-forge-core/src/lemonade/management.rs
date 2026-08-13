@@ -268,7 +268,8 @@ pub fn chat_component_state(
 
 /// Choose the first compatible backend in preference order. Lifecycle states
 /// that Lemonade can install or update are returned so the caller can enqueue
-/// the idempotent install task.
+/// the idempotent install task. An empty preference accepts any compatible
+/// backend, which is used for recipes whose device is implicit (such as FLM).
 pub fn select_setup_backend(
     catalog: &LemonadeServerCatalog,
     recipe: &str,
@@ -286,21 +287,20 @@ pub fn select_setup_backend(
         })
         .collect();
 
-    let selected = preference
-        .iter()
-        .find_map(|name| {
+    let selected = if preference.is_empty() {
+        candidates
+            .iter()
+            .find(|backend| backend.state == "installed")
+            .copied()
+            .or_else(|| candidates.first().copied())
+    } else {
+        preference.iter().find_map(|name| {
             candidates
                 .iter()
                 .find(|backend| backend.backend == *name)
                 .copied()
         })
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|backend| backend.state == "installed")
-                .copied()
-        })
-        .or_else(|| candidates.first().copied())?;
+    }?;
     Some(SetupBackendChoice {
         recipe: selected.recipe.clone(),
         backend: selected.backend.clone(),
@@ -916,6 +916,21 @@ mod tests {
         .unwrap();
         assert_eq!(choice.backend, "vulkan");
         assert!(choice.needs_install());
+    }
+
+    #[test]
+    fn backend_selection_does_not_escape_an_explicit_preference() {
+        let catalog = LemonadeServerCatalog {
+            backends: vec![InstalledBackend {
+                recipe: "llamacpp".to_string(),
+                backend: "rocm".to_string(),
+                state: "installed".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(select_setup_backend(&catalog, "llamacpp", &["vulkan".to_string()]).is_none());
     }
 
     #[test]

@@ -12,12 +12,16 @@
 //! max_loaded_models = 3
 //!
 //! [embedding]
-//! npu_enabled  = true
-//! gpu_enabled  = true
-//! cpu_enabled  = false   # disable CPU worker when GPU handles llamacpp
-//! npu_weight   = 100
-//! gpu_weight   = 50
-//! cpu_weight   = 10
+//! npu_weight = 100
+//! gpu_weight = 50
+//! cpu_weight = 10
+//!
+//! [embedding.standard]
+//! npu_enabled = true
+//! llamacpp_device = "cpu"
+//!
+//! [embedding.high_quality]
+//! llamacpp_device = "gpu"
 //!
 //! [models.load_params]
 //! "embed-gemma-300m-FLM" = { ctx_size = 2048 }
@@ -26,9 +30,8 @@
 //!
 //! # Typical use-cases for disabling a device
 //!
-//! Lemonade Server cannot run the same llamacpp embedding model on both GPU and
-//! CPU simultaneously.  If your setup loads the GGUF model on the GPU, set
-//! `cpu_enabled = false` to prevent the CPU worker from also trying to use it.
+//! Lemonade Server cannot run the same llama.cpp embedding model on both GPU
+//! and CPU simultaneously. Each lane therefore selects one llama.cpp device.
 //!
 //! NPU embedding uses a separate FLM model (not llamacpp), so the NPU worker
 //! never conflicts with GPU/CPU llamacpp workers and can always remain enabled.
@@ -217,6 +220,12 @@ pub struct LemonadeConfig {
     /// embedding model, and high-quality embedding model to remain resident.
     #[serde(default = "LemonadeConfig::default_max_loaded_models")]
     pub max_loaded_models: usize,
+
+    /// Whether one-time hardware-derived defaults have been persisted.
+    /// Missing values are treated as initialized so existing profiles are not
+    /// silently rewritten; the packaged first-run template opts in explicitly.
+    #[serde(default = "default_true")]
+    pub hardware_profile_initialized: bool,
 }
 
 impl LemonadeConfig {
@@ -229,11 +238,49 @@ impl Default for LemonadeConfig {
     fn default() -> Self {
         Self {
             max_loaded_models: Self::default_max_loaded_models(),
+            hardware_profile_initialized: true,
         }
     }
 }
 
 // ── EmbeddingDeviceConfig ─────────────────────────────────────────────────────
+
+/// Which logical device a llama.cpp-backed lane may use.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LlamaCppDevice {
+    Disabled,
+    #[default]
+    Cpu,
+    Gpu,
+}
+
+/// Per-lane embedding policy. FLM/NPU is independent from the single
+/// llama.cpp device because the recipes have distinct model identities.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingLaneConfig {
+    #[serde(default)]
+    pub npu_enabled: bool,
+    #[serde(default)]
+    pub llamacpp_device: LlamaCppDevice,
+}
+
+impl Default for EmbeddingLaneConfig {
+    fn default() -> Self {
+        Self {
+            npu_enabled: false,
+            llamacpp_device: LlamaCppDevice::Cpu,
+        }
+    }
+}
+
+fn default_hq_lane() -> EmbeddingLaneConfig {
+    EmbeddingLaneConfig {
+        npu_enabled: false,
+        llamacpp_device: LlamaCppDevice::Disabled,
+    }
+}
 
 /// Per-device settings for the embedding subsystem.
 ///
@@ -242,16 +289,24 @@ impl Default for LemonadeConfig {
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingDeviceConfig {
     /// Whether to use the NPU embedding worker (FLM model, highest quality).
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing)]
     pub npu_enabled: bool,
 
-    /// Whether to use the GPU embedding worker (llamacpp GGUF model via ROCm/Vulkan).
-    #[serde(default = "default_true")]
+    /// Legacy whole-subsystem GPU flag, retained only for config migration.
+    #[serde(default = "default_true", skip_serializing)]
     pub gpu_enabled: bool,
 
-    /// Whether to use the CPU embedding worker (llamacpp GGUF model, host CPU).
-    #[serde(default = "default_true")]
+    /// Legacy whole-subsystem CPU flag, retained only for config migration.
+    #[serde(default = "default_true", skip_serializing)]
     pub cpu_enabled: bool,
+
+    /// Standard 768-dimensional embedding lane.
+    #[serde(default)]
+    pub standard: EmbeddingLaneConfig,
+
+    /// High-quality embedding lane.
+    #[serde(default = "default_hq_lane")]
+    pub high_quality: EmbeddingLaneConfig,
 
     /// Enable high-quality 4096-dim embedding via `Qwen3-Embedding-8B-GGUF`.
     ///
@@ -280,10 +335,28 @@ impl Default for EmbeddingDeviceConfig {
             npu_enabled: true,
             gpu_enabled: true,
             cpu_enabled: true,
+            standard: EmbeddingLaneConfig::default(),
+            high_quality: default_hq_lane(),
             high_quality_embedding: false,
             npu_weight: default_npu_weight(),
             gpu_weight: default_gpu_weight(),
             cpu_weight: default_cpu_weight(),
+        }
+    }
+}
+
+/// Device policy for the cross-encoder reranking lane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RerankingConfig {
+    #[serde(default)]
+    pub llamacpp_device: LlamaCppDevice,
+}
+
+impl Default for RerankingConfig {
+    fn default() -> Self {
+        Self {
+            llamacpp_device: LlamaCppDevice::Cpu,
         }
     }
 }
@@ -324,6 +397,64 @@ pub struct ModelLoadParams {
 
 // ── ModelConfig ───────────────────────────────────────────────────────────────
 
+/// Preferred implementation for logical GPU lanes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuRuntimePreference {
+    #[default]
+    Vendor,
+    Vulkan,
+}
+
+fn backend_is_usable(candidate: &crate::lemonade::InstalledBackend) -> bool {
+    matches!(
+        candidate.state.as_str(),
+        "installed" | "installable" | "update_required"
+    )
+}
+
+/// Infer the one supported GPU vendor from Lemonade's llama.cpp backend and
+/// device inventory. Device IDs win over backend names so an AMD/NVIDIA system
+/// that currently exposes only Vulkan still retains its native preference.
+fn reported_vendor_gpu_backend(
+    catalog: &crate::lemonade::LemonadeServerCatalog,
+) -> Option<&'static str> {
+    let candidates = catalog
+        .backends
+        .iter()
+        .filter(|candidate| candidate.recipe == "llamacpp" && backend_is_usable(candidate))
+        .collect::<Vec<_>>();
+    let has_device = |vendor: &str| {
+        candidates.iter().any(|candidate| {
+            candidate
+                .devices
+                .iter()
+                .any(|device| device.to_ascii_lowercase().contains(vendor))
+        })
+    };
+    let has_backend = |backend: &str| {
+        candidates
+            .iter()
+            .any(|candidate| candidate.backend == backend)
+    };
+
+    if has_device("nvidia") {
+        Some("cuda")
+    } else if has_device("amd") {
+        Some("rocm")
+    } else if has_device("apple") {
+        Some("metal")
+    } else if has_backend("cuda") && !has_backend("rocm") {
+        Some("cuda")
+    } else if has_backend("rocm") && !has_backend("cuda") {
+        Some("rocm")
+    } else if has_backend("metal") {
+        Some("metal")
+    } else {
+        None
+    }
+}
+
 /// Model-level settings, primarily per-model load-parameter overrides.
 ///
 /// Corresponds to the `[models]` section of `u-forge.toml`.
@@ -346,11 +477,13 @@ pub struct ModelConfig {
     #[serde(default = "default_hq_embedding_models")]
     pub high_quality_embedding_models: Vec<String>,
 
-    /// Preferred llamacpp backend order.  First installed backend wins.
-    ///
-    /// Default: `["rocm", "vulkan", "cpu"]`.
-    #[serde(default = "default_llamacpp_backend_preference")]
+    /// Legacy backend order, read for migration but no longer persisted.
+    #[serde(default = "default_llamacpp_backend_preference", skip_serializing)]
     pub llamacpp_backend_preference: Vec<String>,
+
+    /// GPU runtime policy used whenever a lane targets the logical GPU.
+    #[serde(default)]
+    pub default_gpu_runtime: GpuRuntimePreference,
 
     /// Preference list for embedding models.  First downloaded match wins.
     ///
@@ -377,6 +510,22 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Ordered GPU backends for setup and activation. Vendor mode prefers a
+    /// native runtime and permits Vulkan fallback; Vulkan mode is explicit.
+    pub fn gpu_backend_preference(
+        &self,
+        catalog: &crate::lemonade::LemonadeServerCatalog,
+    ) -> Vec<String> {
+        match self.default_gpu_runtime {
+            GpuRuntimePreference::Vendor => reported_vendor_gpu_backend(catalog)
+                .into_iter()
+                .chain(std::iter::once("vulkan"))
+                .map(String::from)
+                .collect(),
+            GpuRuntimePreference::Vulkan => vec!["vulkan".to_string()],
+        }
+    }
+
     /// Build a [`ModelLoadOptions`] for `model_id` from the configured params.
     ///
     /// Returns an all-`None` (server-default) `ModelLoadOptions` when the
@@ -412,6 +561,7 @@ impl Default for ModelConfig {
             load_params: default_model_load_params(),
             high_quality_embedding_models: default_hq_embedding_models(),
             llamacpp_backend_preference: default_llamacpp_backend_preference(),
+            default_gpu_runtime: GpuRuntimePreference::default(),
             embedding_model_preferences: default_embedding_model_preferences(),
             reranker_model_preferences: default_reranker_model_preferences(),
             stt_model_preferences: default_stt_model_preferences(),
@@ -965,6 +1115,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub embedding: EmbeddingDeviceConfig,
 
+    /// Reranking provider device policy. `chat.rerank` separately controls
+    /// whether search invokes the provider.
+    #[serde(default)]
+    pub reranking: RerankingConfig,
+
     /// Model-level settings (context-window limits, etc.).
     #[serde(default)]
     pub models: ModelConfig,
@@ -1000,12 +1155,106 @@ impl AppConfig {
         }
 
         let text = std::fs::read_to_string(path)?;
+        let document = toml::from_str::<toml::Value>(&text)?;
         let mut config: Self = toml::from_str(&text)?;
+        let has_lane_config = document
+            .get("embedding")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|embedding| {
+                embedding.contains_key("standard") || embedding.contains_key("high_quality")
+            });
+        if !has_lane_config {
+            let llamacpp_device = if config.embedding.gpu_enabled {
+                LlamaCppDevice::Gpu
+            } else if config.embedding.cpu_enabled {
+                LlamaCppDevice::Cpu
+            } else {
+                LlamaCppDevice::Disabled
+            };
+            config.embedding.standard = EmbeddingLaneConfig {
+                npu_enabled: config.embedding.npu_enabled,
+                llamacpp_device,
+            };
+            config.embedding.high_quality = EmbeddingLaneConfig {
+                npu_enabled: false,
+                llamacpp_device,
+            };
+            config.reranking.llamacpp_device = llamacpp_device;
+        }
+        let has_gpu_runtime = document
+            .get("models")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|models| models.contains_key("default_gpu_runtime"));
+        if !has_gpu_runtime
+            && config
+                .models
+                .llamacpp_backend_preference
+                .first()
+                .is_some_and(|backend| backend == "vulkan")
+        {
+            config.models.default_gpu_runtime = GpuRuntimePreference::Vulkan;
+        }
         config.source_path = Some(path.to_path_buf());
 
         info!(path = %path.display(), "AppConfig loaded");
 
         Ok(config)
+    }
+
+    /// Apply the one-time, VRAM-balanced defaults derived from a successful
+    /// Lemonade `/system-info` snapshot. Returns whether the profile changed.
+    pub fn initialize_hardware_profile(
+        &mut self,
+        catalog: &crate::lemonade::LemonadeServerCatalog,
+    ) -> bool {
+        if self.lemonade.hardware_profile_initialized || catalog.diagnostics.system_info.is_some() {
+            return false;
+        }
+        let usable = |recipe: &str, backend: &str| {
+            catalog.backends.iter().any(|candidate| {
+                candidate.recipe == recipe
+                    && candidate.backend == backend
+                    && backend_is_usable(candidate)
+            })
+        };
+        let npu = catalog.backends.iter().any(|candidate| {
+            candidate.recipe == "flm"
+                && backend_is_usable(candidate)
+                && (candidate.backend == "npu"
+                    || candidate.devices.iter().any(|device| device == "amd_npu"))
+        });
+        let vendor_gpu = reported_vendor_gpu_backend(catalog).is_some();
+        let vulkan_gpu = usable("llamacpp", "vulkan");
+        let gpu = vendor_gpu || vulkan_gpu;
+
+        self.embedding.standard = EmbeddingLaneConfig {
+            npu_enabled: npu,
+            llamacpp_device: LlamaCppDevice::Cpu,
+        };
+        self.embedding.high_quality = EmbeddingLaneConfig {
+            npu_enabled: false,
+            llamacpp_device: if gpu {
+                LlamaCppDevice::Gpu
+            } else {
+                LlamaCppDevice::Disabled
+            },
+        };
+        self.embedding.high_quality_embedding = gpu;
+        self.reranking.llamacpp_device = LlamaCppDevice::Cpu;
+        self.models.default_gpu_runtime = if vendor_gpu {
+            GpuRuntimePreference::Vendor
+        } else {
+            GpuRuntimePreference::Vulkan
+        };
+        self.chat.preferred_device = if gpu {
+            ChatDevice::Gpu
+        } else if npu {
+            ChatDevice::Npu
+        } else {
+            ChatDevice::Cpu
+        };
+        self.lemonade.hardware_profile_initialized = true;
+        true
     }
 
     /// Create the canonical XDG profile from packaged defaults when necessary,
@@ -1198,6 +1447,7 @@ impl AppConfig {
         for section in [
             "lemonade",
             "embedding",
+            "reranking",
             "models",
             "chat",
             "storage",
@@ -1211,6 +1461,14 @@ impl AppConfig {
                     document[section] = source.clone();
                 }
             }
+        }
+        if let Some(embedding) = document.get_mut("embedding").and_then(Item::as_table_mut) {
+            embedding.remove("npu_enabled");
+            embedding.remove("gpu_enabled");
+            embedding.remove("cpu_enabled");
+        }
+        if let Some(models) = document.get_mut("models").and_then(Item::as_table_mut) {
+            models.remove("llamacpp_backend_preference");
         }
         if let Some(agent) = document
             .get_mut("chat")
@@ -1727,6 +1985,99 @@ cpu_enabled = false
         assert_eq!(cfg.embedding.npu_weight, 100);
         assert_eq!(cfg.embedding.gpu_weight, 50);
         assert_eq!(cfg.embedding.cpu_weight, 10);
+    }
+
+    fn backend(recipe: &str, backend: &str, devices: &[&str]) -> crate::lemonade::InstalledBackend {
+        crate::lemonade::InstalledBackend {
+            recipe: recipe.to_string(),
+            backend: backend.to_string(),
+            devices: devices.iter().map(|device| (*device).to_string()).collect(),
+            state: "installed".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn first_run_profile_uses_npu_and_cuda_with_vram_balanced_lanes() {
+        let catalog = crate::lemonade::LemonadeServerCatalog {
+            backends: vec![
+                backend("flm", "npu", &["amd_npu"]),
+                backend("llamacpp", "cuda", &["nvidia_gpu"]),
+                backend("llamacpp", "vulkan", &["nvidia_gpu"]),
+            ],
+            ..Default::default()
+        };
+        let mut config = AppConfig::default();
+        config.lemonade.hardware_profile_initialized = false;
+
+        assert!(config.initialize_hardware_profile(&catalog));
+        assert!(config.lemonade.hardware_profile_initialized);
+        assert!(config.embedding.standard.npu_enabled);
+        assert_eq!(
+            config.embedding.standard.llamacpp_device,
+            LlamaCppDevice::Cpu
+        );
+        assert_eq!(
+            config.embedding.high_quality.llamacpp_device,
+            LlamaCppDevice::Gpu
+        );
+        assert!(config.embedding.high_quality_embedding);
+        assert_eq!(config.reranking.llamacpp_device, LlamaCppDevice::Cpu);
+        assert_eq!(
+            config.models.default_gpu_runtime,
+            GpuRuntimePreference::Vendor
+        );
+        assert_eq!(config.chat.preferred_device, ChatDevice::Gpu);
+    }
+
+    #[test]
+    fn first_run_profile_uses_vulkan_when_no_vendor_runtime_exists() {
+        let catalog = crate::lemonade::LemonadeServerCatalog {
+            backends: vec![backend("llamacpp", "vulkan", &["gpu"])],
+            ..Default::default()
+        };
+        let mut config = AppConfig::default();
+        config.lemonade.hardware_profile_initialized = false;
+
+        assert!(config.initialize_hardware_profile(&catalog));
+        assert_eq!(
+            config.models.default_gpu_runtime,
+            GpuRuntimePreference::Vulkan
+        );
+        assert_eq!(config.chat.preferred_device, ChatDevice::Gpu);
+        assert!(!config.embedding.standard.npu_enabled);
+    }
+
+    #[test]
+    fn first_run_profile_retains_amd_vendor_preference_from_vulkan_device() {
+        let catalog = crate::lemonade::LemonadeServerCatalog {
+            backends: vec![backend("llamacpp", "vulkan", &["amd_igpu"])],
+            ..Default::default()
+        };
+        let mut config = AppConfig::default();
+        config.lemonade.hardware_profile_initialized = false;
+
+        assert!(config.initialize_hardware_profile(&catalog));
+        assert_eq!(
+            config.models.default_gpu_runtime,
+            GpuRuntimePreference::Vendor
+        );
+        assert_eq!(
+            config.models.gpu_backend_preference(&catalog),
+            vec!["rocm".to_string(), "vulkan".to_string()]
+        );
+    }
+
+    #[test]
+    fn failed_system_info_keeps_first_run_profile_pending() {
+        let mut catalog = crate::lemonade::LemonadeServerCatalog::default();
+        catalog.diagnostics.system_info = Some("unavailable".to_string());
+        let mut config = AppConfig::default();
+        config.lemonade.hardware_profile_initialized = false;
+
+        assert!(!config.initialize_hardware_profile(&catalog));
+        assert!(!config.lemonade.hardware_profile_initialized);
+        assert_eq!(config.chat.preferred_device, ChatDevice::Auto);
     }
 
     #[test]
