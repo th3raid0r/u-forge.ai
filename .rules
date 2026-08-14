@@ -36,9 +36,15 @@ discover → select → build providers → degrade gracefully) is the canonical
 example. Do not hardcode model IDs, device presence, or capability flags
 without a live catalog check.
 
-### 3. Prescriptive plans belong in feature or bug files — not in shared docs
+### 3. Keep implementation plans out of shared descriptive docs
 
-`.rules`, `.rulesdir/*.mdc`, `ARCHITECTURE.md`, `CLAUDE.md`, and `README.md` must remain descriptive — they describe what **is**, not what **will be**. Implementation plans, step-by-step tasks, phased roadmaps, and `TODO:` sections belong only in `feature_*.md` or `bug_*.md` files.
+`.rules`, `.rulesdir/*.mdc`, `ARCHITECTURE.md`, and `CLAUDE.md` describe the
+current system. Implementation steps, task checklists, and `TODO:` sections
+belong only in `feature_*.md` or `bug_*.md` files.
+
+`README.md` may include a concise public product vision and release roadmap.
+Keep it focused on user-facing direction and outcomes rather than prescribing
+internal architecture, implementation steps, or task sequencing.
 
 ### 4. GPUI: measure first, then apply known patterns
 

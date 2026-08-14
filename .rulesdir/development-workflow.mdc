@@ -22,7 +22,7 @@ variables are optional overrides; see
 ## First Time Setup
 
 1. Install Rust stable ([rustup.rs](https://rustup.rs)), a C compiler (`gcc`,
-   `clang`, or MSVC), and the platform GPUI libraries listed in `README.md`.
+   `clang`, or MSVC), and the platform GPUI libraries listed in `BUILD.md`.
 2. `make build` — the first x86_64 Linux GNU build also downloads the pinned
    upstream Ubuntu x64 Embeddable Lemonade artifact. Set
    `UFORGE_SKIP_EMBEDDED_LEMONADE=1` to skip automatic provisioning; without an
