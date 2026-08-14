@@ -1516,6 +1516,10 @@ impl GraphAgent {
                             {
                                 break 'stream;
                             }
+                            // FinalResponse is scoped to the post-tool turn.
+                            // Keep the fallback buffer scoped the same way so
+                            // terminal-only text never repeats pre-tool prose.
+                            final_text.clear();
                         }
                         StreamedAssistantContent::Reasoning(r) => {
                             // Full reasoning block (some providers emit this instead of deltas).

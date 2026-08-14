@@ -22,6 +22,7 @@ pub struct DuplicateGuard;
 /// Priority order for llamacpp backends: higher wins.
 fn backend_priority(backend: Option<&str>) -> u8 {
     match backend {
+        Some("cuda") => 4,
         Some("rocm") => 3,
         Some("vulkan") => 2,
         Some("metal") => 1,

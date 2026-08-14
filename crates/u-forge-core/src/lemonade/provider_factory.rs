@@ -32,7 +32,7 @@ use super::gpu_manager::GpuResourceManager;
 use super::load::{ModelLoadOptions, load_model_for_recipe_with_connection};
 use super::rerank::{LemonadeRerankProvider, RerankProvider};
 use super::runtime::{LemonadeRuntime, LemonadeRuntimeProfile, ReasoningPolicy};
-use super::selector::SelectedModel;
+use super::selector::{SelectedModel, is_gpu_backend};
 use super::stt::LemonadeSttProvider;
 use super::transcription::LemonadeTranscriptionProvider;
 use super::tts::LemonadeTtsProvider;
@@ -317,10 +317,7 @@ impl ProviderFactory {
         let device = match selected.recipe.as_str() {
             "flm" => Some("npu".to_string()),
             "llamacpp" => Some(
-                if matches!(
-                    selected.backend.as_deref(),
-                    Some("rocm" | "vulkan" | "metal")
-                ) {
+                if is_gpu_backend(selected.backend.as_deref()) {
                     "gpu"
                 } else {
                     "cpu"
@@ -383,10 +380,7 @@ impl ProviderFactory {
     /// llamacpp models with a GPU backend (rocm / vulkan / metal) need the lock;
     /// FLM (NPU) and CPU llamacpp run on dedicated or non-contended resources.
     fn backend_uses_gpu(selected: &SelectedModel) -> bool {
-        matches!(
-            (selected.recipe.as_str(), selected.backend.as_deref()),
-            ("llamacpp", Some("rocm")) | ("llamacpp", Some("vulkan")) | ("llamacpp", Some("metal"))
-        )
+        selected.recipe == "llamacpp" && is_gpu_backend(selected.backend.as_deref())
     }
 
     /// Build a human-readable worker name for logging.
@@ -466,6 +460,15 @@ mod tests {
     }
 
     // ── backend_uses_gpu ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_gpu_llamacpp_cuda() {
+        assert!(ProviderFactory::backend_uses_gpu(&sel(
+            "m",
+            "llamacpp",
+            Some("cuda")
+        )));
+    }
 
     #[test]
     fn test_gpu_llamacpp_rocm() {

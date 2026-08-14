@@ -502,10 +502,7 @@ fn prepare_lemonade_chat(
         .collect::<Vec<_>>();
     let gpu_manager = GpuResourceManager::new();
     let provider = all_llm.get(preferred_idx).map(|selected| {
-        let gpu = all_llm
-            .iter()
-            .any(|model| selected_model_device(model) == "gpu")
-            .then(|| Arc::clone(&gpu_manager));
+        let gpu = (selected_model_device(selected) == "gpu").then(|| Arc::clone(&gpu_manager));
         LemonadeChatProvider::from_connection(connection.clone(), &selected.model_id, gpu)
     });
     LemonadeChatActivation {
@@ -527,7 +524,7 @@ async fn activate_lemonade_capabilities(
         ModelSelector::new(&catalog, &app_config.models, &app_config.embedding)
     };
     let embed_models = selector.select_embedding_models();
-    let reranker_sel = selector.select_reranker();
+    let reranker_sel = selector.select_reranker(app_config.reranking.llamacpp_device);
     let already_loaded: Vec<String> = catalog
         .loaded
         .iter()
@@ -542,7 +539,7 @@ async fn activate_lemonade_capabilities(
         let weight = match selected.recipe.as_str() {
             "flm" => app_config.embedding.npu_weight,
             "llamacpp" => match selected.backend.as_deref() {
-                Some("rocm" | "vulkan" | "metal") => app_config.embedding.gpu_weight,
+                Some("cuda" | "rocm" | "vulkan" | "metal") => app_config.embedding.gpu_weight,
                 _ => app_config.embedding.cpu_weight,
             },
             _ => app_config.embedding.cpu_weight,
@@ -668,10 +665,7 @@ async fn activate_lemonade_capabilities(
         .get(preferred_idx)
         .and_then(|model| model.effective_limits.clone());
     let chat_provider = all_llm.get(preferred_idx).map(|selected| {
-        let gpu = all_llm
-            .iter()
-            .any(|model| selected_model_device(model) == "gpu")
-            .then(|| Arc::clone(&gpu_manager));
+        let gpu = (selected_model_device(selected) == "gpu").then(|| Arc::clone(&gpu_manager));
         LemonadeChatProvider::from_connection(connection.clone(), &selected.model_id, gpu)
     });
     tracing::debug!(
@@ -1449,7 +1443,7 @@ impl AppView {
                 &LemonadeServerCatalog::default(),
                 app_config.chat.active_device_config().model.as_deref(),
                 setup_hq_default,
-                app_config.embedding.npu_enabled,
+                app_config.embedding.standard.npu_enabled,
                 app_config.chat.preferred_device.clone(),
                 app_config.chat.reasoning_control,
             )
@@ -3162,12 +3156,30 @@ impl AppView {
                 }
             };
 
+            let mut effective_config = (*app_config).clone();
+            if effective_config.initialize_hardware_profile(&metadata.catalog) {
+                if let Err(error) = app_config.persist_settings(&effective_config) {
+                    tracing::warn!(%error, "Detected hardware profile could not be persisted");
+                } else {
+                    tracing::info!(
+                        npu = effective_config.embedding.standard.npu_enabled,
+                        hq_device = ?effective_config.embedding.high_quality.llamacpp_device,
+                        gpu_runtime = ?effective_config.models.default_gpu_runtime,
+                        "Initialized hardware-aware defaults"
+                    );
+                }
+            }
+            let effective_config = Arc::new(effective_config);
             let metadata_for_ui = metadata.clone();
+            let config_for_ui = effective_config.clone();
             if this
                 .update(cx, move |view: &mut AppView, cx| {
                     if view.lemonade_init_generation != generation {
                         return;
                     }
+                    view.state.app_config = config_for_ui.clone();
+                    view.search_panel
+                        .update(cx, |panel, _cx| panel.set_app_config(config_for_ui.clone()));
                     view.apply_lemonade_metadata(metadata_for_ui, cx);
                     view.lemonade_init_state = LemonadeInitState::CapabilitiesLoading;
                 })
@@ -3180,7 +3192,7 @@ impl AppView {
             }
 
             let activation_runtime = tokio_rt;
-            let activation_config = app_config;
+            let activation_config = effective_config;
             let activation_timeline = startup.clone();
             let activation_connection = metadata.connection.clone();
             let activation_catalog = metadata.catalog.clone();
@@ -3373,7 +3385,7 @@ impl AppView {
                 .model
                 .as_deref(),
             setup_hq_default,
-            self.state.app_config.embedding.npu_enabled,
+            self.state.app_config.embedding.standard.npu_enabled,
             self.state.app_config.chat.preferred_device.clone(),
             self.state.app_config.chat.reasoning_control,
         )
@@ -3696,7 +3708,9 @@ fn select_preferred_llm_index(
 fn selected_model_device(model: &u_forge_core::lemonade::SelectedModel) -> &'static str {
     match model.recipe.as_str() {
         "flm" => "npu",
-        "llamacpp" if matches!(model.backend.as_deref(), Some("rocm" | "vulkan" | "metal")) => {
+        "llamacpp"
+            if u_forge_core::lemonade::selector::is_gpu_backend(model.backend.as_deref()) =>
+        {
             "gpu"
         }
         _ => "cpu",
@@ -3739,12 +3753,21 @@ async fn provision_lemonade(
     let mut jobs_started = 0usize;
     let mut components = initial_setup_components()
         .into_iter()
-        .filter(|component| {
-            component.required
-                || (component.role == u_forge_core::lemonade::SetupRole::NpuEmbedding
-                    && config.embedding.npu_enabled)
-                || (component.role == u_forge_core::lemonade::SetupRole::HighQualityEmbedding
-                    && request.high_quality_embedding)
+        .filter(|component| match component.role {
+            SetupRole::StandardEmbedding => {
+                config.embedding.standard.llamacpp_device != u_forge_core::LlamaCppDevice::Disabled
+            }
+            SetupRole::NpuEmbedding => config.embedding.standard.npu_enabled,
+            SetupRole::Reranking => {
+                config.chat.rerank
+                    && config.reranking.llamacpp_device != u_forge_core::LlamaCppDevice::Disabled
+            }
+            SetupRole::HighQualityEmbedding => {
+                request.high_quality_embedding
+                    && config.embedding.high_quality.llamacpp_device
+                        != u_forge_core::LlamaCppDevice::Disabled
+            }
+            SetupRole::Chat => false,
         })
         .collect::<Vec<_>>();
     components.sort_by_key(|component| match component.role {
@@ -3759,7 +3782,9 @@ async fn provision_lemonade(
         .rposition(|component| {
             matches!(
                 component.role,
-                SetupRole::StandardEmbedding | SetupRole::HighQualityEmbedding
+                SetupRole::StandardEmbedding
+                    | SetupRole::NpuEmbedding
+                    | SetupRole::HighQualityEmbedding
             )
         })
         .ok_or_else(|| anyhow::anyhow!("standard embedding setup component is missing"))?;
@@ -3777,14 +3802,30 @@ async fn provision_lemonade(
                 .map(|model| model.recipe.as_str())
         });
         if let Some(recipe) = recipe.filter(|recipe| !recipe.is_empty()) {
-            let choice =
-                select_setup_backend(&catalog, recipe, &config.models.llamacpp_backend_preference)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no installed or installable {recipe} backend was reported for {}",
-                            component.model_id
-                        )
-                    })?;
+            let lane_device = match component.role {
+                SetupRole::StandardEmbedding => Some(config.embedding.standard.llamacpp_device),
+                SetupRole::HighQualityEmbedding => {
+                    Some(config.embedding.high_quality.llamacpp_device)
+                }
+                SetupRole::Reranking => Some(config.reranking.llamacpp_device),
+                SetupRole::NpuEmbedding | SetupRole::Chat => None,
+            };
+            let preference = match lane_device {
+                Some(u_forge_core::LlamaCppDevice::Cpu) => vec!["cpu".to_string()],
+                Some(u_forge_core::LlamaCppDevice::Gpu) => {
+                    let mut preference = config.models.gpu_backend_preference(&catalog);
+                    preference.push("cpu".to_string());
+                    preference
+                }
+                Some(u_forge_core::LlamaCppDevice::Disabled) => Vec::new(),
+                None => Vec::new(),
+            };
+            let choice = select_setup_backend(&catalog, recipe, &preference).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no installed or installable {recipe} backend was reported for {}",
+                    component.model_id
+                )
+            })?;
             if choice.needs_install()
                 && installed.insert((choice.recipe.clone(), choice.backend.clone()))
             {
@@ -3828,18 +3869,27 @@ async fn provision_lemonade(
         .iter()
         .find(|model| model.id == request.chat_model)
         .ok_or_else(|| anyhow::anyhow!("selected chat model is no longer in the live catalog"))?;
-    let choice = select_setup_backend(
-        &catalog,
-        &chat_model.recipe,
-        &config.models.llamacpp_backend_preference,
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "no installed or installable {} backend was reported for {}",
-            chat_model.recipe,
-            request.chat_model
-        )
-    })?;
+    let chat_preference = if chat_model.recipe != "llamacpp" {
+        Vec::new()
+    } else {
+        match config.chat.preferred_device {
+            u_forge_core::ChatDevice::Cpu => vec!["cpu".to_string()],
+            u_forge_core::ChatDevice::Gpu | u_forge_core::ChatDevice::Auto => {
+                let mut preference = config.models.gpu_backend_preference(&catalog);
+                preference.push("cpu".to_string());
+                preference
+            }
+            u_forge_core::ChatDevice::Npu => Vec::new(),
+        }
+    };
+    let choice =
+        select_setup_backend(&catalog, &chat_model.recipe, &chat_preference).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no installed or installable {} backend was reported for {}",
+                chat_model.recipe,
+                request.chat_model
+            )
+        })?;
     if choice.needs_install() && installed.insert((choice.recipe.clone(), choice.backend.clone())) {
         let receiver = manager
             .install_backend_stream(&choice.recipe, &choice.backend, request.confirmed_external)

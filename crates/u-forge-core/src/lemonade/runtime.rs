@@ -9,6 +9,7 @@ use crate::config::ReasoningControl;
 
 use super::{
     LemonadeConnection, LemonadeHealth, ModelLoadOptions, reload_model_for_recipe_with_connection,
+    unload_model_with_connection,
 };
 
 /// Three-state reasoning policy used by both direct and agent requests.
@@ -207,6 +208,30 @@ impl LemonadeRuntime {
                 ),
             };
 
+        // A runtime represents one feature's model slot. Release the model
+        // previously owned by that slot before activating a different model so
+        // Lemonade never has to evict an unrelated capability merely to make
+        // room for the replacement. Profile-only changes for the same model
+        // continue through the ordinary reload path below.
+        let previous_model = self
+            .active
+            .lock()
+            .expect("runtime state mutex poisoned")
+            .as_ref()
+            .filter(|active| active.model_id != key.model_id)
+            .map(|active| active.model_id.clone());
+        if let Some(previous_model) = previous_model {
+            unload_model_with_connection(self.connection.clone(), &previous_model)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to release previous Lemonade model {previous_model} before activating {}",
+                        profile.model_id
+                    )
+                })?;
+            *self.active.lock().expect("runtime state mutex poisoned") = None;
+        }
+
         let reload_performed = if live_matches {
             false
         } else {
@@ -378,8 +403,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let loaded = Arc::new(tokio::sync::Mutex::new(None::<serde_json::Value>));
         let reloads = Arc::new(AtomicUsize::new(0));
+        let lifecycle = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let server_loaded = loaded.clone();
         let server_reloads = reloads.clone();
+        let server_lifecycle = lifecycle.clone();
         let server = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -387,6 +414,7 @@ mod tests {
                 };
                 let loaded = server_loaded.clone();
                 let reloads = server_reloads.clone();
+                let lifecycle = server_lifecycle.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buffer = [0_u8; 2048];
@@ -426,6 +454,8 @@ mod tests {
                     } else if path == "/v1/load" {
                         let request_body: serde_json::Value =
                             serde_json::from_slice(&request[header_end..]).unwrap();
+                        let model_name = request_body["model_name"].as_str().unwrap();
+                        lifecycle.lock().await.push(format!("load:{model_name}"));
                         reloads.fetch_add(1, Ordering::SeqCst);
                         *loaded.lock().await = Some(serde_json::json!({
                             "model_name": request_body["model_name"],
@@ -436,6 +466,13 @@ mod tests {
                                 "llamacpp_backend": request_body["llamacpp_backend"],
                             }
                         }));
+                        serde_json::json!({"status":"success"})
+                    } else if path == "/v1/unload" {
+                        let request_body: serde_json::Value =
+                            serde_json::from_slice(&request[header_end..]).unwrap();
+                        let model_name = request_body["model_name"].as_str().unwrap();
+                        lifecycle.lock().await.push(format!("unload:{model_name}"));
+                        *loaded.lock().await = None;
                         serde_json::json!({"status":"success"})
                     } else {
                         panic!("unexpected {path}")
@@ -494,13 +531,40 @@ mod tests {
         let acquired = waiter.await.unwrap().unwrap();
         drop(acquired);
 
+        let replacement_profile = LemonadeRuntimeProfile::new(
+            "replacement-model",
+            true,
+            ModelLoadOptions {
+                ctx_size: Some(4096),
+                llamacpp_backend: Some("rocm".into()),
+                ..Default::default()
+            },
+        )
+        .with_backend_profile("llamacpp", Some("rocm".into()), Some("gpu".into()));
+        let replacement = runtime.acquire(&replacement_profile).await.unwrap();
+        assert!(replacement.reload_performed);
+        drop(replacement);
+        assert_eq!(
+            lifecycle.lock().await.as_slice(),
+            ["load:model", "unload:model", "load:replacement-model"]
+        );
+
         *loaded.lock().await = Some(serde_json::json!({
             "model_name": "changed-by-other-client", "recipe": "llamacpp", "device": "gpu"
         }));
-        let external_change = runtime.acquire(&profile).await.unwrap();
+        let external_change = runtime.acquire(&replacement_profile).await.unwrap();
         assert!(external_change.reload_performed);
         drop(external_change);
-        assert_eq!(reloads.load(Ordering::SeqCst), 2);
+        assert_eq!(reloads.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            lifecycle.lock().await.as_slice(),
+            [
+                "load:model",
+                "unload:model",
+                "load:replacement-model",
+                "load:replacement-model",
+            ]
+        );
         server.abort();
     }
 

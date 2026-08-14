@@ -119,7 +119,7 @@ impl CatalogModel {
 pub struct InstalledBackend {
     /// Recipe name, e.g. `"llamacpp"`, `"flm"`, `"whispercpp"`, `"kokoro"`.
     pub recipe: String,
-    /// Backend name, e.g. `"rocm"`, `"vulkan"`, `"cpu"`, `"npu"`.
+    /// Backend name, e.g. `"cuda"`, `"rocm"`, `"vulkan"`, `"cpu"`, `"npu"`.
     pub backend: String,
     /// Lemonade device IDs this backend targets, e.g. `["amd_igpu"]`.
     pub devices: Vec<String>,

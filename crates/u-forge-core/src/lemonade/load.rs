@@ -113,7 +113,7 @@ pub struct ModelLoadOptions {
     #[serde(skip)]
     pub ubatch_size: Option<usize>,
 
-    /// LlamaCpp backend to use: `"vulkan"`, `"rocm"`, `"metal"`, or `"cpu"`.
+    /// LlamaCpp backend to use: `"cuda"`, `"vulkan"`, `"rocm"`, `"metal"`, or `"cpu"`.
     ///
     /// Applies only to `llamacpp` recipes.  When `None` the server picks the
     /// best available backend automatically.

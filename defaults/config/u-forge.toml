@@ -1,7 +1,8 @@
 [lemonade]
-# Maximum simultaneously resident models per model type. Three allows the
-# standard, optional NPU, and high-quality embedding models to coexist.
-max_loaded_models = 3
+# Maximum simultaneously resident models per model type. Two balances warm
+# capability models against RAM and VRAM pressure on consumer hardware.
+max_loaded_models = 2
+hardware_profile_initialized = false
 
 [ui]
 # Base content font size in pixels (rem unit). Text scales relative to this:
@@ -14,7 +15,7 @@ font_size = 16.0
 interface_size = 20.0
 # Reveal low-level runtime diagnostics and maintenance controls in the app.
 # Ordinary worldbuilding and AI choices remain visible when this is false.
-show_advanced_controls = true
+show_advanced_controls = false
 window_controls_left = false
 
 [storage]
@@ -31,13 +32,24 @@ import_file = "./defaults/example_data/foundation-example.jsonl"
 schema_dir  = "./defaults/schemas/Sine Nomine"
 
 [embedding]
-npu_enabled = true
-high_quality_embedding = true
-gpu_enabled = true
+high_quality_embedding = false
 gpu_weight = 40
-cpu_enabled = false
 cpu_weight = 10
 npu_weight = 100
+
+[embedding.standard]
+npu_enabled = false
+llamacpp_device = "cpu"
+
+[embedding.high_quality]
+npu_enabled = false
+llamacpp_device = "disabled"
+
+[reranking]
+llamacpp_device = "cpu"
+
+[models]
+default_gpu_runtime = "vendor"
 
 [models.load_params]
 ## Mostly important for embedding models, but can be used for any text model.

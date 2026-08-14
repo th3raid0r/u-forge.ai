@@ -4,15 +4,21 @@
 //! on save. It deliberately never renders serialized configuration text.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, Render, Subscription, Window, div,
     prelude::*, px,
 };
-use u_forge_core::{AppConfig, ChatDevice, ChatDeviceConfig, EmbeddingTarget, ReasoningControl};
+use u_forge_core::{
+    AppConfig, ChatDevice, ChatDeviceConfig, EmbeddingTarget, GpuRuntimePreference, LlamaCppDevice,
+    ReasoningControl,
+};
 
 use crate::text_field::{TextChanged, TextFieldView};
 use crate::ui::components::{Button, ButtonStyle};
+
+type DeviceMutator = Rc<dyn Fn(&mut SettingsView, LlamaCppDevice)>;
 use crate::ui::theme::UiTheme;
 
 pub(crate) struct SettingsSaveRequested(pub(crate) AppConfig);
@@ -242,6 +248,33 @@ impl Render for SettingsView {
                 })
                 .into_any_element()
         };
+        let device_picker = |cpu_id: &'static str,
+                             gpu_id: &'static str,
+                             off_id: &'static str,
+                             selected: LlamaCppDevice,
+                             mutate: DeviceMutator| {
+            let button = |id: &'static str, label: &'static str, device: LlamaCppDevice| {
+                let target = handle.clone();
+                let mutate = mutate.clone();
+                Button::new(id, label)
+                    .selected(selected == device)
+                    .on_click(move |_, _, cx| {
+                        target
+                            .update(cx, |view, cx| {
+                                mutate(view, device);
+                                view.mark_dirty(cx);
+                            })
+                            .ok();
+                    })
+            };
+            div()
+                .flex()
+                .gap(px(theme.metrics.space_1))
+                .child(button(cpu_id, "CPU", LlamaCppDevice::Cpu))
+                .child(button(gpu_id, "GPU", LlamaCppDevice::Gpu))
+                .child(button(off_id, "Off", LlamaCppDevice::Disabled))
+                .into_any_element()
+        };
 
         let appearance = div()
             .flex()
@@ -335,45 +368,51 @@ impl Render for SettingsView {
                 ),
             ))
             .child(row(
-                "NPU embeddings",
+                "Default GPU runtime",
                 toggle(
-                    "settings-npu",
-                    if self.draft.embedding.npu_enabled {
-                        "Enabled"
-                    } else {
-                        "Disabled"
+                    "settings-gpu-runtime",
+                    match self.draft.models.default_gpu_runtime {
+                        GpuRuntimePreference::Vendor => "Vendor",
+                        GpuRuntimePreference::Vulkan => "Vulkan",
                     }
                     .to_string(),
-                    self.draft.embedding.npu_enabled,
-                    Box::new(|v| v.draft.embedding.npu_enabled = !v.draft.embedding.npu_enabled),
+                    true,
+                    Box::new(|v| {
+                        v.draft.models.default_gpu_runtime =
+                            match v.draft.models.default_gpu_runtime {
+                                GpuRuntimePreference::Vendor => GpuRuntimePreference::Vulkan,
+                                GpuRuntimePreference::Vulkan => GpuRuntimePreference::Vendor,
+                            }
+                    }),
                 ),
             ))
             .child(row(
-                "GPU embeddings",
+                "Standard NPU worker",
                 toggle(
-                    "settings-gpu",
-                    if self.draft.embedding.gpu_enabled {
+                    "settings-standard-npu",
+                    if self.draft.embedding.standard.npu_enabled {
                         "Enabled"
                     } else {
                         "Disabled"
                     }
                     .to_string(),
-                    self.draft.embedding.gpu_enabled,
-                    Box::new(|v| v.draft.embedding.gpu_enabled = !v.draft.embedding.gpu_enabled),
+                    self.draft.embedding.standard.npu_enabled,
+                    Box::new(|v| {
+                        v.draft.embedding.standard.npu_enabled =
+                            !v.draft.embedding.standard.npu_enabled
+                    }),
                 ),
             ))
             .child(row(
-                "CPU embeddings",
-                toggle(
-                    "settings-cpu",
-                    if self.draft.embedding.cpu_enabled {
-                        "Enabled"
-                    } else {
-                        "Disabled"
-                    }
-                    .to_string(),
-                    self.draft.embedding.cpu_enabled,
-                    Box::new(|v| v.draft.embedding.cpu_enabled = !v.draft.embedding.cpu_enabled),
+                "Standard llama.cpp worker",
+                device_picker(
+                    "settings-standard-cpu",
+                    "settings-standard-gpu",
+                    "settings-standard-off",
+                    self.draft.embedding.standard.llamacpp_device,
+                    Rc::new(|view, device| {
+                        view.draft.embedding.standard.llamacpp_device = device
+                    }),
                 ),
             ))
             .child(row(
@@ -391,6 +430,28 @@ impl Render for SettingsView {
                         v.draft.embedding.high_quality_embedding =
                             !v.draft.embedding.high_quality_embedding
                     }),
+                ),
+            ))
+            .child(row(
+                "HQ llama.cpp worker",
+                device_picker(
+                    "settings-hq-cpu",
+                    "settings-hq-gpu",
+                    "settings-hq-off",
+                    self.draft.embedding.high_quality.llamacpp_device,
+                    Rc::new(|view, device| {
+                        view.draft.embedding.high_quality.llamacpp_device = device
+                    }),
+                ),
+            ))
+            .child(row(
+                "Reranking llama.cpp worker",
+                device_picker(
+                    "settings-rerank-cpu",
+                    "settings-rerank-gpu",
+                    "settings-rerank-off",
+                    self.draft.reranking.llamacpp_device,
+                    Rc::new(|view, device| view.draft.reranking.llamacpp_device = device),
                 ),
             ))
             .child(row(
