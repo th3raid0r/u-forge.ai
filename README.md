@@ -1,7 +1,11 @@
 # u-forge.ai (Universe Forge)
 
-> **Build a world you can see, search, and talk to.** A local-first creative
-> workspace for game masters.
+> **Turn scattered campaign lore into a world you can see, search, and talk
+> to.**
+>
+> u-forge.ai is a local-first desktop workspace for game masters: map every
+> connection, find the detail you need, and create with an AI assistant that
+> understands the structure of your setting.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Status](https://img.shields.io/badge/status-Alpha-yellow.svg)
@@ -9,65 +13,69 @@
 
 ![u-forge.ai showing World Canvas, Details, and Assistant](assets/images/u-forge-ai.png)
 
-## Your setting is more than a stack of notes
+## One world, not a pile of documents
 
-Characters serve factions. Artifacts change hands. Quests cross continents,
-and events from centuries ago still shape the next session. u-forge turns all
-of that lore into a living knowledge graph: one place to create your world,
-follow its relationships, retrieve what matters, and collaborate with a local
-AI assistant that understands the structure you designed.
+Campaign lore grows sideways. Characters serve factions, artifacts change
+hands, quests cross continents, and events from centuries ago still shape the
+next session. Before long, the answer you need is somewhere in your notes—but
+the connections between those notes are harder to see.
 
-- **See the whole setting.** World Canvas turns people, places, factions,
+u-forge turns that sprawl into a living knowledge graph. It gives you one
+focused workspace to build your setting, explore how everything fits together,
+and bring the right lore back when the table needs it.
+
+- **See how the world fits together.** World Canvas turns people, places, factions,
   quests, events, and anything else you define into an explorable relationship
   map.
-- **Make the world model yours.** Schemas define the kinds of things in your
+- **Shape it around your campaign.** Schemas define the kinds of things in your
   setting, the details they carry, and the relationships they allow. The editor
   adapts to your campaign instead of forcing every world into the same sheet.
-- **Find lore the way you remember it.** Exact-word, semantic, and hybrid
-  search bring the right pieces back even when you cannot remember where you
-  wrote them.
-- **Ask questions in context.** The Assistant answers from your own setting,
-  shows when it searches the graph, and keeps conversations beside the world
-  they are about.
-- **Create with the Assistant.** Compatible local models can search, create,
-  and update world items and relationships while respecting your schemas.
-- **Keep imperfect data visible.** Imports are validated against your world
-  model, with malformed records and ambiguous relationships reported instead
-  of silently changing its shape.
+- **Find lore the way you remember it.** Exact-word, semantic, and hybrid search
+  surface the right pieces even when you cannot remember where you wrote them.
+- **Work with an assistant that knows your world.** Compatible local models can
+  search your setting, answer in context, and create or update items and
+  relationships while respecting your schemas.
+- **Know what made it into your world.** Imports are validated against your
+  schemas. Malformed records and ambiguous relationships are reported instead
+  of silently changing the shape of your data.
 
-## Your worlds belong to you
+## Local-first. AI-optional. Yours.
 
-u-forge is local-first. Worlds live in local SQLite databases and require no
-account, subscription, or hosted service. Graph exploration, editing,
-import/export, and word search keep working without an AI server.
+Your worlds live in local SQLite databases. u-forge requires no account,
+subscription, or hosted service, and graph exploration, editing, import/export,
+and full-text search keep working without an AI server.
 
 Optional AI runs through
 [Lemonade Server](https://github.com/lemonade-sdk/lemonade). On Linux x86_64,
 u-forge can provision and manage a private Lemonade runtime; it can also use a
-separately managed server. World data leaves your machine only when you
+separately managed server. Your world data stays on your machine unless you
 explicitly connect u-forge to a non-local endpoint.
 
 World, Search, Details, Assistant, and the permanent World Canvas stay together
-in a focused native workspace. The included Foundation setting offers a quick
-way to explore, or you can start with your own schemas and JSONL data.
+in one native workspace. Explore the included Foundation setting to see it in
+action, or begin with your own schemas and JSONL data.
 
 ## The road to 1.0
 
-The roadmap expands the same foundation rather than replacing it: structured
-world data becomes more expressive, easier to navigate, and increasingly useful
-at the table.
+u-forge is growing into more than a note vault with an assistant attached. The
+vision for 1.0 is a connected campaign workspace where the world graph, its
+history and geography, what happened at the table, and the rules behind it all
+reinforce one another.
 
-| Release | Focus |
-|---------|-------|
-| **v0.1.2** | Another refinement cycle for the core worldbuilding experience. |
-| **v0.2** | Schema-embedded SVG icons replace colored squircles in the World panel and graph view. Any node can override its schema icon with its own embedded SVG. |
-| **v0.3** | Embedding and chunking refactor for more intelligent semantic encoding and efficient retrieval. |
-| **v0.4** | Timeline view with temporal nodes in a dedicated top or bottom strip and three lanes—epochs, eras, and events—for nuanced histories, narrative arcs, and systemic impact. |
-| **v0.5** | World map view that uses `located_in` relationships to place connected entities automatically and turn existing world data into a richer map. |
-| **v0.6** | Session diarization and transcription, preserving play sessions so they can be recalled and converted into world data with the Assistant. |
-| **v0.7–v0.8** | Rules from PDF: apply the retrieval refactor to table-heavy TTRPG rulebooks, build a dedicated rules knowledge graph, and link sourced rules directly to your world. |
-| **v0.9** | Refinement release. |
-| **v1.0** | Feature complete. Your worlds await! |
+Each release builds toward that vision without giving up the local-first
+foundation:
+
+| Release | What it adds to the world |
+|---------|---------------------------|
+| **v0.1.2** | A focused refinement cycle makes the core worldbuilding experience smoother and more dependable. |
+| **v0.2** | Schema-embedded SVG icons give every kind of world item a visual identity across the World panel and graph, with per-item overrides when something should stand apart. |
+| **v0.3** | Smarter embedding and chunking make semantic recall more accurate and efficient as worlds grow. |
+| **v0.4** | A dedicated timeline turns epochs, eras, and events into an explorable history of narrative arcs and systemic consequences. |
+| **v0.5** | A world map uses `located_in` relationships to place connected entities automatically, letting existing world data reveal its geography. |
+| **v0.6** | Session diarization and transcription preserve what happened at the table so the Assistant can recall it and help turn play into lasting world data. |
+| **v0.7–v0.8** | Rules from PDF bring table-heavy TTRPG books into a dedicated rules graph, with sourced rules linked directly to the world they govern. |
+| **v0.9** | A focused refinement release brings the complete experience together. |
+| **v1.0** | A complete local-first campaign workspace connects preparation, world knowledge, and play. Your worlds await. |
 | **v1.x** | Scheming intensifies… |
 
 Release contents and ordering may evolve as each feature meets real worlds and
@@ -75,8 +83,11 @@ real tables.
 
 ## Try v0.1.1
 
-Linux x86_64 releases are distributed as an AppImage with a companion SHA-256
-checksum. Download both files from the release, then verify and run them:
+u-forge is currently alpha software. The packaged release targets Linux x86_64
+and is distributed as an AppImage with a companion SHA-256 checksum.
+
+**[Download the latest release](https://github.com/th3raid0r/u-forge.ai/releases/latest)**,
+grab both files, then verify and run the AppImage:
 
 ```bash
 sha256sum --check u-forge-0.1.1-x86_64.AppImage.sha256
@@ -103,11 +114,19 @@ copy remain yours across later launches.
 A new profile opens a guided world-creation flow. Choose a schema directory
 and, optionally, an initial JSONL data file. Lemonade discovery and downloads
 continue in the background, so a schema-only world can be created without
-waiting for AI models.
+waiting for AI models. The included defaults are the quickest way to start
+exploring.
 
 Use **File → Import Schema…** and **File → Import Data…** for later imports.
 Select an item in World or on the canvas, edit it in Details, and save the
 change when it is ready.
+
+## Support u-forge
+
+If u-forge helps you build better worlds, you can support its continued
+development on Ko-fi.
+
+<a href='https://ko-fi.com/P4U0251C4T' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi6.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
 
 ## Project documentation
 
