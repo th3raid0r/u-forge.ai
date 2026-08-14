@@ -1,7 +1,7 @@
 [lemonade]
-# Maximum simultaneously resident models per model type. Three allows the
-# standard, optional NPU, and high-quality embedding models to coexist.
-max_loaded_models = 3
+# Maximum simultaneously resident models per model type. Two balances warm
+# capability models against RAM and VRAM pressure on consumer hardware.
+max_loaded_models = 2
 hardware_profile_initialized = false
 
 [ui]
@@ -15,7 +15,7 @@ font_size = 16.0
 interface_size = 20.0
 # Reveal low-level runtime diagnostics and maintenance controls in the app.
 # Ordinary worldbuilding and AI choices remain visible when this is false.
-show_advanced_controls = true
+show_advanced_controls = false
 window_controls_left = false
 
 [storage]

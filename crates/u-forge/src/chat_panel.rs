@@ -282,6 +282,20 @@ impl AvailableModel {
     }
 }
 
+/// Provider metadata is rebuilt during settings changes and reconnects. Keep
+/// the feature-scoped runtime when the underlying connection is unchanged so
+/// it retains ownership of the currently active chat model and can release it
+/// before the replacement model is loaded.
+fn runtime_for_provider_refresh(
+    current: Option<&Arc<LemonadeRuntime>>,
+    replacement: Arc<LemonadeRuntime>,
+) -> Arc<LemonadeRuntime> {
+    current
+        .filter(|runtime| Arc::ptr_eq(runtime.connection(), replacement.connection()))
+        .cloned()
+        .unwrap_or(replacement)
+}
+
 impl ChatPanel {
     pub(crate) fn new(
         system_prompt: String,
@@ -390,7 +404,7 @@ impl ChatPanel {
     ) {
         self.available_models = models;
         self.selected_model_idx = preferred_idx;
-        self.runtime = Some(runtime);
+        self.runtime = Some(runtime_for_provider_refresh(self.runtime.as_ref(), runtime));
         self.reasoning_control = reasoning_control;
         self.chat_provider = Some(provider);
         self.apply_selected_chat_profile();
@@ -466,9 +480,9 @@ impl ChatPanel {
         assistant_controls_locked(self.streaming, self.connecting, &self.profile_reload_state)
     }
 
-    /// Explicitly activate the currently selected model/reasoning profile.
-    /// Ordinary selector and thinking-toggle changes are intentionally lazy;
-    /// the send path acquires the desired profile without locking the chrome.
+    /// Activate the currently selected model/reasoning profile. Model-picker
+    /// changes call this eagerly so loading overlaps the user's think time;
+    /// the send path still acquires the profile authoritatively before use.
     fn reload_selected_profile(&mut self, cx: &mut Context<Self>) {
         if self.controls_locked() {
             return;
@@ -1834,6 +1848,7 @@ impl Render for ChatPanel {
                         .when(is_selected, |el| el.bg(rgba(0x45475a88)))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgba(0x45475a66)))
+                        .debug_selector(move || format!("model-option-{idx}"))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -1845,9 +1860,10 @@ impl Render for ChatPanel {
                                 }
                                 this.model_dropdown_open = false;
                                 if changed {
-                                    this.profile_reload_state = ProfileReloadState::Ready;
+                                    this.reload_selected_profile(cx);
+                                } else {
+                                    cx.notify();
                                 }
-                                cx.notify();
                             }),
                         )
                         .child(label)
@@ -2606,6 +2622,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_refresh_retains_runtime_for_the_same_connection() {
+        let connection = Arc::new(
+            u_forge_core::lemonade::LemonadeConnection::external("http://127.0.0.1:1/v1").unwrap(),
+        );
+        let current = Arc::new(LemonadeRuntime::from_connection(connection.clone()));
+        let replacement = Arc::new(LemonadeRuntime::from_connection(connection));
+
+        let retained = runtime_for_provider_refresh(Some(&current), replacement);
+
+        assert!(Arc::ptr_eq(&retained, &current));
+
+        let other_connection = Arc::new(
+            u_forge_core::lemonade::LemonadeConnection::external("http://127.0.0.1:2/v1").unwrap(),
+        );
+        let other = Arc::new(LemonadeRuntime::from_connection(other_connection));
+        let replaced = runtime_for_provider_refresh(Some(&current), other.clone());
+
+        assert!(Arc::ptr_eq(&replaced, &other));
+    }
+
     #[gpui::test]
     fn model_selector_press_is_not_closed_by_the_input_area(cx: &mut TestAppContext) {
         cx.update(UiTheme::init);
@@ -2631,6 +2668,47 @@ mod tests {
 
         assert!(cx.update(|_window, app| panel.read(app).model_dropdown_open));
         assert!(cx.debug_bounds("model-dropdown").is_some());
+    }
+
+    #[gpui::test]
+    fn model_option_click_eagerly_starts_profile_activation(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (panel, cx) = cx.add_window_view(move |_window, cx| {
+            let mut panel = ChatPanel::new("Test assistant".into(), &db_path, runtime, false, cx);
+            panel.available_models = vec![
+                picker_test_model("publisher/old-GGUF"),
+                picker_test_model("publisher/replacement-GGUF"),
+            ];
+            panel.chat_provider = Some(LemonadeChatProvider::new(
+                "http://127.0.0.1:1/v1",
+                "old-GGUF",
+                None,
+            ));
+            panel
+        });
+        cx.update(|window, _app| window.refresh());
+        cx.run_until_parked();
+
+        let selector = cx.debug_bounds("model-selector-btn").unwrap();
+        cx.simulate_mouse_down(selector.center(), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let replacement = cx.debug_bounds("model-option-1").unwrap();
+        cx.simulate_mouse_down(replacement.center(), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        cx.update(|_window, app| {
+            let panel = panel.read(app);
+            assert_eq!(panel.selected_model_idx, 1);
+            assert!(!panel.model_dropdown_open);
+            assert!(matches!(
+                panel.profile_reload_state,
+                ProfileReloadState::Failed(ref error)
+                    if error.contains("runtime is not available")
+            ));
+        });
     }
 
     #[gpui::test]

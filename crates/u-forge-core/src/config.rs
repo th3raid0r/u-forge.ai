@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [lemonade]
-//! max_loaded_models = 3
+//! max_loaded_models = 2
 //!
 //! [embedding]
 //! npu_weight = 100
@@ -1574,6 +1574,20 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn packaged_template_uses_conservative_consumer_defaults() {
+        let config: AppConfig =
+            toml::from_str(include_str!("../../../defaults/config/u-forge.toml")).unwrap();
+
+        assert_eq!(config.lemonade.max_loaded_models, 2);
+        assert!(!config.lemonade.hardware_profile_initialized);
+        assert!(!config.ui.show_advanced_controls);
+        assert_eq!(
+            config.chat.gpu.model.as_deref(),
+            Some("Gemma-4-E4B-it-GGUF")
+        );
+    }
 
     #[test]
     fn test_default_values() {
