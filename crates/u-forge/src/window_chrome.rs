@@ -141,6 +141,9 @@ impl RenderOnce for WindowTitleBar {
         let mut controls = div()
             .id("window-controls")
             .flex()
+            .when(self.side == WindowControlSide::Left, |controls| {
+                controls.flex_row_reverse()
+            })
             .flex_none()
             .h_full()
             .w(side_width);
@@ -839,7 +842,9 @@ mod tests {
         assert!(cx.debug_bounds("window-minimize").is_none());
         let compact_title = cx.debug_bounds("window-title-bar").unwrap();
         let compact_close = cx.debug_bounds("window-close").unwrap();
+        let compact_maximize = cx.debug_bounds("window-maximize").unwrap();
         assert!(compact_close.center().x < compact_title.center().x);
+        assert!(compact_close.center().x < compact_maximize.center().x);
 
         cx.update(|window, app| {
             UiTheme::set_interface_size(app, 24.0);
@@ -860,8 +865,10 @@ mod tests {
         });
         cx.run_until_parked();
         let right_close = cx.debug_bounds("window-close").unwrap();
+        let right_maximize = cx.debug_bounds("window-maximize").unwrap();
         let title = cx.debug_bounds("window-title-bar").unwrap();
         assert!(right_close.center().x > title.center().x);
+        assert!(right_maximize.center().x < right_close.center().x);
 
         harness.update(cx, |harness, _| harness.actions.borrow_mut().clear());
         let title_position = title.center();
