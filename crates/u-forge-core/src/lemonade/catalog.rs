@@ -90,7 +90,8 @@ pub struct CatalogModel {
     pub id: String,
     /// Recipe name: `"llamacpp"`, `"flm"`, `"whispercpp"`, `"kokoro"`, `"sd-cpp"`.
     pub recipe: String,
-    /// Server-supplied labels: `"embeddings"`, `"reranking"`, `"audio"`, `"tts"`, etc.
+    /// Server-supplied labels: `"chat"`, `"embeddings"`, `"reranking"`, `"audio"`,
+    /// `"tts"`, etc.
     pub labels: HashSet<String>,
     /// Whether the model weights have been downloaded locally.
     pub downloaded: bool,

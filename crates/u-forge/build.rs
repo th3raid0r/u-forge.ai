@@ -7,14 +7,15 @@ use std::{
     process::Command,
 };
 
-const LEMONADE_VERSION: &str = "11.5.2";
+const LEMONADE_VERSION: &str = "11.7.0";
 const INSTALL_REVISION: &str = "ubuntu-x64-minimal-v1";
-const PATCH_REVISION: &str = "gemma4-reasoning-llamacpp-11.5.1-v1";
+const PATCH_REVISION: &str = "gemma4-reasoning-stock-backends-v1";
 const CHECKSUM_FILE: &str = "../../packaging/lemonade-embeddable.sha256";
 const SKIP_ENV: &str = "UFORGE_SKIP_EMBEDDED_LEMONADE";
 const REQUIRE_ENV: &str = "UFORGE_REQUIRE_EMBEDDED_LEMONADE";
-// Keep the 11.5.2 control plane while rolling only its llama.cpp downloads
-// back to the pins in Lemonade's v11.5.1 backend_versions.json.
+// Retain the last known-good backend pins for quick rollback while testing the
+// backend versions shipped by the current Lemonade control plane.
+const PIN_LLAMACPP_11_5_1_BACKENDS: bool = false;
 const LLAMACPP_11_5_1_PINS: [(&str, &str); 6] = [
     ("vulkan", "b9747"),
     ("rocm-stable", "b9752"),
@@ -77,7 +78,7 @@ fn bootstrap() -> Result<(), Box<dyn Error>> {
     let checksum_path = manifest_dir.join(CHECKSUM_FILE);
     let (expected_checksum, asset_name) = read_checksum_spec(&checksum_path)?;
     let expected_marker = format!(
-        "version={LEMONADE_VERSION}\nasset={asset_name}\nsha256={expected_checksum}\ninstall={INSTALL_REVISION}\npatch={PATCH_REVISION}\n"
+        "version={LEMONADE_VERSION}\nasset={asset_name}\nsha256={expected_checksum}\ninstall={INSTALL_REVISION}\npatch={PATCH_REVISION}\npin_llamacpp_11_5_1={PIN_LLAMACPP_11_5_1_BACKENDS}\n"
     );
     if artifact_is_current(
         &install_dir,
@@ -222,7 +223,7 @@ fn artifact_is_current(
         return false;
     }
     verify_reasoning_patch(model_manifest).is_ok()
-        && verify_llamacpp_11_5_1_pins(backend_versions).is_ok()
+        && (!PIN_LLAMACPP_11_5_1_BACKENDS || verify_llamacpp_11_5_1_pins(backend_versions).is_ok())
 }
 
 fn ensure_archive(
@@ -330,8 +331,10 @@ fn install_archive(
 
     let patched = patch_reasoning_labels(&model_manifest)?;
     verify_reasoning_patch(&model_manifest)?;
-    patch_llamacpp_11_5_1_pins(&backend_versions)?;
-    verify_llamacpp_11_5_1_pins(&backend_versions)?;
+    if PIN_LLAMACPP_11_5_1_BACKENDS {
+        patch_llamacpp_11_5_1_pins(&backend_versions)?;
+        verify_llamacpp_11_5_1_pins(&backend_versions)?;
+    }
 
     let prepared = staging.join("lemonade");
     fs::create_dir_all(prepared.join("resources"))?;
@@ -350,8 +353,13 @@ fn install_archive(
         fs::remove_dir_all(install_dir)?;
     }
     fs::rename(&prepared, install_dir)?;
+    let backend_policy = if PIN_LLAMACPP_11_5_1_BACKENDS {
+        "pinned llama.cpp backends to Lemonade 11.5.1"
+    } else {
+        "kept upstream llama.cpp backend versions"
+    };
     println!(
-        "cargo:warning=provisioned Embeddable Lemonade {LEMONADE_VERSION}; added reasoning to {patched} Gemma 4 GGUF models and pinned llama.cpp backends to Lemonade 11.5.1"
+        "cargo:warning=provisioned Embeddable Lemonade {LEMONADE_VERSION}; added reasoning to {patched} Gemma 4 GGUF models and {backend_policy}"
     );
     Ok(())
 }

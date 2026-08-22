@@ -1549,10 +1549,15 @@ mod tests {
         labels: &[&str],
         downloaded: bool,
     ) -> u_forge_core::lemonade::CatalogModel {
+        let mut labels = labels
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect::<std::collections::HashSet<_>>();
+        labels.insert("chat".to_string());
         u_forge_core::lemonade::CatalogModel {
             id: id.to_string(),
             recipe: "llamacpp".to_string(),
-            labels: labels.iter().map(|label| (*label).to_string()).collect(),
+            labels,
             downloaded,
             ..Default::default()
         }

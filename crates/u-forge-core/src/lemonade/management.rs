@@ -241,7 +241,8 @@ pub fn component_state(
     }
 }
 
-/// Validate a user-selected chat model without imposing a particular recipe.
+/// Validate a user-selected chat model against the supported recipes and
+/// Lemonade's explicit `"chat"` capability label.
 pub fn chat_component_state(
     catalog: &LemonadeServerCatalog,
     model_id: &str,
@@ -249,14 +250,7 @@ pub fn chat_component_state(
     let Some(model) = catalog.models.iter().find(|model| model.id == model_id) else {
         return SetupComponentState::Missing;
     };
-    if !matches!(model.recipe.as_str(), "llamacpp" | "flm")
-        || model.labels.iter().any(|label| {
-            matches!(
-                label.as_str(),
-                "embeddings" | "reranking" | "audio" | "transcription" | "tts"
-            )
-        })
-    {
+    if !matches!(model.recipe.as_str(), "llamacpp" | "flm") || !model.labels.contains("chat") {
         return SetupComponentState::Conflict(format!("{model_id} is not a chat model"));
     }
     if model.downloaded {
@@ -316,13 +310,7 @@ pub fn setup_chat_models(catalog: &LemonadeServerCatalog) -> Vec<&CatalogModel> 
         .models
         .iter()
         .filter(|model| {
-            matches!(model.recipe.as_str(), "llamacpp" | "flm")
-                && !model.labels.iter().any(|label| {
-                    matches!(
-                        label.as_str(),
-                        "embeddings" | "reranking" | "audio" | "transcription" | "tts"
-                    )
-                })
+            matches!(model.recipe.as_str(), "llamacpp" | "flm") && model.labels.contains("chat")
         })
         .collect()
 }
@@ -742,6 +730,72 @@ mod tests {
                 .iter()
                 .any(|item| item.role == SetupRole::HighQualityEmbedding && !item.required)
         );
+    }
+
+    #[test]
+    fn chat_component_requires_explicit_chat_capability() {
+        let catalog = LemonadeServerCatalog {
+            models: vec![
+                CatalogModel {
+                    id: "ready-chat".to_string(),
+                    recipe: "llamacpp".to_string(),
+                    labels: ["chat".to_string()].into_iter().collect(),
+                    downloaded: true,
+                    ..Default::default()
+                },
+                CatalogModel {
+                    id: "untyped-llm".to_string(),
+                    recipe: "llamacpp".to_string(),
+                    downloaded: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            chat_component_state(&catalog, "ready-chat"),
+            SetupComponentState::Ready
+        );
+        assert!(matches!(
+            chat_component_state(&catalog, "untyped-llm"),
+            SetupComponentState::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn setup_chat_picker_uses_chat_label_and_supported_recipes() {
+        let catalog = LemonadeServerCatalog {
+            models: vec![
+                CatalogModel {
+                    id: "downloadable-chat".to_string(),
+                    recipe: "flm".to_string(),
+                    labels: ["chat".to_string()].into_iter().collect(),
+                    downloaded: false,
+                    ..Default::default()
+                },
+                CatalogModel {
+                    id: "untyped-llm".to_string(),
+                    recipe: "llamacpp".to_string(),
+                    downloaded: false,
+                    ..Default::default()
+                },
+                CatalogModel {
+                    id: "unsupported-chat".to_string(),
+                    recipe: "other".to_string(),
+                    labels: ["chat".to_string()].into_iter().collect(),
+                    downloaded: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let ids = setup_chat_models(&catalog)
+            .into_iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["downloadable-chat"]);
     }
 
     #[test]

@@ -627,7 +627,7 @@ fn prepare_private_root(package_root: &Path, data_root: &Path) -> Result<()> {
             .as_object_mut()
             .ok_or_else(|| anyhow!("Lemonade defaults.json must contain an object"))?;
         object.insert("host".into(), serde_json::json!("127.0.0.1"));
-        object.insert("no_broadcast".into(), serde_json::json!(true));
+        object.insert("broadcast".into(), serde_json::json!(false));
         object.insert(
             "models_dir".into(),
             serde_json::json!(data_root.join("models")),
@@ -819,6 +819,8 @@ mod tests {
             serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap())
                 .unwrap();
         assert_eq!(config["host"], "127.0.0.1");
+        assert_eq!(config["broadcast"], false);
+        assert!(config.get("no_broadcast").is_none());
         assert_eq!(
             config["models_dir"],
             data.path().join("models").to_string_lossy().as_ref()

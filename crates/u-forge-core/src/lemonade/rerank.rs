@@ -38,7 +38,7 @@ pub trait RerankProvider: Send + Sync {
     ) -> Result<Vec<RerankDocument>>;
 }
 
-/// Reranker via `POST /api/v1/reranking` on Lemonade Server.
+/// Reranker via `POST /api/v1/rerank` on Lemonade Server.
 ///
 /// Unlike the GPU/NPU providers there is no shared-resource contention for
 /// reranking — requests are sent directly to Lemonade Server which serialises
@@ -131,7 +131,7 @@ impl LemonadeRerankProvider {
 
         let resp: RerankResponse = self
             .client
-            .post_json("/reranking", &body)
+            .post_json("/rerank", &body)
             .await
             .context("Rerank HTTP request failed")?;
 
@@ -181,5 +181,51 @@ impl RerankProvider for LemonadeRerankProvider {
         top_n: Option<usize>,
     ) -> Result<Vec<RerankDocument>> {
         LemonadeRerankProvider::rerank(self, query, documents, top_n).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn rerank_uses_the_canonical_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"results":[]}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let provider = LemonadeRerankProvider::new(&format!("http://{address}/v1"), "reranker");
+        assert!(
+            provider
+                .rerank("query", vec!["document".into()], None)
+                .await
+                .is_ok()
+        );
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /v1/rerank HTTP/1.1\r\n"));
     }
 }

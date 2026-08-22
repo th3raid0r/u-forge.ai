@@ -76,6 +76,7 @@ impl TranscriptionProvider for LemonadeTranscriptionProvider {
 
         let form = reqwest::multipart::Form::new()
             .text("model", self.model.clone())
+            .text("response_format", "json")
             .part("file", part);
 
         let resp: serde_json::Value = self
@@ -108,5 +109,70 @@ impl TranscriptionProvider for LemonadeTranscriptionProvider {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn transcription_multipart_explicitly_asks_for_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before sending request body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"text":"transcript"}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let provider =
+            LemonadeTranscriptionProvider::new(&format!("http://{address}/v1"), "whisper");
+        let text = provider
+            .transcribe(vec![1, 2, 3], "clip.wav")
+            .await
+            .unwrap();
+        assert_eq!(text, "transcript");
+
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /v1/audio/transcriptions HTTP/1.1\r\n"));
+        assert!(request.contains("name=\"response_format\""));
+        assert!(request.contains("\r\n\r\njson\r\n"));
     }
 }
