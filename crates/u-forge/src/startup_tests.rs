@@ -195,7 +195,7 @@ fn response_body(configured: bool, method: &str, path: &str) -> String {
                 model(
                     "Gemma-4-E4B-it-GGUF",
                     "llamacpp",
-                    &["llm", "tools"],
+                    &["chat", "tool-calling"],
                     "Gemma-4-E4B-it-GGUF",
                 ),
             ]

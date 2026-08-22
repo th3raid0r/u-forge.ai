@@ -330,9 +330,8 @@ impl<'a> ModelSelector<'a> {
         result
     }
 
-    /// Returns LLM models (recipe `"llamacpp"` or `"flm"`, without
-    /// `"embeddings"`, `"reranking"`, `"audio"`, `"transcription"`, or `"tts"`
-    /// labels).
+    /// Returns downloaded chat models using a supported recipe (`"llamacpp"`
+    /// or `"flm"`) and advertising Lemonade's explicit `"chat"` capability.
     ///
     /// **At most one worker per device slot** (FLM → NPU, llamacpp + GPU
     /// backend → GPU, llamacpp + cpu → CPU).  Both a GPU worker and an NPU
@@ -346,11 +345,7 @@ impl<'a> ModelSelector<'a> {
             .filter(|m| {
                 m.downloaded
                     && (m.recipe == "llamacpp" || m.recipe == "flm")
-                    && !m.labels.contains("embeddings")
-                    && !m.labels.contains("reranking")
-                    && !m.labels.contains("audio")
-                    && !m.labels.contains("transcription")
-                    && !m.labels.contains("tts")
+                    && m.labels.contains("chat")
             })
             .collect();
 
@@ -380,7 +375,8 @@ impl<'a> ModelSelector<'a> {
         result
     }
 
-    /// Returns **all** downloaded LLM-capable models, without the one-per-device-slot
+    /// Returns **all** downloaded models advertising Lemonade's explicit `"chat"`
+    /// capability through a supported recipe, without the one-per-device-slot
     /// deduplication applied by [`select_llm_models`]. Preference ordering is still
     /// applied. Intended for the chat UI model picker where the user should see
     /// every available model.
@@ -392,11 +388,7 @@ impl<'a> ModelSelector<'a> {
             .filter(|m| {
                 m.downloaded
                     && (m.recipe == "llamacpp" || m.recipe == "flm")
-                    && !m.labels.contains("embeddings")
-                    && !m.labels.contains("reranking")
-                    && !m.labels.contains("audio")
-                    && !m.labels.contains("transcription")
-                    && !m.labels.contains("tts")
+                    && m.labels.contains("chat")
             })
             .collect();
 
@@ -845,7 +837,7 @@ mod tests {
     #[test]
     fn test_llamacpp_backend_prefers_rocm_over_vulkan() {
         let catalog = catalog_with(
-            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![model("llm-gguf", "llamacpp", &["chat", "reasoning"])],
             vec![
                 installed_backend("llamacpp", "rocm", &["amd_igpu"]),
                 installed_backend("llamacpp", "vulkan", &["amd_igpu"]),
@@ -862,7 +854,7 @@ mod tests {
     #[test]
     fn test_llamacpp_backend_falls_back_to_vulkan() {
         let catalog = catalog_with(
-            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![model("llm-gguf", "llamacpp", &["chat", "reasoning"])],
             vec![installed_backend("llamacpp", "vulkan", &["amd_igpu"])],
         );
         let cfg = ModelConfig::default();
@@ -876,7 +868,7 @@ mod tests {
     #[test]
     fn test_amd_device_keeps_rocm_preference_when_only_vulkan_is_available() {
         let catalog = catalog_with(
-            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![model("llm-gguf", "llamacpp", &["chat", "reasoning"])],
             vec![installed_backend("llamacpp", "vulkan", &["amd_igpu"])],
         );
         let cfg = ModelConfig::default();
@@ -894,7 +886,7 @@ mod tests {
     #[test]
     fn test_llamacpp_backend_prefers_cuda_over_vulkan() {
         let catalog = catalog_with(
-            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![model("llm-gguf", "llamacpp", &["chat", "reasoning"])],
             vec![
                 installed_backend("llamacpp", "cuda", &["nvidia_gpu"]),
                 installed_backend("llamacpp", "vulkan", &["nvidia_gpu"]),
@@ -915,7 +907,7 @@ mod tests {
     #[test]
     fn test_nvidia_device_keeps_cuda_preference_when_only_vulkan_is_available() {
         let catalog = catalog_with(
-            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![model("llm-gguf", "llamacpp", &["chat", "reasoning"])],
             vec![installed_backend("llamacpp", "vulkan", &["nvidia_gpu"])],
         );
         let cfg = ModelConfig::default();
@@ -929,7 +921,7 @@ mod tests {
     #[test]
     fn test_explicit_vulkan_runtime_overrides_cuda() {
         let catalog = catalog_with(
-            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![model("llm-gguf", "llamacpp", &["chat", "reasoning"])],
             vec![
                 installed_backend("llamacpp", "cuda", &["nvidia_gpu"]),
                 installed_backend("llamacpp", "vulkan", &["nvidia_gpu"]),
@@ -948,7 +940,7 @@ mod tests {
     #[test]
     fn test_llamacpp_backend_falls_back_to_cpu_when_nothing_installed() {
         let catalog = catalog_with(
-            vec![model("llm-gguf", "llamacpp", &["reasoning"])],
+            vec![model("llm-gguf", "llamacpp", &["chat", "reasoning"])],
             vec![], // no backends installed
         );
         let cfg = ModelConfig::default();
@@ -962,7 +954,7 @@ mod tests {
     #[test]
     fn test_flm_recipe_has_no_backend() {
         let catalog = catalog_with(
-            vec![model("qwen3.5-4B-FLM", "flm", &["reasoning"])],
+            vec![model("qwen3.5-4B-FLM", "flm", &["chat", "reasoning"])],
             vec![installed_backend("flm", "npu", &["amd_npu"])],
         );
         let cfg = ModelConfig::default();
@@ -1078,13 +1070,18 @@ mod tests {
     // ── LLM selection ─────────────────────────────────────────────────────────
 
     #[test]
-    fn test_select_llm_excludes_embedding_and_reranking() {
+    fn test_select_llm_requires_explicit_chat_label() {
         let catalog = catalog_with(
             vec![
-                model("Gemma-4-26B-A4B-it-GGUF", "llamacpp", &["tool-calling"]),
+                model(
+                    "Gemma-4-26B-A4B-it-GGUF",
+                    "llamacpp",
+                    &["chat", "tool-calling"],
+                ),
                 model("embed-gguf", "llamacpp", &["embeddings"]), // excluded
                 model("reranker", "llamacpp", &["reranking"]),    // excluded
-                model("qwen3.5-4B-FLM", "flm", &["reasoning"]),
+                model("untyped-llm", "llamacpp", &["reasoning"]), // excluded
+                model("qwen3.5-4B-FLM", "flm", &["chat", "reasoning"]),
             ],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );
@@ -1104,14 +1101,22 @@ mod tests {
         );
         assert!(!ids.contains(&"embed-gguf"), "Embedding must be excluded");
         assert!(!ids.contains(&"reranker"), "Reranker must be excluded");
+        assert!(
+            !ids.contains(&"untyped-llm"),
+            "Models without the chat label must be excluded"
+        );
     }
 
     #[test]
     fn test_select_llm_preference_order() {
         let catalog = catalog_with(
             vec![
-                model("Gemma-4-26B-A4B-it-GGUF", "llamacpp", &["tool-calling"]),
-                model("qwen3.5-4B-FLM", "flm", &["reasoning"]),
+                model(
+                    "Gemma-4-26B-A4B-it-GGUF",
+                    "llamacpp",
+                    &["chat", "tool-calling"],
+                ),
+                model("qwen3.5-4B-FLM", "flm", &["chat", "reasoning"]),
             ],
             vec![],
         );
@@ -1129,8 +1134,12 @@ mod tests {
         // Two GPU (llamacpp + rocm) LLMs — only the preferred one wins the slot.
         let catalog = catalog_with(
             vec![
-                model("Gemma-4-26B-A4B-it-GGUF", "llamacpp", &["tool-calling"]),
-                model("Qwen3-30B-A3B-GGUF", "llamacpp", &["reasoning"]),
+                model(
+                    "Gemma-4-26B-A4B-it-GGUF",
+                    "llamacpp",
+                    &["chat", "tool-calling"],
+                ),
+                model("Qwen3-30B-A3B-GGUF", "llamacpp", &["chat", "reasoning"]),
             ],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );
@@ -1151,8 +1160,12 @@ mod tests {
         // One FLM (NPU) and one llamacpp (GPU) — separate slots, both survive.
         let catalog = catalog_with(
             vec![
-                model("qwen3.5-4B-FLM", "flm", &["reasoning"]),
-                model("Gemma-4-26B-A4B-it-GGUF", "llamacpp", &["tool-calling"]),
+                model("qwen3.5-4B-FLM", "flm", &["chat", "reasoning"]),
+                model(
+                    "Gemma-4-26B-A4B-it-GGUF",
+                    "llamacpp",
+                    &["chat", "tool-calling"],
+                ),
             ],
             vec![installed_backend("llamacpp", "rocm", &["amd_igpu"])],
         );

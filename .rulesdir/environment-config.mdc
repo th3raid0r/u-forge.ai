@@ -89,11 +89,11 @@ The desktop app uses the persistent path from `[storage].db_path`.
 Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
 TTS) via an OpenAI-compatible HTTP API. On x86_64 Linux with GNU libc, building
 the desktop UI downloads the checksum-pinned upstream Ubuntu x64 Embeddable
-Lemonade 11.5.2 release into `target/`. `make release` packages that runtime,
+Lemonade 11.7.0 release into `target/`. `make release` packages that runtime,
 the desktop executable, and the complete defaults tree into an AppImage built
 on Ubuntu 26.04. The build adds the `reasoning` catalog label to built-in Gemma
-4 GGUF models and pins llama.cpp backend downloads to Lemonade 11.5.1 before
-installation. If provisioning is skipped or unavailable, AI features degrade
+4 GGUF models and otherwise retains Lemonade 11.7.0's upstream backend version
+manifest. If provisioning is skipped or unavailable, AI features degrade
 gracefully and the knowledge graph remains usable.
 
 ### Setup
@@ -150,7 +150,7 @@ Lemonade runs on its default port.
 | `/api/v1/audio/transcriptions` | POST (multipart) | `LemonadeTranscriptionProvider` (no GPU lock) / `LemonadeSttProvider` (GPU-managed) |
 | `/api/v1/audio/speech` | POST (JSON) | `LemonadeTtsProvider` |
 | `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` |
-| `/api/v1/reranking` | POST (JSON) | `LemonadeRerankProvider` |
+| `/api/v1/rerank` | POST (JSON) | `LemonadeRerankProvider` |
 
 ### Why two transcription providers
 

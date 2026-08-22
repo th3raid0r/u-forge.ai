@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_openai::types::InputSource;
-use async_openai::types::audio::{AudioInput, CreateTranscriptionRequestArgs};
+use async_openai::types::audio::{
+    AudioInput, AudioResponseFormat, CreateTranscriptionRequest, CreateTranscriptionRequestArgs,
+};
 use async_openai::{Client, config::OpenAIConfig};
 use serde::{Deserialize, Serialize};
 
@@ -78,18 +80,7 @@ impl LemonadeSttProvider {
 
         let start = std::time::Instant::now();
 
-        let audio_input = AudioInput {
-            source: InputSource::VecU8 {
-                filename: filename.to_string(),
-                vec: audio_data,
-            },
-        };
-
-        let req = CreateTranscriptionRequestArgs::default()
-            .model(&self.model)
-            .file(audio_input)
-            .build()
-            .context("Failed to build transcription request")?;
+        let req = build_transcription_request(&self.model, audio_data, filename)?;
 
         // Use create_raw() because Lemonade's transcription response omits the
         // `usage` field that async-openai's typed `CreateTranscriptionResponseJson`
@@ -119,6 +110,26 @@ impl LemonadeSttProvider {
     }
 }
 
+fn build_transcription_request(
+    model: &str,
+    audio_data: Vec<u8>,
+    filename: &str,
+) -> Result<CreateTranscriptionRequest> {
+    let audio_input = AudioInput {
+        source: InputSource::VecU8 {
+            filename: filename.to_string(),
+            vec: audio_data,
+        },
+    };
+
+    CreateTranscriptionRequestArgs::default()
+        .model(model)
+        .file(audio_input)
+        .response_format(AudioResponseFormat::Json)
+        .build()
+        .context("Failed to build transcription request")
+}
+
 #[async_trait]
 impl TranscriptionProvider for LemonadeSttProvider {
     /// Delegates to the inherent [`transcribe`](Self::transcribe) method and
@@ -130,5 +141,16 @@ impl TranscriptionProvider for LemonadeSttProvider {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcription_request_explicitly_asks_for_json() {
+        let request = build_transcription_request("whisper", vec![1, 2, 3], "clip.wav").unwrap();
+        assert_eq!(request.response_format, Some(AudioResponseFormat::Json));
     }
 }
