@@ -2,6 +2,7 @@
 mod definition;
 mod ingestion;
 mod manager;
+pub(crate) mod validation;
 
 pub use definition::{
     Cardinality, EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType,
@@ -9,4 +10,5 @@ pub use definition::{
     ValidationResult, ValidationRule, ValidationWarning,
 };
 pub use ingestion::SchemaIngestion;
-pub use manager::{PropertyIssue, SchemaManager, SchemaStats};
+pub use manager::{SchemaManager, SchemaStats};
+pub use validation::PropertyIssue;

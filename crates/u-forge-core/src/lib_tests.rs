@@ -4,6 +4,7 @@
 use tempfile::TempDir;
 
 use crate::graph::MAX_CHUNK_TOKENS;
+use crate::schema::ValidationRule;
 use crate::types::{ChunkType, EdgeType};
 use crate::{
     EdgeTypeSchema, EmbeddingTarget, GraphChange, KnowledgeGraph, ObjectBuilder, ObjectTypeSchema,
@@ -250,7 +251,11 @@ async fn registered_object_type_is_immediately_visible_and_enforced() {
     let (graph, _tmp) = create_test_graph_async().await;
 
     let spell_schema = ObjectTypeSchema::new("spell".to_string(), "A magical spell".to_string())
-        .with_property("level".to_string(), PropertySchema::number("Spell level"))
+        .with_property(
+            "level".to_string(),
+            PropertySchema::number("Spell level")
+                .with_validation(ValidationRule::new().with_value_range(Some(1.0), Some(5.0))),
+        )
         .with_property(
             "school".to_string(),
             PropertySchema::string("School of magic"),
@@ -303,6 +308,18 @@ async fn registered_object_type_is_immediately_visible_and_enforced() {
         error.contains("Missing required property: level"),
         "{error}"
     );
+
+    let coercible = ObjectBuilder::custom("spell".to_string(), "String Level".to_string())
+        .with_property("level".to_string(), "3".to_string())
+        .build();
+    let error = graph.add_object(coercible).unwrap_err().to_string();
+    assert!(error.contains("Expected: number, Got: string"), "{error}");
+
+    let out_of_range = ObjectBuilder::custom("spell".to_string(), "Impossible".to_string())
+        .with_json_property("level".to_string(), serde_json::json!(9))
+        .build();
+    let error = graph.add_object(out_of_range).unwrap_err().to_string();
+    assert!(error.contains("maximum value is 5"), "{error}");
 
     let stats = graph.get_schema_stats("default").await.unwrap();
     assert!(stats.object_type_count >= 7); // 6 built-in + "spell"

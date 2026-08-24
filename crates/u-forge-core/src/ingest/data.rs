@@ -19,7 +19,8 @@
 
 use crate::KnowledgeGraph;
 use crate::queue::CancellationToken;
-use crate::schema::{EdgeTypeSchema, ObjectTypeSchema};
+use crate::schema::validation::{NormalizationPolicy, normalize_object_properties};
+use crate::schema::{EdgeTypeSchema, ObjectTypeSchema, PropertyIssue};
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -1186,44 +1187,52 @@ impl<'a> DataIngestion<'a> {
         schema: &ObjectTypeSchema,
         properties: &Map<String, Value>,
     ) -> Result<Map<String, Value>> {
-        let mut filtered = Map::new();
+        let mut schema_properties = properties.clone();
+        // `name` is top-level ObjectMetadata and remains accepted even for
+        // programmatic schemas that list it only in required_properties.
+        let name_value = schema_properties.remove("name");
+        let normalization =
+            normalize_object_properties(schema, &schema_properties, NormalizationPolicy::IMPORT);
 
-        for (key, value) in properties {
-            if key == "name" || schema.properties.contains_key(key) {
-                filtered.insert(key.clone(), value.clone());
-            } else {
-                let value_json = compact_json_value(value);
+        for warning in &normalization.warnings {
+            if let PropertyIssue::UnknownProperty { key } = warning {
+                let value = properties
+                    .get(key)
+                    .map(compact_json_value)
+                    .unwrap_or_else(|| "<nested>".to_string());
                 self.record_property_drop(
                     format!("object:{node_type}:property:{key}"),
-                    format!("{name}.{key}={value_json}"),
+                    format!("{name}.{key}={value}"),
                 );
                 warn!(
                     object_type = node_type,
                     object_name = name,
                     property = key,
-                    value = %value_json,
+                    value,
                     constraint = "declared_schema_property",
                     "Dropping import property not declared in schema"
                 );
             }
         }
 
-        for required in &schema.required_properties {
-            if required == "name" {
-                if name.is_empty() {
-                    bail!("Required property 'name' is missing for {node_type}");
-                }
-                continue;
-            }
-
-            if !filtered.contains_key(required)
-                || filtered.get(required).is_some_and(|value| value.is_null())
-            {
-                bail!("Required property '{required}' is missing for {node_type} '{name}'");
-            }
+        if !normalization.errors.is_empty() {
+            bail!(
+                "Schema validation failed for {node_type} '{name}': {}",
+                normalization
+                    .errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
         }
 
-        Ok(filtered)
+        let mut normalized = normalization.normalized;
+        if let Some(name_value) = name_value {
+            normalized.insert("name".to_string(), name_value);
+        }
+
+        Ok(normalized)
     }
 
     fn add_properties_to_builder(
@@ -1352,7 +1361,9 @@ fn record_diagnostic_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition};
+    use crate::schema::{
+        EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationRule,
+    };
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1516,6 +1527,52 @@ mod tests {
         assert_eq!(stats.edge_records_skipped, 0);
         assert!(graph.find_by_name("npc", "Hari Seldon").unwrap().is_empty());
         assert_eq!(graph.get_stats().unwrap().node_count, 1);
+    }
+
+    #[tokio::test]
+    async fn schema_import_normalizes_values_and_rejects_rule_failures_before_persistence() {
+        let (_temp_dir, graph) = create_test_graph();
+        let mut schema = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "test".to_string(),
+        );
+        schema.add_object_type(
+            "spell".to_string(),
+            ObjectTypeSchema::new("spell".to_string(), "Spell".to_string())
+                .with_property("name".to_string(), PropertySchema::string("name"))
+                .with_property(
+                    "level".to_string(),
+                    PropertySchema::number("level").with_validation(
+                        ValidationRule::new().with_value_range(Some(1.0), Some(5.0)),
+                    ),
+                )
+                .with_required_property("name".to_string())
+                .with_required_property("level".to_string()),
+        );
+        graph.get_schema_manager().save_schema(&schema).unwrap();
+
+        let mut ingestion = DataIngestion::new(&graph);
+        let jsonl = r#"{"entitytype":"node","id":"00000000-0000-0000-0000-000000000001","nodetype":"spell","properties":{"name":"Shield","level":"3"}}
+{"entitytype":"node","id":"00000000-0000-0000-0000-000000000002","nodetype":"spell","properties":{"name":"Impossible","level":"9"}}"#;
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("test.jsonl");
+        std::fs::write(&file, jsonl).unwrap();
+
+        ingestion.import_json_data(&file).await.unwrap();
+
+        let stats = ingestion.get_stats();
+        assert_eq!(stats.objects_created, 1);
+        assert_eq!(stats.object_records_skipped, 1);
+        assert_eq!(stats.validation_errors, 1);
+        let shield = graph.find_by_name("spell", "Shield").unwrap().remove(0);
+        assert_eq!(shield.get_json_property("level"), Some(&json!(3.0)));
+        assert!(
+            graph
+                .find_by_name("spell", "Impossible")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

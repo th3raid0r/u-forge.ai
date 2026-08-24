@@ -683,6 +683,38 @@ impl UpsertNodeTool {
     }
 }
 
+fn preflight_node_properties(
+    graph: &KnowledgeGraph,
+    metadata: &mut ObjectMetadata,
+) -> Result<(), ToolError> {
+    let schema_manager = graph.get_schema_manager();
+    if !schema_manager.is_valid_object_type(&metadata.object_type) {
+        let valid = schema_manager.all_object_type_names().join(", ");
+        return Err(ToolError(format!(
+            "Unknown object_type \"{}\". Valid types: {valid}",
+            metadata.object_type
+        )));
+    }
+
+    let property_issues = if let serde_json::Value::Object(properties) = &mut metadata.properties {
+        graph.validate_and_coerce_properties(&metadata.object_type, properties)
+    } else {
+        vec![]
+    };
+    if property_issues.is_empty() {
+        return Ok(());
+    }
+
+    let details = property_issues
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(ToolError(format!(
+        "Node properties do not satisfy the loaded schema: {details}"
+    )))
+}
+
 impl Tool for UpsertNodeTool {
     const NAME: &'static str = "upsert_node";
 
@@ -730,16 +762,6 @@ impl Tool for UpsertNodeTool {
             (oid, false, new_meta)
         };
 
-        // Validate object_type against schema.
-        let schema_mgr = self.graph.get_schema_manager();
-        if !schema_mgr.is_valid_object_type(&args.object_type) {
-            let valid = schema_mgr.all_object_type_names().join(", ");
-            return Err(ToolError(format!(
-                "Unknown object_type \"{}\". Valid types: {valid}",
-                args.object_type
-            )));
-        }
-
         // Apply caller-provided fields.
         meta.name = args.name;
         meta.object_type = args.object_type;
@@ -761,24 +783,9 @@ impl Tool for UpsertNodeTool {
             }
         }
 
-        // Validate and coerce properties against the schema. Coercions (e.g. "42" → 42) are
-        // applied in-place; issues are appended to the output so the LLM can self-correct.
-        let prop_issues = if let serde_json::Value::Object(ref mut props) = meta.properties {
-            self.graph
-                .validate_and_coerce_properties(&meta.object_type, props)
-        } else {
-            vec![]
-        };
-        if !prop_issues.is_empty() {
-            let details = prop_issues
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ToolError(format!(
-                "Node properties do not satisfy the loaded schema: {details}"
-            )));
-        }
+        // Validate and normalize before persistence so the tool can return
+        // actionable nested/rule diagnostics without relying on the final guard.
+        preflight_node_properties(&self.graph, &mut meta)?;
 
         // Persist the node.
         if self.cancellation.is_cancelled() {
@@ -1729,12 +1736,16 @@ pub use rig;
 mod tests {
     use super::tool_validation::validate_tool_args;
     use super::{
-        AgentParams, GraphAgent, first_matched_search_content, format_search_response, resolve_node,
+        AgentParams, GraphAgent, first_matched_search_content, format_search_response,
+        preflight_node_properties, resolve_node,
     };
     use serde_json::json;
     use tempfile::TempDir;
+    use u_forge_core::schema::ValidationRule;
     use u_forge_core::search::{SearchStageOutcome, SearchStageOutcomes, SearchStageStatus};
-    use u_forge_core::{KnowledgeGraph, ObjectMetadata};
+    use u_forge_core::{
+        KnowledgeGraph, ObjectMetadata, ObjectTypeSchema, PropertySchema, SchemaDefinition,
+    };
 
     fn stage(status: SearchStageStatus, diagnostic: Option<&str>) -> SearchStageOutcome {
         SearchStageOutcome {
@@ -1908,6 +1919,44 @@ mod tests {
             }),
         )
         .expect("full valid args should pass");
+    }
+
+    #[test]
+    fn upsert_node_preflight_reports_rules_and_applies_coercion() {
+        let temp = TempDir::new().unwrap();
+        let graph = KnowledgeGraph::new(temp.path()).unwrap();
+        let mut schema = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "test".to_string(),
+        );
+        schema.add_object_type(
+            "spell".to_string(),
+            ObjectTypeSchema::new("spell".to_string(), "Spell".to_string())
+                .with_property(
+                    "level".to_string(),
+                    PropertySchema::number("level").with_validation(
+                        ValidationRule::new().with_value_range(Some(1.0), Some(5.0)),
+                    ),
+                )
+                .with_required_property("level".to_string()),
+        );
+        graph.get_schema_manager().save_schema(&schema).unwrap();
+
+        let mut invalid = ObjectMetadata::new("spell".to_string(), "Impossible".to_string())
+            .with_property("level".to_string(), "9".to_string());
+        let error = preflight_node_properties(&graph, &mut invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("property 'level': maximum value is 5"),
+            "{error}"
+        );
+
+        let mut valid = ObjectMetadata::new("spell".to_string(), "Shield".to_string())
+            .with_property("level".to_string(), "3".to_string());
+        preflight_node_properties(&graph, &mut valid).unwrap();
+        assert_eq!(valid.get_json_property("level"), Some(&json!(3.0)));
     }
 
     #[test]

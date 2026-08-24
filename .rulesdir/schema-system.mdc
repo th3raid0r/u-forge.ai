@@ -93,10 +93,24 @@ context; no valid-looking subset is silently loaded.
 
 ## Validation boundaries
 
-`SchemaManager::validate_and_coerce_properties` reports missing required
-properties, unknown properties, type mismatches, and invalid enum values while
-coercing only compatible primitive representations. Callers must consume the
-issues; invoking the helper and discarding them defeats the schema boundary.
+One pure recursive normalizer governs property types, nested requiredness,
+length/range/regex/allowed-value rules, and deterministic structured issues.
+Cache lookup stays in `SchemaManager`; callers select policy rather than
+forking validation logic:
+
+- strict graph mutation permits no coercion and treats unknown fields as errors;
+- editor and agent preflight coerce compatible numeric/boolean strings and
+  treat unknown fields as errors;
+- strict import uses the same coercion and rule evaluation, drops unknown
+  fields through an explicit policy, and records every drop as a diagnostic;
+- the general warning-oriented validation API retains unknown fields as
+  warnings.
+
+`SchemaManager::validate_and_coerce_properties` mutates successful primitive
+coercions in place and returns missing required fields, unknown types or
+properties, type mismatches, invalid enum values, and validation-rule failures.
+Callers must consume the issues; invoking the helper and discarding them
+defeats the schema boundary.
 
 When one or more schemas are persisted, the JSONL importer is stricter than the
 general warning-oriented validation API:
