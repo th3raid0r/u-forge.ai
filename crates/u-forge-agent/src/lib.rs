@@ -833,7 +833,7 @@ pub struct UpsertEdgeArgs {
     pub source: String,
     /// Exact name or UUID of the target node.
     pub target: String,
-    /// Freeform relationship label, e.g. "led_by", "located_in", "member_of".
+    /// Must be an edge type from the active schema, and the resolved source/target node types must be a permitted endpoint pair.
     pub edge_type: String,
     /// Optional weight (0.0–1.0). Defaults to 1.0.
     pub weight: Option<f32>,
@@ -916,6 +916,47 @@ fn resolve_node(graph: &KnowledgeGraph, input: &str) -> Result<ObjectId, ToolErr
     }
 }
 
+fn preflight_edge_contract(
+    graph: &KnowledgeGraph,
+    source_id: ObjectId,
+    target_id: ObjectId,
+    edge_type: &str,
+) -> Result<(ObjectMetadata, ObjectMetadata), ToolError> {
+    let schema_manager = graph.get_schema_manager();
+    if !schema_manager.is_valid_edge_type(edge_type) {
+        let valid = schema_manager.all_edge_type_names();
+        let choices = if valid.is_empty() {
+            "no edge types are loaded".to_string()
+        } else {
+            valid.join(", ")
+        };
+        return Err(ToolError(format!(
+            "Unknown edge_type \"{edge_type}\". Valid edge types: {choices}"
+        )));
+    }
+
+    let source = graph
+        .get_object(source_id)
+        .map_err(|error| ToolError(format!("Failed to load source node: {error:#}")))?
+        .ok_or_else(|| ToolError(format!("Source node {source_id} no longer exists")))?;
+    let target = graph
+        .get_object(target_id)
+        .map_err(|error| ToolError(format!("Failed to load target node: {error:#}")))?
+        .ok_or_else(|| ToolError(format!("Target node {target_id} no longer exists")))?;
+    let candidate =
+        u_forge_core::Edge::new(source_id, target_id, u_forge_core::EdgeType::new(edge_type));
+    schema_manager
+        .validate_edge_cached_strict(&candidate, &source, &target)
+        .map_err(|error| {
+            ToolError(format!(
+                "Edge type \"{edge_type}\" does not permit endpoint pair {} -> {}: {error:#}",
+                source.object_type, target.object_type
+            ))
+        })?;
+
+    Ok((source, target))
+}
+
 impl Tool for UpsertEdgeTool {
     const NAME: &'static str = "upsert_edge";
 
@@ -925,7 +966,8 @@ impl Tool for UpsertEdgeTool {
 
     fn description(&self) -> String {
         "Create or update a relationship (edge) between two nodes in the knowledge graph. \
-                 Nodes can be specified by exact name or UUID. \
+                 Nodes can be specified by exact name or UUID. Use an edge_type from the active \
+                 schema and only a source/target object-type pair that edge permits. \
                  Both endpoint nodes are re-indexed after the edge is saved."
             .to_string()
     }
@@ -948,6 +990,8 @@ impl Tool for UpsertEdgeTool {
         })?;
         let source_id = resolve_node(&self.graph, &args.source)?;
         let target_id = resolve_node(&self.graph, &args.target)?;
+        let (source, target) =
+            preflight_edge_contract(&self.graph, source_id, target_id, &args.edge_type)?;
 
         let weight = args.weight.unwrap_or(1.0);
         if self.cancellation.is_cancelled() {
@@ -982,25 +1026,9 @@ impl Tool for UpsertEdgeTool {
             }
         }
 
-        // Resolve names for the confirmation message.
-        let source_name = self
-            .graph
-            .get_object(source_id)
-            .ok()
-            .flatten()
-            .map(|m| m.name)
-            .unwrap_or_else(|| source_id.to_string());
-        let target_name = self
-            .graph
-            .get_object(target_id)
-            .ok()
-            .flatten()
-            .map(|m| m.name)
-            .unwrap_or_else(|| target_id.to_string());
-
         let mut output = format!(
-            "Edge created: {source_name} -[{}]-> {target_name} (weight: {weight:.2})",
-            args.edge_type,
+            "Edge created: {} -[{}]-> {} (weight: {weight:.2})",
+            source.name, args.edge_type, target.name,
         );
         for w in &reembed_warnings {
             output.push('\n');
@@ -1737,15 +1765,139 @@ mod tests {
     use super::tool_validation::validate_tool_args;
     use super::{
         AgentParams, GraphAgent, first_matched_search_content, format_search_response,
-        preflight_node_properties, resolve_node,
+        preflight_edge_contract, preflight_node_properties, resolve_node,
     };
+    use rig::tool::{Tool, ToolContext};
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tempfile::TempDir;
+    use u_forge_core::ai::embeddings::{
+        EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
+    };
+    use u_forge_core::lemonade::{BuiltProvider, Capability, ProviderSlot};
+    use u_forge_core::queue::{CancellationToken, InferenceQueue, InferenceQueueBuilder};
     use u_forge_core::schema::ValidationRule;
     use u_forge_core::search::{SearchStageOutcome, SearchStageOutcomes, SearchStageStatus};
     use u_forge_core::{
-        KnowledgeGraph, ObjectMetadata, ObjectTypeSchema, PropertySchema, SchemaDefinition,
+        KnowledgeGraph, ObjectId, ObjectMetadata, ObjectTypeSchema, PropertySchema,
+        SchemaDefinition,
     };
+
+    struct CountingEmbeddingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for CountingEmbeddingProvider {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let seed = text.len() as f32;
+            Ok((0..768)
+                .map(|index| ((seed + index as f32) % 1000.0) / 1000.0)
+                .collect())
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut embeddings = Vec::with_capacity(texts.len());
+            for text in texts {
+                embeddings.push(self.embed(&text).await?);
+            }
+            Ok(embeddings)
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(768)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            Some(EmbeddingModelInfo {
+                name: "agent-edge-test".to_string(),
+                dimensions: 768,
+                description: None,
+            })
+        }
+    }
+
+    fn counting_embedding_queue() -> (Arc<InferenceQueue>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            calls: calls.clone(),
+        };
+        let queue = InferenceQueueBuilder::new()
+            .with_provider(BuiltProvider {
+                name: "agent-edge-test".to_string(),
+                capability: Capability::Embedding,
+                provider: ProviderSlot::Embedding(Arc::new(provider)),
+                weight: 100,
+            })
+            .build();
+        (Arc::new(queue), calls)
+    }
+
+    fn graph_with_edge_contract() -> (Arc<KnowledgeGraph>, TempDir, ObjectId, ObjectId, ObjectId) {
+        let temp = TempDir::new().unwrap();
+        let graph = Arc::new(KnowledgeGraph::new(temp.path()).unwrap());
+        let mut schema = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "test".to_string(),
+        );
+        schema.add_object_type(
+            "character".to_string(),
+            ObjectTypeSchema::new("character".to_string(), "Character".to_string()),
+        );
+        schema.add_object_type(
+            "location".to_string(),
+            ObjectTypeSchema::new("location".to_string(), "Location".to_string()),
+        );
+        schema.add_edge_type(
+            "protects".to_string(),
+            u_forge_core::EdgeTypeSchema::new("protects".to_string(), "Guards a place".to_string())
+                .with_source_types(vec!["character".to_string()])
+                .with_target_types(vec!["location".to_string()]),
+        );
+        schema.add_edge_type(
+            "knows".to_string(),
+            u_forge_core::EdgeTypeSchema::new(
+                "knows".to_string(),
+                "Knows another character".to_string(),
+            )
+            .with_source_types(vec!["character".to_string()])
+            .with_target_types(vec!["character".to_string()]),
+        );
+        graph.get_schema_manager().save_schema(&schema).unwrap();
+
+        let guardian = graph
+            .add_object(ObjectMetadata::new(
+                "character".to_string(),
+                "Guardian".to_string(),
+            ))
+            .unwrap();
+        let sanctum = graph
+            .add_object(ObjectMetadata::new(
+                "location".to_string(),
+                "Sanctum".to_string(),
+            ))
+            .unwrap();
+        let intruder = graph
+            .add_object(ObjectMetadata::new(
+                "character".to_string(),
+                "Intruder".to_string(),
+            ))
+            .unwrap();
+        (graph, temp, guardian, sanctum, intruder)
+    }
 
     fn stage(status: SearchStageStatus, diagnostic: Option<&str>) -> SearchStageOutcome {
         SearchStageOutcome {
@@ -1957,6 +2109,113 @@ mod tests {
             .with_property("level".to_string(), "3".to_string());
         preflight_node_properties(&graph, &mut valid).unwrap();
         assert_eq!(valid.get_json_property("level"), Some(&json!(3.0)));
+    }
+
+    #[test]
+    fn upsert_edge_preflight_reports_sorted_schema_choices() {
+        let (graph, _temp, guardian, sanctum, _intruder) = graph_with_edge_contract();
+
+        let error = preflight_edge_contract(&graph, guardian, sanctum, "invented")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("Valid edge types: knows, protects"),
+            "{error}"
+        );
+        assert!(graph.get_relationships(guardian).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upsert_edge_preflight_reports_invalid_endpoint_pair() {
+        let (graph, _temp, guardian, _sanctum, intruder) = graph_with_edge_contract();
+
+        let error = preflight_edge_contract(&graph, guardian, intruder, "protects")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("character -> character"), "{error}");
+        assert!(
+            error.contains("does not allow target type 'character'"),
+            "{error}"
+        );
+        assert!(graph.get_relationships(guardian).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_edge_persists_and_reembeds_both_endpoints() {
+        let (graph, _temp, guardian, sanctum, _intruder) = graph_with_edge_contract();
+        let (queue, calls) = counting_embedding_queue();
+        let tool = super::UpsertEdgeTool::new(graph.clone(), queue, None);
+        let mut context = ToolContext::new();
+
+        let output = tool
+            .call(
+                &mut context,
+                json!({
+                    "source": guardian.to_string(),
+                    "target": sanctum.to_string(),
+                    "edge_type": "protects"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            output.contains("Guardian -[protects]-> Sanctum"),
+            "{output}"
+        );
+        assert_eq!(graph.get_relationships(guardian).unwrap().len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn upsert_self_edge_reembeds_endpoint_once() {
+        let (graph, _temp, guardian, _sanctum, _intruder) = graph_with_edge_contract();
+        let (queue, calls) = counting_embedding_queue();
+        let tool = super::UpsertEdgeTool::new(graph.clone(), queue, None);
+        let mut context = ToolContext::new();
+
+        tool.call(
+            &mut context,
+            json!({
+                "source": guardian.to_string(),
+                "target": guardian.to_string(),
+                "edge_type": "knows"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(graph.get_relationships(guardian).unwrap().len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_edge_cancellation_before_persistence_prevents_write() {
+        let (graph, _temp, guardian, sanctum, _intruder) = graph_with_edge_contract();
+        let queue = Arc::new(InferenceQueueBuilder::new().build());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let tool =
+            super::UpsertEdgeTool::new(graph.clone(), queue, None).with_cancellation(cancellation);
+        let mut context = ToolContext::new();
+
+        let error = tool
+            .call(
+                &mut context,
+                json!({
+                    "source": guardian.to_string(),
+                    "target": sanctum.to_string(),
+                    "edge_type": "protects"
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.to_lowercase().contains("cancel"), "{error}");
+        assert!(graph.get_relationships(guardian).unwrap().is_empty());
     }
 
     #[test]

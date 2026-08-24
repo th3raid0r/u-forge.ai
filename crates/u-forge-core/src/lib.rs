@@ -763,9 +763,14 @@ impl KnowledgeGraph {
         self.schema_manager.list_schemas()
     }
 
-    /// Return a compact, LLM-readable summary of **all** persisted schemas,
+    /// Return an unbounded LLM-readable summary of **all** persisted schemas,
     /// merged into a single prompt block.  Node/edge types from every schema
     /// are combined and deduplicated (later schemas win on conflicts).
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.1.1",
+        note = "use merged_schema_definition with request-bounded whole-record selection"
+    )]
     pub fn schema_prompt_summary_all(&self) -> String {
         self.merged_schema_definition()
             .ok()

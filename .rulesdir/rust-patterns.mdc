@@ -94,6 +94,11 @@ Fluent API for node construction in `src/builder.rs`. Convenience constructors:
 Always descriptive string literals (`"located_in"`, `"controls"`, `"offers"`).
 `EdgeType` is a transparent newtype `struct EdgeType(pub String)` — not an enum.
 
+The Rust representation is open-ended, but mutations are not freeform once an
+authoritative schema is loaded. Agent/editor/import callers must select a
+loaded edge type and satisfy its allowed source/target object-type pair; the
+graph facade revalidates both immediately before persistence.
+
 Backward compatibility is provided by the string newtype and its serde
 representation; no deprecated enum variants remain. Do not reintroduce a fixed
 relationship enum: TTRPG worldbuilding needs open-ended relationship labels.

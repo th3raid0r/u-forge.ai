@@ -46,12 +46,15 @@ impl SchemaDefinition {
         self.updated_at = chrono::Utc::now();
     }
 
-    /// Generate a compact, LLM-readable summary of this schema.
+    /// Generate an unbounded LLM-readable summary of this schema.
     ///
-    /// Intended for injection into a system prompt so the model knows which
-    /// node types and properties exist.  Edge types are intentionally omitted
-    /// because they are freeform — the model should use natural language labels
-    /// like "led_by" or "located_in" rather than picking from a fixed list.
+    /// Edge records include their authoritative endpoint constraints. Model
+    /// requests should use the agent's request-bounded whole-record selector
+    /// instead of this compatibility formatter.
+    #[deprecated(
+        since = "0.1.1",
+        note = "use structured SchemaDefinition with u_forge_agent::bounded_schema_summary"
+    )]
     pub fn prompt_summary(&self) -> String {
         let mut out = String::new();
         out.push_str("## Knowledge Graph Schema\n\n");
@@ -78,6 +81,30 @@ impl SchemaDefinition {
                     ps.description
                 ));
             }
+        }
+
+        out.push_str("\n### Edge Types\n");
+        let mut edge_types: Vec<(&String, &EdgeTypeSchema)> = self.edge_types.iter().collect();
+        edge_types.sort_by_key(|(name, _)| name.as_str());
+        for (edge_name, edge) in edge_types {
+            let mut sources = edge.allowed_source_types.clone();
+            let mut targets = edge.allowed_target_types.clone();
+            sources.sort();
+            targets.sort();
+            let sources = if sources.is_empty() {
+                "any".to_string()
+            } else {
+                sources.join(", ")
+            };
+            let targets = if targets.is_empty() {
+                "any".to_string()
+            } else {
+                targets.join(", ")
+            };
+            out.push_str(&format!(
+                "- **{edge_name}**: {}; sources: [{sources}]; targets: [{targets}]; bidirectional: {}\n",
+                edge.description, edge.bidirectional
+            ));
         }
 
         out
@@ -765,5 +792,15 @@ mod tests {
 
         assert!(!result.valid);
         assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_prompt_summary_includes_authoritative_edge_constraints() {
+        let summary = SchemaDefinition::create_default().prompt_summary();
+        assert!(summary.contains("### Edge Types"));
+        assert!(summary.contains("**knows**"));
+        assert!(summary.contains("sources: [character]"));
+        assert!(summary.contains("targets: [character]"));
     }
 }
