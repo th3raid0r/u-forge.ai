@@ -18,13 +18,13 @@ use crate::error::{
 };
 use crate::ingest::EmbeddingTarget;
 use crate::schema::SchemaDefinition;
-use crate::types::{ChunkType, ObjectId, ObjectMetadata};
+use crate::types::{ChunkId, ChunkType, Edge, EdgeType, ObjectId, ObjectMetadata, TextChunk};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::Path;
 use std::sync::{Arc, Once};
-use tracing::warn;
+use tracing::{debug, warn};
 
 // ─── SQL schema ───────────────────────────────────────────────────────────────
 
@@ -322,33 +322,129 @@ pub(super) fn str_to_chunk_type(s: &str) -> ChunkType {
     }
 }
 
-/// Build an `ObjectMetadata` from the seven column values returned by every
-/// `SELECT … FROM nodes` query.  Centralising this avoids repeating
-/// fallible parsing logic across multiple methods.
-pub(super) fn row_to_metadata(
-    id_str: String,
+/// Raw values in the canonical seven-column node projection.
+pub(super) struct RawNodeRow {
+    id: String,
     object_type: String,
     schema_name: Option<String>,
     name: String,
-    props_str: String,
-    created_at_str: String,
-    updated_at_str: String,
-) -> Result<ObjectMetadata> {
-    Ok(ObjectMetadata {
-        id: ObjectId::parse_str(&id_str)
-            .with_context(|| format!("Invalid UUID in nodes table: '{id_str}'"))?,
-        object_type,
-        schema_name,
-        name,
-        properties: serde_json::from_str(&props_str)
-            .with_context(|| format!("Invalid properties JSON: '{props_str}'"))?,
-        created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
-            .with_context(|| format!("Invalid created_at timestamp: '{created_at_str}'"))?
-            .with_timezone(&chrono::Utc),
-        updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at_str)
-            .with_context(|| format!("Invalid updated_at timestamp: '{updated_at_str}'"))?
-            .with_timezone(&chrono::Utc),
-    })
+    properties: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl RawNodeRow {
+    pub(super) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            object_type: row.get(1)?,
+            schema_name: row.get(2)?,
+            name: row.get(3)?,
+            properties: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    }
+
+    pub(super) fn into_metadata(self) -> Result<ObjectMetadata> {
+        Ok(ObjectMetadata {
+            id: ObjectId::parse_str(&self.id)
+                .with_context(|| format!("Invalid UUID in nodes table: '{}'", self.id))?,
+            object_type: self.object_type,
+            schema_name: self.schema_name,
+            name: self.name,
+            properties: serde_json::from_str(&self.properties)
+                .with_context(|| format!("Invalid properties JSON: '{}'", self.properties))?,
+            created_at: chrono::DateTime::parse_from_rfc3339(&self.created_at)
+                .with_context(|| format!("Invalid created_at timestamp: '{}'", self.created_at))?
+                .with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&self.updated_at)
+                .with_context(|| format!("Invalid updated_at timestamp: '{}'", self.updated_at))?
+                .with_timezone(&chrono::Utc),
+        })
+    }
+}
+
+/// Raw values in the canonical six-column chunk projection.
+pub(super) struct RawChunkRow {
+    id: String,
+    object_id: String,
+    chunk_type: String,
+    content: String,
+    token_count: i64,
+    created_at: String,
+}
+
+impl RawChunkRow {
+    pub(super) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            object_id: row.get(1)?,
+            chunk_type: row.get(2)?,
+            content: row.get(3)?,
+            token_count: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    }
+
+    pub(super) fn into_chunk(self) -> Result<TextChunk> {
+        Ok(TextChunk {
+            id: ChunkId::parse_str(&self.id)
+                .with_context(|| format!("Invalid chunk UUID: '{}'", self.id))?,
+            object_id: ObjectId::parse_str(&self.object_id)
+                .with_context(|| format!("Invalid object UUID in chunk: '{}'", self.object_id))?,
+            chunk_type: str_to_chunk_type(&self.chunk_type),
+            content: self.content,
+            token_count: self.token_count as usize,
+            created_at: chrono::DateTime::parse_from_rfc3339(&self.created_at)
+                .with_context(|| format!("Invalid chunk created_at: '{}'", self.created_at))?
+                .with_timezone(&chrono::Utc),
+        })
+    }
+}
+
+/// Raw values in the canonical six-column edge projection.
+pub(super) struct RawEdgeRow {
+    source_id: String,
+    target_id: String,
+    edge_type: String,
+    weight: f64,
+    metadata: String,
+    created_at: String,
+}
+
+impl RawEdgeRow {
+    pub(super) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            source_id: row.get(0)?,
+            target_id: row.get(1)?,
+            edge_type: row.get(2)?,
+            weight: row.get(3)?,
+            metadata: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    }
+
+    pub(super) fn into_edge(self) -> Result<Edge> {
+        let metadata = serde_json::from_str(&self.metadata).unwrap_or_else(|error| {
+            debug!("Edge metadata JSON parse failed (using empty): {error}");
+            Default::default()
+        });
+        Ok(Edge {
+            from: ObjectId::parse_str(&self.source_id).with_context(|| {
+                format!("Invalid source UUID in edges table: '{}'", self.source_id)
+            })?,
+            to: ObjectId::parse_str(&self.target_id).with_context(|| {
+                format!("Invalid target UUID in edges table: '{}'", self.target_id)
+            })?,
+            edge_type: EdgeType::new(self.edge_type),
+            weight: self.weight as f32,
+            metadata,
+            created_at: chrono::DateTime::parse_from_rfc3339(&self.created_at)
+                .with_context(|| format!("Invalid edge created_at: '{}'", self.created_at))?
+                .with_timezone(&chrono::Utc),
+        })
+    }
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -1159,6 +1255,132 @@ mod tests {
         let result_iso = storage.query_subgraph(pippin.id, 3).unwrap();
         assert_eq!(result_iso.objects.len(), 1);
         assert!(result_iso.edges.is_empty());
+    }
+
+    // ── Raw row codec corruption handling ────────────────────────────────────
+
+    #[test]
+    fn corrupt_node_rows_preserve_parse_diagnostics() {
+        let (storage, _dir) = create_test_storage();
+        let node = ObjectMetadata::new("character".to_string(), "Corruptible".to_string());
+        let node_id = node.id;
+        let created_at = node.created_at.to_rfc3339();
+        storage.upsert_node(node).unwrap();
+
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE nodes SET id = 'broken-node-id' WHERE id = ?1",
+                params![node_id.hyphenated().to_string()],
+            )
+            .unwrap();
+        }
+        let error = storage.get_all_objects().unwrap_err().to_string();
+        assert!(error.contains("Invalid UUID in nodes table: 'broken-node-id'"));
+
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE nodes SET id = ?1, created_at = 'broken-created-at' \
+                 WHERE id = 'broken-node-id'",
+                params![node_id.hyphenated().to_string()],
+            )
+            .unwrap();
+        }
+        let error = storage.get_node(node_id).unwrap_err().to_string();
+        assert!(error.contains("Invalid created_at timestamp: 'broken-created-at'"));
+
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE nodes SET created_at = ?1, properties = '{broken-json' WHERE id = ?2",
+                params![created_at, node_id.hyphenated().to_string()],
+            )
+            .unwrap();
+        }
+        let error = storage.get_node(node_id).unwrap_err().to_string();
+        assert!(error.contains("Invalid properties JSON: '{broken-json'"));
+    }
+
+    #[test]
+    fn corrupt_chunk_rows_preserve_parse_diagnostics() {
+        let (storage, _dir) = create_test_storage();
+        let node = ObjectMetadata::new("location".to_string(), "Corruptible".to_string());
+        storage.upsert_node(node.clone()).unwrap();
+        let chunk = TextChunk::new(
+            node.id,
+            "Persisted content.".to_string(),
+            ChunkType::Description,
+        );
+        let chunk_id = chunk.id;
+        storage.upsert_chunk(chunk).unwrap();
+
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE chunks SET id = 'broken-chunk-id' WHERE id = ?1",
+                params![chunk_id.hyphenated().to_string()],
+            )
+            .unwrap();
+        }
+        let error = storage
+            .get_chunks_for_node(node.id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Invalid chunk UUID: 'broken-chunk-id'"));
+
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE chunks SET id = ?1, created_at = 'broken-chunk-time' \
+                 WHERE id = 'broken-chunk-id'",
+                params![chunk_id.hyphenated().to_string()],
+            )
+            .unwrap();
+        }
+        let error = storage
+            .get_chunks_for_node(node.id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Invalid chunk created_at: 'broken-chunk-time'"));
+    }
+
+    #[test]
+    fn corrupt_edge_metadata_falls_back_but_timestamps_fail_closed() {
+        let (storage, _dir) = create_test_storage();
+        let source = ObjectMetadata::new("character".to_string(), "Source".to_string());
+        let target = ObjectMetadata::new("location".to_string(), "Target".to_string());
+        storage.upsert_node(source.clone()).unwrap();
+        storage.upsert_node(target.clone()).unwrap();
+        storage
+            .upsert_edge(Edge::new(source.id, target.id, EdgeType::new("visits")))
+            .unwrap();
+
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE edges SET metadata = '{broken-json' WHERE source_id = ?1",
+                params![source.id.hyphenated().to_string()],
+            )
+            .unwrap();
+        }
+        let incident = storage.get_edges(source.id).unwrap();
+        assert_eq!(incident.len(), 1);
+        assert!(incident[0].metadata.is_empty());
+        let all = storage.get_all_edges().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].metadata.is_empty());
+
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE edges SET created_at = 'broken-edge-time' WHERE source_id = ?1",
+                params![source.id.hyphenated().to_string()],
+            )
+            .unwrap();
+        }
+        let error = storage.get_all_edges().unwrap_err().to_string();
+        assert!(error.contains("Invalid edge created_at: 'broken-edge-time'"));
     }
 
     // ── Semantic (vector) search ──────────────────────────────────────────────

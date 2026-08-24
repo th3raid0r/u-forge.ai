@@ -4,7 +4,7 @@ use super::storage::*;
 use anyhow::{Context, Result};
 use rusqlite::params;
 
-use crate::types::{ChunkId, ObjectId, TextChunk};
+use crate::types::{ObjectId, TextChunk};
 
 impl KnowledgeGraphStorage {
     /// Insert or update a text chunk.
@@ -64,31 +64,10 @@ impl KnowledgeGraphStorage {
              WHERE v.rowid IS NULL",
             descriptor.table
         ))?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map([], RawChunkRow::from_row)?;
         let mut chunks = Vec::new();
         for row in rows {
-            let (id_s, obj_s, ct_s, content, token_count, ca_s) = row?;
-            chunks.push(TextChunk {
-                id: ChunkId::parse_str(&id_s)
-                    .with_context(|| format!("Invalid chunk UUID: '{id_s}'"))?,
-                object_id: ObjectId::parse_str(&obj_s)
-                    .with_context(|| format!("Invalid object UUID in chunk: '{obj_s}'"))?,
-                chunk_type: str_to_chunk_type(&ct_s),
-                content,
-                token_count: token_count as usize,
-                created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
-                    .with_context(|| format!("Invalid chunk created_at: '{ca_s}'"))?
-                    .with_timezone(&chrono::Utc),
-            });
+            chunks.push(row?.into_chunk()?);
         }
         Ok(chunks)
     }
@@ -102,32 +81,11 @@ impl KnowledgeGraphStorage {
              FROM chunks
              WHERE object_id = ?1",
         )?;
-        let rows = stmt.query_map(params![id_str], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![id_str], RawChunkRow::from_row)?;
 
         let mut chunks = Vec::new();
         for row in rows {
-            let (id_s, obj_s, ct_s, content, token_count, ca_s) = row?;
-            chunks.push(TextChunk {
-                id: ChunkId::parse_str(&id_s)
-                    .with_context(|| format!("Invalid chunk UUID: '{id_s}'"))?,
-                object_id: ObjectId::parse_str(&obj_s)
-                    .with_context(|| format!("Invalid object UUID in chunk: '{obj_s}'"))?,
-                chunk_type: str_to_chunk_type(&ct_s),
-                content,
-                token_count: token_count as usize,
-                created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
-                    .with_context(|| format!("Invalid chunk created_at: '{ca_s}'"))?
-                    .with_timezone(&chrono::Utc),
-            });
+            chunks.push(row?.into_chunk()?);
         }
         Ok(chunks)
     }
