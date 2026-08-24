@@ -13,18 +13,17 @@ use gpui::{
 };
 use parking_lot::RwLock;
 use tracing::Instrument;
-use u_forge_agent::{AgentParams, GraphAgent};
+use u_forge_agent::GraphAgent;
 use u_forge_core::{
     AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, KnowledgeGraph, ObjectMetadata,
     SchemaManager,
     ingest::build_hq_embed_queue_with_connection,
     lemonade::{
-        Capability, EffectiveChatLimits, EmbeddedLemonade, GpuResourceManager,
-        LemonadeChatProvider, LemonadeConnection, LemonadeManagement, LemonadeOwnership,
-        LemonadeRuntime, LemonadeServerCatalog, ManagementEventKind, ManagementProgressEvent,
-        ModelSelector, ProviderFactory, QualityTier, SetupRole, chat_component_state,
-        component_state, initial_setup_components, resolve_runtime_connection,
-        select_setup_backend,
+        Capability, EmbeddedLemonade, GpuResourceManager, LemonadeChatProvider, LemonadeConnection,
+        LemonadeManagement, LemonadeOwnership, LemonadeRuntime, LemonadeServerCatalog,
+        ManagementEventKind, ManagementProgressEvent, ModelSelector, ProviderFactory, QualityTier,
+        SetupRole, chat_component_state, component_state, initial_setup_components,
+        resolve_runtime_connection, select_setup_backend,
     },
     queue::{CancellationToken, InferenceQueueBuilder},
     types::ObjectId,

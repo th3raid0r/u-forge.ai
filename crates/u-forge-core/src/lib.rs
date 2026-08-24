@@ -25,7 +25,6 @@ pub mod ingest;
 pub mod lemonade;
 pub mod mutation;
 pub mod queue;
-pub mod rag;
 pub mod schema;
 pub mod search;
 pub(crate) mod text;
@@ -64,7 +63,6 @@ pub use lemonade::{
     StreamToken, SttGuard, TranscriptionResult, load_model, reload_model,
 };
 pub use mutation::{GraphChange, GraphMutation};
-pub use rag::{RagContext, build_rag_messages, format_search_context};
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertyIssue, PropertySchema, PropertyType,
     SchemaDefinition, SchemaIngestion, SchemaManager, SchemaStats, ValidationResult,
@@ -753,21 +751,6 @@ impl KnowledgeGraph {
     /// Names of all schemas currently persisted.
     pub fn list_schemas(&self) -> Result<Vec<String>> {
         self.schema_manager.list_schemas()
-    }
-
-    /// Return an unbounded LLM-readable summary of **all** persisted schemas,
-    /// merged into a single prompt block.  Node/edge types from every schema
-    /// are combined and deduplicated (later schemas win on conflicts).
-    #[allow(deprecated)]
-    #[deprecated(
-        since = "0.1.1",
-        note = "use merged_schema_definition with request-bounded whole-record selection"
-    )]
-    pub fn schema_prompt_summary_all(&self) -> String {
-        self.merged_schema_definition()
-            .ok()
-            .flatten()
-            .map_or_else(String::new, |schema| schema.prompt_summary())
     }
 
     /// Merge every persisted schema into one virtual definition.

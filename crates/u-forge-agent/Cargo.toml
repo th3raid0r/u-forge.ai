@@ -2,6 +2,7 @@
 name = "u-forge-agent"
 version = "0.1.1"
 edition = "2024"
+publish = false
 
 [dependencies]
 u-forge-core = { path = "../u-forge-core" }

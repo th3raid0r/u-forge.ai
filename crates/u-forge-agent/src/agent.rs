@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rig::client::AgentClientExt;
-use rig::completion::{Prompt, PromptError};
+
 use rig::providers::openai::CompletionsClient;
 use u_forge_core::queue::{CancellationToken, InferenceQueue};
 use u_forge_core::{EffectiveAgentBudget, KnowledgeGraph};
@@ -89,8 +89,8 @@ impl Default for AgentParams {
 /// A configured agent backed by the three graph search tools.
 ///
 /// Wraps a rig `CompletionsClient` pointed at Lemonade's OpenAI-compatible
-/// endpoint. Each call to [`GraphAgent::prompt`] builds a fresh rig agent,
-/// runs the multi-turn tool loop (search ↔ LLM), and returns the final text.
+/// endpoint. Each cancellable streaming operation builds a fresh Rig agent and
+/// runs the multi-turn search and mutation tool loop.
 ///
 /// `Clone` is cheap — the inner client and Arc handles are reference-counted.
 #[derive(Clone)]
@@ -103,7 +103,6 @@ pub struct GraphAgent {
     tool_guidance: String,
     schema: Option<u_forge_core::SchemaDefinition>,
     tool_definition_tokens: TokenEstimate,
-    pub(crate) params: AgentParams,
     pub(crate) gpu: Option<Arc<u_forge_core::GpuResourceManager>>,
 }
 
@@ -116,12 +115,11 @@ impl GraphAgent {
         queue: Arc<InferenceQueue>,
         hq_queue: Option<Arc<InferenceQueue>>,
         system_prompt: impl Into<String>,
-        params: AgentParams,
     ) -> anyhow::Result<Self> {
         let connection = Arc::new(u_forge_core::lemonade::LemonadeConnection::external(
             lemonade_url,
         )?);
-        Self::new_with_connection(connection, graph, queue, hq_queue, system_prompt, params)
+        Self::new_with_connection(connection, graph, queue, hq_queue, system_prompt)
     }
 
     pub fn new_with_connection(
@@ -130,17 +128,8 @@ impl GraphAgent {
         queue: Arc<InferenceQueue>,
         hq_queue: Option<Arc<InferenceQueue>>,
         system_prompt: impl Into<String>,
-        params: AgentParams,
     ) -> anyhow::Result<Self> {
-        Self::new_with_connection_and_gpu(
-            connection,
-            graph,
-            queue,
-            hq_queue,
-            system_prompt,
-            params,
-            None,
-        )
+        Self::new_with_connection_and_gpu(connection, graph, queue, hq_queue, system_prompt, None)
     }
 
     pub fn new_with_connection_and_gpu(
@@ -149,7 +138,6 @@ impl GraphAgent {
         queue: Arc<InferenceQueue>,
         hq_queue: Option<Arc<InferenceQueue>>,
         system_prompt: impl Into<String>,
-        params: AgentParams,
         gpu: Option<Arc<u_forge_core::GpuResourceManager>>,
     ) -> anyhow::Result<Self> {
         let client = CompletionsClient::builder()
@@ -184,7 +172,6 @@ impl GraphAgent {
             tool_guidance,
             schema,
             tool_definition_tokens: budget::estimate_tool_definitions(&tool_definitions),
-            params,
             gpu,
         })
     }
@@ -319,44 +306,5 @@ impl GraphAgent {
                 .with_cancellation(cancellation),
             )
             .build()
-    }
-}
-
-impl GraphAgent {
-    /// Run the agent tool loop for a single user message (non-streaming).
-    ///
-    /// Uses the same tools and sampling parameters as [`prompt_stream`].
-    pub async fn prompt(
-        &self,
-        model_id: &str,
-        user_message: &str,
-        history: &[HistoryMessage],
-    ) -> Result<String, String> {
-        let (budget, selected_history) = self.prepare_budget(user_message, history, &self.params);
-        let agent = self.build_agent_with_params(
-            model_id,
-            u_forge_core::ReasoningPolicy::Enabled,
-            &self.params,
-            CancellationToken::new(),
-            budget.clone(),
-        );
-        let rig_history: Vec<rig::completion::message::Message> = selected_history
-            .iter()
-            .map(|m| match m.role.as_str() {
-                "assistant" => rig::completion::message::Message::assistant(&m.content),
-                "system" => rig::completion::message::Message::system(&m.content),
-                _ => rig::completion::message::Message::user(&m.content),
-            })
-            .collect();
-        agent
-            .prompt(user_message)
-            .history(rig_history)
-            .max_turns(self.params.max_tool_turns)
-            .await
-            .map_err(|e: PromptError| match budget.termination() {
-                Some(budget::BudgetTermination::Budget(reason))
-                | Some(budget::BudgetTermination::Repeat(reason)) => reason,
-                None => e.to_string(),
-            })
     }
 }

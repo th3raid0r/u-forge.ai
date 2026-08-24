@@ -19,7 +19,6 @@ struct LemonadeActivation {
     llm_models: Vec<AvailableModel>,
     preferred_idx: usize,
     runtime: Arc<LemonadeRuntime>,
-    effective_limits: Option<EffectiveChatLimits>,
 }
 
 struct LemonadeChatActivation {
@@ -418,9 +417,7 @@ async fn activate_lemonade_capabilities(
             )
         })
         .collect::<Vec<_>>();
-    let effective_limits = llm_models
-        .get(preferred_idx)
-        .and_then(|model| model.effective_limits.clone());
+
     let chat_provider = all_llm.get(preferred_idx).map(|selected| {
         let gpu = (selected_model_device(selected) == "gpu").then(|| Arc::clone(&gpu_manager));
         LemonadeChatProvider::from_connection(connection.clone(), &selected.model_id, gpu)
@@ -437,7 +434,6 @@ async fn activate_lemonade_capabilities(
         llm_models,
         preferred_idx,
         runtime: Arc::new(LemonadeRuntime::from_connection(connection)),
-        effective_limits,
     })
 }
 
@@ -1158,7 +1154,6 @@ impl AppView {
             llm_models,
             preferred_idx,
             runtime,
-            effective_limits,
         } = activation;
         let has_embedding =
             queue.has_embedding() || hq_queue.as_ref().is_some_and(|queue| queue.has_embedding());
@@ -1173,30 +1168,7 @@ impl AppView {
         let agent_gpu = chat_provider
             .as_ref()
             .and_then(|provider| provider.gpu.clone());
-        let developer = llm_models
-            .get(preferred_idx)
-            .map(|model| &model.sampling)
-            .unwrap_or_else(|| self.state.app_config.chat.active_device_config());
-        let agent_params = AgentParams {
-            temperature: developer.temperature.map(f64::from),
-            max_tokens: effective_limits
-                .as_ref()
-                .map(|limits| limits.agent_generation as u64)
-                .or_else(|| developer.max_tokens.map(u64::from)),
-            top_p: developer.top_p.map(f64::from),
-            top_k: developer.top_k,
-            min_p: developer.min_p.map(f64::from),
-            frequency_penalty: developer.frequency_penalty.map(f64::from),
-            presence_penalty: developer.presence_penalty.map(f64::from),
-            repetition_penalty: developer.repetition_penalty.map(f64::from),
-            seed: developer.seed,
-            stop: developer.stop.clone(),
-            max_tool_turns: self.state.app_config.chat.max_tool_turns,
-            budget: llm_models
-                .get(preferred_idx)
-                .map(|model| model.agent_budget.clone())
-                .unwrap_or_default(),
-        };
+
         if has_chat {
             match GraphAgent::new_with_connection_and_gpu(
                 runtime.connection().clone(),
@@ -1204,7 +1176,6 @@ impl AppView {
                 Arc::new(queue),
                 hq_arc,
                 self.state.app_config.chat.system_prompt.clone(),
-                agent_params,
                 agent_gpu,
             ) {
                 Ok(agent) => self

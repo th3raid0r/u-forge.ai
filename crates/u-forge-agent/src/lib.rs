@@ -22,7 +22,5 @@ pub use tools::{
     SemanticSearchTool, ToolError, UpsertEdgeArgs, UpsertEdgeTool, UpsertNodeArgs, UpsertNodeTool,
 };
 
-pub use rig;
-
 #[cfg(test)]
 mod tests;

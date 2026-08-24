@@ -13,9 +13,11 @@ High-level architecture, data model, storage schema, inference design, and desig
 | `u-forge-ui-traits` | lib | Complete | Framework-agnostic rendering contracts (`DrawCommands`, `Viewport`, `generate_draw_commands`) |
 | `u-forge` | lib + bin | Alpha | Authoritative application package; currently the GPUI native desktop app — DM workspace, World Canvas, Details editing, search, chat, and managed setup |
 | `u-forge-agent` | lib | Complete | Rig-based LLM agent with five graph tools and streaming event loop |
-| `u-forge-ts-runtime` | lib | Skeleton | Embedded deno_core TypeScript sandbox — not started |
 
-`defaults/` (schemas + sample data) lives at the workspace root.
+All first-party crates are internal workspace packages with `publish = false`.
+Their Rust visibility supports workspace boundaries and is not a stable SDK
+compatibility promise. `defaults/` (schemas + sample data) lives at the
+workspace root.
 
 ---
 
@@ -268,7 +270,7 @@ FTS5 instead of querying incompatible vectors.
 
 ## Schema System (`src/schema/`)
 
-`SchemaDefinition` holds named maps of `ObjectTypeSchema` and `EdgeTypeSchema`. `prompt_summary()` generates a compact markdown block (node types with property names/types/required flags + edge types) for system prompt injection.
+`SchemaDefinition` holds named maps of `ObjectTypeSchema` and `EdgeTypeSchema`.
 
 `SchemaManager` caches schemas in `parking_lot::RwLock<HashMap>`. Validation
 helpers (`is_valid_object_type`, `all_object_type_names`, etc.) read from the
@@ -280,9 +282,7 @@ drops undeclared properties and skips records that reference unknown types,
 omit required properties, or use invalid edge endpoints.
 
 `KnowledgeGraph::merged_schema_definition()` merges all persisted schemas into
-the structured definition consumed by `GraphAgent`; the legacy
-`schema_prompt_summary_all()` convenience method still returns the complete
-unbounded text summary.
+the structured definition consumed by `GraphAgent`.
 
 Agent schema injection uses whatever room remains in the active model context.
 `u-forge-agent::budget` selects complete object/edge records, with types named
@@ -502,10 +502,9 @@ and server-decorated Linux; GNOME X11 is unsupported.
   on Linux and renders title bar/frame/resize geometry only when GPUI reports
   client-side mode. Server-decorated geometry remains unchanged; GNOME X11 is
   outside the supported configuration set.
-- **The TypeScript runtime is a stub** — `u-forge-ts-runtime` has no V8 or
-  `deno_core` implementation and participates in the workspace only as a
-  placeholder crate. Its approved-design gate is
-  `.plans/feature_TS-Agent-Sandbox.md`.
+- **The TypeScript runtime is design-gated** — no runtime crate exists until
+  `.plans/feature_TS-Agent-Sandbox.md` records an approved `deno_core` API,
+  threat model, resource controls, and v1 operation surface.
 
 ---
 

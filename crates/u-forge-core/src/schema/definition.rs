@@ -46,70 +46,6 @@ impl SchemaDefinition {
         self.updated_at = chrono::Utc::now();
     }
 
-    /// Generate an unbounded LLM-readable summary of this schema.
-    ///
-    /// Edge records include their authoritative endpoint constraints. Model
-    /// requests should use the agent's request-bounded whole-record selector
-    /// instead of this compatibility formatter.
-    #[deprecated(
-        since = "0.1.1",
-        note = "use structured SchemaDefinition with u_forge_agent::bounded_schema_summary"
-    )]
-    pub fn prompt_summary(&self) -> String {
-        let mut out = String::new();
-        out.push_str("## Knowledge Graph Schema\n\n");
-
-        // --- Node types -------------------------------------------------
-        out.push_str("### Node Types\n");
-        let mut node_types: Vec<(&String, &ObjectTypeSchema)> = self.object_types.iter().collect();
-        node_types.sort_by_key(|(k, _)| k.as_str());
-        for (type_name, ots) in &node_types {
-            out.push_str(&format!("- **{}**: {}\n", type_name, ots.description));
-            let mut props: Vec<(&String, &PropertySchema)> = ots.properties.iter().collect();
-            props.sort_by_key(|(k, _)| k.as_str());
-            for (prop_name, ps) in &props {
-                let req = if ots.required_properties.contains(prop_name) {
-                    " (required)"
-                } else {
-                    ""
-                };
-                out.push_str(&format!(
-                    "  - `{}` ({}){}: {}\n",
-                    prop_name,
-                    ps.property_type.name(),
-                    req,
-                    ps.description
-                ));
-            }
-        }
-
-        out.push_str("\n### Edge Types\n");
-        let mut edge_types: Vec<(&String, &EdgeTypeSchema)> = self.edge_types.iter().collect();
-        edge_types.sort_by_key(|(name, _)| name.as_str());
-        for (edge_name, edge) in edge_types {
-            let mut sources = edge.allowed_source_types.clone();
-            let mut targets = edge.allowed_target_types.clone();
-            sources.sort();
-            targets.sort();
-            let sources = if sources.is_empty() {
-                "any".to_string()
-            } else {
-                sources.join(", ")
-            };
-            let targets = if targets.is_empty() {
-                "any".to_string()
-            } else {
-                targets.join(", ")
-            };
-            out.push_str(&format!(
-                "- **{edge_name}**: {}; sources: [{sources}]; targets: [{targets}]; bidirectional: {}\n",
-                edge.description, edge.bidirectional
-            ));
-        }
-
-        out
-    }
-
     /// Create a default D&D 5e-style schema based on current hardcoded types
     pub fn create_default() -> Self {
         let mut schema = Self::new(
@@ -792,15 +728,5 @@ mod tests {
 
         assert!(!result.valid);
         assert_eq!(result.errors.len(), 1);
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn legacy_prompt_summary_includes_authoritative_edge_constraints() {
-        let summary = SchemaDefinition::create_default().prompt_summary();
-        assert!(summary.contains("### Edge Types"));
-        assert!(summary.contains("**knows**"));
-        assert!(summary.contains("sources: [character]"));
-        assert!(summary.contains("targets: [character]"));
     }
 }

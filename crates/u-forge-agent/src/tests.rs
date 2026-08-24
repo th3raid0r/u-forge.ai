@@ -63,15 +63,8 @@ async fn tool_catalog_matches_validation_budget_and_rig_registration() {
     let graph = Arc::new(KnowledgeGraph::new(temp.path()).unwrap());
     let queue = Arc::new(InferenceQueueBuilder::new().build());
     let params = AgentParams::default();
-    let graph_agent = GraphAgent::new(
-        "http://127.0.0.1:13305/api/v1",
-        graph,
-        queue,
-        None,
-        "test",
-        params.clone(),
-    )
-    .unwrap();
+    let graph_agent =
+        GraphAgent::new("http://127.0.0.1:13305/api/v1", graph, queue, None, "test").unwrap();
     let (budget, _) = graph_agent.prepare_budget("test", &[], &params);
     let rig_agent = graph_agent.build_agent_with_params(
         "test-model",
