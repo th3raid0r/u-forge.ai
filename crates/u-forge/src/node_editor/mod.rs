@@ -21,6 +21,72 @@ pub(crate) use field_spec::{EditableEdge, EditorTab};
 pub(crate) struct CloseDirtyTabRequested(pub usize);
 impl gpui::EventEmitter<CloseDirtyTabRequested> for NodeEditorPanel {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorSaveFailureStage {
+    SchemaValidation,
+    Persistence,
+}
+
+impl EditorSaveFailureStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SchemaValidation => "schema validation",
+            Self::Persistence => "persistence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorSaveFailure {
+    node_id: ObjectId,
+    node_name: String,
+    stage: EditorSaveFailureStage,
+    message: String,
+}
+
+impl EditorSaveFailure {
+    fn user_message(&self) -> String {
+        let display_name = if self.node_name.trim().is_empty() {
+            format!("unnamed node {}", self.node_id)
+        } else {
+            format!("\"{}\"", self.node_name)
+        };
+        format!(
+            "Could not save {display_name} during {}: {}",
+            self.stage.label(),
+            self.message
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EditorSaveResult {
+    pub(crate) saved: usize,
+    pub(crate) saved_ids: Vec<ObjectId>,
+    pub(crate) discarded_ids: Vec<ObjectId>,
+    pub(crate) skipped_edges: usize,
+    failures: Vec<EditorSaveFailure>,
+}
+
+impl EditorSaveResult {
+    pub(crate) fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    pub(crate) fn user_diagnostic(&self) -> Option<String> {
+        let first = self.failures.first()?;
+        if self.failures.len() == 1 {
+            Some(first.user_message())
+        } else {
+            Some(format!(
+                "Could not save {} nodes. First failure: {}",
+                self.failures.len(),
+                first.user_message()
+            ))
+        }
+    }
+}
+
 // ── Edge node-selector dropdown state ─────────────────────────────────────────
 
 /// Tracks the state of a filterable node-selector dropdown used when editing
@@ -423,49 +489,30 @@ impl NodeEditorPanel {
 
     /// Collect dirty tabs and save them to the DB.
     ///
-    /// Returns `(count, saved_ids, discarded_ids)`:
-    /// - `count`: how many nodes were actually persisted.
-    /// - `saved_ids`: ObjectIds that need re-chunking/re-embedding.
-    /// - `discarded_ids`: ObjectIds of empty in-memory drafts that were closed.
-    pub(crate) fn save_dirty_tabs(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+    /// The result includes persisted/discarded IDs, incomplete edges, and
+    /// actionable validation or persistence failures for AppView presentation.
+    pub(crate) fn save_dirty_tabs(&mut self, cx: &mut Context<Self>) -> EditorSaveResult {
         self.save_tabs(None, cx)
     }
 
-    pub(crate) fn save_active_tab(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+    pub(crate) fn save_active_tab(&mut self, cx: &mut Context<Self>) -> EditorSaveResult {
         let active = self.active_tab;
         self.save_tabs(active, cx)
     }
 
-    pub(crate) fn save_tab(
-        &mut self,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
+    pub(crate) fn save_tab(&mut self, index: usize, cx: &mut Context<Self>) -> EditorSaveResult {
         self.save_tabs(Some(index), cx)
     }
 
-    fn save_tabs(
-        &mut self,
-        target: Option<usize>,
-        cx: &mut Context<Self>,
-    ) -> (usize, Vec<ObjectId>, Vec<ObjectId>, usize) {
-        let mut saved = 0usize;
-        let mut saved_ids = Vec::new();
-        let mut discarded_ids = Vec::new();
-        let mut skipped_edges = 0usize;
+    fn save_tabs(&mut self, target: Option<usize>, cx: &mut Context<Self>) -> EditorSaveResult {
+        let mut result = EditorSaveResult::default();
 
         // First pass: identify empty-new tabs to discard.
         let mut discard_indices = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
             if target.is_none_or(|target| target == i) && tab.is_new && tab.name.trim().is_empty() {
                 discard_indices.push(i);
-                discarded_ids.push(tab.node_id);
+                result.discarded_ids.push(tab.node_id);
             }
         }
         // Empty drafts have never reached storage; removing their tabs is enough.
@@ -491,66 +538,45 @@ impl NodeEditorPanel {
             if !tab.dirty || target.is_some_and(|target| target != index) {
                 continue;
             }
-            let mut meta = tab.original.clone();
-            meta.name = tab
-                .edited_values
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&meta.name)
-                .to_string();
-            // Rebuild properties JSON from all edited values except "name"
-            // (which is a top-level field). All schema properties — including
-            // "description" and "tags" — are stored uniformly in properties.
-            let mut props = serde_json::Map::new();
-            for (k, v) in &tab.edited_values {
-                if k == "name" {
+            let meta = match persist_editor_values(
+                &self.graph,
+                &tab.original,
+                &tab.edited_values,
+                tab.is_new,
+            ) {
+                Ok(meta) => meta,
+                Err(failure) => {
+                    tracing::warn!(
+                        node_id = %failure.node_id,
+                        node_name = failure.node_name,
+                        stage = failure.stage.label(),
+                        error = failure.message,
+                        "Node save failed"
+                    );
+                    result.failures.push(failure);
                     continue;
                 }
-                // Drop empty strings for description so the key stays absent
-                // rather than storing an empty string.
-                if k == "description" && v.as_str().is_some_and(|s| s.is_empty()) {
-                    continue;
-                }
-                props.insert(k.clone(), v.clone());
-            }
-            // Validate and coerce properties against the schema.
-            let issues = self
-                .graph
-                .validate_and_coerce_properties(&meta.object_type, &mut props);
-            if !issues.is_empty() {
-                for issue in &issues {
-                    tracing::warn!(node_id = %meta.id, %issue, "Node save blocked by schema issue");
-                }
-                continue;
-            }
-            meta.properties = serde_json::Value::Object(props);
-
-            let persist_result = if tab.is_new {
-                self.graph.add_object(meta.clone()).map(|_| ())
-            } else {
-                self.graph.update_object(meta.clone())
             };
-            if persist_result.is_ok() {
-                // ── Save edge changes ─────────────────────────────────────
-                skipped_edges += Self::save_edges_for_tab(&self.graph, tab);
 
-                saved_ids.push(tab.node_id);
-                tab.original = meta;
-                tab.dirty = false;
-                tab.is_new = false;
+            // ── Save edge changes ─────────────────────────────────────────
+            result.skipped_edges += Self::save_edges_for_tab(&self.graph, tab);
 
-                // Refresh original_edges so subsequent dirty checks are correct.
-                tab.original_edges = self
-                    .graph
-                    .get_relationships(tab.node_id)
-                    .unwrap_or_default();
+            result.saved_ids.push(tab.node_id);
+            tab.original = meta;
+            tab.dirty = false;
+            tab.is_new = false;
 
-                saved += 1;
-            }
+            // Refresh original_edges so subsequent dirty checks are correct.
+            tab.original_edges = self
+                .graph
+                .get_relationships(tab.node_id)
+                .unwrap_or_default();
+
+            result.saved += 1;
         }
         cx.notify();
         self.rebuild_field_subscriptions(cx);
-        (saved, saved_ids, discarded_ids, skipped_edges)
+        result
     }
 
     /// Persist edge changes for a single tab: delete removed edges and add new ones.
@@ -889,6 +915,62 @@ impl NodeEditorPanel {
     }
 }
 
+fn persist_editor_values(
+    graph: &KnowledgeGraph,
+    original: &ObjectMetadata,
+    edited_values: &HashMap<String, serde_json::Value>,
+    is_new: bool,
+) -> Result<ObjectMetadata, EditorSaveFailure> {
+    let mut metadata = original.clone();
+    metadata.name = edited_values
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&metadata.name)
+        .to_string();
+
+    // Rebuild properties from edited values. `name` remains top-level, while
+    // every schema property (including description/tags) stays in the JSON map.
+    let mut properties = serde_json::Map::new();
+    for (key, value) in edited_values {
+        if key == "name" {
+            continue;
+        }
+        if key == "description" && value.as_str().is_some_and(str::is_empty) {
+            continue;
+        }
+        properties.insert(key.clone(), value.clone());
+    }
+
+    let issues = graph.validate_and_coerce_properties(&metadata.object_type, &mut properties);
+    if !issues.is_empty() {
+        return Err(EditorSaveFailure {
+            node_id: metadata.id,
+            node_name: metadata.name,
+            stage: EditorSaveFailureStage::SchemaValidation,
+            message: issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    metadata.properties = serde_json::Value::Object(properties);
+
+    let persist_result = if is_new {
+        graph.add_object(metadata.clone()).map(|_| ())
+    } else {
+        graph.update_object(metadata.clone())
+    };
+    persist_result.map_err(|error| EditorSaveFailure {
+        node_id: metadata.id,
+        node_name: metadata.name.clone(),
+        stage: EditorSaveFailureStage::Persistence,
+        message: format!("{error:#}"),
+    })?;
+
+    Ok(metadata)
+}
+
 impl Focusable for NodeEditorPanel {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -920,7 +1002,33 @@ fn remap_index_after_move(index: usize, from: usize, to: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{relative_tab_index, remap_index_after_move};
+    use super::{
+        EditorSaveFailure, EditorSaveFailureStage, EditorSaveResult, persist_editor_values,
+        relative_tab_index, remap_index_after_move,
+    };
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+    use u_forge_core::{
+        KnowledgeGraph, ObjectMetadata, ObjectTypeSchema, PropertySchema, SchemaDefinition,
+    };
+
+    fn graph_with_spell_schema() -> (KnowledgeGraph, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let graph = KnowledgeGraph::new(temp.path()).unwrap();
+        let mut schema = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "test".to_string(),
+        );
+        schema.add_object_type(
+            "spell".to_string(),
+            ObjectTypeSchema::new("spell".to_string(), "Spell".to_string())
+                .with_property("level".to_string(), PropertySchema::number("level"))
+                .with_required_property("level".to_string()),
+        );
+        graph.get_schema_manager().save_schema(&schema).unwrap();
+        (graph, temp)
+    }
 
     #[test]
     fn relative_tab_navigation_wraps_and_rejects_stale_state() {
@@ -941,5 +1049,103 @@ mod tests {
         assert_eq!(remap_index_after_move(0, 3, 0), 1);
         assert_eq!(remap_index_after_move(1, 3, 0), 2);
         assert_eq!(remap_index_after_move(4, 1, 3), 4);
+    }
+
+    #[test]
+    fn editor_save_normalizes_before_the_final_write() {
+        let (graph, _temp) = graph_with_spell_schema();
+        let original = ObjectMetadata::new("spell".to_string(), "Shield".to_string());
+        let edited = HashMap::from([
+            (
+                "name".to_string(),
+                serde_json::Value::String("Shield".to_string()),
+            ),
+            (
+                "level".to_string(),
+                serde_json::Value::String("3".to_string()),
+            ),
+        ]);
+
+        let persisted = persist_editor_values(&graph, &original, &edited, true).unwrap();
+
+        assert_eq!(
+            persisted.get_json_property("level"),
+            Some(&serde_json::json!(3.0))
+        );
+        assert!(graph.get_object(original.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn editor_save_returns_actionable_preflight_failure_without_writing() {
+        let (graph, _temp) = graph_with_spell_schema();
+        let original = ObjectMetadata::new("spell".to_string(), "Incomplete".to_string());
+        let edited = HashMap::from([(
+            "name".to_string(),
+            serde_json::Value::String("Incomplete".to_string()),
+        )]);
+
+        let failure = persist_editor_values(&graph, &original, &edited, true).unwrap_err();
+
+        assert_eq!(failure.stage, EditorSaveFailureStage::SchemaValidation);
+        assert!(
+            failure
+                .message
+                .contains("required property 'level' is missing")
+        );
+        assert!(graph.get_object(original.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn editor_save_returns_final_persistence_failure_without_writing() {
+        let (graph, _temp) = graph_with_spell_schema();
+        graph
+            .get_schema_manager()
+            .save_schema(&SchemaDefinition::create_default())
+            .unwrap();
+        let original = ObjectMetadata::new("spell".to_string(), "Misrouted".to_string())
+            .with_schema("default".to_string());
+        let edited = HashMap::from([
+            (
+                "name".to_string(),
+                serde_json::Value::String("Misrouted".to_string()),
+            ),
+            ("level".to_string(), serde_json::json!(3)),
+        ]);
+
+        let failure = persist_editor_values(&graph, &original, &edited, true).unwrap_err();
+
+        assert_eq!(failure.stage, EditorSaveFailureStage::Persistence);
+        assert!(failure.message.contains("Unknown object type 'spell'"));
+        assert!(graph.get_object(original.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn editor_save_failure_summary_is_stable() {
+        let first_id = u_forge_core::ObjectId::new_v4();
+        let second_id = u_forge_core::ObjectId::new_v4();
+        let result = EditorSaveResult {
+            failures: vec![
+                EditorSaveFailure {
+                    node_id: first_id,
+                    node_name: "First".to_string(),
+                    stage: EditorSaveFailureStage::SchemaValidation,
+                    message: "required property 'role' is missing".to_string(),
+                },
+                EditorSaveFailure {
+                    node_id: second_id,
+                    node_name: "Second".to_string(),
+                    stage: EditorSaveFailureStage::Persistence,
+                    message: "database is read-only".to_string(),
+                },
+            ],
+            ..EditorSaveResult::default()
+        };
+
+        assert_eq!(
+            result.user_diagnostic().as_deref(),
+            Some(
+                "Could not save 2 nodes. First failure: Could not save \"First\" during schema validation: required property 'role' is missing"
+            )
+        );
     }
 }

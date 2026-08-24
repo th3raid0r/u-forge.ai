@@ -41,7 +41,7 @@ use crate::confirmation_modal::{
 };
 use crate::dock_state::{DockFocusIntent, DockState};
 use crate::graph_canvas::GraphCanvas;
-use crate::node_editor::{CloseDirtyTabRequested, NodeEditorPanel};
+use crate::node_editor::{CloseDirtyTabRequested, EditorSaveResult, NodeEditorPanel};
 use crate::node_panel::{CreateNodeRequest, DeleteNodeRequest, NodePanel};
 use crate::panel_contracts::{PanelId, WorldCanvasViewId};
 use crate::path_picker::{
@@ -2417,15 +2417,14 @@ impl AppView {
             return;
         }
 
-        let (saved, saved_ids, discarded_ids, skipped_edges) =
-            self.node_editor.update(cx, |editor, cx| {
-                if all {
-                    editor.save_dirty_tabs(cx)
-                } else {
-                    editor.save_active_tab(cx)
-                }
-            });
-        self.finish_editor_save((saved, saved_ids, discarded_ids, skipped_edges), cx);
+        let result = self.node_editor.update(cx, |editor, cx| {
+            if all {
+                editor.save_dirty_tabs(cx)
+            } else {
+                editor.save_active_tab(cx)
+            }
+        });
+        self.finish_editor_save(result, cx);
     }
 
     fn save_and_close_editor_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2449,6 +2448,7 @@ impl AppView {
         let result = self
             .node_editor
             .update(cx, |editor, cx| editor.save_tab(index, cx));
+        let had_detailed_failure = result.has_failures();
         self.finish_editor_save(result, cx);
 
         if let Some(node_id) = node_id {
@@ -2459,10 +2459,12 @@ impl AppView {
                 .iter()
                 .any(|tab| tab.node_id == node_id && tab.dirty);
             if still_dirty {
-                self.state.data_status = Some(
-                    "Could not close the tab because its changes did not pass validation."
-                        .to_string(),
-                );
+                if !had_detailed_failure {
+                    self.state.data_status = Some(
+                        "Could not close the tab because its changes did not pass validation."
+                            .to_string(),
+                    );
+                }
             } else {
                 self.node_editor.update(cx, |editor, cx| {
                     if let Some(index) = editor.tabs.iter().position(|tab| tab.node_id == node_id) {
@@ -2474,34 +2476,34 @@ impl AppView {
         cx.notify();
     }
 
-    fn finish_editor_save(
-        &mut self,
-        result: (usize, Vec<ObjectId>, Vec<ObjectId>, usize),
-        cx: &mut Context<Self>,
-    ) {
-        let (saved, saved_ids, discarded_ids, skipped_edges) = result;
-
-        if skipped_edges > 0 {
+    fn finish_editor_save(&mut self, result: EditorSaveResult, cx: &mut Context<Self>) {
+        if let Some(diagnostic) = result.user_diagnostic() {
+            self.state.data_status = Some(diagnostic);
+        } else if result.skipped_edges > 0 {
             self.state.data_status = Some(format!(
-                "{skipped_edges} incomplete relationship(s) skipped — fill both endpoints before saving."
+                "{} incomplete relationship(s) skipped — fill both endpoints before saving.",
+                result.skipped_edges
             ));
         }
 
         // If any nodes were discarded, refresh the full snapshot.
-        if !discarded_ids.is_empty() {
-            eprintln!("Discarded {} empty new node(s).", discarded_ids.len());
+        if !result.discarded_ids.is_empty() {
+            eprintln!(
+                "Discarded {} empty new node(s).",
+                result.discarded_ids.len()
+            );
             self.refresh_snapshot(cx);
         }
 
-        if saved > 0 {
-            eprintln!("Saved {} node(s).", saved);
+        if result.saved > 0 {
+            eprintln!("Saved {} node(s).", result.saved);
 
             // Refresh snapshot fully when edges may have changed.
             self.refresh_snapshot(cx);
 
             // 3. Re-chunk and embed every saved node so semantic search stays current.
-            if !saved_ids.is_empty() {
-                self.run_embedding_plan(EmbeddingPlan::rechunk(saved_ids), cx);
+            if !result.saved_ids.is_empty() {
+                self.run_embedding_plan(EmbeddingPlan::rechunk(result.saved_ids), cx);
             }
         }
 
