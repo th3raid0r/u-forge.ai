@@ -7,9 +7,11 @@ speculative dependencies and APIs cannot imply an approved design. This
 document records the questions and invariants that must be resolved before the
 crate, dependencies, or code land; it is not implementation approval.
 
-The Alpha correctness, Lemonade runtime, inference lifecycle, agent-budget, and
-desktop-foundation prerequisites are complete. The sandbox consumes the
-implemented `InferenceJob` / `StreamingInferenceJob` and parent
+The Alpha correctness, Lemonade runtime, inference lifecycle, and desktop
+foundation are complete. The original static agent-budget controls were
+partially rolled back after disrupting tool use; adaptive context optimization
+is now planned in `feature_agent-context-optimization.md`. The sandbox consumes
+the implemented `InferenceJob` / `StreamingInferenceJob` and parent
 `CancellationToken` contracts rather than defining a parallel queue API.
 
 ## Product goal
@@ -21,6 +23,28 @@ schema-authoritative graph mutation boundary.
 
 JSON-compatible DTOs are an acceptable op boundary. They do not imply that raw
 `v8::Local<Value>` handles are persisted or cross isolate boundaries.
+
+## Context-optimization integration
+
+A future sandbox run may receive a verbose structured tool result as explicit
+input and return a transformed artifact before the agent reads that data. This
+allows TypeScript to filter, group, join, or reshape raw results without first
+placing the complete payload in model-visible context.
+
+- Raw tool data remains host-owned and outside the prompt until transformation.
+- Sandbox input/output bytes and execution remain bounded for host safety; those
+  bounds are not per-tool prompt budgets.
+- The transformed artifact carries concise provenance identifying its source and
+  transformation.
+- Transformation cancellation is parented by the same request token.
+- A transform failure returns a typed outcome or an explicit native fallback; it
+  never silently dumps an oversized raw payload into the prompt.
+- Caller-supplied structured input is part of the versioned Rust/TypeScript DTO
+  contract even when no graph or inference op is exposed to the script.
+
+This integration boundary does not approve the sandbox implementation or change
+the v1 read-only default. It ensures the design gate accounts for adaptive
+context management and intentionally verbose tools.
 
 ## Go/no-go decisions required
 
