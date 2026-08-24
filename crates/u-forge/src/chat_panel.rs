@@ -1,3 +1,5 @@
+mod run;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,6 +25,8 @@ use crate::text_field::{TextFieldView, TextSubmit};
 use crate::ui::components::Tooltip;
 use crate::ui::icons::{Icon, IconName, IconSize};
 use crate::ui::theme::UiTheme;
+
+use run::{ChatRunEvent, ChatRunReducer, ChatRunTerminal};
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
@@ -92,6 +96,8 @@ pub(crate) struct ChatPanel {
     stream_task: Option<gpui::Task<()>>,
     /// Explicit owner for runtime loading, provider streams, and agent tools.
     stream_cancellation: Option<CancellationToken>,
+    /// Normalizes both transports and admits exactly one terminal transition.
+    run_reducer: ChatRunReducer,
     /// During streaming: handle to the Thinking message entity being appended to
     /// (lazily created on the first ReasoningDelta / Thinking token).
     streaming_thinking: Option<Entity<ChatMessageView>>,
@@ -354,6 +360,7 @@ impl ChatPanel {
             streaming: false,
             stream_task: None,
             stream_cancellation: None,
+            run_reducer: ChatRunReducer::default(),
             streaming_thinking: None,
             streaming_assistant: None,
             pending_assistant: None,
@@ -612,69 +619,12 @@ impl ChatPanel {
         msg
     }
 
-    /// Finalize streaming state and persist the session.
-    fn finalize_stream(&mut self, cx: &mut Context<Self>) {
-        if let Some(pending) = self.pending_assistant.take() {
-            pending.update(cx, |message, cx| {
-                message.replace_text("No response was received.", cx);
-            });
-        }
-        self.pending_animation_task.take();
-        self.streaming = false;
-        self.stream_task = None;
-        self.stream_cancellation = None;
-        self.streaming_thinking = None;
-        self.streaming_assistant = None;
-        self.streaming_tool_calls.clear();
-        self.save_current_session(cx);
-        cx.notify();
-    }
-
-    /// Apply terminal aggregate text only when no deltas produced the current
-    /// assistant row. Some OpenAI-compatible streams deliver useful text only
-    /// in Rig's final aggregate response.
-    fn finish_agent_stream(&mut self, full_text: Option<String>, cx: &mut Context<Self>) {
-        let fallback = full_text.filter(|text| !text.trim().is_empty());
-        let used_fallback = self.streaming_assistant.is_none() && fallback.is_some();
-        if self.streaming_assistant.is_none()
-            && let Some(text) = fallback
-        {
-            let message = self.take_pending_assistant(true, cx).unwrap_or_else(|| {
-                self.push_text_message(ChatMessageRole::Assistant, String::new(), cx)
-            });
-            message.update(cx, |message, cx| message.replace_text(text, cx));
-            self.streaming_assistant = Some(message);
-        }
-        tracing::info!(
-            model = self
-                .available_models
-                .get(self.selected_model_idx)
-                .map(|model| model.model_id.as_str())
-                .unwrap_or("unknown"),
-            backend = self
-                .available_models
-                .get(self.selected_model_idx)
-                .and_then(|model| model.backend.as_deref())
-                .unwrap_or("implicit"),
-            streamed_text = !used_fallback && self.streaming_assistant.is_some(),
-            terminal_fallback = used_fallback,
-            "Assistant agent stream reached a successful terminal event"
-        );
-        self.finalize_stream(cx);
-    }
-
     fn stop_stream(&mut self, cx: &mut Context<Self>) {
         if let Some(cancellation) = self.stream_cancellation.take() {
             cancellation.cancel();
         }
         self.stream_task.take();
-        if let Some(msg) = self.pending_assistant.take() {
-            msg.update(cx, |message, cx| message.replace_text("[Cancelled]", cx));
-        } else if let Some(msg) = self.streaming_assistant.clone() {
-            msg.update(cx, |m, cx| m.append_text("\n[Cancelled]", cx));
-        }
-        self.pending_animation_task.take();
-        self.finalize_stream(cx);
+        self.apply_run_event(ChatRunEvent::Terminal(ChatRunTerminal::Cancelled), cx);
     }
 
     fn start_pending_assistant(&mut self, cx: &mut Context<Self>) {
@@ -718,31 +668,6 @@ impl ChatPanel {
                 }
             }
         }));
-    }
-
-    /// Consume the pending row. Text responses can reuse it; reasoning and
-    /// tool events remove it so chronological message ordering stays exact.
-    fn take_pending_assistant(
-        &mut self,
-        reuse_for_text: bool,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<ChatMessageView>> {
-        let pending = self.pending_assistant.take();
-        self.pending_animation_task.take();
-        let pending = pending?;
-        if reuse_for_text {
-            pending.update(cx, |message, cx| message.replace_text("", cx));
-            return Some(pending);
-        }
-        if let Some(index) = self
-            .messages
-            .iter()
-            .position(|message| message.entity_id() == pending.entity_id())
-        {
-            self.messages.remove(index);
-            self.list_state.reset(self.messages.len());
-        }
-        None
     }
 
     /// Re-run the user turn at or before `msg_entity_id`.
@@ -819,7 +744,10 @@ impl ChatPanel {
         self.toolbar_menu_open = false;
         if let Some(previous) = self.stream_cancellation.take() {
             previous.supersede();
+            self.stream_task.take();
+            self.apply_run_event(ChatRunEvent::Terminal(ChatRunTerminal::Superseded), cx);
         }
+        self.run_reducer.begin();
         let cancellation = CancellationToken::new();
         self.stream_cancellation = Some(cancellation.clone());
 
@@ -901,15 +829,12 @@ impl ChatPanel {
                     view.profile_reload_state = ProfileReloadState::Failed(format!(
                         "Could not load the selected Assistant model: {error:#}"
                     ));
-                    if let Some(message) = view.take_pending_assistant(true, cx) {
-                        message.update(cx, |message, cx| {
-                            message.replace_text(
-                                format!("Runtime profile reload failed: {error:#}"),
-                                cx,
-                            );
-                        });
-                    }
-                    view.finalize_stream(cx);
+                    view.apply_run_event(
+                        ChatRunEvent::Terminal(ChatRunTerminal::RuntimeFailure(format!(
+                            "{error:#}"
+                        ))),
+                        cx,
+                    );
                 }
                 None => {}
             })
@@ -940,6 +865,7 @@ impl ChatPanel {
             let uses_gpu = selected_model.uses_gpu();
             let reasoning_enabled = self.selected_reasoning_enabled();
             let tokio_rt = self.tokio_rt.clone();
+            let stream_cancellation = cancellation.clone();
 
             let task = cx.spawn(async move |this, cx| {
                 // Get the mpsc::Receiver on the background executor.
@@ -975,43 +901,23 @@ impl ChatPanel {
                     rx = event.0;
                     match event.1 {
                         None => {
-                            // Channel closed without Done — treat as finished.
+                            let terminal =
+                                ChatRunTerminal::for_closed_stream(&stream_cancellation, "Agent");
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                view.finalize_stream(cx);
+                                view.apply_run_event(ChatRunEvent::Terminal(terminal), cx);
                             })
                             .ok();
                             break;
                         }
                         Some(AgentStreamEvent::ReasoningDelta(delta)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                view.take_pending_assistant(false, cx);
-                                let msg = view.streaming_thinking.clone().unwrap_or_else(|| {
-                                    let m = view.push_text_message(
-                                        ChatMessageRole::Thinking,
-                                        String::new(),
-                                        cx,
-                                    );
-                                    view.streaming_thinking = Some(m.clone());
-                                    m
-                                });
-                                msg.update(cx, |m, cx| m.append_text(&delta, cx));
+                                view.apply_run_event(ChatRunEvent::ReasoningDelta(delta), cx);
                             })
                             .ok();
                         }
                         Some(AgentStreamEvent::TextDelta(delta)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                    let m = view.take_pending_assistant(true, cx).unwrap_or_else(|| {
-                                        view.push_text_message(
-                                            ChatMessageRole::Assistant,
-                                            String::new(),
-                                            cx,
-                                        )
-                                    });
-                                    view.streaming_assistant = Some(m.clone());
-                                    m
-                                });
-                                msg.update(cx, |m, cx| m.append_text(&delta, cx));
+                                view.apply_run_event(ChatRunEvent::TextDelta(delta), cx);
                             })
                             .ok();
                         }
@@ -1021,19 +927,14 @@ impl ChatPanel {
                             args_display,
                         }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                view.take_pending_assistant(false, cx);
-                                let msg = view.push_tool_call_message(
-                                    internal_id.clone(),
-                                    name,
-                                    args_display,
+                                view.apply_run_event(
+                                    ChatRunEvent::ToolCallStart {
+                                        internal_id,
+                                        name,
+                                        args_display,
+                                    },
                                     cx,
                                 );
-                                view.streaming_tool_calls.insert(internal_id, msg);
-                                // Reset the current assistant so the next text
-                                // delta creates a fresh message after the tool.
-                                view.streaming_assistant = None;
-                                view.streaming_thinking = None;
-                                cx.notify();
                             })
                             .ok();
                         }
@@ -1041,12 +942,14 @@ impl ChatPanel {
                             internal_id,
                             content,
                         }) => {
-                            this.update(cx, |view: &mut ChatPanel, _cx| {
-                                if let Some(msg) =
-                                    view.streaming_tool_calls.get(&internal_id).cloned()
-                                {
-                                    msg.update(_cx, |m, cx| m.set_tool_result(content, cx));
-                                }
+                            this.update(cx, |view: &mut ChatPanel, cx| {
+                                view.apply_run_event(
+                                    ChatRunEvent::ToolResult {
+                                        internal_id,
+                                        content,
+                                    },
+                                    cx,
+                                );
                             })
                             .ok();
                         }
@@ -1057,32 +960,15 @@ impl ChatPanel {
                             diagnostics,
                         }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                    let message = view.take_pending_assistant(true, cx).unwrap_or_else(
-                                        || {
-                                            view.push_text_message(
-                                                ChatMessageRole::Assistant,
-                                                String::new(),
-                                                cx,
-                                            )
-                                        },
-                                    );
-                                    view.streaming_assistant = Some(message.clone());
-                                    message
-                                });
-                                msg.update(cx, |message, cx| {
-                                    message.append_text(
-                                        &format!(
-                                            "\n[Agent budget stop: {reason} Used {} model call(s), \
-                                             {} request tokens, and {} tool-output tokens.]",
-                                            diagnostics.model_calls,
-                                            diagnostics.request_tokens,
-                                            diagnostics.tool_output_tokens
-                                        ),
-                                        cx,
-                                    )
-                                });
-                                view.finalize_stream(cx);
+                                view.apply_run_event(
+                                    ChatRunEvent::Terminal(ChatRunTerminal::BudgetStop {
+                                        reason,
+                                        model_calls: diagnostics.model_calls,
+                                        request_tokens: diagnostics.request_tokens,
+                                        tool_output_tokens: diagnostics.tool_output_tokens,
+                                    }),
+                                    cx,
+                                );
                             })
                             .ok();
                             break;
@@ -1092,57 +978,33 @@ impl ChatPanel {
                             diagnostics,
                         }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                    let message = view.take_pending_assistant(true, cx).unwrap_or_else(
-                                        || {
-                                            view.push_text_message(
-                                                ChatMessageRole::Assistant,
-                                                String::new(),
-                                                cx,
-                                            )
-                                        },
-                                    );
-                                    view.streaming_assistant = Some(message.clone());
-                                    message
-                                });
-                                msg.update(cx, |message, cx| {
-                                    message.append_text(
-                                        &format!(
-                                            "\n[Agent repeat stop: {reason} Used {} model call(s).]",
-                                            diagnostics.model_calls
-                                        ),
-                                        cx,
-                                    )
-                                });
-                                view.finalize_stream(cx);
+                                view.apply_run_event(
+                                    ChatRunEvent::Terminal(ChatRunTerminal::RepeatStop {
+                                        reason,
+                                        model_calls: diagnostics.model_calls,
+                                    }),
+                                    cx,
+                                );
                             })
                             .ok();
                             break;
                         }
                         Some(AgentStreamEvent::Finished { full_text, .. }) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                view.finish_agent_stream(full_text, cx);
+                                view.apply_run_event(
+                                    ChatRunEvent::Terminal(ChatRunTerminal::Success { full_text }),
+                                    cx,
+                                );
                             })
                             .ok();
                             break;
                         }
                         Some(AgentStreamEvent::FatalError(e)) => {
                             this.update(cx, |view: &mut ChatPanel, cx| {
-                                let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                    let m = view.take_pending_assistant(true, cx).unwrap_or_else(|| {
-                                        view.push_text_message(
-                                            ChatMessageRole::Assistant,
-                                            String::new(),
-                                            cx,
-                                        )
-                                    });
-                                    view.streaming_assistant = Some(m.clone());
-                                    m
-                                });
-                                msg.update(cx, |m, cx| {
-                                    m.append_error(&format!("\n[Agent error: {e}]"), cx)
-                                });
-                                view.finalize_stream(cx);
+                                view.apply_run_event(
+                                    ChatRunEvent::Terminal(ChatRunTerminal::AgentFailure(e)),
+                                    cx,
+                                );
                             })
                             .ok();
                             break;
@@ -1158,13 +1020,7 @@ impl ChatPanel {
         let provider = match &self.chat_provider {
             Some(p) => p.clone(),
             None => {
-                self.push_text_message(
-                    ChatMessageRole::Assistant,
-                    "Chat unavailable — Lemonade Server not connected.".to_string(),
-                    cx,
-                );
-                self.streaming = false;
-                cx.notify();
+                self.apply_run_event(ChatRunEvent::Terminal(ChatRunTerminal::Unavailable), cx);
                 return;
             }
         };
@@ -1204,6 +1060,7 @@ impl ChatPanel {
 
         let tokio_rt = self.tokio_rt.clone();
         let provider_cancellation = cancellation.clone();
+        let stream_cancellation = cancellation;
 
         // Spawn a background task to drive the stream.
         let task = cx.spawn(async move |this, cx| {
@@ -1226,6 +1083,7 @@ impl ChatPanel {
 
             // Consume tokens from the stream.
             let mut rx = rx;
+            let mut finished = false;
             loop {
                 let token = cx
                     .background_executor()
@@ -1240,64 +1098,37 @@ impl ChatPanel {
                 match result {
                     Some(Ok(StreamToken::Content(text))) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
-                            let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                let m =
-                                    view.take_pending_assistant(true, cx).unwrap_or_else(|| {
-                                        view.push_text_message(
-                                            ChatMessageRole::Assistant,
-                                            String::new(),
-                                            cx,
-                                        )
-                                    });
-                                view.streaming_assistant = Some(m.clone());
-                                m
-                            });
-                            msg.update(cx, |m, cx| m.append_text(&text, cx));
+                            view.apply_run_event(ChatRunEvent::TextDelta(text), cx);
                         })
                         .ok();
                     }
                     Some(Ok(StreamToken::Thinking(text))) => {
                         this.update(cx, |view: &mut ChatPanel, cx| {
-                            view.take_pending_assistant(false, cx);
-                            let msg = view.streaming_thinking.clone().unwrap_or_else(|| {
-                                let m = view.push_text_message(
-                                    ChatMessageRole::Thinking,
-                                    String::new(),
-                                    cx,
-                                );
-                                view.streaming_thinking = Some(m.clone());
-                                m
-                            });
-                            msg.update(cx, |m, cx| m.append_text(&text, cx));
+                            view.apply_run_event(ChatRunEvent::ReasoningDelta(text), cx);
                         })
                         .ok();
                     }
-                    Some(Ok(StreamToken::FinishReason(_reason))) => {}
+                    Some(Ok(StreamToken::FinishReason(_reason))) => finished = true,
                     Some(Ok(StreamToken::Usage(_usage))) => {}
                     Some(Err(e)) => {
+                        let terminal = ChatRunTerminal::for_stream_error(&stream_cancellation, &e);
                         this.update(cx, |view: &mut ChatPanel, cx| {
-                            let msg = view.streaming_assistant.clone().unwrap_or_else(|| {
-                                let m =
-                                    view.take_pending_assistant(true, cx).unwrap_or_else(|| {
-                                        view.push_text_message(
-                                            ChatMessageRole::Assistant,
-                                            String::new(),
-                                            cx,
-                                        )
-                                    });
-                                view.streaming_assistant = Some(m.clone());
-                                m
-                            });
-                            msg.update(cx, |m, cx| m.append_error(&format!("\n[Error: {e}]"), cx));
-                            view.finalize_stream(cx);
+                            view.apply_run_event(ChatRunEvent::Terminal(terminal), cx);
                         })
                         .ok();
                         break;
                     }
                     None => {
-                        // Stream finished.
+                        let terminal = if finished {
+                            ChatRunTerminal::Success { full_text: None }
+                        } else {
+                            ChatRunTerminal::for_closed_stream(
+                                &stream_cancellation,
+                                "Direct provider",
+                            )
+                        };
                         this.update(cx, |view: &mut ChatPanel, cx| {
-                            view.finalize_stream(cx);
+                            view.apply_run_event(ChatRunEvent::Terminal(terminal), cx);
                         })
                         .ok();
                         break;
@@ -1393,7 +1224,7 @@ impl ChatPanel {
     ///
     /// No-op while streaming: swapping `self.messages` mid-stream would cause
     /// in-flight `TextDelta` / `ReasoningDelta` events to append to the new
-    /// session and `finalize_stream` to save the polluted list under the
+    /// session and terminal run cleanup to save the polluted list under the
     /// wrong session_id. The Send button is already gated on `streaming`.
     fn new_session(&mut self, cx: &mut Context<Self>) {
         if self.controls_locked() {
@@ -2750,7 +2581,12 @@ mod tests {
             panel.update(app, |panel, cx| {
                 panel.streaming = true;
                 panel.start_pending_assistant(cx);
-                panel.finish_agent_stream(Some("CUDA answer".into()), cx);
+                panel.apply_run_event(
+                    ChatRunEvent::Terminal(ChatRunTerminal::Success {
+                        full_text: Some("CUDA answer".into()),
+                    }),
+                    cx,
+                );
 
                 assert!(!panel.streaming);
                 assert_eq!(panel.messages.len(), 1);
@@ -2778,10 +2614,73 @@ mod tests {
                     cx,
                 );
                 panel.streaming_assistant = Some(message);
-                panel.finish_agent_stream(Some("streamed answer".into()), cx);
+                panel.apply_run_event(
+                    ChatRunEvent::Terminal(ChatRunTerminal::Success {
+                        full_text: Some("streamed answer".into()),
+                    }),
+                    cx,
+                );
 
                 assert_eq!(panel.messages.len(), 1);
                 assert_eq!(panel.messages[0].read(cx).text(), "streamed answer");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn normalized_run_events_preserve_tool_order_and_finalize_once(cx: &mut TestAppContext) {
+        cx.update(UiTheme::init);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (panel, cx) = cx.add_window_view(move |_window, cx| {
+            ChatPanel::new("Test assistant".into(), &db_path, runtime, false, cx)
+        });
+
+        cx.update(|_window, app| {
+            panel.update(app, |panel, cx| {
+                panel.run_reducer.begin();
+                panel.streaming = true;
+                panel.start_pending_assistant(cx);
+                panel.apply_run_event(ChatRunEvent::TextDelta("before".into()), cx);
+                panel.apply_run_event(
+                    ChatRunEvent::ToolCallStart {
+                        internal_id: "call-1".into(),
+                        name: "search_graph".into(),
+                        args_display: "{}".into(),
+                    },
+                    cx,
+                );
+                panel.apply_run_event(
+                    ChatRunEvent::ToolResult {
+                        internal_id: "call-1".into(),
+                        content: "found".into(),
+                    },
+                    cx,
+                );
+                panel.apply_run_event(ChatRunEvent::TextDelta("after".into()), cx);
+                panel.apply_run_event(
+                    ChatRunEvent::Terminal(ChatRunTerminal::Success { full_text: None }),
+                    cx,
+                );
+
+                assert!(!panel.streaming);
+                assert_eq!(panel.messages.len(), 3);
+                assert_eq!(panel.messages[0].read(cx).role, ChatMessageRole::Assistant);
+                assert_eq!(panel.messages[0].read(cx).text(), "before");
+                assert_eq!(panel.messages[1].read(cx).role, ChatMessageRole::ToolCall);
+                assert_eq!(panel.messages[2].read(cx).role, ChatMessageRole::Assistant);
+                assert_eq!(panel.messages[2].read(cx).text(), "after");
+                let session_id = panel.current_session_id.clone();
+                let session_count = panel.session_list.len();
+
+                panel.apply_run_event(
+                    ChatRunEvent::Terminal(ChatRunTerminal::ProviderFailure("late".into())),
+                    cx,
+                );
+                assert_eq!(panel.current_session_id, session_id);
+                assert_eq!(panel.session_list.len(), session_count);
+                assert_eq!(panel.messages.len(), 3);
             });
         });
     }
