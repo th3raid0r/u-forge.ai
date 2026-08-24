@@ -3,34 +3,11 @@
 
 use super::*;
 
-impl Render for ChatPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let render_start = Instant::now();
-        let theme = *UiTheme::get(cx);
-        let panel_focused = self.focus.contains_focused(window, cx);
-        let enter_to_submit = self.enter_to_submit;
-        let streaming = self.streaming;
-        let connecting = self.connecting;
-        let profile_reloading = self.profile_reload_state.is_reloading();
-        let controls_locked = self.controls_locked();
-        let profile_reload_error = self.profile_reload_state.error().map(ToString::to_string);
-        let connect_error = self.connect_error.clone();
-        let model_dropdown_open = self.model_dropdown_open;
-        let toolbar_menu_open = self.toolbar_menu_open;
-        let reasoning_capable = self
-            .available_models
-            .get(self.selected_model_idx)
-            .is_some_and(|model| model.reasoning_capable);
-        let reasoning_enabled = self.reasoning_enabled && reasoning_capable;
-        let has_provider = self.chat_provider.is_some() || self.agent.is_some();
-        let model_label = self.selected_model_label();
-        let history_dropdown_open = self.history_dropdown_open;
-        let history_label = self.session_title();
-
-        // Virtualized history dropdown list — only renders visible rows so the
-        // dropdown stays cheap even with hundreds of accumulated sessions.
+impl ChatPanel {
+    /// Build the virtualized history dropdown without allocating off-screen rows.
+    fn build_history_list(&self, cx: &mut Context<Self>) -> impl IntoElement + Styled + use<> {
         let history_list_entity = cx.entity().clone();
-        let history_list_el = list(
+        list(
             self.history_list_state.clone(),
             move |ix, _window, cx: &mut App| {
                 let panel = history_list_entity.read(cx);
@@ -156,14 +133,17 @@ impl Render for ChatPanel {
                     )
                     .into_any_element()
             },
-        );
+        )
+    }
 
-        // Build the virtualized message list. Only visible items (+ overdraw
-        // buffer) are rendered, so long chat histories don't slow down layout.
-        // Each item is its own `Entity<ChatMessageView>` — streaming token
-        // deltas only invalidate the target entity, not this panel.
+    /// Build message rows at the parent render site so actions need no per-message subscriptions.
+    fn build_message_list(
+        &self,
+        theme: UiTheme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + Styled + use<> {
         let list_entity = cx.entity().clone();
-        let list_el = list(self.list_state.clone(), move |ix, _window, cx: &mut App| {
+        list(self.list_state.clone(), move |ix, _window, cx: &mut App| {
             let _span = tracing::trace_span!("chat_panel::list_item", ix).entered();
             let panel = list_entity.read(cx);
             let Some(msg) = panel.messages.get(ix).cloned() else {
@@ -310,7 +290,43 @@ impl Render for ChatPanel {
                 row = row.child(action_bar);
             }
             row.into_any_element()
-        });
+        })
+    }
+}
+
+impl Render for ChatPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_start = Instant::now();
+        let theme = *UiTheme::get(cx);
+        let panel_focused = self.focus.contains_focused(window, cx);
+        let enter_to_submit = self.enter_to_submit;
+        let streaming = self.streaming;
+        let connecting = self.connecting;
+        let profile_reloading = self.profile_reload_state.is_reloading();
+        let controls_locked = self.controls_locked();
+        let profile_reload_error = self.profile_reload_state.error().map(ToString::to_string);
+        let connect_error = self.connect_error.clone();
+        let model_dropdown_open = self.model_dropdown_open;
+        let toolbar_menu_open = self.toolbar_menu_open;
+        let reasoning_capable = self
+            .available_models
+            .get(self.selected_model_idx)
+            .is_some_and(|model| model.reasoning_capable);
+        let reasoning_enabled = self.reasoning_enabled && reasoning_capable;
+        let has_provider = self.chat_provider.is_some() || self.agent.is_some();
+        let model_label = self.selected_model_label();
+        let history_dropdown_open = self.history_dropdown_open;
+        let history_label = self.session_title();
+
+        // Virtualized history rows and message rows retain their existing
+        // list-state and entity-cache boundaries in local builders.
+        let history_list_el = self.build_history_list(cx);
+
+        // Build the virtualized message list. Only visible items (+ overdraw
+        // buffer) are rendered, so long chat histories don't slow down layout.
+        // Each item is its own `Entity<ChatMessageView>` — streaming token
+        // deltas only invalidate the target entity, not this panel.
+        let list_el = self.build_message_list(theme, cx);
 
         // Model dropdown items.
         let model_items: Vec<_> = if model_dropdown_open {
