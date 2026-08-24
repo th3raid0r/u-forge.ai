@@ -2,8 +2,9 @@ use super::{
     Cardinality, EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType,
     RelationshipDefinition, SchemaDefinition, ValidationRule,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -58,30 +59,14 @@ impl SchemaIngestion {
             format!("Schema loaded from directory: {:?}", dir_path),
         );
 
-        // Read all .json files in the directory
-        let entries = fs::read_dir(dir_path).context("Failed to read schema directory")?;
-
-        let mut loaded_schemas = Vec::new();
-
-        for entry in entries {
-            let entry = entry.context("Failed to read directory entry")?;
-            let path = entry.path();
-
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                match Self::load_json_schema_file(&path) {
-                    Ok(json_schema) => {
-                        loaded_schemas.push(json_schema);
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to load schema file {:?}: {}", path, e);
-                    }
-                }
-            }
-        }
-
-        // Convert JSON schemas to ObjectTypeSchemas
-        for json_schema in loaded_schemas {
-            let object_type_schema = Self::convert_json_to_object_schema(json_schema)?;
+        // Parse files in a stable order and fail the whole authoritative schema
+        // load if any definition is malformed. Silently skipping one type can
+        // weaken later object and edge validation.
+        for path in Self::list_schema_files(dir_path)? {
+            let json_schema = Self::load_json_schema_file(&path)
+                .with_context(|| format!("Invalid schema file '{}'", path.display()))?;
+            let object_type_schema = Self::convert_json_to_object_schema(json_schema)
+                .with_context(|| format!("Invalid schema file '{}'", path.display()))?;
             let object_type_name = Self::extract_object_type_name(&object_type_schema.name);
             schema_definition.add_object_type(object_type_name, object_type_schema);
         }
@@ -111,17 +96,32 @@ impl SchemaIngestion {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("JSON file must contain an object"))?;
 
+        Self::reject_unknown_keys(
+            obj,
+            &["name", "description", "properties", "additionalProperties"],
+            "schema",
+        )?;
+
         let name = obj
             .get("name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' field"))?
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Field 'name' must be a non-empty string"))?
             .to_string();
 
-        let description = obj
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("No description")
-            .to_string();
+        let description = match obj.get("description") {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Field 'description' must be a string"))?
+                .to_string(),
+            None => "No description".to_string(),
+        };
+
+        if let Some(additional_properties) = obj.get("additionalProperties") {
+            additional_properties
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("Field 'additionalProperties' must be a boolean"))?;
+        }
 
         let properties = obj
             .get("properties")
@@ -146,23 +146,23 @@ impl SchemaIngestion {
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("Property '{}' must be an object", prop_name))?;
 
-            let property_schema =
-                Self::convert_json_property_to_schema(prop_name.clone(), prop_obj)?;
+            let property_schema = Self::convert_json_property_to_schema(
+                &format!("property '{prop_name}'"),
+                prop_obj,
+            )?;
 
             // Check if this property is required
-            if prop_obj
-                .get("required")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
+            if property_schema
+                .validation
+                .as_ref()
+                .is_some_and(|validation| validation.required)
             {
                 object_schema = object_schema.with_required_property(prop_name.clone());
             }
 
             // Add any relationship edge types as allowed edges
-            if let Some(relationship) = prop_obj.get("relationship")
-                && let Some(edge_type) = relationship.get("edgeType").and_then(|v| v.as_str())
-            {
-                object_schema = object_schema.with_allowed_edge(edge_type.to_string());
+            if let Some(relationship) = &property_schema.relationship {
+                object_schema = object_schema.with_allowed_edge(relationship.edge_type.clone());
             }
 
             object_schema = object_schema.with_property(prop_name, property_schema);
@@ -173,106 +173,196 @@ impl SchemaIngestion {
 
     /// Convert a JSON property definition to a PropertySchema
     fn convert_json_property_to_schema(
-        prop_name: String,
+        property_path: &str,
         prop_obj: &Map<String, Value>,
     ) -> Result<PropertySchema> {
+        Self::reject_unknown_keys(
+            prop_obj,
+            &[
+                "type",
+                "description",
+                "required",
+                "items",
+                "properties",
+                "targetType",
+                "enum",
+                "validation",
+                "relationship",
+            ],
+            property_path,
+        )?;
+
         let prop_type = prop_obj
             .get("type")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Property '{}' missing type", prop_name))?;
+            .ok_or_else(|| anyhow::anyhow!("{property_path} is missing string field 'type'"))?;
 
-        let description = prop_obj
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("No description")
-            .to_string();
+        let description = match prop_obj.get("description") {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("{property_path}.description must be a string"))?
+                .to_string(),
+            None => "No description".to_string(),
+        };
+
+        let required = match prop_obj.get("required") {
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("{property_path}.required must be a boolean"))?,
+            None => false,
+        };
+
+        if prop_type != "array" && prop_obj.contains_key("items") {
+            bail!("{property_path}.items is only valid for type 'array'");
+        }
+        if prop_type != "object" && prop_obj.contains_key("properties") {
+            bail!("{property_path}.properties is only valid for type 'object'");
+        }
+        if prop_type != "reference" && prop_obj.contains_key("targetType") {
+            bail!("{property_path}.targetType is only valid for type 'reference'");
+        }
+        if !matches!(prop_type, "string" | "enum") && prop_obj.contains_key("enum") {
+            bail!("{property_path}.enum is only valid for type 'string' or 'enum'");
+        }
+
+        let mut validation_rule = match prop_obj.get("validation") {
+            Some(value) => Self::parse_validation_rule(property_path, value)?,
+            None => ValidationRule::new(),
+        };
+
+        let top_level_enum = match prop_obj.get("enum") {
+            Some(value) => Some(Self::parse_string_list(
+                &format!("{property_path}.enum"),
+                value,
+            )?),
+            None => None,
+        };
+
+        if let (Some(compatibility_values), Some(canonical_values)) =
+            (&top_level_enum, &validation_rule.allowed_values)
+            && compatibility_values != canonical_values
+        {
+            bail!("{property_path} declares conflicting enum and validation.allowed_values lists");
+        }
+
+        let enum_values = validation_rule
+            .allowed_values
+            .clone()
+            .or_else(|| top_level_enum.clone());
 
         let property_type = match prop_type {
-            "string" => PropertyType::String,
+            "string" => enum_values
+                .clone()
+                .map_or(PropertyType::String, PropertyType::Enum),
+            "text" => PropertyType::Text,
             "number" => PropertyType::Number,
             "boolean" => PropertyType::Boolean,
             "array" => {
-                // For arrays, try to determine the element type
-                if let Some(items) = prop_obj.get("items") {
-                    if let Some(items_obj) = items.as_object() {
-                        if let Some(item_type) = items_obj.get("type").and_then(|v| v.as_str()) {
-                            match item_type {
-                                "string" => PropertyType::Array(Box::new(PropertyType::String)),
-                                "number" => PropertyType::Array(Box::new(PropertyType::Number)),
-                                "boolean" => PropertyType::Array(Box::new(PropertyType::Boolean)),
-                                _ => PropertyType::Array(Box::new(PropertyType::String)), // Default to string
-                            }
-                        } else {
-                            PropertyType::Array(Box::new(PropertyType::String))
-                        }
-                    } else {
-                        PropertyType::Array(Box::new(PropertyType::String))
-                    }
-                } else {
-                    PropertyType::Array(Box::new(PropertyType::String))
-                }
+                let element_type = match prop_obj.get("items") {
+                    Some(value) => Self::parse_array_item_type(property_path, value)?,
+                    // Compatibility with the shipped pre-v0.1.1 schemas. This
+                    // shorthand is explicit in the file contract; supplied
+                    // item schemas are never weakened or defaulted.
+                    None => PropertyType::String,
+                };
+                PropertyType::Array(Box::new(element_type))
             }
-            _ => PropertyType::String, // Default to string for unknown types
+            "object" => {
+                let nested = prop_obj
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{property_path}.properties must be an object for type 'object'"
+                        )
+                    })?;
+                let mut properties = HashMap::new();
+                for (name, value) in nested {
+                    let nested_obj = value.as_object().ok_or_else(|| {
+                        anyhow::anyhow!("{property_path}.{name} must be an object")
+                    })?;
+                    properties.insert(
+                        name.clone(),
+                        Self::convert_json_property_to_schema(
+                            &format!("{property_path}.{name}"),
+                            nested_obj,
+                        )?,
+                    );
+                }
+                PropertyType::Object(properties)
+            }
+            "reference" => {
+                let target_type = prop_obj
+                    .get("targetType")
+                    .and_then(Value::as_str)
+                    .filter(|target| !target.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{property_path}.targetType must be a non-empty string for type 'reference'"
+                        )
+                    })?;
+                PropertyType::Reference(target_type.to_string())
+            }
+            "enum" => PropertyType::Enum(enum_values.clone().ok_or_else(|| {
+                anyhow::anyhow!("{property_path} of type 'enum' requires validation.allowed_values")
+            })?),
+            unknown => bail!("{property_path} has unsupported type '{unknown}'"),
         };
 
+        if top_level_enum.is_some() {
+            validation_rule.allowed_values = enum_values;
+        }
+        validation_rule.required = required;
+        Self::validate_rule_compatibility(property_path, &property_type, &validation_rule)?;
+
         let mut property_schema = PropertySchema::new(property_type, description);
-
-        // Add validation rules
-        let mut validation_rule = ValidationRule::new();
-        let mut has_validation = false;
-
-        // Handle enum values
-        if let Some(enum_values) = prop_obj.get("enum")
-            && let Some(enum_array) = enum_values.as_array()
-        {
-            let enum_strings: Vec<String> = enum_array
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect();
-
-            if !enum_strings.is_empty() {
-                // Update property type to enum
-                property_schema.property_type = PropertyType::Enum(enum_strings.clone());
-                validation_rule = validation_rule.with_allowed_values(enum_strings);
-                has_validation = true;
-            }
-        }
-
-        // Mark as required if specified
-        if prop_obj
-            .get("required")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            validation_rule.required = true;
-            has_validation = true;
-        }
-
-        if has_validation {
+        if required || Self::has_validation_constraints(&validation_rule) {
             property_schema = property_schema.with_validation(validation_rule);
         }
 
         // Add relationship information if present
-        if let Some(relationship) = prop_obj.get("relationship")
-            && let Some(relationship_obj) = relationship.as_object()
-        {
+        if let Some(relationship) = prop_obj.get("relationship") {
+            let relationship_obj = relationship
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("{property_path}.relationship must be an object"))?;
+            Self::reject_unknown_keys(
+                relationship_obj,
+                &["edgeType", "targetType", "description"],
+                &format!("{property_path}.relationship"),
+            )?;
             let edge_type = relationship_obj
                 .get("edgeType")
                 .and_then(|v| v.as_str())
-                .unwrap_or("related_to")
+                .filter(|edge_type| !edge_type.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{property_path}.relationship.edgeType must be a non-empty string"
+                    )
+                })?
                 .to_string();
 
-            let rel_description = relationship_obj
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Related entity")
-                .to_string();
+            let rel_description = match relationship_obj.get("description") {
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{property_path}.relationship.description must be a string")
+                    })?
+                    .to_string(),
+                None => "Related entity".to_string(),
+            };
 
             let mut relationship_def = RelationshipDefinition::new(edge_type, rel_description)
                 .with_cardinality(Cardinality::ManyToMany);
 
-            if let Some(target_type) = relationship_obj.get("targetType").and_then(|v| v.as_str()) {
+            if let Some(target_type) = relationship_obj.get("targetType") {
+                let target_type = target_type
+                    .as_str()
+                    .filter(|target| !target.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{property_path}.relationship.targetType must be a non-empty string"
+                        )
+                    })?;
                 relationship_def = relationship_def.with_target_type(target_type.to_string());
             }
 
@@ -280,6 +370,204 @@ impl SchemaIngestion {
         }
 
         Ok(property_schema)
+    }
+
+    fn parse_array_item_type(property_path: &str, value: &Value) -> Result<PropertyType> {
+        let item_path = format!("{property_path}.items");
+        let item_obj = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("{item_path} must be an object"))?;
+        let item_schema = Self::convert_json_property_to_schema(&item_path, item_obj)?;
+        if item_schema.validation.as_ref().is_some_and(|validation| {
+            validation.required
+                || validation.min_length.is_some()
+                || validation.max_length.is_some()
+                || validation.min_value.is_some()
+                || validation.max_value.is_some()
+                || validation.pattern.is_some()
+                || (validation.allowed_values.is_some()
+                    && !matches!(item_schema.property_type, PropertyType::Enum(_)))
+        }) {
+            bail!("{item_path} validation and requiredness are not supported");
+        }
+        if item_schema.relationship.is_some() {
+            bail!("{item_path} relationship metadata is not supported");
+        }
+        Ok(item_schema.property_type)
+    }
+
+    fn parse_validation_rule(property_path: &str, value: &Value) -> Result<ValidationRule> {
+        let validation_path = format!("{property_path}.validation");
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("{validation_path} must be an object"))?;
+        Self::reject_unknown_keys(
+            object,
+            &[
+                "min_length",
+                "max_length",
+                "min_value",
+                "max_value",
+                "pattern",
+                "allowed_values",
+            ],
+            &validation_path,
+        )?;
+
+        let min_length = Self::optional_usize(object, "min_length", &validation_path)?;
+        let max_length = Self::optional_usize(object, "max_length", &validation_path)?;
+        if let (Some(min), Some(max)) = (min_length, max_length)
+            && min > max
+        {
+            bail!("{validation_path}.min_length must not exceed max_length");
+        }
+
+        let min_value = Self::optional_f64(object, "min_value", &validation_path)?;
+        let max_value = Self::optional_f64(object, "max_value", &validation_path)?;
+        if let (Some(min), Some(max)) = (min_value, max_value)
+            && min > max
+        {
+            bail!("{validation_path}.min_value must not exceed max_value");
+        }
+
+        let pattern = match object.get("pattern") {
+            Some(value) => {
+                let pattern = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("{validation_path}.pattern must be a string"))?;
+                regex::Regex::new(pattern).with_context(|| {
+                    format!("{validation_path}.pattern is not a valid regular expression")
+                })?;
+                Some(pattern.to_string())
+            }
+            None => None,
+        };
+
+        let allowed_values = object
+            .get("allowed_values")
+            .map(|value| {
+                Self::parse_string_list(&format!("{validation_path}.allowed_values"), value)
+            })
+            .transpose()?;
+
+        Ok(ValidationRule {
+            min_length,
+            max_length,
+            min_value,
+            max_value,
+            pattern,
+            allowed_values,
+            required: false,
+        })
+    }
+
+    fn optional_usize(
+        object: &Map<String, Value>,
+        key: &str,
+        context: &str,
+    ) -> Result<Option<usize>> {
+        object
+            .get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{context}.{key} must be a non-negative integer")
+                    })
+            })
+            .transpose()
+    }
+
+    fn optional_f64(object: &Map<String, Value>, key: &str, context: &str) -> Result<Option<f64>> {
+        object
+            .get(key)
+            .map(|value| {
+                value
+                    .as_f64()
+                    .filter(|number| number.is_finite())
+                    .ok_or_else(|| anyhow::anyhow!("{context}.{key} must be a finite number"))
+            })
+            .transpose()
+    }
+
+    fn parse_string_list(context: &str, value: &Value) -> Result<Vec<String>> {
+        let values = value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("{context} must be an array of strings"))?;
+        if values.is_empty() {
+            bail!("{context} must not be empty");
+        }
+        let mut parsed = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            let item = value
+                .as_str()
+                .filter(|item| !item.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("{context}[{index}] must be a non-empty string"))?
+                .to_string();
+            if parsed.contains(&item) {
+                bail!("{context} contains duplicate value '{item}'");
+            }
+            parsed.push(item);
+        }
+        Ok(parsed)
+    }
+
+    fn validate_rule_compatibility(
+        property_path: &str,
+        property_type: &PropertyType,
+        rule: &ValidationRule,
+    ) -> Result<()> {
+        let is_string_like = matches!(
+            property_type,
+            PropertyType::String
+                | PropertyType::Text
+                | PropertyType::Reference(_)
+                | PropertyType::Enum(_)
+        );
+        if (rule.min_length.is_some()
+            || rule.max_length.is_some()
+            || rule.pattern.is_some()
+            || rule.allowed_values.is_some())
+            && !is_string_like
+        {
+            bail!("{property_path} has string validation rules for a non-string property");
+        }
+        if (rule.min_value.is_some() || rule.max_value.is_some())
+            && !matches!(property_type, PropertyType::Number)
+        {
+            bail!("{property_path} has numeric validation rules for a non-number property");
+        }
+        Ok(())
+    }
+
+    fn has_validation_constraints(rule: &ValidationRule) -> bool {
+        rule.min_length.is_some()
+            || rule.max_length.is_some()
+            || rule.min_value.is_some()
+            || rule.max_value.is_some()
+            || rule.pattern.is_some()
+            || rule.allowed_values.is_some()
+    }
+
+    fn reject_unknown_keys(
+        object: &Map<String, Value>,
+        allowed: &[&str],
+        context: &str,
+    ) -> Result<()> {
+        let mut unknown = object
+            .keys()
+            .filter(|key| !allowed.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        unknown.sort();
+        if !unknown.is_empty() {
+            bail!(
+                "{context} contains unsupported field(s): {}",
+                unknown.join(", ")
+            );
+        }
+        Ok(())
     }
 
     /// Extract object type name from schema name (e.g., "add_npc" -> "npc")
@@ -370,8 +658,10 @@ impl SchemaIngestion {
         let mut errors = Vec::new();
 
         for file_path in schema_files {
-            if let Err(e) = Self::load_json_schema_file(&file_path) {
-                errors.push(format!("{:?}: {}", file_path, e));
+            let result = Self::load_json_schema_file(&file_path)
+                .and_then(Self::convert_json_to_object_schema);
+            if let Err(error) = result {
+                errors.push(format!("{}: {error:#}", file_path.display()));
             }
         }
 
@@ -586,6 +876,197 @@ mod tests {
             }
             _ => panic!("Expected array property type"),
         }
+    }
+
+    #[test]
+    fn test_recursive_property_and_validation_conversion() {
+        let temp_dir = TempDir::new().unwrap();
+        let schema_content = r#"{
+            "name": "add_record",
+            "description": "A recursive record",
+            "properties": {
+                "summary": {
+                    "type": "text",
+                    "validation": {
+                        "min_length": 3,
+                        "max_length": 40,
+                        "pattern": "^[A-Z]",
+                        "allowed_values": ["Alpha", "Beta"]
+                    }
+                },
+                "rating": {
+                    "type": "number",
+                    "validation": { "min_value": 0.5, "max_value": 5.0 }
+                },
+                "active": { "type": "boolean" },
+                "references": {
+                    "type": "array",
+                    "items": { "type": "reference", "targetType": "record" }
+                },
+                "profile": {
+                    "type": "object",
+                    "properties": {
+                        "alias": { "type": "string", "required": true },
+                        "flags": {
+                            "type": "array",
+                            "items": { "type": "boolean" }
+                        }
+                    }
+                },
+                "owner": { "type": "reference", "targetType": "npc" },
+                "state": {
+                    "type": "enum",
+                    "validation": { "allowed_values": ["draft", "final"] }
+                },
+                "legacyState": {
+                    "type": "string",
+                    "enum": ["open", "closed"]
+                }
+            }
+        }"#;
+        create_test_schema_file(temp_dir.path(), "record", schema_content).unwrap();
+
+        let schema =
+            SchemaIngestion::load_schemas_from_directory(temp_dir.path(), "test_schema", "1.0.0")
+                .unwrap();
+        let properties = &schema.object_types["record"].properties;
+
+        assert!(matches!(
+            properties["summary"].property_type,
+            PropertyType::Text
+        ));
+        let summary_validation = properties["summary"].validation.as_ref().unwrap();
+        assert_eq!(summary_validation.min_length, Some(3));
+        assert_eq!(summary_validation.max_length, Some(40));
+        assert_eq!(summary_validation.pattern.as_deref(), Some("^[A-Z]"));
+        assert_eq!(
+            summary_validation.allowed_values.as_deref(),
+            Some(["Alpha".to_string(), "Beta".to_string()].as_slice())
+        );
+        let rating_validation = properties["rating"].validation.as_ref().unwrap();
+        assert_eq!(rating_validation.min_value, Some(0.5));
+        assert_eq!(rating_validation.max_value, Some(5.0));
+        assert!(matches!(
+            properties["active"].property_type,
+            PropertyType::Boolean
+        ));
+        assert!(matches!(
+            properties["references"].property_type,
+            PropertyType::Array(ref item)
+                if matches!(item.as_ref(), PropertyType::Reference(target) if target == "record")
+        ));
+        assert!(matches!(
+            properties["owner"].property_type,
+            PropertyType::Reference(ref target) if target == "npc"
+        ));
+        assert!(matches!(
+            properties["state"].property_type,
+            PropertyType::Enum(ref values) if values == &["draft", "final"]
+        ));
+        assert!(matches!(
+            properties["legacyState"].property_type,
+            PropertyType::Enum(ref values) if values == &["open", "closed"]
+        ));
+
+        let PropertyType::Object(profile) = &properties["profile"].property_type else {
+            panic!("expected nested object property");
+        };
+        assert!(
+            profile["alias"]
+                .validation
+                .as_ref()
+                .is_some_and(|validation| validation.required)
+        );
+        assert!(matches!(
+            profile["flags"].property_type,
+            PropertyType::Array(ref item) if matches!(item.as_ref(), PropertyType::Boolean)
+        ));
+    }
+
+    #[test]
+    fn malformed_property_contracts_fail_closed_with_context() {
+        let cases = [
+            (
+                "unknown_type",
+                r#"{ "type": "mystery" }"#,
+                "unsupported type 'mystery'",
+            ),
+            (
+                "non_object_items",
+                r#"{ "type": "array", "items": "string" }"#,
+                "property 'value'.items must be an object",
+            ),
+            (
+                "unknown_item_type",
+                r#"{ "type": "array", "items": { "type": "mystery" } }"#,
+                "property 'value'.items has unsupported type 'mystery'",
+            ),
+            (
+                "object_without_properties",
+                r#"{ "type": "object" }"#,
+                "properties must be an object for type 'object'",
+            ),
+            (
+                "reference_without_target",
+                r#"{ "type": "reference" }"#,
+                "targetType must be a non-empty string",
+            ),
+            (
+                "unsupported_validation",
+                r#"{ "type": "string", "validation": { "format": "uuid" } }"#,
+                "contains unsupported field(s): format",
+            ),
+            (
+                "invalid_pattern",
+                r#"{ "type": "string", "validation": { "pattern": "[" } }"#,
+                "pattern is not a valid regular expression",
+            ),
+            (
+                "unsupported_property_field",
+                r#"{ "type": "string", "default": "x" }"#,
+                "contains unsupported field(s): default",
+            ),
+            (
+                "conflicting_enum_forms",
+                r#"{
+                    "type": "enum",
+                    "enum": ["a"],
+                    "validation": { "allowed_values": ["b"] }
+                }"#,
+                "conflicting enum and validation.allowed_values",
+            ),
+        ];
+
+        for (name, property, expected) in cases {
+            let temp_dir = TempDir::new().unwrap();
+            let schema = format!(
+                r#"{{
+                    "name": "add_test",
+                    "properties": {{ "value": {property} }}
+                }}"#
+            );
+            create_test_schema_file(temp_dir.path(), name, &schema).unwrap();
+            let error = SchemaIngestion::load_schemas_from_directory(
+                temp_dir.path(),
+                "test_schema",
+                "1.0.0",
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(&format!("{name}.json")), "{message}");
+            assert!(message.contains("property 'value'"), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn shipped_schemas_conform_to_external_contract() {
+        let schema_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../defaults/schemas/Sine Nomine");
+        let schema =
+            SchemaIngestion::load_schemas_from_directory(schema_dir, "imported_schemas", "1.0.0")
+                .unwrap();
+        assert_eq!(schema.object_types.len(), 13);
     }
 
     #[test]

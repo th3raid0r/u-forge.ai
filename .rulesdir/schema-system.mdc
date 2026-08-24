@@ -57,9 +57,39 @@ The internal object type is `npc`. Relationship metadata makes the owning
 object type an allowed source and `targetType` an allowed target; no unrelated
 “common edge” registry is added implicitly.
 
-Supported property kinds are `string`, `text`, `number`, `boolean`, `array`,
-`object`, `reference`, and `enum`. Validation rules include length/range,
-regex, and allowed-value constraints.
+Every property is an object with a required string `type`, optional string
+`description`, optional boolean `required`, and optional `validation` and
+`relationship` objects. Supported property kinds and their type-specific fields
+are:
+
+- `string`, `text`, `number`, and `boolean` need no additional type fields;
+- `array` accepts an `items` property definition and converts it recursively.
+  Pre-v0.1.1 files may omit `items` as an explicit compatibility shorthand for
+  `{ "type": "string" }`; new schemas should declare it. Item type shapes are
+  recursive, including object fields, references, and enums; item-level
+  requiredness, validation constraints, and relationship metadata are rejected
+  because the persisted array type cannot represent them;
+- `object` requires a recursive `properties` object;
+- `reference` requires a non-empty `targetType` string;
+- `enum` requires `validation.allowed_values`.
+
+`validation` accepts only `min_length`, `max_length`, `min_value`, `max_value`,
+`pattern`, and `allowed_values`. Length, regex, and allowed-value rules apply to
+string-like properties; numeric ranges apply to numbers. The legacy top-level
+`enum` string array remains accepted for shipped and external compatibility and
+normalizes to `validation.allowed_values`. If both forms are present, they must
+be identical.
+
+`relationship` accepts a required non-empty `edgeType` plus optional
+`targetType` and `description` strings. At the file root, `name` and
+`properties` are required; `description` and the legacy boolean
+`additionalProperties` field are accepted. `additionalProperties` does not
+widen the graph contract: undeclared persisted properties remain invalid.
+
+Schema loading is fail-closed. Unknown fields or kinds, malformed recursive
+definitions, invalid regular expressions, incompatible constraints, and
+ambiguous enum forms reject the directory import with file and property
+context; no valid-looking subset is silently loaded.
 
 ## Validation boundaries
 
