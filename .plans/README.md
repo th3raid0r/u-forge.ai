@@ -10,7 +10,7 @@ records under `archive/` and are not current implementation instructions.
 
 | Plan | State | Progress |
 |------|-------|----------|
-| [v0.1.1 audit remediation](v0.1.1_audit-remediation.md) | Complete | Items 1–11 are implemented and verified on `chore/v0.1.1-audit-remediation`. |
+
 
 ## Active design gate
 
@@ -35,6 +35,7 @@ The August completion briefs live in
 | Inference lifecycle | 2026-08-09 | Typed cancellable jobs, parent cancellation, explicit terminal outcomes, queue telemetry, and evidence-retained routing/retry constants. |
 | Agent budgets | 2026-08-09 | Model-reconciled schema/request/tool budgets, repeat circuit breaking, semantic output bounds, and explicit chat outcomes. |
 | Linux client decorations | 2026-08-09 | Negotiated GPUI client chrome, native window interactions, tiling-aware geometry, persisted control placement, and supported-session validation. |
+| [v0.1.1 audit remediation](v0.1.1_audit-remediation.md) | Complete | Items 1–11 are implemented and verified on `chore/v0.1.1-audit-remediation`. |
 
 These features were sometimes implemented with narrower or different mechanics
 than their original proposals. The archived briefs record final outcomes; the
