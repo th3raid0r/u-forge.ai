@@ -242,9 +242,6 @@ impl SchemaManager {
         schema.add_object_type(type_name.to_string(), type_schema);
         self.save_schema(&schema)?;
 
-        // Invalidate cache to force reload
-        self.schema_cache.write().remove(schema_name);
-
         Ok(())
     }
 
@@ -258,9 +255,6 @@ impl SchemaManager {
         let mut schema = (*self.load_schema(schema_name).await?).clone();
         schema.add_edge_type(edge_name.to_string(), edge_schema);
         self.save_schema(&schema)?;
-
-        // Invalidate cache to force reload
-        self.schema_cache.write().remove(schema_name);
 
         Ok(())
     }
@@ -960,6 +954,59 @@ mod tests {
 
         let result = manager.validate_object(&spell).await.unwrap();
         assert!(result.valid);
+    }
+
+    #[tokio::test]
+    async fn registration_preserves_cached_schema_precedence() {
+        let (manager, _temp) = create_test_schema_manager();
+
+        let mut imported = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "Imported schema".to_string(),
+        );
+        imported.add_object_type(
+            "ritual".to_string(),
+            ObjectTypeSchema::new("ritual".to_string(), "Imported ritual".to_string())
+                .with_property("origin".to_string(), PropertySchema::string("Origin"))
+                .with_required_property("origin".to_string()),
+        );
+        manager.save_schema(&imported).unwrap();
+
+        manager
+            .register_object_type(
+                "default",
+                "ritual",
+                ObjectTypeSchema::new("ritual".to_string(), "Default ritual".to_string())
+                    .with_property("level".to_string(), PropertySchema::number("Level"))
+                    .with_required_property("level".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            manager
+                .get_object_type_schema("default", "ritual")
+                .is_some()
+        );
+        assert!(
+            manager
+                .get_object_type_schema("imported_schemas", "ritual")
+                .is_some()
+        );
+
+        let imported_ritual = ObjectMetadata::new("ritual".to_string(), "Old Rite".to_string())
+            .with_property("origin".to_string(), "Archive".to_string());
+        manager
+            .validate_object_cached_strict(&imported_ritual)
+            .unwrap();
+
+        let default_ritual = ObjectMetadata::new("ritual".to_string(), "New Rite".to_string())
+            .with_schema("default".to_string())
+            .with_json_property("level".to_string(), serde_json::json!(2));
+        manager
+            .validate_object_cached_strict(&default_ritual)
+            .unwrap();
     }
 
     #[tokio::test]
