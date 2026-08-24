@@ -10,7 +10,14 @@ records under `archive/` and are not current implementation instructions.
 
 | Plan | State | Progress |
 |------|-------|----------|
+| [Staged Hybrid Search Pipeline](feature_hybrid-search-pipeline.md) | Planned | Impact rank 1; covers `CORE-01`, `AGENT-07`, and the `ALLOW-11` acceptance outcome. |
+| [Unified Inference Queue Lifecycle](feature_inference-queue-lifecycle.md) | Planned | Impact rank 2; covers `CORE-05`, `CORE-09`, `CORE-11`, and the `ALLOW-08` acceptance outcome. |
+| [Adaptive Agent Context Optimization](feature_agent-context-optimization.md) | Planned | Impact rank 3; removes rollback residue and replaces per-source budgets with pressure-triggered compaction. Covers `AGENT-02`, `AGENT-03`, `AGENT-05`, `AGENT-10`, and `ALLOW-05`. |
+| [Typed Chat Run Lifecycle](feature_chat-run-lifecycle.md) | Planned | Impact rank 4; covers `AGENT-01`, `AGENT-04`, `AGENT-09`, `UI-08`, and the `ALLOW-10` acceptance outcome. |
+| [Catalog-Derived Lemonade Setup and Activation](feature_lemonade-setup-activation.md) | Planned | Impact rank 5; covers `UI-04`, `UI-01`, `UI-05`, and `LEMON-08`. |
 
+The source inventory and full surfaced/planned/remediated candidate ledger live in
+[`v0.1.1_analysis.md`](v0.1.1_analysis.md).
 
 ## Active design gate
 
@@ -33,7 +40,7 @@ The August completion briefs live in
 | Lemonade runtime | 2026-08-05 | Pinned private runtime, shared connection/auth, partial discovery, effective runtime profiles, setup management, and coordinated chat transports. |
 | Zed-structured workspace | 2026-08-07 | Semantic components, behavioral docks, focus/actions, Details tabs, menus, status UI, and the DM-oriented World Canvas. |
 | Inference lifecycle | 2026-08-09 | Typed cancellable jobs, parent cancellation, explicit terminal outcomes, queue telemetry, and evidence-retained routing/retry constants. |
-| Agent budgets | 2026-08-09 | Model-reconciled schema/request/tool budgets, repeat circuit breaking, semantic output bounds, and explicit chat outcomes. |
+| Agent budgets | 2026-08-09 | Initial model-reconciled budget controls landed; conservative constraints were later partially rolled back after disrupting tool use. Adaptive context optimization is now planned above. |
 | Linux client decorations | 2026-08-09 | Negotiated GPUI client chrome, native window interactions, tiling-aware geometry, persisted control placement, and supported-session validation. |
 | [v0.1.1 audit remediation](v0.1.1_audit-remediation.md) | Complete | Items 1–11 are implemented and verified on `chore/v0.1.1-audit-remediation`. |
 
