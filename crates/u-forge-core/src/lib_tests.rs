@@ -4,9 +4,11 @@
 use tempfile::TempDir;
 
 use crate::graph::MAX_CHUNK_TOKENS;
+use crate::schema::ValidationRule;
 use crate::types::{ChunkType, EdgeType};
 use crate::{
-    EmbeddingTarget, GraphChange, KnowledgeGraph, ObjectBuilder, ObjectTypeSchema, PropertySchema,
+    EdgeTypeSchema, EmbeddingTarget, GraphChange, KnowledgeGraph, ObjectBuilder, ObjectTypeSchema,
+    PropertySchema,
 };
 
 fn create_test_graph() -> (KnowledgeGraph, TempDir) {
@@ -245,11 +247,15 @@ fn test_add_text_chunk_long_content_stored_as_multiple_chunks() {
 // ── Schema integration ────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_schema_integration() {
+async fn registered_object_type_is_immediately_visible_and_enforced() {
     let (graph, _tmp) = create_test_graph_async().await;
 
     let spell_schema = ObjectTypeSchema::new("spell".to_string(), "A magical spell".to_string())
-        .with_property("level".to_string(), PropertySchema::number("Spell level"))
+        .with_property(
+            "level".to_string(),
+            PropertySchema::number("Spell level")
+                .with_validation(ValidationRule::new().with_value_range(Some(1.0), Some(5.0))),
+        )
         .with_property(
             "school".to_string(),
             PropertySchema::string("School of magic"),
@@ -260,6 +266,8 @@ async fn test_schema_integration() {
         .register_object_type("spell", spell_schema)
         .await
         .unwrap();
+
+    assert!(graph.get_schema_manager().is_valid_object_type("spell"));
 
     let spell = ObjectBuilder::custom("spell".to_string(), "Fireball".to_string())
         .with_json_property(
@@ -272,20 +280,105 @@ async fn test_schema_integration() {
         )
         .build();
 
-    let validation = graph.validate_object(&spell).await.unwrap();
-    assert!(
-        validation.valid,
-        "Expected valid spell: {:?}",
-        validation.errors
-    );
-
-    let spell_id = graph.add_object_validated(spell).await.unwrap();
+    let spell_id = graph.add_object(spell).unwrap();
     let retrieved = graph.get_object(spell_id).unwrap().unwrap();
     assert_eq!(retrieved.name, "Fireball");
     assert_eq!(retrieved.object_type, "spell");
 
+    let unknown = ObjectBuilder::custom("incantation".to_string(), "Unknown".to_string()).build();
+    let error = graph.add_object(unknown).unwrap_err().to_string();
+    assert!(
+        error.contains("Unknown object type 'incantation'"),
+        "{error}"
+    );
+
+    let undeclared = ObjectBuilder::custom("spell".to_string(), "Wild Magic".to_string())
+        .with_json_property("level".to_string(), serde_json::json!(1))
+        .with_property("damage".to_string(), "8d6".to_string())
+        .build();
+    let error = graph.add_object(undeclared).unwrap_err().to_string();
+    assert!(
+        error.contains("Property 'damage' is not defined"),
+        "{error}"
+    );
+
+    let missing = ObjectBuilder::custom("spell".to_string(), "Cantrip".to_string()).build();
+    let error = graph.add_object(missing).unwrap_err().to_string();
+    assert!(
+        error.contains("Missing required property: level"),
+        "{error}"
+    );
+
+    let coercible = ObjectBuilder::custom("spell".to_string(), "String Level".to_string())
+        .with_property("level".to_string(), "3".to_string())
+        .build();
+    let error = graph.add_object(coercible).unwrap_err().to_string();
+    assert!(error.contains("Expected: number, Got: string"), "{error}");
+
+    let out_of_range = ObjectBuilder::custom("spell".to_string(), "Impossible".to_string())
+        .with_json_property("level".to_string(), serde_json::json!(9))
+        .build();
+    let error = graph.add_object(out_of_range).unwrap_err().to_string();
+    assert!(error.contains("maximum value is 5"), "{error}");
+
     let stats = graph.get_schema_stats("default").await.unwrap();
     assert!(stats.object_type_count >= 7); // 6 built-in + "spell"
+}
+
+#[tokio::test]
+async fn registered_edge_type_is_immediately_visible_and_enforced() {
+    let (graph, _tmp) = create_test_graph_async().await;
+
+    graph
+        .register_edge_type(
+            "protects",
+            EdgeTypeSchema::new("protects".to_string(), "Guards a place".to_string())
+                .with_source_types(vec!["character".to_string()])
+                .with_target_types(vec!["location".to_string()]),
+        )
+        .await
+        .unwrap();
+
+    assert!(graph.get_schema_manager().is_valid_edge_type("protects"));
+
+    let guardian = graph
+        .add_object(ObjectBuilder::character("Guardian".to_string()).build())
+        .unwrap();
+    let location = graph
+        .add_object(
+            ObjectBuilder::location("Sanctum".to_string())
+                .with_property("type".to_string(), "temple".to_string())
+                .build(),
+        )
+        .unwrap();
+    let intruder = graph
+        .add_object(ObjectBuilder::character("Intruder".to_string()).build())
+        .unwrap();
+
+    let error = graph
+        .connect_objects_str(guardian, location, "invented_edge")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Unknown edge type 'invented_edge'"),
+        "{error}"
+    );
+
+    let error = graph
+        .connect_objects_str(guardian, intruder, "protects")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("does not allow target type 'character'"),
+        "{error}"
+    );
+
+    graph
+        .connect_objects_str(guardian, location, "protects")
+        .unwrap();
+    let relationships = graph.get_relationships(guardian).unwrap();
+    assert_eq!(relationships.len(), 1);
+    assert_eq!(relationships[0].edge_type.as_str(), "protects");
 }
 
 #[tokio::test]

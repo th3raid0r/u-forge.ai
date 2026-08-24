@@ -1,6 +1,9 @@
+use super::validation::{
+    NormalizationPolicy, PropertyIssue, normalize_object_properties, normalize_property_value,
+};
 use super::{
-    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, PropertyType, SchemaDefinition,
-    ValidationError, ValidationErrorType, ValidationResult, ValidationRule, ValidationWarning,
+    EdgeTypeSchema, ObjectTypeSchema, PropertySchema, SchemaDefinition, ValidationError,
+    ValidationErrorType, ValidationResult, ValidationWarning,
 };
 use crate::graph::KnowledgeGraphStorage;
 use crate::types::{Edge, ObjectMetadata};
@@ -9,7 +12,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 
 /// Schema manager for validating objects and managing schemas at runtime
@@ -106,43 +108,27 @@ impl SchemaManager {
             }
         };
 
-        // Validate required properties
-        for required_prop in &object_schema.required_properties {
-            if required_prop == "name" {
-                // Name is always available in ObjectMetadata
-                continue;
-            }
-
-            let properties = object.properties.as_object();
-            if properties.is_none_or(|properties| {
-                !properties.contains_key(required_prop)
-                    || properties.get(required_prop).is_some_and(Value::is_null)
-            }) {
-                result.add_error(ValidationError {
-                    property: required_prop.clone(),
-                    message: format!("Missing required property: {}", required_prop),
-                    error_type: ValidationErrorType::MissingRequired,
-                });
-            }
+        let Some(properties) = object.properties.as_object() else {
+            result.add_error(ValidationError {
+                property: "properties".to_string(),
+                message: "Object properties must be a JSON object".to_string(),
+                error_type: ValidationErrorType::TypeMismatch,
+            });
+            return Ok(result);
+        };
+        let normalization = normalize_object_properties(
+            object_schema,
+            properties,
+            NormalizationPolicy::WARNING_ONLY_UNKNOWN,
+        );
+        for issue in normalization.errors {
+            result.add_error(validation_error_from_issue(&issue));
         }
-
-        // Validate property types and values
-        if let Some(props) = object.properties.as_object() {
-            for (key, value) in props {
-                if let Some(prop_schema) = object_schema.properties.get(key) {
-                    if let Err(validation_error) =
-                        self.validate_property_value(key, value, prop_schema)
-                    {
-                        result.add_error(validation_error);
-                    }
-                } else {
-                    // Property not defined in schema - add warning
-                    result.add_warning(ValidationWarning {
-                        property: key.clone(),
-                        message: format!("Property '{}' is not defined in schema", key),
-                    });
-                }
-            }
+        for issue in normalization.warnings {
+            result.add_warning(ValidationWarning {
+                property: issue.key().to_string(),
+                message: validation_message(&issue),
+            });
         }
 
         Ok(result)
@@ -242,9 +228,6 @@ impl SchemaManager {
         schema.add_object_type(type_name.to_string(), type_schema);
         self.save_schema(&schema)?;
 
-        // Invalidate cache to force reload
-        self.schema_cache.write().remove(schema_name);
-
         Ok(())
     }
 
@@ -258,9 +241,6 @@ impl SchemaManager {
         let mut schema = (*self.load_schema(schema_name).await?).clone();
         schema.add_edge_type(edge_name.to_string(), edge_schema);
         self.save_schema(&schema)?;
-
-        // Invalidate cache to force reload
-        self.schema_cache.write().remove(schema_name);
 
         Ok(())
     }
@@ -328,19 +308,21 @@ impl SchemaManager {
                     object.object_type
                 )
             })?;
-        let validation = self.validate_object_with_schema(object, &schema)?;
-        if !validation.valid || !validation.warnings.is_empty() {
-            let mut messages = validation
+        let properties = object
+            .properties
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Object properties must be a JSON object"))?;
+        let normalization = normalize_object_properties(
+            &schema.object_types[&object.object_type],
+            properties,
+            NormalizationPolicy::STRICT,
+        );
+        if !normalization.errors.is_empty() {
+            let messages = normalization
                 .errors
-                .into_iter()
-                .map(|error| error.message)
+                .iter()
+                .map(validation_message)
                 .collect::<Vec<_>>();
-            messages.extend(
-                validation
-                    .warnings
-                    .into_iter()
-                    .map(|warning| warning.message),
-            );
             bail!("Object validation failed: {}", messages.join("; "));
         }
         Ok(())
@@ -486,179 +468,12 @@ impl SchemaManager {
         value: &Value,
         schema: &PropertySchema,
     ) -> Result<(), ValidationError> {
-        // Check type compatibility
-        let is_type_valid = match (&schema.property_type, value) {
-            (PropertyType::String, Value::String(_)) => true,
-            (PropertyType::Text, Value::String(_)) => true,
-            (PropertyType::Number, Value::Number(_)) => true,
-            (PropertyType::Boolean, Value::Bool(_)) => true,
-            (PropertyType::Array(_), Value::Array(_)) => true,
-            (PropertyType::Object(_), Value::Object(_)) => true,
-            (PropertyType::Reference(_), Value::String(_)) => true,
-            (PropertyType::Enum(allowed), Value::String(s)) => allowed.contains(s),
-            _ => false,
-        };
-
-        if !is_type_valid {
-            return Err(ValidationError {
-                property: property_name.to_string(),
-                message: format!(
-                    "Property '{}' has incorrect type. Expected: {}, Got: {}",
-                    property_name,
-                    schema.property_type.name(),
-                    match value {
-                        Value::String(_) => "string",
-                        Value::Number(_) => "number",
-                        Value::Bool(_) => "boolean",
-                        Value::Array(_) => "array",
-                        Value::Object(_) => "object",
-                        Value::Null => "null",
-                    }
-                ),
-                error_type: ValidationErrorType::TypeMismatch,
-            });
-        }
-
-        // Apply validation rules if present
-        if let Some(validation) = &schema.validation {
-            self.apply_validation_rules(property_name, value, validation)?;
-        }
-
-        // Validate array elements if it's an array
-        if let (PropertyType::Array(element_type), Value::Array(arr)) =
-            (&schema.property_type, value)
-        {
-            for (i, element) in arr.iter().enumerate() {
-                let element_schema =
-                    PropertySchema::new((**element_type).clone(), "Array element".to_string());
-                self.validate_property_value(
-                    &format!("{}[{}]", property_name, i),
-                    element,
-                    &element_schema,
-                )?;
-            }
-        }
-
-        // Validate object properties if it's an object
-        if let (PropertyType::Object(obj_schema), Value::Object(obj)) =
-            (&schema.property_type, value)
-        {
-            for (key, prop_schema) in obj_schema {
-                if let Some(prop_value) = obj.get(key) {
-                    self.validate_property_value(
-                        &format!("{}.{}", property_name, key),
-                        prop_value,
-                        prop_schema,
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Apply validation rules to a property value
-    fn apply_validation_rules(
-        &self,
-        property_name: &str,
-        value: &Value,
-        validation: &ValidationRule,
-    ) -> Result<(), ValidationError> {
-        // String length validation
-        if let Value::String(s) = value {
-            if let Some(min_len) = validation.min_length
-                && s.len() < min_len
-            {
-                return Err(ValidationError {
-                    property: property_name.to_string(),
-                    message: format!(
-                        "Property '{}' is too short. Minimum length: {}",
-                        property_name, min_len
-                    ),
-                    error_type: ValidationErrorType::ValidationRuleFailed,
-                });
-            }
-
-            if let Some(max_len) = validation.max_length
-                && s.len() > max_len
-            {
-                return Err(ValidationError {
-                    property: property_name.to_string(),
-                    message: format!(
-                        "Property '{}' is too long. Maximum length: {}",
-                        property_name, max_len
-                    ),
-                    error_type: ValidationErrorType::ValidationRuleFailed,
-                });
-            }
-
-            // Pattern validation
-            if let Some(pattern) = &validation.pattern {
-                let regex = regex::Regex::new(pattern).map_err(|_| ValidationError {
-                    property: property_name.to_string(),
-                    message: format!("Invalid regex pattern in schema: {}", pattern),
-                    error_type: ValidationErrorType::ValidationRuleFailed,
-                })?;
-
-                if !regex.is_match(s) {
-                    return Err(ValidationError {
-                        property: property_name.to_string(),
-                        message: format!(
-                            "Property '{}' does not match required pattern: {}",
-                            property_name, pattern
-                        ),
-                        error_type: ValidationErrorType::ValidationRuleFailed,
-                    });
-                }
-            }
-
-            // Allowed values validation
-            if let Some(allowed) = &validation.allowed_values
-                && !allowed.contains(s)
-            {
-                return Err(ValidationError {
-                    property: property_name.to_string(),
-                    message: format!(
-                        "Property '{}' has invalid value. Allowed values: {:?}",
-                        property_name, allowed
-                    ),
-                    error_type: ValidationErrorType::ValidationRuleFailed,
-                });
-            }
-        }
-
-        // Numeric range validation
-        if let Value::Number(n) = value {
-            let num_val = n.as_f64().unwrap_or(0.0);
-
-            if let Some(min_val) = validation.min_value
-                && num_val < min_val
-            {
-                return Err(ValidationError {
-                    property: property_name.to_string(),
-                    message: format!(
-                        "Property '{}' is too small. Minimum value: {}",
-                        property_name, min_val
-                    ),
-                    error_type: ValidationErrorType::ValidationRuleFailed,
-                });
-            }
-
-            if let Some(max_val) = validation.max_value
-                && num_val > max_val
-            {
-                return Err(ValidationError {
-                    property: property_name.to_string(),
-                    message: format!(
-                        "Property '{}' is too large. Maximum value: {}",
-                        property_name, max_val
-                    ),
-                    error_type: ValidationErrorType::ValidationRuleFailed,
-                });
-            }
-        }
-
-        Ok(())
+        let normalization =
+            normalize_property_value(property_name, value, schema, NormalizationPolicy::STRICT);
+        normalization
+            .errors
+            .first()
+            .map_or(Ok(()), |issue| Err(validation_error_from_issue(issue)))
     }
 
     /// Validate and coerce `properties` for `object_type` against the cached schema.
@@ -668,165 +483,85 @@ impl SchemaManager {
     /// - `String("true"/"false"/"yes"/"no"/"1"/"0")` → `Bool` when the schema declares `Boolean`
     ///
     /// Issues returned for caller action:
+    /// - [`PropertyIssue::UnknownObjectType`] — type absent from authoritative cached schemas
     /// - [`PropertyIssue::MissingRequired`] — required key is absent or null
     /// - [`PropertyIssue::TypeMismatch`] — wrong type and no coercion available
     /// - [`PropertyIssue::UnknownProperty`] — key not declared in the schema
     /// - [`PropertyIssue::InvalidEnum`] — string not in the enum's allowed list
+    /// - [`PropertyIssue::ValidationFailed`] — length, range, regex, or allowed-value failure
     ///
-    /// Returns an empty vec when the schema or object type is not cached yet.
+    /// Returns an empty vec only when no authoritative schema is cached yet.
     pub fn validate_and_coerce_properties(
         &self,
         object_type: &str,
         properties: &mut serde_json::Map<String, Value>,
     ) -> Vec<PropertyIssue> {
+        if self.schema_cache.read().is_empty() {
+            return vec![];
+        }
         let type_schema = match self.cached_schema_for_object_type(object_type, None) {
             Some(schema) => schema
                 .object_types
                 .get(object_type)
                 .cloned()
                 .expect("schema was selected for this object type"),
-            None => return vec![],
+            None => {
+                return vec![PropertyIssue::UnknownObjectType {
+                    object_type: object_type.to_string(),
+                    valid: self.all_object_type_names(),
+                }];
+            }
         };
 
-        let mut issues = Vec::new();
-        let mut coercions: Vec<(String, Value)> = Vec::new();
-
-        for required in &type_schema.required_properties {
-            // `name` is stored as a top-level ObjectMetadata field and is not
-            // present in this properties map.
-            if required == "name" {
-                continue;
-            }
-            if !properties.contains_key(required)
-                || properties.get(required).is_some_and(Value::is_null)
-            {
-                issues.push(PropertyIssue::MissingRequired {
-                    key: required.clone(),
-                });
-            }
-        }
-
-        for (key, value) in properties.iter() {
-            let prop_schema = match type_schema.properties.get(key) {
-                Some(s) => s,
-                None => {
-                    issues.push(PropertyIssue::UnknownProperty { key: key.clone() });
-                    continue;
-                }
-            };
-
-            match (&prop_schema.property_type, value) {
-                // Already the right type.
-                (PropertyType::String, Value::String(_))
-                | (PropertyType::Text, Value::String(_))
-                | (PropertyType::Number, Value::Number(_))
-                | (PropertyType::Boolean, Value::Bool(_))
-                | (PropertyType::Array(_), Value::Array(_))
-                | (PropertyType::Object(_), Value::Object(_))
-                | (PropertyType::Reference(_), Value::String(_)) => {}
-
-                // Enum: string must be in the allowed list.
-                (PropertyType::Enum(allowed), Value::String(s)) => {
-                    if !allowed.contains(s) {
-                        issues.push(PropertyIssue::InvalidEnum {
-                            key: key.clone(),
-                            value: s.clone(),
-                            allowed: allowed.clone(),
-                        });
-                    }
-                }
-
-                // Number schema + String value: attempt numeric coercion.
-                (PropertyType::Number, Value::String(s)) => {
-                    if let Ok(n) = s.parse::<f64>() {
-                        if let Some(num) = serde_json::Number::from_f64(n) {
-                            coercions.push((key.clone(), Value::Number(num)));
-                        } else {
-                            issues.push(PropertyIssue::TypeMismatch {
-                                key: key.clone(),
-                                expected: "number".to_string(),
-                            });
-                        }
-                    } else {
-                        issues.push(PropertyIssue::TypeMismatch {
-                            key: key.clone(),
-                            expected: "number".to_string(),
-                        });
-                    }
-                }
-
-                // Boolean schema + String value: attempt boolean coercion.
-                (PropertyType::Boolean, Value::String(s)) => match s.to_lowercase().as_str() {
-                    "true" | "1" | "yes" => coercions.push((key.clone(), Value::Bool(true))),
-                    "false" | "0" | "no" => coercions.push((key.clone(), Value::Bool(false))),
-                    _ => issues.push(PropertyIssue::TypeMismatch {
-                        key: key.clone(),
-                        expected: "boolean".to_string(),
-                    }),
-                },
-
-                // All other mismatches.
-                _ => {
-                    issues.push(PropertyIssue::TypeMismatch {
-                        key: key.clone(),
-                        expected: prop_schema.property_type.name().to_string(),
-                    });
-                }
-            }
-        }
-
-        for (key, new_value) in coercions {
-            properties.insert(key, new_value);
-        }
-
-        issues
+        let normalization =
+            normalize_object_properties(&type_schema, properties, NormalizationPolicy::PREFLIGHT);
+        *properties = normalization.normalized;
+        normalization.errors
     }
 }
 
-/// Describes a validation or coercion result for a single property.
-///
-/// Returned by [`SchemaManager::validate_and_coerce_properties`]. Coercions are applied
-/// in-place and are NOT included in the returned vec — only issues that require caller
-/// attention are reported.
-#[derive(Debug, Clone)]
-pub enum PropertyIssue {
-    /// A required property is absent or explicitly null.
-    MissingRequired { key: String },
-    /// Value type does not match schema and could not be automatically coerced.
-    TypeMismatch { key: String, expected: String },
-    /// Property key is not declared in the schema for this object type.
-    UnknownProperty { key: String },
-    /// String value is not in the enum's allowed list.
-    InvalidEnum {
-        key: String,
-        value: String,
-        allowed: Vec<String>,
-    },
+fn validation_error_from_issue(issue: &PropertyIssue) -> ValidationError {
+    let error_type = match issue {
+        PropertyIssue::UnknownObjectType { .. } => ValidationErrorType::InvalidValue,
+        PropertyIssue::MissingRequired { .. } => ValidationErrorType::MissingRequired,
+        PropertyIssue::TypeMismatch { .. } => ValidationErrorType::TypeMismatch,
+        PropertyIssue::UnknownProperty { .. } | PropertyIssue::InvalidEnum { .. } => {
+            ValidationErrorType::InvalidValue
+        }
+        PropertyIssue::ValidationFailed { .. } => ValidationErrorType::ValidationRuleFailed,
+    };
+    ValidationError {
+        property: issue.key().to_string(),
+        message: validation_message(issue),
+        error_type,
+    }
 }
 
-impl fmt::Display for PropertyIssue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PropertyIssue::MissingRequired { key } => {
-                write!(f, "required property '{key}' is missing")
-            }
-            PropertyIssue::TypeMismatch { key, expected } => {
-                write!(f, "property '{key}': expected {expected}")
-            }
-            PropertyIssue::UnknownProperty { key } => {
-                write!(f, "property '{key}' is not declared in schema")
-            }
-            PropertyIssue::InvalidEnum {
-                key,
-                value,
-                allowed,
-            } => {
-                write!(
-                    f,
-                    "property '{key}': '{value}' is not a valid enum value (allowed: {})",
-                    allowed.join(", ")
-                )
-            }
+fn validation_message(issue: &PropertyIssue) -> String {
+    match issue {
+        PropertyIssue::UnknownObjectType { object_type, valid } => format!(
+            "Unknown object type '{object_type}'. Valid types: {}",
+            valid.join(", ")
+        ),
+        PropertyIssue::MissingRequired { key } => format!("Missing required property: {key}"),
+        PropertyIssue::TypeMismatch {
+            key,
+            expected,
+            actual,
+        } => format!("Property '{key}' has incorrect type. Expected: {expected}, Got: {actual}"),
+        PropertyIssue::UnknownProperty { key } => {
+            format!("Property '{key}' is not defined in schema")
+        }
+        PropertyIssue::InvalidEnum {
+            key,
+            value,
+            allowed,
+        } => format!(
+            "Property '{key}' has invalid value '{value}'. Allowed values: {}",
+            allowed.join(", ")
+        ),
+        PropertyIssue::ValidationFailed { key, message } => {
+            format!("Property '{key}' failed validation: {message}")
         }
     }
 }
@@ -844,6 +579,7 @@ pub struct SchemaStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{PropertyType, ValidationRule};
     use crate::types::{Edge, EdgeType, ObjectMetadata};
     use tempfile::TempDir;
 
@@ -963,6 +699,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_preserves_cached_schema_precedence() {
+        let (manager, _temp) = create_test_schema_manager();
+
+        let mut imported = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "Imported schema".to_string(),
+        );
+        imported.add_object_type(
+            "ritual".to_string(),
+            ObjectTypeSchema::new("ritual".to_string(), "Imported ritual".to_string())
+                .with_property("origin".to_string(), PropertySchema::string("Origin"))
+                .with_required_property("origin".to_string()),
+        );
+        manager.save_schema(&imported).unwrap();
+
+        manager
+            .register_object_type(
+                "default",
+                "ritual",
+                ObjectTypeSchema::new("ritual".to_string(), "Default ritual".to_string())
+                    .with_property("level".to_string(), PropertySchema::number("Level"))
+                    .with_required_property("level".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            manager
+                .get_object_type_schema("default", "ritual")
+                .is_some()
+        );
+        assert!(
+            manager
+                .get_object_type_schema("imported_schemas", "ritual")
+                .is_some()
+        );
+
+        let imported_ritual = ObjectMetadata::new("ritual".to_string(), "Old Rite".to_string())
+            .with_property("origin".to_string(), "Archive".to_string());
+        manager
+            .validate_object_cached_strict(&imported_ritual)
+            .unwrap();
+
+        let default_ritual = ObjectMetadata::new("ritual".to_string(), "New Rite".to_string())
+            .with_schema("default".to_string())
+            .with_json_property("level".to_string(), serde_json::json!(2));
+        manager
+            .validate_object_cached_strict(&default_ritual)
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_schema_stats() {
         let (manager, _temp) = create_test_schema_manager();
 
@@ -1052,5 +841,67 @@ mod tests {
                 .validate_and_coerce_properties("npc", &mut valid)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn preflight_recurses_and_applies_rules_before_persistence() {
+        let (manager, _temp) = create_test_schema_manager();
+        let nested = HashMap::from([(
+            "alias".to_string(),
+            PropertySchema::string("alias").with_validation(ValidationRule::required()),
+        )]);
+        let mut schema = SchemaDefinition::new(
+            "imported_schemas".to_string(),
+            "1.0.0".to_string(),
+            "test".to_string(),
+        );
+        schema.add_object_type(
+            "record".to_string(),
+            ObjectTypeSchema::new("record".to_string(), "Record".to_string())
+                .with_property(
+                    "profile".to_string(),
+                    PropertySchema::new(PropertyType::Object(nested), "profile".to_string()),
+                )
+                .with_property(
+                    "score".to_string(),
+                    PropertySchema::number("score")
+                        .with_validation(ValidationRule::new().with_value_range(None, Some(5.0))),
+                ),
+        );
+        manager.save_schema(&schema).unwrap();
+        let mut properties = serde_json::json!({ "profile": {}, "score": "9" })
+            .as_object()
+            .unwrap()
+            .clone();
+
+        let issues = manager.validate_and_coerce_properties("record", &mut properties);
+
+        assert_eq!(properties["score"], serde_json::json!(9.0));
+        assert_eq!(
+            issues.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "required property 'profile.alias' is missing",
+                "property 'score': maximum value is 5",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_unknown_type_is_schema_less_only_when_cache_is_empty() {
+        let (manager, _temp) = create_test_schema_manager();
+        let mut properties = serde_json::Map::new();
+        assert!(
+            manager
+                .validate_and_coerce_properties("unknown", &mut properties)
+                .is_empty()
+        );
+
+        manager.load_schema("default").await.unwrap();
+        let issues = manager.validate_and_coerce_properties("unknown", &mut properties);
+        assert!(matches!(
+            issues.as_slice(),
+            [PropertyIssue::UnknownObjectType { object_type, valid }]
+                if object_type == "unknown" && valid.windows(2).all(|pair| pair[0] <= pair[1])
+        ));
     }
 }

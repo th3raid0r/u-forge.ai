@@ -1,10 +1,16 @@
 # Plan Ledger
 
-Last reconciled: 2026-08-09 against `main` after PR #44.
+Last reconciled: 2026-08-24 on `chore/v0.1.1-audit-remediation`.
 
 Source code and verified behavior are authoritative. This directory contains
 only active or deliberately parked product work; completed checklists are audit
 records under `archive/` and are not current implementation instructions.
+
+## Remediation
+
+| Plan | State | Progress |
+|------|-------|----------|
+| [v0.1.1 audit remediation](v0.1.1_audit-remediation.md) | Complete | Items 1–11 are implemented and verified on `chore/v0.1.1-audit-remediation`. |
 
 ## Active design gate
 
@@ -12,9 +18,9 @@ records under `archive/` and are not current implementation instructions.
 |------|-------|---------|
 | [TypeScript agent sandbox](feature_TS-Agent-Sandbox.md) | Design gate | Approve a pinned `deno_core` API, threat model, resource controls, and v1 op surface before runtime dependencies or implementation land. |
 
-The sandbox crate remains a placeholder. The completed inference lifecycle is
-its cancellation boundary: sandbox-owned AI operations use an explicit parent
-`CancellationToken` and the typed queue job outcomes.
+No sandbox crate exists before design approval. The completed inference
+lifecycle is its future cancellation boundary: sandbox-owned AI operations use
+an explicit parent `CancellationToken` and the typed queue job outcomes.
 
 ## Completed Alpha work
 

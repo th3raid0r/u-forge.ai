@@ -25,7 +25,6 @@ pub mod ingest;
 pub mod lemonade;
 pub mod mutation;
 pub mod queue;
-pub mod rag;
 pub mod schema;
 pub mod search;
 pub(crate) mod text;
@@ -64,7 +63,6 @@ pub use lemonade::{
     StreamToken, SttGuard, TranscriptionResult, load_model, reload_model,
 };
 pub use mutation::{GraphChange, GraphMutation};
-pub use rag::{RagContext, build_rag_messages, format_search_context};
 pub use schema::{
     EdgeTypeSchema, ObjectTypeSchema, PropertyIssue, PropertySchema, PropertyType,
     SchemaDefinition, SchemaIngestion, SchemaManager, SchemaStats, ValidationResult,
@@ -527,21 +525,13 @@ impl KnowledgeGraph {
 
     /// Verify or initialize the provider identity for one embedding lane.
     pub fn ensure_embedding_space(&self, target: EmbeddingTarget, fingerprint: &str) -> Result<()> {
-        let lane = match target {
-            EmbeddingTarget::Standard => "standard",
-            EmbeddingTarget::HighQuality => "high_quality",
-        };
-        self.storage.ensure_embedding_space(lane, fingerprint)
+        self.storage.ensure_embedding_target(target, fingerprint)
     }
 
     /// Clear one regenerable embedding lane so it can be rebuilt with the
     /// currently selected provider. Nodes, chunks, and FTS content are kept.
     pub fn reset_embedding_space(&self, target: EmbeddingTarget) -> Result<()> {
-        let lane = match target {
-            EmbeddingTarget::Standard => "standard",
-            EmbeddingTarget::HighQuality => "high_quality",
-        };
-        self.storage.reset_embedding_space(lane)
+        self.storage.reset_embedding_target(target)
     }
 
     pub(crate) fn upsert_chunk_embeddings(
@@ -761,16 +751,6 @@ impl KnowledgeGraph {
     /// Names of all schemas currently persisted.
     pub fn list_schemas(&self) -> Result<Vec<String>> {
         self.schema_manager.list_schemas()
-    }
-
-    /// Return a compact, LLM-readable summary of **all** persisted schemas,
-    /// merged into a single prompt block.  Node/edge types from every schema
-    /// are combined and deduplicated (later schemas win on conflicts).
-    pub fn schema_prompt_summary_all(&self) -> String {
-        self.merged_schema_definition()
-            .ok()
-            .flatten()
-            .map_or_else(String::new, |schema| schema.prompt_summary())
     }
 
     /// Merge every persisted schema into one virtual definition.

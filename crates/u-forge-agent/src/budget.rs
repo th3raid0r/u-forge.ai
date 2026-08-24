@@ -15,7 +15,7 @@ use tiktoken_rs::CoreBPE;
 use u_forge_core::lemonade::AgentBudgetDiagnostics;
 use u_forge_core::{EffectiveAgentBudget, SchemaDefinition};
 
-use crate::{HistoryMessage, tool_validation};
+use crate::{HistoryMessage, tools::validation};
 
 const TOKENS_PER_MESSAGE: usize = 4;
 const REPLY_PRIMING_TOKENS: usize = 3;
@@ -623,16 +623,9 @@ fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
 }
 
 fn fingerprint(tool_name: &str, args: &str) -> Option<String> {
-    let validated_name = match tool_name {
-        "search_fts" => "search_fts",
-        "search_semantic" => "search_semantic",
-        "search_hybrid" => "search_hybrid",
-        "upsert_node" => "upsert_node",
-        "upsert_edge" => "upsert_edge",
-        _ => return None,
-    };
+    let spec = validation::find(tool_name)?;
     let value: serde_json::Value = serde_json::from_str(args).ok()?;
-    tool_validation::validate_tool_args(validated_name, &value).ok()?;
+    validation::validate_tool_args(spec.name, &value).ok()?;
     Some(format!("{tool_name}:{}", canonical_json(&value)))
 }
 
@@ -791,7 +784,7 @@ impl AgentHook for BudgetController {
         let raw_hash = stable_hash(&raw_text);
         let call_fingerprint = fingerprint(event.tool_name, event.args);
         let mutation_progress =
-            event.tool_name.starts_with("upsert_") && event.raw_result.is_success();
+            validation::is_mutation(event.tool_name) && event.raw_result.is_success();
 
         let mut state = self.lock();
         let repeated_call_limit = state.limits.repeated_call_limit;

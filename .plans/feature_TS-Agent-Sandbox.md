@@ -2,9 +2,10 @@
 
 ## Status: Active design gate — post Alpha
 
-The workspace crate is a placeholder with no `deno_core` dependency or runtime
-implementation. This document records the questions and invariants that must be
-resolved before dependencies or code land; it is not implementation approval.
+No runtime crate exists. The former empty workspace placeholder was removed so
+speculative dependencies and APIs cannot imply an approved design. This
+document records the questions and invariants that must be resolved before the
+crate, dependencies, or code land; it is not implementation approval.
 
 The Alpha correctness, Lemonade runtime, inference lifecycle, agent-budget, and
 desktop-foundation prerequisites are complete. The sandbox consumes the

@@ -189,22 +189,12 @@ impl<'a> ModelSelector<'a> {
                     "llamacpp" => self.resolve_llamacpp_device(lane.llamacpp_device)?,
                     _ => self.resolve_llamacpp_backend(&m.recipe),
                 };
-                Some(SelectedModel {
-                    model_id: m.id.clone(),
-                    recipe: m.recipe.clone(),
-                    backend: backend.clone(),
-                    load_opts: self.load_options_for(m),
-                    quality_tier,
-                    checkpoint: m.checkpoint.clone(),
-                    max_context_window: m.max_context_window,
-                    tool_capable: m.supports_tool_calling(),
-                    reasoning_capable: m.supports_reasoning(),
-                    diagnostics: if lane.llamacpp_device == LlamaCppDevice::Gpu {
-                        self.backend_diagnostics(&m.recipe, backend.as_deref())
-                    } else {
-                        Vec::new()
-                    },
-                })
+                let diagnostics = if lane.llamacpp_device == LlamaCppDevice::Gpu {
+                    self.backend_diagnostics(&m.recipe, backend.as_deref())
+                } else {
+                    Vec::new()
+                };
+                Some(self.materialize(m, backend, quality_tier, diagnostics))
             })
             .collect();
 
@@ -237,22 +227,7 @@ impl<'a> ModelSelector<'a> {
             .models
             .iter()
             .find(|m| m.id == model_id && m.downloaded)?;
-        let backend = self.resolve_llamacpp_backend(&m.recipe);
-        Some(SelectedModel {
-            model_id: m.id.clone(),
-            recipe: m.recipe.clone(),
-            backend,
-            load_opts: self.load_options_for(m),
-            quality_tier,
-            checkpoint: m.checkpoint.clone(),
-            max_context_window: m.max_context_window,
-            tool_capable: m.supports_tool_calling(),
-            reasoning_capable: m.supports_reasoning(),
-            diagnostics: self.backend_diagnostics(
-                &m.recipe,
-                self.resolve_llamacpp_backend(&m.recipe).as_deref(),
-            ),
-        })
+        Some(self.materialize_with_resolved_backend(m, quality_tier))
     }
 
     /// Returns the best available reranker (label `"reranking"`).
@@ -266,22 +241,12 @@ impl<'a> ModelSelector<'a> {
                 "llamacpp" => self.resolve_llamacpp_device(device)?,
                 _ => self.resolve_llamacpp_backend(&m.recipe),
             };
-            Some(SelectedModel {
-                model_id: m.id.clone(),
-                recipe: m.recipe.clone(),
-                backend: backend.clone(),
-                load_opts: self.load_options_for(m),
-                quality_tier: QualityTier::NotApplicable,
-                checkpoint: m.checkpoint.clone(),
-                max_context_window: m.max_context_window,
-                tool_capable: m.supports_tool_calling(),
-                reasoning_capable: m.supports_reasoning(),
-                diagnostics: if device == LlamaCppDevice::Gpu {
-                    self.backend_diagnostics(&m.recipe, backend.as_deref())
-                } else {
-                    Vec::new()
-                },
-            })
+            let diagnostics = if device == LlamaCppDevice::Gpu {
+                self.backend_diagnostics(&m.recipe, backend.as_deref())
+            } else {
+                Vec::new()
+            };
+            Some(self.materialize(m, backend, QualityTier::NotApplicable, diagnostics))
         })
     }
 
@@ -308,21 +273,7 @@ impl<'a> ModelSelector<'a> {
 
         let mut result: Vec<SelectedModel> = ordered
             .into_iter()
-            .map(|m| SelectedModel {
-                model_id: m.id.clone(),
-                recipe: m.recipe.clone(),
-                backend: self.resolve_llamacpp_backend(&m.recipe),
-                load_opts: self.load_options_for(m),
-                quality_tier: QualityTier::NotApplicable,
-                checkpoint: m.checkpoint.clone(),
-                max_context_window: m.max_context_window,
-                tool_capable: m.supports_tool_calling(),
-                reasoning_capable: m.supports_reasoning(),
-                diagnostics: self.backend_diagnostics(
-                    &m.recipe,
-                    self.resolve_llamacpp_backend(&m.recipe).as_deref(),
-                ),
-            })
+            .map(|model| self.materialize_with_resolved_backend(model, QualityTier::NotApplicable))
             .collect();
 
         let mut seen_slots = HashSet::<String>::new();
@@ -330,88 +281,27 @@ impl<'a> ModelSelector<'a> {
         result
     }
 
-    /// Returns downloaded chat models using a supported recipe (`"llamacpp"`
-    /// or `"flm"`) and advertising Lemonade's explicit `"chat"` capability.
+    /// Returns downloaded models advertising Lemonade's explicit `"chat"`
+    /// capability, independent of the inference recipe.
     ///
     /// **At most one worker per device slot** (FLM → NPU, llamacpp + GPU
     /// backend → GPU, llamacpp + cpu → CPU).  Both a GPU worker and an NPU
     /// worker may coexist; the chat layer picks between them via
     /// `ChatConfig::preferred_device`.
     pub fn select_llm_models(&self) -> Vec<SelectedModel> {
-        let candidates: Vec<&CatalogModel> = self
-            .catalog
-            .models
-            .iter()
-            .filter(|m| {
-                m.downloaded
-                    && (m.recipe == "llamacpp" || m.recipe == "flm")
-                    && m.labels.contains("chat")
-            })
-            .collect();
-
-        let ordered = self.apply_preference_order(&candidates, &self.config.llm_model_preferences);
-
-        let mut result: Vec<SelectedModel> = ordered
-            .into_iter()
-            .map(|m| SelectedModel {
-                model_id: m.id.clone(),
-                recipe: m.recipe.clone(),
-                backend: self.resolve_llamacpp_backend(&m.recipe),
-                load_opts: self.load_options_for(m),
-                quality_tier: QualityTier::NotApplicable,
-                checkpoint: m.checkpoint.clone(),
-                max_context_window: m.max_context_window,
-                tool_capable: m.supports_tool_calling(),
-                reasoning_capable: m.supports_reasoning(),
-                diagnostics: self.backend_diagnostics(
-                    &m.recipe,
-                    self.resolve_llamacpp_backend(&m.recipe).as_deref(),
-                ),
-            })
-            .collect();
-
+        let mut result = self.materialize_llm_candidates();
         let mut seen_slots = HashSet::<String>::new();
-        result.retain(|s| seen_slots.insert(model_device_slot(s)));
+        result.retain(|selected| seen_slots.insert(model_device_slot(selected)));
         result
     }
 
     /// Returns **all** downloaded models advertising Lemonade's explicit `"chat"`
-    /// capability through a supported recipe, without the one-per-device-slot
-    /// deduplication applied by [`select_llm_models`]. Preference ordering is still
+    /// capability, without the one-per-device-slot deduplication applied by
+    /// [`select_llm_models`]. Preference ordering is still
     /// applied. Intended for the chat UI model picker where the user should see
     /// every available model.
     pub fn select_all_llm_models(&self) -> Vec<SelectedModel> {
-        let candidates: Vec<&CatalogModel> = self
-            .catalog
-            .models
-            .iter()
-            .filter(|m| {
-                m.downloaded
-                    && (m.recipe == "llamacpp" || m.recipe == "flm")
-                    && m.labels.contains("chat")
-            })
-            .collect();
-
-        let ordered = self.apply_preference_order(&candidates, &self.config.llm_model_preferences);
-
-        ordered
-            .into_iter()
-            .map(|m| SelectedModel {
-                model_id: m.id.clone(),
-                recipe: m.recipe.clone(),
-                backend: self.resolve_llamacpp_backend(&m.recipe),
-                load_opts: self.load_options_for(m),
-                quality_tier: QualityTier::NotApplicable,
-                checkpoint: m.checkpoint.clone(),
-                max_context_window: m.max_context_window,
-                tool_capable: m.supports_tool_calling(),
-                reasoning_capable: m.supports_reasoning(),
-                diagnostics: self.backend_diagnostics(
-                    &m.recipe,
-                    self.resolve_llamacpp_backend(&m.recipe).as_deref(),
-                ),
-            })
-            .collect()
+        self.materialize_llm_candidates()
     }
 
     /// Returns the TTS model (recipe `"kokoro"` or label `"tts"`).
@@ -431,24 +321,61 @@ impl<'a> ModelSelector<'a> {
 
         let ordered = self.apply_preference_order(&candidates, &self.config.tts_model_preferences);
 
-        ordered.into_iter().next().map(|m| SelectedModel {
-            model_id: m.id.clone(),
-            recipe: m.recipe.clone(),
-            backend: None, // TTS is always CPU via kokoro; no backend param needed
-            load_opts: self.load_options_for(m),
-            quality_tier: QualityTier::NotApplicable,
-            checkpoint: m.checkpoint.clone(),
-            max_context_window: m.max_context_window,
-            tool_capable: m.supports_tool_calling(),
-            reasoning_capable: m.supports_reasoning(),
-            diagnostics: self.backend_diagnostics(
-                &m.recipe,
-                self.resolve_llamacpp_backend(&m.recipe).as_deref(),
-            ),
-        })
+        ordered
+            .into_iter()
+            .next()
+            .map(|model| self.materialize(model, None, QualityTier::NotApplicable, Vec::new()))
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    fn materialize(
+        &self,
+        model: &CatalogModel,
+        backend: Option<String>,
+        quality_tier: QualityTier,
+        diagnostics: Vec<String>,
+    ) -> SelectedModel {
+        SelectedModel {
+            model_id: model.id.clone(),
+            recipe: model.recipe.clone(),
+            backend,
+            load_opts: self.load_options_for(model),
+            quality_tier,
+            checkpoint: model.checkpoint.clone(),
+            max_context_window: model.max_context_window,
+            tool_capable: model.supports_tool_calling(),
+            reasoning_capable: model.supports_reasoning(),
+            diagnostics,
+        }
+    }
+
+    fn materialize_with_resolved_backend(
+        &self,
+        model: &CatalogModel,
+        quality_tier: QualityTier,
+    ) -> SelectedModel {
+        let backend = self.resolve_llamacpp_backend(&model.recipe);
+        let diagnostics = self.backend_diagnostics(&model.recipe, backend.as_deref());
+        self.materialize(model, backend, quality_tier, diagnostics)
+    }
+
+    fn materialize_llm_candidates(&self) -> Vec<SelectedModel> {
+        let candidates = self
+            .catalog
+            .models
+            .iter()
+            .filter(|model| Self::is_llm_candidate(model))
+            .collect::<Vec<_>>();
+        self.apply_preference_order(&candidates, &self.config.llm_model_preferences)
+            .into_iter()
+            .map(|model| self.materialize_with_resolved_backend(model, QualityTier::NotApplicable))
+            .collect()
+    }
+
+    fn is_llm_candidate(model: &CatalogModel) -> bool {
+        model.downloaded && model.labels.contains("chat")
+    }
 
     /// Resolve configured load options without asking Lemonade to exceed the
     /// selected model's advertised capability.
@@ -1153,6 +1080,58 @@ mod tests {
         let results = selector.select_llm_models();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].model_id, "Gemma-4-26B-A4B-it-GGUF");
+    }
+
+    #[test]
+    fn chat_tags_define_candidates_before_worker_slot_dedup() {
+        let mut preferred = model(
+            "preferred",
+            "llamacpp",
+            &["chat", "tool-calling", "reasoning"],
+        );
+        preferred.checkpoint = "preferred-checkpoint".to_string();
+        preferred.max_context_window = Some(8_192);
+        let catalog = catalog_with(
+            vec![
+                model("secondary", "llamacpp", &["chat"]),
+                preferred,
+                not_downloaded("missing", "llamacpp", &["chat"]),
+                model("tagged-chat", "vllm", &["chat"]),
+            ],
+            vec![installed_backend("llamacpp", "vulkan", &["gpu"])],
+        );
+        let mut config = ModelConfig {
+            llm_model_preferences: vec!["preferred".to_string()],
+            ..Default::default()
+        };
+        config.load_params.insert(
+            "preferred".to_string(),
+            ModelLoadParams {
+                ctx_size: Some(16_384),
+                ..Default::default()
+            },
+        );
+        let embedding = default_embedding_cfg();
+        let selector = ModelSelector::new(&catalog, &config, &embedding);
+
+        let all = selector.select_all_llm_models();
+        assert_eq!(
+            all.iter()
+                .map(|selected| selected.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["preferred", "secondary", "tagged-chat"]
+        );
+        let workers = selector.select_llm_models();
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].model_id, "preferred");
+        assert_eq!(workers[1].model_id, "tagged-chat");
+        assert_eq!(workers[0].backend, all[0].backend);
+        assert_eq!(workers[0].load_opts.ctx_size, Some(8_192));
+        assert_eq!(workers[0].checkpoint, "preferred-checkpoint");
+        assert_eq!(workers[0].max_context_window, Some(8_192));
+        assert!(workers[0].tool_capable);
+        assert!(workers[0].reasoning_capable);
+        assert_eq!(workers[0].diagnostics, all[0].diagnostics);
     }
 
     #[test]

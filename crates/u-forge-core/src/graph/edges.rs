@@ -3,10 +3,8 @@
 use super::storage::*;
 use anyhow::{Context, Result};
 use rusqlite::params;
-use tracing::debug;
 
-use crate::types::{Edge, EdgeType, ObjectId};
-use std::collections::HashMap;
+use crate::types::{Edge, ObjectId};
 
 impl KnowledgeGraphStorage {
     /// Atomically insert or update a batch of edges.
@@ -79,39 +77,11 @@ impl KnowledgeGraphStorage {
              FROM edges
              WHERE source_id = ?1 OR target_id = ?1",
         )?;
-        let rows = stmt.query_map(params![id_str], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![id_str], RawEdgeRow::from_row)?;
 
         let mut edges = Vec::new();
         for row in rows {
-            let (src_s, tgt_s, et_s, weight, meta_s, ca_s) = row?;
-            let metadata: HashMap<String, String> = match serde_json::from_str(&meta_s) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!("Edge metadata JSON parse failed (using empty): {e}");
-                    HashMap::new()
-                }
-            };
-            edges.push(Edge {
-                from: ObjectId::parse_str(&src_s)
-                    .with_context(|| format!("Invalid source UUID in edges table: '{src_s}'"))?,
-                to: ObjectId::parse_str(&tgt_s)
-                    .with_context(|| format!("Invalid target UUID in edges table: '{tgt_s}'"))?,
-                edge_type: EdgeType::new(et_s),
-                weight: weight as f32,
-                metadata,
-                created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
-                    .with_context(|| format!("Invalid edge created_at: '{ca_s}'"))?
-                    .with_timezone(&chrono::Utc),
-            });
+            edges.push(row?.into_edge()?);
         }
         Ok(edges)
     }
@@ -127,39 +97,11 @@ impl KnowledgeGraphStorage {
             "SELECT source_id, target_id, edge_type, weight, metadata, created_at
              FROM edges",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map([], RawEdgeRow::from_row)?;
 
         let mut edges = Vec::new();
         for row in rows {
-            let (src_s, tgt_s, et_s, weight, meta_s, ca_s) = row?;
-            let metadata: HashMap<String, String> = match serde_json::from_str(&meta_s) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!("Edge metadata JSON parse failed (using empty): {e}");
-                    HashMap::new()
-                }
-            };
-            edges.push(Edge {
-                from: ObjectId::parse_str(&src_s)
-                    .with_context(|| format!("Invalid source UUID in edges table: '{src_s}'"))?,
-                to: ObjectId::parse_str(&tgt_s)
-                    .with_context(|| format!("Invalid target UUID in edges table: '{tgt_s}'"))?,
-                edge_type: EdgeType::new(et_s),
-                weight: weight as f32,
-                metadata,
-                created_at: chrono::DateTime::parse_from_rfc3339(&ca_s)
-                    .with_context(|| format!("Invalid edge created_at: '{ca_s}'"))?
-                    .with_timezone(&chrono::Utc),
-            });
+            edges.push(row?.into_edge()?);
         }
         Ok(edges)
     }

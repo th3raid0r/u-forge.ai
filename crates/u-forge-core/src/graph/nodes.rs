@@ -81,27 +81,12 @@ impl KnowledgeGraphStorage {
                  FROM nodes
                  WHERE id = ?1",
                 params![id.hyphenated().to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                    ))
-                },
+                RawNodeRow::from_row,
             )
             .optional()
             .context("Failed to query node by id")?;
 
-        match result {
-            None => Ok(None),
-            Some((id_s, ot, sn, nm, props, ca, ua)) => {
-                Ok(Some(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?))
-            }
-        }
+        result.map(RawNodeRow::into_metadata).transpose()
     }
 
     /// Return every node stored in the graph.
@@ -111,22 +96,11 @@ impl KnowledgeGraphStorage {
             "SELECT id, object_type, schema_name, name, properties, created_at, updated_at
              FROM nodes",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
+        let rows = stmt.query_map([], RawNodeRow::from_row)?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, ot, sn, nm, props, ca, ua) = row?;
-            out.push(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?);
+            out.push(row?.into_metadata()?);
         }
         Ok(out)
     }
@@ -141,22 +115,11 @@ impl KnowledgeGraphStorage {
              FROM nodes
              WHERE object_type = ?1 AND name = ?2",
         )?;
-        let rows = stmt.query_map(params![object_type, name], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![object_type, name], RawNodeRow::from_row)?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, ot, sn, nm, props, ca, ua) = row?;
-            out.push(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?);
+            out.push(row?.into_metadata()?);
         }
         Ok(out)
     }
@@ -172,22 +135,11 @@ impl KnowledgeGraphStorage {
              FROM nodes
              WHERE name = ?1",
         )?;
-        let rows = stmt.query_map(params![name], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![name], RawNodeRow::from_row)?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, ot, sn, nm, props, ca, ua) = row?;
-            out.push(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?);
+            out.push(row?.into_metadata()?);
         }
         Ok(out)
     }
@@ -204,22 +156,11 @@ impl KnowledgeGraphStorage {
              ORDER BY name
              LIMIT ?1 OFFSET ?2",
         )?;
-        let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![limit as i64, offset as i64], RawNodeRow::from_row)?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, ot, sn, nm, props, ca, ua) = row?;
-            out.push(row_to_metadata(id_s, ot, sn, nm, props, ca, ua)?);
+            out.push(row?.into_metadata()?);
         }
         Ok(out)
     }
