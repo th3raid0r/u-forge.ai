@@ -16,6 +16,7 @@
 use crate::error::{
     EmbeddingDimensionMismatch, EmbeddingSpaceMismatch, UnidentifiedEmbeddingSpace,
 };
+use crate::ingest::EmbeddingTarget;
 use crate::schema::SchemaDefinition;
 use crate::types::{ChunkType, ObjectId, ObjectMetadata};
 use anyhow::{Context, Result};
@@ -194,6 +195,86 @@ pub struct KnowledgeGraphStorage {
     pub(super) high_quality_embedding_dimensions: usize,
 }
 
+/// One of the two fixed sqlite-vec storage lanes.
+///
+/// This enum is deliberately private to graph storage. SQL identifiers are
+/// selected only from these variants and are never accepted from callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VectorLane {
+    Standard,
+    HighQuality,
+}
+
+impl VectorLane {
+    fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "standard" => Ok(Self::Standard),
+            "high_quality" => Ok(Self::HighQuality),
+            other => Err(anyhow::anyhow!("Unknown embedding lane '{other}'")),
+        }
+    }
+
+    fn descriptor(
+        self,
+        embedding_dimensions: usize,
+        high_quality_embedding_dimensions: usize,
+    ) -> VectorLaneDescriptor {
+        match self {
+            Self::Standard => VectorLaneDescriptor {
+                table: "chunks_vec",
+                expected_dimensions: embedding_dimensions,
+                fingerprint_key: "chunks_vec_fingerprint",
+                diagnostic_label: "standard",
+            },
+            Self::HighQuality => VectorLaneDescriptor {
+                table: "chunks_vec_hq",
+                expected_dimensions: high_quality_embedding_dimensions,
+                fingerprint_key: "chunks_vec_hq_fingerprint",
+                diagnostic_label: "high_quality",
+            },
+        }
+    }
+
+    pub(super) const fn upsert_operation(self) -> &'static str {
+        match self {
+            Self::Standard => "upsert_chunk_embedding",
+            Self::HighQuality => "upsert_chunk_embedding_hq",
+        }
+    }
+
+    pub(super) const fn dimension_subject(self) -> &'static str {
+        match self {
+            Self::Standard => "Embedding",
+            Self::HighQuality => "HQ embedding",
+        }
+    }
+
+    pub(super) const fn result_context(self) -> &'static str {
+        match self {
+            Self::Standard => "semantic",
+            Self::HighQuality => "HQ semantic",
+        }
+    }
+}
+
+impl From<EmbeddingTarget> for VectorLane {
+    fn from(target: EmbeddingTarget) -> Self {
+        match target {
+            EmbeddingTarget::Standard => Self::Standard,
+            EmbeddingTarget::HighQuality => Self::HighQuality,
+        }
+    }
+}
+
+/// Controlled storage metadata for a vector lane.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct VectorLaneDescriptor {
+    pub(super) table: &'static str,
+    pub(super) expected_dimensions: usize,
+    pub(super) fingerprint_key: &'static str,
+    pub(super) diagnostic_label: &'static str,
+}
+
 /// Aggregate statistics about the knowledge graph.
 #[derive(Debug, Clone)]
 pub struct GraphStats {
@@ -319,48 +400,63 @@ fn check_or_init_embedding_dims(conn: &Connection, checks: &[(&str, usize)]) -> 
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 impl KnowledgeGraphStorage {
+    pub(super) fn vector_lane(&self, lane: VectorLane) -> VectorLaneDescriptor {
+        lane.descriptor(
+            self.embedding_dimensions,
+            self.high_quality_embedding_dimensions,
+        )
+    }
+
     /// Verify or initialize the model fingerprint for a vector lane.
     ///
     /// A fingerprint may be initialized only while the lane is empty. This
     /// prevents legacy vectors with unknown provenance from being silently
     /// blessed as compatible with the currently selected model.
     pub fn ensure_embedding_space(&self, lane: &str, fingerprint: &str) -> Result<()> {
-        let table = match lane {
-            "standard" => "chunks_vec",
-            "high_quality" => "chunks_vec_hq",
-            other => return Err(anyhow::anyhow!("Unknown embedding lane '{other}'")),
-        };
-        let key = format!("{table}_fingerprint");
+        self.ensure_vector_lane(VectorLane::from_name(lane)?, fingerprint)
+    }
+
+    pub(crate) fn ensure_embedding_target(
+        &self,
+        target: EmbeddingTarget,
+        fingerprint: &str,
+    ) -> Result<()> {
+        self.ensure_vector_lane(target.into(), fingerprint)
+    }
+
+    fn ensure_vector_lane(&self, lane: VectorLane, fingerprint: &str) -> Result<()> {
+        let descriptor = self.vector_lane(lane);
         let conn = self.conn.lock();
         let stored: Option<String> = conn
             .query_row(
                 "SELECT value FROM schema_metadata WHERE key = ?1",
-                params![key],
+                params![descriptor.fingerprint_key],
                 |row| row.get(0),
             )
             .optional()?;
         match stored {
             Some(stored) if stored == fingerprint => Ok(()),
             Some(stored) => Err(EmbeddingSpaceMismatch {
-                lane: lane.to_string(),
+                lane: descriptor.diagnostic_label.to_string(),
                 stored,
                 current: fingerprint.to_string(),
             }
             .into()),
             None => {
-                let vector_count: i64 =
-                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                        row.get(0)
-                    })?;
+                let vector_count: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {}", descriptor.table),
+                    [],
+                    |row| row.get(0),
+                )?;
                 if vector_count > 0 {
                     return Err(UnidentifiedEmbeddingSpace {
-                        lane: lane.to_string(),
+                        lane: descriptor.diagnostic_label.to_string(),
                     }
                     .into());
                 }
                 conn.execute(
                     "INSERT INTO schema_metadata (key, value) VALUES (?1, ?2)",
-                    params![key, fingerprint],
+                    params![descriptor.fingerprint_key, fingerprint],
                 )?;
                 Ok(())
             }
@@ -373,16 +469,22 @@ impl KnowledgeGraphStorage {
     /// embedding sweep records the active provider fingerprint before writing
     /// replacement vectors.
     pub fn reset_embedding_space(&self, lane: &str) -> Result<()> {
-        let table = match lane {
-            "standard" => "chunks_vec",
-            "high_quality" => "chunks_vec_hq",
-            other => return Err(anyhow::anyhow!("Unknown embedding lane '{other}'")),
-        };
-        let key = format!("{table}_fingerprint");
+        self.reset_vector_lane(VectorLane::from_name(lane)?)
+    }
+
+    pub(crate) fn reset_embedding_target(&self, target: EmbeddingTarget) -> Result<()> {
+        self.reset_vector_lane(target.into())
+    }
+
+    fn reset_vector_lane(&self, lane: VectorLane) -> Result<()> {
+        let descriptor = self.vector_lane(lane);
         let mut conn = self.conn.lock();
         let transaction = conn.transaction()?;
-        transaction.execute(&format!("DELETE FROM {table}"), [])?;
-        transaction.execute("DELETE FROM schema_metadata WHERE key = ?1", params![key])?;
+        transaction.execute(&format!("DELETE FROM {}", descriptor.table), [])?;
+        transaction.execute(
+            "DELETE FROM schema_metadata WHERE key = ?1",
+            params![descriptor.fingerprint_key],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -457,11 +559,15 @@ impl KnowledgeGraphStorage {
         // Returns EmbeddingDimensionMismatch if the model was changed without
         // recreating the database.
         let dimensions_start = std::time::Instant::now();
+        let standard = VectorLane::Standard
+            .descriptor(embedding_dimensions, high_quality_embedding_dimensions);
+        let high_quality = VectorLane::HighQuality
+            .descriptor(embedding_dimensions, high_quality_embedding_dimensions);
         check_or_init_embedding_dims(
             &conn,
             &[
-                ("chunks_vec", embedding_dimensions),
-                ("chunks_vec_hq", high_quality_embedding_dimensions),
+                (standard.table, standard.expected_dimensions),
+                (high_quality.table, high_quality.expected_dimensions),
             ],
         )?;
         let dimensions_duration_us = dimensions_start.elapsed().as_micros() as u64;
@@ -490,24 +596,30 @@ impl KnowledgeGraphStorage {
     /// CASCADE`), all schemas, and explicitly clears the vector index tables
     /// (`chunks_vec` and `chunks_vec_hq`).
     pub fn clear_all(&self) -> Result<()> {
+        let standard = self.vector_lane(VectorLane::Standard);
+        let high_quality = self.vector_lane(VectorLane::HighQuality);
         let conn = self.conn.lock();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "DELETE FROM nodes;
              DELETE FROM schemas;
-             DELETE FROM chunks_vec;
-             DELETE FROM chunks_vec_hq;",
-        )
+             DELETE FROM {};
+             DELETE FROM {};",
+            standard.table, high_quality.table
+        ))
         .context("Failed to clear knowledge graph")
     }
 
     /// Delete all node data (nodes, edges via cascade, chunks, vectors) but leave schemas intact.
     pub fn clear_data_only(&self) -> Result<()> {
+        let standard = self.vector_lane(VectorLane::Standard);
+        let high_quality = self.vector_lane(VectorLane::HighQuality);
         let conn = self.conn.lock();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "DELETE FROM nodes;
-             DELETE FROM chunks_vec;
-             DELETE FROM chunks_vec_hq;",
-        )
+             DELETE FROM {};
+             DELETE FROM {};",
+            standard.table, high_quality.table
+        ))
         .context("Failed to clear node data")
     }
 
@@ -536,12 +648,17 @@ impl KnowledgeGraphStorage {
                 |r| r.get(0),
             )
             .context("Failed to sum token_count")?;
-        let embedded_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
-            .context("Failed to count chunks_vec")?;
-        let embedded_hq_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_vec_hq", [], |r| r.get(0))
-            .context("Failed to count chunks_vec_hq")?;
+        let count_vectors = |lane| {
+            let descriptor = self.vector_lane(lane);
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {}", descriptor.table),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .with_context(|| format!("Failed to count {}", descriptor.table))
+        };
+        let embedded_count = count_vectors(VectorLane::Standard)?;
+        let embedded_hq_count = count_vectors(VectorLane::HighQuality)?;
 
         Ok(GraphStats {
             node_count: node_count as usize,
@@ -1053,6 +1170,197 @@ mod tests {
         let mut v = vec![0.0f32; dims];
         v[hot_dim] = 1.0;
         v
+    }
+
+    fn lane_dimensions(storage: &KnowledgeGraphStorage, lane: VectorLane) -> usize {
+        storage.vector_lane(lane).expected_dimensions
+    }
+
+    fn upsert_lane(
+        storage: &KnowledgeGraphStorage,
+        lane: VectorLane,
+        chunk_id: ChunkId,
+        embedding: &[f32],
+    ) -> Result<()> {
+        match lane {
+            VectorLane::Standard => storage.upsert_chunk_embedding(chunk_id, embedding),
+            VectorLane::HighQuality => storage.upsert_chunk_embedding_hq(chunk_id, embedding),
+        }
+    }
+
+    fn search_lane(
+        storage: &KnowledgeGraphStorage,
+        lane: VectorLane,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(ChunkId, ObjectId, String, f32)>> {
+        match lane {
+            VectorLane::Standard => storage.search_chunks_semantic(embedding, limit),
+            VectorLane::HighQuality => storage.search_chunks_semantic_hq(embedding, limit),
+        }
+    }
+
+    fn unembedded_lane(
+        storage: &KnowledgeGraphStorage,
+        lane: VectorLane,
+    ) -> Result<Vec<TextChunk>> {
+        match lane {
+            VectorLane::Standard => storage.get_unembedded_chunks(),
+            VectorLane::HighQuality => storage.get_unembedded_chunks_hq(),
+        }
+    }
+
+    fn embedded_lane_count(stats: &GraphStats, lane: VectorLane) -> usize {
+        match lane {
+            VectorLane::Standard => stats.embedded_count,
+            VectorLane::HighQuality => stats.embedded_hq_count,
+        }
+    }
+
+    fn other_lane(lane: VectorLane) -> VectorLane {
+        match lane {
+            VectorLane::Standard => VectorLane::HighQuality,
+            VectorLane::HighQuality => VectorLane::Standard,
+        }
+    }
+
+    #[test]
+    fn vector_lane_storage_contracts_match() {
+        for lane in [VectorLane::Standard, VectorLane::HighQuality] {
+            let (storage, _dir) = create_test_storage();
+            let dimensions = lane_dimensions(&storage, lane);
+            let first = one_hot(0, dimensions);
+            let second = one_hot(1, dimensions);
+            assert!(search_lane(&storage, lane, &first, 5).unwrap().is_empty());
+
+            let node = ObjectMetadata::new("location".to_string(), "Terminus".to_string());
+            storage.upsert_node(node.clone()).unwrap();
+            let chunk_a = TextChunk::new(
+                node.id,
+                "The home of the Foundation.".to_string(),
+                ChunkType::Description,
+            );
+            let chunk_b = TextChunk::new(
+                node.id,
+                "The edge of the galaxy.".to_string(),
+                ChunkType::Description,
+            );
+            let (id_a, id_b) = (chunk_a.id, chunk_b.id);
+            storage.upsert_chunk(chunk_a).unwrap();
+            storage.upsert_chunk(chunk_b).unwrap();
+            assert_eq!(unembedded_lane(&storage, lane).unwrap().len(), 2);
+
+            let wrong_dimensions = vec![0.0; dimensions - 1];
+            assert!(upsert_lane(&storage, lane, id_a, &wrong_dimensions).is_err());
+            assert!(search_lane(&storage, lane, &wrong_dimensions, 5).is_err());
+            assert!(
+                upsert_lane(&storage, lane, ChunkId::new_v4(), &first)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not found")
+            );
+
+            upsert_lane(&storage, lane, id_a, &first).unwrap();
+            upsert_lane(&storage, lane, id_b, &second).unwrap();
+            assert!(unembedded_lane(&storage, lane).unwrap().is_empty());
+            let nearest = search_lane(&storage, lane, &second, 1).unwrap();
+            assert_eq!(nearest.len(), 1);
+            assert_eq!(nearest[0].0, id_b);
+
+            upsert_lane(&storage, lane, id_b, &first).unwrap();
+            let replaced = search_lane(&storage, lane, &second, 2).unwrap();
+            assert!(
+                replaced
+                    .iter()
+                    .find(|result| result.0 == id_b)
+                    .is_some_and(|result| result.3 > 0.5)
+            );
+            assert_eq!(embedded_lane_count(&storage.get_stats().unwrap(), lane), 2);
+
+            storage.delete_node(node.id).unwrap();
+            assert!(search_lane(&storage, lane, &first, 5).unwrap().is_empty());
+            assert_eq!(embedded_lane_count(&storage.get_stats().unwrap(), lane), 0);
+        }
+    }
+
+    #[test]
+    fn vector_lane_fingerprints_and_resets_are_isolated() {
+        for lane in [VectorLane::Standard, VectorLane::HighQuality] {
+            let other = other_lane(lane);
+            let (storage, _dir) = create_test_storage();
+            let node = ObjectMetadata::new("location".to_string(), "Trantor".to_string());
+            storage.upsert_node(node.clone()).unwrap();
+            let chunk = TextChunk::new(
+                node.id,
+                "The capital of the Galactic Empire.".to_string(),
+                ChunkType::Description,
+            );
+            let chunk_id = chunk.id;
+            storage.upsert_chunk(chunk).unwrap();
+
+            for (candidate, fingerprint) in [(lane, "selected-v1"), (other, "other-v1")] {
+                let descriptor = storage.vector_lane(candidate);
+                storage
+                    .ensure_embedding_space(descriptor.diagnostic_label, fingerprint)
+                    .unwrap();
+                upsert_lane(
+                    &storage,
+                    candidate,
+                    chunk_id,
+                    &one_hot(0, descriptor.expected_dimensions),
+                )
+                .unwrap();
+            }
+            let selected = storage.vector_lane(lane);
+            assert!(
+                storage
+                    .ensure_embedding_space(selected.diagnostic_label, "selected-v2")
+                    .is_err()
+            );
+
+            storage
+                .reset_embedding_space(selected.diagnostic_label)
+                .unwrap();
+            let stats = storage.get_stats().unwrap();
+            assert_eq!(embedded_lane_count(&stats, lane), 0);
+            assert_eq!(embedded_lane_count(&stats, other), 1);
+            assert_eq!(stats.chunk_count, 1);
+            assert_eq!(storage.search_chunks_fts("Empire", 5).unwrap().len(), 1);
+            assert_eq!(unembedded_lane(&storage, lane).unwrap().len(), 1);
+            assert!(unembedded_lane(&storage, other).unwrap().is_empty());
+            storage
+                .ensure_embedding_space(selected.diagnostic_label, "selected-v2")
+                .unwrap();
+            let untouched = storage.vector_lane(other);
+            assert!(
+                storage
+                    .ensure_embedding_space(untouched.diagnostic_label, "other-v2")
+                    .is_err()
+            );
+
+            let (legacy, _legacy_dir) = create_test_storage();
+            let legacy_node = ObjectMetadata::new("location".to_string(), "Legacy".to_string());
+            legacy.upsert_node(legacy_node.clone()).unwrap();
+            let legacy_chunk = TextChunk::new(
+                legacy_node.id,
+                "Unknown model provenance.".to_string(),
+                ChunkType::Description,
+            );
+            let legacy_chunk_id = legacy_chunk.id;
+            legacy.upsert_chunk(legacy_chunk).unwrap();
+            let legacy_lane = legacy.vector_lane(lane);
+            upsert_lane(
+                &legacy,
+                lane,
+                legacy_chunk_id,
+                &one_hot(0, legacy_lane.expected_dimensions),
+            )
+            .unwrap();
+            let error = legacy
+                .ensure_embedding_space(legacy_lane.diagnostic_label, "current")
+                .unwrap_err();
+            assert!(error.to_string().contains("unidentified"));
+        }
     }
 
     #[test]

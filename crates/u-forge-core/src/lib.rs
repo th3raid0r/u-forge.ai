@@ -527,21 +527,13 @@ impl KnowledgeGraph {
 
     /// Verify or initialize the provider identity for one embedding lane.
     pub fn ensure_embedding_space(&self, target: EmbeddingTarget, fingerprint: &str) -> Result<()> {
-        let lane = match target {
-            EmbeddingTarget::Standard => "standard",
-            EmbeddingTarget::HighQuality => "high_quality",
-        };
-        self.storage.ensure_embedding_space(lane, fingerprint)
+        self.storage.ensure_embedding_target(target, fingerprint)
     }
 
     /// Clear one regenerable embedding lane so it can be rebuilt with the
     /// currently selected provider. Nodes, chunks, and FTS content are kept.
     pub fn reset_embedding_space(&self, target: EmbeddingTarget) -> Result<()> {
-        let lane = match target {
-            EmbeddingTarget::Standard => "standard",
-            EmbeddingTarget::HighQuality => "high_quality",
-        };
-        self.storage.reset_embedding_space(lane)
+        self.storage.reset_embedding_target(target)
     }
 
     pub(crate) fn upsert_chunk_embeddings(
