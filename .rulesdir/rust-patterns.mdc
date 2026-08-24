@@ -108,8 +108,10 @@ Always use `params![]` for parameterised inserts.
 
 ### Non-obvious design decisions
 
-- **`INSERT OR REPLACE` on `nodes`** — safe because nodes have no cascading
-  rowid dependencies. Chunks and edges reference nodes by UUID (TEXT), not rowid.
+- **`ON CONFLICT(id) DO UPDATE` on `nodes`** — required because
+  `INSERT OR REPLACE` deletes the conflicting node before inserting its
+  replacement. That delete activates the foreign-key cascades on chunks and
+  edges even though they reference the node by UUID (`TEXT`), not by rowid.
 - **`ON CONFLICT DO UPDATE` on `chunks`** — required, not stylistic. The
   implicit SQLite `rowid` is what `chunks_fts` and `chunks_vec` reference. Using
   `INSERT OR REPLACE` here would change the rowid and silently break FTS and

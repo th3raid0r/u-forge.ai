@@ -119,7 +119,7 @@ Holds `chunks_vec_dims` and `chunks_vec_hq_dims`. `check_or_init_embedding_dims`
 - `ON DELETE CASCADE` on both `edges` and `chunks` — node deletion is a single `DELETE FROM nodes WHERE id = ?`; the database removes all dependent rows automatically. O(log N), not O(N).
 - Edge uniqueness `UNIQUE(source_id, target_id, edge_type)` replaces old manual adjacency-list deduplication.
 - `ON CONFLICT DO UPDATE` on `chunks` — preserves the implicit SQLite `rowid` that `chunks_fts` references. Do not use `INSERT OR REPLACE` on chunks.
-- `INSERT OR REPLACE` on `nodes` is safe — no cascading rowid dependencies to preserve.
+- `ON CONFLICT(id) DO UPDATE` on `nodes` preserves dependent edges and chunks. Do not use `INSERT OR REPLACE`: SQLite deletes the conflicting row before inserting its replacement, so the delete activates foreign-key cascades even though dependents reference the node by UUID rather than rowid.
 - Chunk size: `add_text_chunk` splits at word boundaries into ≤350-token pieces (`MAX_CHUNK_TOKENS`). Uses `len.div_ceil(3)` heuristic (≈ 1,050 chars per chunk). Guards against the llamacpp 512-token batch limit.
 - All complex fields (tags, properties, metadata) stored as JSON text. UUIDs as hyphenated `TEXT`. Datetimes as RFC 3339 `TEXT`.
 - FKs enabled at connection time: `PRAGMA foreign_keys = ON`.

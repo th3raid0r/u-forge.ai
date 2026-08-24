@@ -687,6 +687,41 @@ mod tests {
         assert_eq!(all.len(), 1);
     }
 
+    #[test]
+    fn test_upsert_node_preserves_edges_and_chunks() {
+        let (storage, _dir) = create_test_storage();
+
+        let mut gandalf = ObjectMetadata::new("character".to_string(), "Gandalf".to_string());
+        let frodo = ObjectMetadata::new("character".to_string(), "Frodo".to_string());
+        storage.upsert_node(gandalf.clone()).unwrap();
+        storage.upsert_node(frodo.clone()).unwrap();
+
+        storage
+            .upsert_edge(Edge::new(gandalf.id, frodo.id, EdgeType::new("knows")))
+            .unwrap();
+        let chunk = TextChunk::new(
+            gandalf.id,
+            "A wizard of the Istari order.".to_string(),
+            ChunkType::Description,
+        );
+        let chunk_id = chunk.id;
+        storage.upsert_chunk(chunk).unwrap();
+
+        gandalf.name = "Gandalf the White".to_string();
+        storage.upsert_node(gandalf.clone()).unwrap();
+
+        assert_eq!(
+            storage.get_node(gandalf.id).unwrap().unwrap().name,
+            "Gandalf the White"
+        );
+        assert_eq!(storage.get_edges(gandalf.id).unwrap().len(), 1);
+        assert_eq!(storage.get_edges(frodo.id).unwrap().len(), 1);
+        assert_eq!(
+            storage.get_chunks_for_node(gandalf.id).unwrap()[0].id,
+            chunk_id
+        );
+    }
+
     // ── Edges ─────────────────────────────────────────────────────────────────
 
     #[test]
