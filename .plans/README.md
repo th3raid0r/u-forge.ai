@@ -6,6 +6,12 @@ Source code and verified behavior are authoritative. This directory contains
 only active or deliberately parked product work; completed checklists are audit
 records under `archive/` and are not current implementation instructions.
 
+## Active remediation
+
+| Plan | State | Progress |
+|------|-------|----------|
+| [v0.1.1 audit remediation](v0.1.1_audit-remediation.md) | Work in progress | Items 1–6 are implemented and verified on `chore/v0.1.1-audit-remediation`; items 7–11 remain open. |
+
 ## Active design gate
 
 | Plan | State | Purpose |
