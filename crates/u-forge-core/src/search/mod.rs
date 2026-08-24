@@ -1358,6 +1358,38 @@ mod tests {
 
     struct WrongDimensionEmbeddingProvider;
 
+    struct CancellingEmbeddingProvider {
+        cancellation: CancellationToken,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for CancellingEmbeddingProvider {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.cancellation.cancel();
+            std::future::pending().await
+        }
+
+        async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("batch embedding is not used by this test provider")
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(768)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
     #[async_trait]
     impl EmbeddingProvider for WrongDimensionEmbeddingProvider {
         async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
@@ -1389,6 +1421,10 @@ mod tests {
 
     struct EmptyRerankProvider;
 
+    struct CancellingRerankProvider {
+        cancellation: CancellationToken,
+    }
+
     #[async_trait]
     impl RerankProvider for FailingRerankProvider {
         async fn rerank(
@@ -1410,6 +1446,19 @@ mod tests {
             _top_n: Option<usize>,
         ) -> anyhow::Result<Vec<RerankDocument>> {
             Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for CancellingRerankProvider {
+        async fn rerank(
+            &self,
+            _query: &str,
+            _documents: Vec<String>,
+            _top_n: Option<usize>,
+        ) -> anyhow::Result<Vec<RerankDocument>> {
+            self.cancellation.cancel();
+            std::future::pending().await
         }
     }
 
@@ -1573,10 +1622,14 @@ mod tests {
     }
 
     fn make_custom_embed_queue(provider: Arc<dyn EmbeddingProvider>) -> InferenceQueue {
+        make_named_embed_queue("mock-embed", provider)
+    }
+
+    fn make_named_embed_queue(name: &str, provider: Arc<dyn EmbeddingProvider>) -> InferenceQueue {
         let built = BuiltProvider {
-            // Keep the fixture's persisted embedding-space fingerprint compatible
-            // so tests exercise runtime embedding/ANN failures, not setup checks.
-            name: "mock-embed".to_string(),
+            // `mock-embed` keeps the fixture's persisted embedding-space
+            // fingerprint compatible; other names exercise mismatch handling.
+            name: name.to_string(),
             capability: Capability::Embedding,
             provider: ProviderSlot::Embedding(provider),
             weight: 100,
@@ -1599,6 +1652,16 @@ mod tests {
             name: "mock-rerank".to_string(),
             capability: Capability::Reranking,
             provider: ProviderSlot::Rerank(Arc::new(EmptyRerankProvider)),
+            weight: 100,
+        };
+        InferenceQueueBuilder::new().with_provider(built).build()
+    }
+
+    fn make_cancelling_rerank_queue(cancellation: CancellationToken) -> InferenceQueue {
+        let built = BuiltProvider {
+            name: "mock-rerank".to_string(),
+            capability: Capability::Reranking,
+            provider: ProviderSlot::Rerank(Arc::new(CancellingRerankProvider { cancellation })),
             weight: 100,
         };
         InferenceQueueBuilder::new().with_provider(built).build()
@@ -2126,6 +2189,152 @@ mod tests {
             response.outcomes.reranking.status,
             SearchStageStatus::IntentionallySkipped
         );
+    }
+
+    #[tokio::test]
+    async fn empty_and_punctuation_only_queries_skip_only_fts() {
+        let (graph, _tmp) = make_graph_with_data();
+        let queue = make_embed_queue();
+        let config = HybridSearchConfig {
+            rerank: false,
+            ..Default::default()
+        };
+
+        for query in ["", "?!?!!!"] {
+            let response = search_hybrid_response(&graph, &queue, None, query, &config)
+                .await
+                .unwrap();
+
+            assert_eq!(response.query, query);
+            assert_eq!(
+                response.outcomes.fts.status,
+                SearchStageStatus::IntentionallySkipped
+            );
+            assert_eq!(
+                response.outcomes.standard_semantic.status,
+                SearchStageStatus::Applied
+            );
+            assert_eq!(
+                response.outcomes.high_quality_semantic.status,
+                SearchStageStatus::Unavailable
+            );
+            assert_eq!(
+                response.outcomes.reranking.status,
+                SearchStageStatus::IntentionallySkipped
+            );
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .all(|result| result.sources.fts_rank.is_none())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fingerprint_mismatch_retains_fts_results_and_reports_unavailable_lane() {
+        let (graph, _tmp) = make_graph_with_data();
+        let queue = make_named_embed_queue("other-embed", Arc::new(MockEmbeddingProvider));
+        let config = HybridSearchConfig {
+            rerank: false,
+            ..Default::default()
+        };
+
+        let response = search_hybrid_response(&graph, &queue, None, "wizard", &config)
+            .await
+            .unwrap();
+
+        assert!(!response.results.is_empty());
+        assert_eq!(
+            response.outcomes.standard_semantic.status,
+            SearchStageStatus::Unavailable
+        );
+        assert!(
+            response
+                .results
+                .iter()
+                .all(|result| result.sources.fts_rank.is_some()
+                    && result.sources.semantic_distance.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_search_preserves_supersession() {
+        let (graph, _tmp) = make_graph_with_data();
+        let queue = make_embed_queue();
+        let cancellation = CancellationToken::new();
+        cancellation.supersede();
+
+        let error = search_hybrid_response_with_cancellation(
+            &graph,
+            &queue,
+            None,
+            "wizard",
+            &HybridSearchConfig::default(),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::queue::InferenceError>(),
+            Some(crate::queue::InferenceError::Superseded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_embedding_terminates_search() {
+        let (graph, _tmp) = make_graph_with_data();
+        let cancellation = CancellationToken::new();
+        let queue = make_custom_embed_queue(Arc::new(CancellingEmbeddingProvider {
+            cancellation: cancellation.clone(),
+        }));
+
+        let error = search_hybrid_response_with_cancellation(
+            &graph,
+            &queue,
+            None,
+            "wizard",
+            &HybridSearchConfig {
+                rerank: false,
+                ..Default::default()
+            },
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::queue::InferenceError>(),
+            Some(crate::queue::InferenceError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_reranking_terminates_search() {
+        let (graph, _tmp) = make_graph_with_data();
+        let cancellation = CancellationToken::new();
+        let queue = make_cancelling_rerank_queue(cancellation.clone());
+
+        let error = search_hybrid_response_with_cancellation(
+            &graph,
+            &queue,
+            None,
+            "wizard",
+            &HybridSearchConfig {
+                alpha: 0.0,
+                rerank: true,
+                ..Default::default()
+            },
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::queue::InferenceError>(),
+            Some(crate::queue::InferenceError::Cancelled)
+        ));
     }
 
     #[tokio::test]
