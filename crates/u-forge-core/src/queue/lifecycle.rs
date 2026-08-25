@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use super::jobs::JobContext;
 use super::telemetry::QueueMetrics;
 
 /// Stable timeout categories exposed to callers and queue telemetry.
@@ -271,6 +272,38 @@ impl<T> Future for InferenceJob<T> {
     }
 }
 
+/// Construct and enqueue one accepted one-shot job, or return an unavailable
+/// completion without invoking either capability-specific closure.
+pub(super) fn submit_one_shot<T, J>(
+    available: bool,
+    capability: &'static str,
+    cancellation: CancellationToken,
+    metrics: Arc<QueueMetrics>,
+    make_job: impl FnOnce(JobContext, oneshot::Sender<InferenceResult<T>>) -> J,
+    enqueue: impl FnOnce(J),
+) -> InferenceJob<T>
+where
+    T: Send + 'static,
+{
+    if !available {
+        metrics.unavailable();
+        return InferenceJob {
+            completion: JobCompletion::ready(Err(InferenceError::CapabilityUnavailable {
+                capability,
+            })),
+            cancellation,
+        };
+    }
+
+    let (response, receiver) = oneshot::channel();
+    let context = JobContext::new(cancellation.clone(), Arc::clone(&metrics));
+    enqueue(make_job(context, response));
+    InferenceJob {
+        completion: JobCompletion::from_receiver(cancellation.clone(), receiver, Some(metrics)),
+        cancellation,
+    }
+}
+
 /// Streaming queue submission with explicit cancellation and termination.
 pub struct StreamingInferenceJob<T> {
     pub cancellation: CancellationToken,
@@ -287,6 +320,48 @@ impl<T> StreamingInferenceJob<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn one_shot_submission_constructs_and_accounts_once() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let job = submit_one_shot(
+            true,
+            "test",
+            CancellationToken::new(),
+            Arc::clone(&metrics),
+            |_, response| response,
+            |response| {
+                response.send(Ok(42)).unwrap();
+            },
+        );
+
+        assert_eq!(job.await.unwrap(), 42);
+        let counters = metrics.snapshot();
+        assert_eq!(counters.submitted, 1);
+        assert_eq!(counters.unavailable, 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_one_shot_skips_payload_and_queue_construction() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let job: InferenceJob<()> = submit_one_shot(
+            false,
+            "test",
+            CancellationToken::new(),
+            Arc::clone(&metrics),
+            |_, _| panic!("unavailable submission built a payload"),
+            |_: ()| panic!("unavailable submission reached a queue"),
+        );
+
+        assert!(matches!(
+            job.await,
+            Err(InferenceError::CapabilityUnavailable { capability: "test" })
+        ));
+        let counters = metrics.snapshot();
+        assert_eq!(counters.submitted, 1);
+        assert_eq!(counters.unavailable, 1);
+        assert_eq!(counters.started, 0);
+    }
 
     #[tokio::test]
     async fn cancellation_reason_is_preserved() {

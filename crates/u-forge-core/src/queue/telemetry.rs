@@ -25,6 +25,7 @@ pub struct QueueCounters {
     pub started: u64,
     pub succeeded: u64,
     pub provider_failed: u64,
+    pub unavailable: u64,
     pub cancelled_pending: u64,
     pub cancelled_active: u64,
     pub timed_out: u64,
@@ -42,6 +43,7 @@ pub(crate) struct QueueMetrics {
     started: AtomicU64,
     succeeded: AtomicU64,
     provider_failed: AtomicU64,
+    unavailable: AtomicU64,
     cancelled_pending: AtomicU64,
     cancelled_active: AtomicU64,
     timed_out: AtomicU64,
@@ -93,6 +95,11 @@ impl QueueMetrics {
         increment(&self.worker_dropped);
     }
 
+    pub(super) fn unavailable(&self) {
+        increment(&self.submitted);
+        increment(&self.unavailable);
+    }
+
     pub(super) fn cancelled_pending(&self, error: &InferenceError) {
         increment(&self.cancelled_pending);
         self.record_cancellation_kind(error);
@@ -113,10 +120,8 @@ impl QueueMetrics {
                 increment(&self.cancelled_active);
                 increment(&self.timed_out);
             }
-            Err(InferenceError::ProviderFailed { .. })
-            | Err(InferenceError::CapabilityUnavailable { .. }) => {
-                increment(&self.provider_failed);
-            }
+            Err(InferenceError::ProviderFailed { .. }) => increment(&self.provider_failed),
+            Err(InferenceError::CapabilityUnavailable { .. }) => increment(&self.unavailable),
             Err(InferenceError::WorkerDropped) => increment(&self.worker_dropped),
         }
     }
@@ -135,6 +140,7 @@ impl QueueMetrics {
             started: self.started.load(Ordering::Relaxed),
             succeeded: self.succeeded.load(Ordering::Relaxed),
             provider_failed: self.provider_failed.load(Ordering::Relaxed),
+            unavailable: self.unavailable.load(Ordering::Relaxed),
             cancelled_pending: self.cancelled_pending.load(Ordering::Relaxed),
             cancelled_active: self.cancelled_active.load(Ordering::Relaxed),
             timed_out: self.timed_out.load(Ordering::Relaxed),
@@ -198,6 +204,7 @@ mod tests {
             result: InferenceResult<()>,
             succeeded: u64,
             provider_failed: u64,
+            unavailable: u64,
             cancelled_active: u64,
             timed_out: u64,
             superseded: u64,
@@ -209,6 +216,7 @@ mod tests {
                 result: Ok(()),
                 succeeded: 1,
                 provider_failed: 0,
+                unavailable: 0,
                 cancelled_active: 0,
                 timed_out: 0,
                 superseded: 0,
@@ -220,6 +228,7 @@ mod tests {
                 }),
                 succeeded: 0,
                 provider_failed: 1,
+                unavailable: 0,
                 cancelled_active: 0,
                 timed_out: 0,
                 superseded: 0,
@@ -229,6 +238,7 @@ mod tests {
                 result: Err(InferenceError::Cancelled),
                 succeeded: 0,
                 provider_failed: 0,
+                unavailable: 0,
                 cancelled_active: 1,
                 timed_out: 0,
                 superseded: 0,
@@ -238,6 +248,7 @@ mod tests {
                 result: Err(InferenceError::Superseded),
                 succeeded: 0,
                 provider_failed: 0,
+                unavailable: 0,
                 cancelled_active: 1,
                 timed_out: 0,
                 superseded: 1,
@@ -249,6 +260,7 @@ mod tests {
                 }),
                 succeeded: 0,
                 provider_failed: 0,
+                unavailable: 0,
                 cancelled_active: 1,
                 timed_out: 1,
                 superseded: 0,
@@ -258,6 +270,7 @@ mod tests {
                 result: Err(InferenceError::WorkerDropped),
                 succeeded: 0,
                 provider_failed: 0,
+                unavailable: 0,
                 cancelled_active: 0,
                 timed_out: 0,
                 superseded: 0,
@@ -266,7 +279,8 @@ mod tests {
             Case {
                 result: Err(InferenceError::CapabilityUnavailable { capability: "test" }),
                 succeeded: 0,
-                provider_failed: 1,
+                provider_failed: 0,
+                unavailable: 1,
                 cancelled_active: 0,
                 timed_out: 0,
                 superseded: 0,
@@ -285,6 +299,7 @@ mod tests {
             assert_eq!(counters.started, 1);
             assert_eq!(counters.succeeded, case.succeeded);
             assert_eq!(counters.provider_failed, case.provider_failed);
+            assert_eq!(counters.unavailable, case.unavailable);
             assert_eq!(counters.cancelled_active, case.cancelled_active);
             assert_eq!(counters.timed_out, case.timed_out);
             assert_eq!(counters.superseded, case.superseded);
@@ -297,6 +312,7 @@ mod tests {
                 counters.started,
                 counters.succeeded
                     + counters.provider_failed
+                    + counters.unavailable
                     + counters.cancelled_active
                     + counters.worker_dropped
             );
