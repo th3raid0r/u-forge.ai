@@ -1,6 +1,6 @@
 # Plan Ledger
 
-Last reconciled: 2026-08-24 on `feature/hybrid-search-pipeline`.
+Last reconciled: 2026-08-24 on `feature/inference-queue-lifecycle`.
 
 Source code and verified behavior are authoritative. This directory contains
 only active or deliberately parked product work; completed checklists are audit
@@ -10,7 +10,6 @@ records under `archive/` and are not current implementation instructions.
 
 | Plan | State | Progress |
 |------|-------|----------|
-| [Unified Inference Queue Lifecycle](feature_inference-queue-lifecycle.md) | Planned | Impact rank 2; covers `CORE-05`, `CORE-09`, `CORE-11`, and the `ALLOW-08` acceptance outcome. |
 | [Adaptive Agent Context Optimization](feature_agent-context-optimization.md) | Planned | Impact rank 3; removes rollback residue and replaces per-source budgets with pressure-triggered compaction. Covers `AGENT-02`, `AGENT-03`, `AGENT-05`, `AGENT-10`, and `ALLOW-05`. |
 | [Typed Chat Run Lifecycle](feature_chat-run-lifecycle.md) | Planned | Impact rank 4; covers `AGENT-01`, `AGENT-04`, `AGENT-09`, `UI-08`, and the `ALLOW-10` acceptance outcome. |
 | [Catalog-Derived Lemonade Setup and Activation](feature_lemonade-setup-activation.md) | Planned | Impact rank 5; covers `UI-04`, `UI-01`, `UI-05`, and `LEMON-08`. |
@@ -23,6 +22,7 @@ The source inventory and full surfaced/planned/remediated candidate ledger live 
 | Plan | Completed | Outcome |
 |------|-----------|---------|
 | [Staged Hybrid Search Pipeline](archive/feature_hybrid-search-pipeline.md) | 2026-08-24 | Remediated `CORE-01` and `AGENT-07`; removed `ALLOW-11`; preserved the public search and cancellation contracts. |
+| [Unified Inference Queue Lifecycle](archive/feature_inference-queue-lifecycle.md) | 2026-08-24 | Remediated `CORE-05`, `CORE-09`, and `CORE-11`; removed `ALLOW-08`; unified submission and terminal accounting while preserving capability-specific execution. |
 
 ## Active design gate
 

@@ -140,7 +140,7 @@ Before remediation is marked complete, run `make test` for owned-runtime setup, 
 
 ## Dependencies and sequencing
 
-This slice can begin with pure catalog/config tests, but implementation should consume the settled queue lifecycle from `feature_inference-queue-lifecycle.md`. `LEMON-03`, `LEMON-06`, and `LEMON-09` remain surfaced follow-ups; do not absorb them unless source changes prove they are required to establish one setup authority.
+This slice can begin with pure catalog/config tests, but implementation should consume the [settled queue lifecycle](archive/feature_inference-queue-lifecycle.md). `LEMON-03`, `LEMON-06`, and `LEMON-09` remain surfaced follow-ups; do not absorb them unless source changes prove they are required to establish one setup authority.
 
 ## Out of scope
 

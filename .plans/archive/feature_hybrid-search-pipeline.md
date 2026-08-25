@@ -116,7 +116,7 @@ Final results: 51 focused search tests and 32 agent tests passed; `make clippy` 
 
 ## Dependencies and sequencing
 
-The search design was implemented against the existing cancellable queue boundary without creating a second lifecycle abstraction. Any later work from [`feature_inference-queue-lifecycle.md`](../feature_inference-queue-lifecycle.md) must revalidate these submission points.
+The search design was implemented against the existing cancellable queue boundary without creating a second lifecycle abstraction. The later [unified inference queue lifecycle](feature_inference-queue-lifecycle.md) revalidated these submission points through the complete workspace suites.
 
 ## Out of scope
 
