@@ -356,6 +356,11 @@ impl<T> OneShotReporter<T> {
         self.started_at.elapsed()
     }
 
+    pub(super) fn record_retry(&self, attempt: u32) {
+        self.context.metrics.retry();
+        self.span.record("retries", attempt);
+    }
+
     pub(super) fn finish(mut self, result: InferenceResult<T>) {
         self.record_terminal(&result);
         if let Some(response) = self.response.take() {

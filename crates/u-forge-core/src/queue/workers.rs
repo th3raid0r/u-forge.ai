@@ -27,10 +27,7 @@ use crate::lemonade::{
 use super::jobs::{
     EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
 };
-use super::lifecycle::{
-    InferenceError, OneShotReporter, StreamingReporter, TimeoutClass, finish_queue_span,
-    queue_job_span, record_pending_cancellation,
-};
+use super::lifecycle::{InferenceError, OneShotReporter, StreamingReporter, TimeoutClass};
 use super::weighted::WeightedEmbedDispatcher;
 
 /// Maximum number of attempts for a single embed job before the error is
@@ -309,110 +306,74 @@ async fn execute_embed_job(
     ewma_us: &Arc<AtomicU64>,
     stolen: bool,
 ) {
-    if job.context.cancellation.is_cancelled() {
-        let error = job.context.cancellation.error();
-        record_pending_cancellation(&job.context, "embedding", device_name, &error);
-        let _ = job.response.send(Err(error));
+    let EmbedJob {
+        context,
+        text,
+        response,
+    } = job;
+    let Some(reporter) =
+        OneShotReporter::begin(context, response, "embedding", device_name, stolen)
+    else {
         return;
-    }
-    let span = queue_job_span(&job.context, "embedding", device_name, stolen);
-    let start = job.context.begin(stolen);
-    let mut last_err: Option<InferenceError> = None;
-    let mut result: Option<Vec<f32>> = None;
-
-    for attempt in 1..=EMBED_MAX_ATTEMPTS {
-        let attempt_result = async {
-            tokio::select! {
-                _ = job.context.cancellation.cancelled() => {
-                    Err(job.context.cancellation.error())
-                }
-                result = provider.embed(&job.text) => result.map_err(|error| {
+    };
+    let cancellation = reporter.cancellation().clone();
+    let final_result = async {
+        for attempt in 1..=EMBED_MAX_ATTEMPTS {
+            let attempt_result = tokio::select! {
+                _ = cancellation.cancelled() => Err(cancellation.error()),
+                result = provider.embed(&text) => result.map_err(|error| {
                     InferenceError::classify_timeout(error, TimeoutClass::Provider)
                 }),
-            }
-        }
-        .instrument(span.clone())
-        .await;
-        match attempt_result {
-            Ok(vec) => {
-                result = Some(vec);
-                break;
-            }
-            Err(
-                error @ (InferenceError::Cancelled
-                | InferenceError::Superseded
-                | InferenceError::TimedOut { .. }),
-            ) => {
-                let elapsed_us = start.elapsed().as_micros() as u64;
-                job.context.metrics.finished(&Err(&error), elapsed_us);
-                finish_queue_span::<Vec<f32>>(&span, &Err(error), elapsed_us);
-                let _ = job.response.send(Err(job.context.cancellation.error()));
-                return;
-            }
-            Err(e) => {
-                let delay_ms = EMBED_RETRY_BASE_MS * (1 << (attempt - 1));
-                debug!(
-                    device = %device_name,
-                    attempt,
-                    EMBED_MAX_ATTEMPTS,
-                    delay_ms,
-                    error = %e,
-                    "Embed attempt failed — retrying"
-                );
-                last_err = Some(e);
-                if attempt < EMBED_MAX_ATTEMPTS {
-                    job.context.metrics.retry();
-                    span.record("retries", attempt);
+            };
+            match attempt_result {
+                Ok(vector) => return Ok(vector),
+                Err(
+                    error @ (InferenceError::Cancelled
+                    | InferenceError::Superseded
+                    | InferenceError::TimedOut { .. }),
+                ) => return Err(error),
+                Err(error) => {
+                    let delay_ms = EMBED_RETRY_BASE_MS * (1 << (attempt - 1));
+                    debug!(
+                        device = %device_name,
+                        attempt,
+                        EMBED_MAX_ATTEMPTS,
+                        delay_ms,
+                        error = %error,
+                        "Embed attempt failed — retrying"
+                    );
+                    if attempt == EMBED_MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+                    reporter.record_retry(attempt);
                     tokio::select! {
-                        _ = job.context.cancellation.cancelled() => {
-                            let error = job.context.cancellation.error();
-                            job.context.metrics.finished(
-                                &Err(&error),
-                                start.elapsed().as_micros() as u64,
-                            );
-                            finish_queue_span::<Vec<f32>>(
-                                &span,
-                                &Err(job.context.cancellation.error()),
-                                start.elapsed().as_micros() as u64,
-                            );
-                            let _ = job.response.send(Err(error));
-                            return;
-                        }
+                        _ = cancellation.cancelled() => return Err(cancellation.error()),
                         _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
                     }
                 }
             }
         }
+        Err(InferenceError::provider(
+            "embed failed with no error detail",
+        ))
     }
+    .instrument(reporter.span().clone())
+    .await;
 
-    let final_result = result.ok_or_else(|| {
-        last_err.unwrap_or_else(|| InferenceError::provider("embed failed with no error detail"))
-    });
-
-    let elapsed_us = start.elapsed().as_micros() as u64;
+    let elapsed_us = reporter.elapsed().as_micros() as u64;
     debug!(
-        job_id = job.context.id,
+        job_id = reporter.job_id(),
         device = %device_name,
-        text_len = job.text.len(),
+        text_len = text.len(),
         ok = final_result.is_ok(),
         duration_ms = elapsed_us / 1000,
         "Embed job complete"
     );
 
-    job.context
-        .metrics
-        .finished(&final_result.as_ref().map(|_| ()), elapsed_us);
-    finish_queue_span(&span, &final_result, elapsed_us);
-
     // Cancellation never trains the dispatch estimator. Successful work and
     // terminal provider failures do, because both represent occupied service
     // time on this worker.
-    if !matches!(
-        final_result,
-        Err(InferenceError::Cancelled
-            | InferenceError::Superseded
-            | InferenceError::TimedOut { .. })
-    ) {
+    if trains_embedding_ewma(&final_result) {
         let old = ewma_us.load(Ordering::Relaxed);
         let new_ewma = if old == 0 {
             elapsed_us
@@ -422,7 +383,16 @@ async fn execute_embed_job(
         ewma_us.store(new_ewma, Ordering::Relaxed);
     }
 
-    let _ = job.response.send(final_result);
+    reporter.finish(final_result);
+}
+
+fn trains_embedding_ewma<T>(result: &Result<T, InferenceError>) -> bool {
+    !matches!(
+        result,
+        Err(InferenceError::Cancelled
+            | InferenceError::Superseded
+            | InferenceError::TimedOut { .. })
+    )
 }
 
 /// Embedding worker loop with work stealing.
@@ -571,4 +541,32 @@ pub(super) async fn run_tts_worker(
         }
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_ewma_trains_only_on_observed_service() {
+        assert!(trains_embedding_ewma(&Ok::<_, InferenceError>(())));
+        assert!(trains_embedding_ewma::<()>(&Err(
+            InferenceError::ProviderFailed {
+                message: "terminal provider failure".into(),
+            }
+        )));
+
+        for result in [
+            Err(InferenceError::Cancelled),
+            Err(InferenceError::Superseded),
+            Err(InferenceError::TimedOut {
+                class: TimeoutClass::Provider,
+            }),
+            Err(InferenceError::TimedOut {
+                class: TimeoutClass::Operation,
+            }),
+        ] {
+            assert!(!trains_embedding_ewma::<()>(&result));
+        }
+    }
 }
