@@ -25,6 +25,7 @@ pub struct QueueCounters {
     pub started: u64,
     pub succeeded: u64,
     pub provider_failed: u64,
+    pub unavailable: u64,
     pub cancelled_pending: u64,
     pub cancelled_active: u64,
     pub timed_out: u64,
@@ -42,6 +43,7 @@ pub(crate) struct QueueMetrics {
     started: AtomicU64,
     succeeded: AtomicU64,
     provider_failed: AtomicU64,
+    unavailable: AtomicU64,
     cancelled_pending: AtomicU64,
     cancelled_active: AtomicU64,
     timed_out: AtomicU64,
@@ -93,6 +95,11 @@ impl QueueMetrics {
         increment(&self.worker_dropped);
     }
 
+    pub(super) fn unavailable(&self) {
+        increment(&self.submitted);
+        increment(&self.unavailable);
+    }
+
     pub(super) fn cancelled_pending(&self, error: &InferenceError) {
         increment(&self.cancelled_pending);
         self.record_cancellation_kind(error);
@@ -113,10 +120,8 @@ impl QueueMetrics {
                 increment(&self.cancelled_active);
                 increment(&self.timed_out);
             }
-            Err(InferenceError::ProviderFailed { .. })
-            | Err(InferenceError::CapabilityUnavailable { .. }) => {
-                increment(&self.provider_failed);
-            }
+            Err(InferenceError::ProviderFailed { .. }) => increment(&self.provider_failed),
+            Err(InferenceError::CapabilityUnavailable { .. }) => increment(&self.unavailable),
             Err(InferenceError::WorkerDropped) => increment(&self.worker_dropped),
         }
     }
@@ -135,6 +140,7 @@ impl QueueMetrics {
             started: self.started.load(Ordering::Relaxed),
             succeeded: self.succeeded.load(Ordering::Relaxed),
             provider_failed: self.provider_failed.load(Ordering::Relaxed),
+            unavailable: self.unavailable.load(Ordering::Relaxed),
             cancelled_pending: self.cancelled_pending.load(Ordering::Relaxed),
             cancelled_active: self.cancelled_active.load(Ordering::Relaxed),
             timed_out: self.timed_out.load(Ordering::Relaxed),
@@ -152,6 +158,164 @@ impl QueueMetrics {
                 total_us: self.service_total_us.load(Ordering::Relaxed),
                 max_us: self.service_max_us.load(Ordering::Relaxed),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::{InferenceResult, TimeoutClass};
+
+    #[test]
+    fn pending_terminal_matrix_records_one_classification_per_submission() {
+        let cases = [
+            (InferenceError::Cancelled, 0, 0),
+            (InferenceError::Superseded, 1, 0),
+            (
+                InferenceError::TimedOut {
+                    class: TimeoutClass::QueueWait,
+                },
+                0,
+                1,
+            ),
+        ];
+
+        for (error, superseded, timed_out) in cases {
+            let metrics = QueueMetrics::default();
+            metrics.submitted();
+            metrics.cancelled_pending(&error);
+
+            let counters = metrics.snapshot();
+            assert_eq!(counters.submitted, 1);
+            assert_eq!(counters.started, 0);
+            assert_eq!(counters.cancelled_pending, 1);
+            assert_eq!(counters.cancelled_active, 0);
+            assert_eq!(counters.superseded, superseded);
+            assert_eq!(counters.timed_out, timed_out);
+            assert_eq!(counters.queue_wait.samples, 0);
+            assert_eq!(counters.service_time.samples, 0);
+        }
+    }
+
+    #[test]
+    fn started_terminal_matrix_records_one_service_transition() {
+        struct Case {
+            result: InferenceResult<()>,
+            succeeded: u64,
+            provider_failed: u64,
+            unavailable: u64,
+            cancelled_active: u64,
+            timed_out: u64,
+            superseded: u64,
+            worker_dropped: u64,
+        }
+
+        let cases = [
+            Case {
+                result: Ok(()),
+                succeeded: 1,
+                provider_failed: 0,
+                unavailable: 0,
+                cancelled_active: 0,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::ProviderFailed {
+                    message: "provider failed".into(),
+                }),
+                succeeded: 0,
+                provider_failed: 1,
+                unavailable: 0,
+                cancelled_active: 0,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::Cancelled),
+                succeeded: 0,
+                provider_failed: 0,
+                unavailable: 0,
+                cancelled_active: 1,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::Superseded),
+                succeeded: 0,
+                provider_failed: 0,
+                unavailable: 0,
+                cancelled_active: 1,
+                timed_out: 0,
+                superseded: 1,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::TimedOut {
+                    class: TimeoutClass::Provider,
+                }),
+                succeeded: 0,
+                provider_failed: 0,
+                unavailable: 0,
+                cancelled_active: 1,
+                timed_out: 1,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::WorkerDropped),
+                succeeded: 0,
+                provider_failed: 0,
+                unavailable: 0,
+                cancelled_active: 0,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 1,
+            },
+            Case {
+                result: Err(InferenceError::CapabilityUnavailable { capability: "test" }),
+                succeeded: 0,
+                provider_failed: 0,
+                unavailable: 1,
+                cancelled_active: 0,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+        ];
+
+        for case in cases {
+            let metrics = QueueMetrics::default();
+            metrics.submitted();
+            metrics.started(17, false);
+            metrics.finished(&case.result.as_ref().map(|_| ()), 23);
+
+            let counters = metrics.snapshot();
+            assert_eq!(counters.submitted, 1);
+            assert_eq!(counters.started, 1);
+            assert_eq!(counters.succeeded, case.succeeded);
+            assert_eq!(counters.provider_failed, case.provider_failed);
+            assert_eq!(counters.unavailable, case.unavailable);
+            assert_eq!(counters.cancelled_active, case.cancelled_active);
+            assert_eq!(counters.timed_out, case.timed_out);
+            assert_eq!(counters.superseded, case.superseded);
+            assert_eq!(counters.worker_dropped, case.worker_dropped);
+            assert_eq!(counters.queue_wait.samples, 1);
+            assert_eq!(counters.queue_wait.total_us, 17);
+            assert_eq!(counters.service_time.samples, 1);
+            assert_eq!(counters.service_time.total_us, 23);
+            assert_eq!(
+                counters.started,
+                counters.succeeded
+                    + counters.provider_failed
+                    + counters.unavailable
+                    + counters.cancelled_active
+                    + counters.worker_dropped
+            );
         }
     }
 }

@@ -1,10 +1,11 @@
 # Feature: Unified Inference Queue Lifecycle
 
-## Status: Planned — impact rank 2
+## Status: Completed — 2026-08-24
 
-- **Primary candidate:** `CORE-05`
-- **Bundled supporting candidates:** `CORE-09`, `CORE-11`
-- **Acceptance outcome:** resolve or explicitly reclassify `ALLOW-08` after the weighted-dispatch state is verified.
+- **Primary candidate remediated:** `CORE-05`
+- **Bundled supporting candidates remediated:** `CORE-09`, `CORE-11`
+- **Acceptance outcome:** `ALLOW-08` removed after verifying that idle state had no dispatch authority.
+- **Implementation commits:** `12a01de`, `9ab6048`, `f9263fc`, `df44f1f`, `c982dc1`, `d70cbbf`, `4fbb5d7`, `bce58f7`, `6baa901`.
 
 ## Goal
 
@@ -24,7 +25,7 @@ Queue lifecycle mechanics are repeated at both ends of every AI capability. Subm
 - `crates/u-forge-core/src/queue/lifecycle.rs` — metrics and lifecycle helpers.
 - `crates/u-forge-core/src/queue/telemetry.rs` — spans and queue statistics.
 - `crates/u-forge-core/src/queue/builder.rs` — capability registration and task spawning.
-- `crates/u-forge-core/src/queue/weighted.rs` — embedding routing, stealing, wakeups, idle/EWMA state.
+- `crates/u-forge-core/src/queue/weighted.rs` — embedding routing, stealing, wakeups, and EWMA state.
 - `crates/u-forge-core/benches/inference_lifecycle.rs` — evidence-retained routing and lifecycle scenarios.
 
 ## Required invariants
@@ -113,17 +114,24 @@ Avoid macros for control flow. The lifecycle should stay visible to the type che
 
 ## Validation
 
+Completed serially on 2026-08-24:
+
 ```bash
 cargo test -p u-forge-core queue -- --test-threads=1
+make fmt-check
 make clippy
 make test-ci
+cargo bench -p u-forge-core --bench inference_lifecycle -- --noplot
+make test
 ```
 
-Run the deterministic scenarios in `crates/u-forge-core/benches/inference_lifecycle.rs` and compare terminal classification, routing, stealing, and makespan behavior. Before remediation is marked complete, run `make test` for provider-factory and live queue integration coverage.
+Final results: 63 focused queue tests passed; formatting and workspace Clippy passed; `make test-ci` passed 370 workspace and 16 patched `cosmic-text` tests; `make test` passed 547 workspace and 16 patched `cosmic-text` tests with the owned embedded runtime shutting down cleanly.
+
+The final deterministic benchmark reported no statistically significant change in any retained scenario. Cold and preseeded heterogeneous routing remained near 35 ms, retry recovery and lockstep recovery remained near 307 ms, and work stealing remained near 81 ms. Routing, retry, EWMA, and stealing constants were unchanged.
 
 ## Dependencies and sequencing
 
-Land this before the hybrid-search rewrite where practical. Search, chat, ingestion embedding, and future sandbox work all consume the queue lifecycle and should not create local substitutes while this boundary is changing.
+The rewrite landed after the staged hybrid-search pipeline and revalidated its queue submission points through the complete workspace suites. Search, chat, ingestion embedding, and future sandbox work now consume the unified lifecycle boundary and should not create local substitutes.
 
 ## Out of scope
 

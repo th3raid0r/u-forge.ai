@@ -123,7 +123,7 @@ Before remediation is marked complete, run `make test` for runtime acquisition, 
 
 ## Dependencies and sequencing
 
-Consume typed context-overflow and repeat outcomes from `feature_agent-context-optimization.md`. Coordinate with `feature_inference-queue-lifecycle.md` so the run handle follows the established split between streamed items and awaitable completion instead of creating incompatible lifecycle vocabulary.
+Consume typed context-overflow and repeat outcomes from `feature_agent-context-optimization.md`. Coordinate with the [completed inference queue lifecycle](archive/feature_inference-queue-lifecycle.md) so the run handle follows the established split between streamed items and awaitable completion instead of creating incompatible lifecycle vocabulary.
 
 ## Out of scope
 

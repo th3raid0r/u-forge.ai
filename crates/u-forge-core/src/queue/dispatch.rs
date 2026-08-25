@@ -16,7 +16,7 @@ use super::jobs::{
 };
 use super::lifecycle::{
     CancellationToken, InferenceError, InferenceJob, InferenceResult, JobCompletion,
-    StreamingInferenceJob,
+    StreamingInferenceJob, submit_one_shot,
 };
 use super::telemetry::{QueueCounters, QueueMetrics};
 use super::weighted::WeightedEmbedDispatcher;
@@ -106,32 +106,30 @@ impl InferenceQueue {
         text: impl Into<String>,
         cancellation: CancellationToken,
     ) -> InferenceJob<Vec<f32>> {
-        if self.embedding_workers == 0 {
-            return unavailable_job(cancellation, "embedding");
-        }
-        let text = text.into();
         let span = tracing::Span::current();
-        span.record("text_len", text.len());
-        span.record("pending_jobs", self.embed_dispatcher.pending());
-
         let t0 = std::time::Instant::now();
-        let (tx, rx) = oneshot::channel();
-        let context = JobContext::new(cancellation.clone(), Arc::clone(&self.metrics));
-        let worker_id = self.embed_dispatcher.submit(EmbedJob {
-            context,
-            text,
-            response: tx,
-        });
-        span.record("selected_worker_id", worker_id);
-        span.record("duration_us", t0.elapsed().as_micros() as u64);
-        InferenceJob {
-            completion: JobCompletion::from_receiver(
-                cancellation.clone(),
-                rx,
-                Some(Arc::clone(&self.metrics)),
-            ),
+        let job = submit_one_shot(
+            self.embedding_workers > 0,
+            "embedding",
             cancellation,
-        }
+            Arc::clone(&self.metrics),
+            |context, response| {
+                let text = text.into();
+                span.record("text_len", text.len());
+                span.record("pending_jobs", self.embed_dispatcher.pending());
+                EmbedJob {
+                    context,
+                    text,
+                    response,
+                }
+            },
+            |job| {
+                let worker_id = self.embed_dispatcher.submit(job);
+                span.record("selected_worker_id", worker_id);
+            },
+        );
+        span.record("duration_us", t0.elapsed().as_micros() as u64);
+        job
     }
 
     /// Stable provider-set identity used to prevent mixing vector spaces.
@@ -214,28 +212,24 @@ impl InferenceQueue {
         filename: impl Into<String>,
         cancellation: CancellationToken,
     ) -> InferenceJob<String> {
-        if self.transcription_workers == 0 {
-            return unavailable_job(cancellation, "transcription");
-        }
-        let filename = filename.into();
-        tracing::Span::current().record("filename", &filename);
-        tracing::Span::current().record("audio_bytes_len", audio_bytes.len());
-
-        let (tx, rx) = oneshot::channel();
-        self.transcribe_queue.push(TranscribeJob {
-            context: JobContext::new(cancellation.clone(), Arc::clone(&self.metrics)),
-            audio_bytes,
-            filename,
-            response: tx,
-        });
-        InferenceJob {
-            completion: JobCompletion::from_receiver(
-                cancellation.clone(),
-                rx,
-                Some(Arc::clone(&self.metrics)),
-            ),
+        submit_one_shot(
+            self.transcription_workers > 0,
+            "transcription",
             cancellation,
-        }
+            Arc::clone(&self.metrics),
+            |context, response| {
+                let filename = filename.into();
+                tracing::Span::current().record("filename", &filename);
+                tracing::Span::current().record("audio_bytes_len", audio_bytes.len());
+                TranscribeJob {
+                    context,
+                    audio_bytes,
+                    filename,
+                    response,
+                }
+            },
+            |job| self.transcribe_queue.push(job),
+        )
     }
 
     /// Submit a text-to-speech synthesis request and await the audio bytes.
@@ -275,30 +269,26 @@ impl InferenceQueue {
         voice: Option<KokoroVoice>,
         cancellation: CancellationToken,
     ) -> InferenceJob<Vec<u8>> {
-        if self.tts_workers == 0 {
-            return unavailable_job(cancellation, "TTS");
-        }
-        let text = text.into();
-        if let Some(ref v) = voice {
-            tracing::Span::current().record("voice", v.as_str());
-        }
-        tracing::Span::current().record("text_len", text.len());
-
-        let (tx, rx) = oneshot::channel();
-        self.synthesize_queue.push(SynthesizeJob {
-            context: JobContext::new(cancellation.clone(), Arc::clone(&self.metrics)),
-            text,
-            voice,
-            response: tx,
-        });
-        InferenceJob {
-            completion: JobCompletion::from_receiver(
-                cancellation.clone(),
-                rx,
-                Some(Arc::clone(&self.metrics)),
-            ),
+        submit_one_shot(
+            self.tts_workers > 0,
+            "TTS",
             cancellation,
-        }
+            Arc::clone(&self.metrics),
+            |context, response| {
+                let text = text.into();
+                if let Some(ref voice) = voice {
+                    tracing::Span::current().record("voice", voice.as_str());
+                }
+                tracing::Span::current().record("text_len", text.len());
+                SynthesizeJob {
+                    context,
+                    text,
+                    voice,
+                    response,
+                }
+            },
+            |job| self.synthesize_queue.push(job),
+        )
     }
 
     /// Submit a chat-completion / LLM generation request and await the result.
@@ -326,25 +316,21 @@ impl InferenceQueue {
         request: ChatRequest,
         cancellation: CancellationToken,
     ) -> InferenceJob<ChatCompletionResponse> {
-        if self.llm_workers == 0 {
-            return unavailable_job(cancellation, "text-generation");
-        }
-        tracing::Span::current().record("n_messages", request.messages.len());
-
-        let (tx, rx) = oneshot::channel();
-        self.generate_queue.push(GenerateJob {
-            context: JobContext::new(cancellation.clone(), Arc::clone(&self.metrics)),
-            request,
-            response: tx,
-        });
-        InferenceJob {
-            completion: JobCompletion::from_receiver(
-                cancellation.clone(),
-                rx,
-                Some(Arc::clone(&self.metrics)),
-            ),
+        submit_one_shot(
+            self.llm_workers > 0,
+            "text-generation",
             cancellation,
-        }
+            Arc::clone(&self.metrics),
+            |context, response| {
+                tracing::Span::current().record("n_messages", request.messages.len());
+                GenerateJob {
+                    context,
+                    request,
+                    response,
+                }
+            },
+            |job| self.generate_queue.push(job),
+        )
     }
 
     /// Submit a streaming LLM request; returns an mpsc receiver that yields
@@ -377,6 +363,7 @@ impl InferenceQueue {
         cancellation: CancellationToken,
     ) -> InferenceResult<StreamingInferenceJob<StreamToken>> {
         if self.llm_workers == 0 {
+            self.metrics.unavailable();
             return Err(InferenceError::CapabilityUnavailable {
                 capability: "text-generation",
             });
@@ -390,10 +377,9 @@ impl InferenceQueue {
             completion: completion_tx,
         });
         Ok(StreamingInferenceJob {
-            completion: JobCompletion::from_receiver(
-                cancellation.clone(),
+            completion: JobCompletion::from_terminal_receiver(
                 completion_rx,
-                Some(Arc::clone(&self.metrics)),
+                Arc::clone(&self.metrics),
             ),
             cancellation,
             stream: rx,
@@ -453,31 +439,27 @@ impl InferenceQueue {
         top_n: Option<usize>,
         cancellation: CancellationToken,
     ) -> InferenceJob<Vec<RerankDocument>> {
-        if self.reranking_workers == 0 {
-            return unavailable_job(cancellation, "reranking");
-        }
-        let query = query.into();
-        tracing::Span::current().record("n_docs", documents.len());
-        if let Some(n) = top_n {
-            tracing::Span::current().record("top_n", n);
-        }
-
-        let (tx, rx) = oneshot::channel();
-        self.rerank_queue.push(RerankJob {
-            context: JobContext::new(cancellation.clone(), Arc::clone(&self.metrics)),
-            query,
-            documents,
-            top_n,
-            response: tx,
-        });
-        InferenceJob {
-            completion: JobCompletion::from_receiver(
-                cancellation.clone(),
-                rx,
-                Some(Arc::clone(&self.metrics)),
-            ),
+        submit_one_shot(
+            self.reranking_workers > 0,
+            "reranking",
             cancellation,
-        }
+            Arc::clone(&self.metrics),
+            |context, response| {
+                let query = query.into();
+                tracing::Span::current().record("n_docs", documents.len());
+                if let Some(n) = top_n {
+                    tracing::Span::current().record("top_n", n);
+                }
+                RerankJob {
+                    context,
+                    query,
+                    documents,
+                    top_n,
+                    response,
+                }
+            },
+            |job| self.rerank_queue.push(job),
+        )
     }
 
     // ── Monitoring ────────────────────────────────────────────────────────────
@@ -543,16 +525,6 @@ impl InferenceQueue {
     /// Number of background worker tasks registered for reranking.
     pub fn reranking_worker_count(&self) -> usize {
         self.reranking_workers
-    }
-}
-
-fn unavailable_job<T: Send + 'static>(
-    cancellation: CancellationToken,
-    capability: &'static str,
-) -> InferenceJob<T> {
-    InferenceJob {
-        completion: JobCompletion::ready(Err(InferenceError::CapabilityUnavailable { capability })),
-        cancellation,
     }
 }
 
@@ -774,7 +746,7 @@ mod tests {
         let synthesize_queue = Arc::new(WorkQueue::new());
 
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider);
-        let (embed_q, embed_idle, embed_ewma) = embed_dispatcher.add_worker(100, "mock-npu");
+        let (embed_q, embed_ewma) = embed_dispatcher.add_worker(100, "mock-npu");
 
         // Wrap before spawning so the worker can call steal_from_busiest.
         let embed_dispatcher = Arc::new(embed_dispatcher);
@@ -785,7 +757,6 @@ mod tests {
                     embed_q,
                     provider,
                     "mock-npu".to_string(),
-                    embed_idle,
                     embed_ewma,
                     dispatcher,
                 )
@@ -833,6 +804,33 @@ mod tests {
             builder.providers.is_empty(),
             "New builder should have no providers registered"
         );
+    }
+
+    #[tokio::test]
+    async fn builder_derives_embedding_registration_output() {
+        let queue = build_embedding_queue(Arc::new(MockEmbeddingProvider));
+
+        assert_eq!(queue.embedding_worker_count(), 1);
+        assert_eq!(
+            queue.embedding_space_fingerprint(),
+            Some("deterministic/mock@unknown")
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_skips_mismatched_capability_slots() {
+        let queue = InferenceQueueBuilder::new()
+            .with_provider(crate::lemonade::BuiltProvider {
+                name: "mismatched/mock".into(),
+                capability: crate::lemonade::Capability::Transcription,
+                provider: crate::lemonade::ProviderSlot::Embedding(Arc::new(MockEmbeddingProvider)),
+                weight: 100,
+            })
+            .build();
+
+        assert_eq!(queue.embedding_worker_count(), 0);
+        assert_eq!(queue.transcription_worker_count(), 0);
+        assert_eq!(queue.embedding_space_fingerprint(), None);
     }
 
     #[tokio::test]
@@ -1052,6 +1050,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_stream_submission_is_accounted_once() {
+        let queue = build_mock_queue();
+        let request = ChatRequest::new(vec![crate::lemonade::ChatMessage::user("test")]);
+
+        assert!(matches!(
+            queue.submit_generate_stream(request),
+            Err(InferenceError::CapabilityUnavailable {
+                capability: "text-generation"
+            })
+        ));
+        let counters = queue.stats().counters;
+        assert_eq!(counters.submitted, 1);
+        assert_eq!(counters.unavailable, 1);
+        assert_eq!(counters.started, 0);
+    }
+
+    #[tokio::test]
     async fn test_synthesize_errors_when_no_tts_device() {
         let queue = build_mock_queue(); // no TTS workers
         let result = queue.synthesize("Hello!", None).await;
@@ -1148,12 +1163,12 @@ mod tests {
 
         let mut embed_dispatcher = WeightedEmbedDispatcher::new();
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(SlowProvider);
-        let (q, idle, ewma) = embed_dispatcher.add_worker(100, "slow-npu");
+        let (q, ewma) = embed_dispatcher.add_worker(100, "slow-npu");
         let embed_dispatcher = Arc::new(embed_dispatcher);
         {
             let dispatcher = Arc::clone(&embed_dispatcher);
             tokio::spawn(async move {
-                run_embed_worker(q, provider, "slow-npu".to_string(), idle, ewma, dispatcher).await;
+                run_embed_worker(q, provider, "slow-npu".to_string(), ewma, dispatcher).await;
             });
         }
 
