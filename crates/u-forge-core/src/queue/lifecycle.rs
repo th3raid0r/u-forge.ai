@@ -451,6 +451,12 @@ impl<T> StreamingReporter<T> {
         }
     }
 
+    pub(super) async fn item_receiver_closed(&self) -> InferenceError {
+        self.response.closed().await;
+        self.context.cancellation.cancel();
+        self.context.cancellation.error()
+    }
+
     pub(super) fn finish(mut self, result: InferenceResult<()>) {
         self.record_terminal(&result);
         if let Some(completion) = self.completion.take() {
@@ -856,7 +862,7 @@ mod tests {
         )
         .unwrap();
 
-        let terminal = reporter.send_item(Ok(())).await.unwrap_err();
+        let terminal = reporter.item_receiver_closed().await;
         assert!(matches!(terminal, InferenceError::Cancelled));
         assert!(cancellation.is_cancelled());
         reporter.finish(Err(terminal));

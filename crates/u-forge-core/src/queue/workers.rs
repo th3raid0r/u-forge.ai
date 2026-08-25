@@ -160,11 +160,11 @@ pub(super) async fn run_llm_stream_worker(
 
                 let mut profile = provider.profile.clone();
                 profile.reasoning = reasoning_policy(request.enable_thinking);
-                let lease = match provider
-                    .runtime
-                    .acquire_with_cancellation(&profile, &cancellation)
-                    .await
-                {
+                let lease_result = tokio::select! {
+                    error = reporter.item_receiver_closed() => return Err(error),
+                    result = provider.runtime.acquire_with_cancellation(&profile, &cancellation) => result,
+                };
+                let lease = match lease_result {
                     Ok(lease) => lease,
                     Err(error) => {
                         reporter.send_item(Err(error.clone())).await?;
@@ -180,9 +180,8 @@ pub(super) async fn run_llm_stream_worker(
                     );
                 loop {
                     let item = tokio::select! {
-                        _ = cancellation.cancelled() => {
-                            return Err(cancellation.error());
-                        }
+                        _ = cancellation.cancelled() => return Err(cancellation.error()),
+                        error = reporter.item_receiver_closed() => return Err(error),
                         item = stream.recv() => item,
                     };
                     match item {
