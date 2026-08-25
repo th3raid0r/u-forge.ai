@@ -808,6 +808,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builder_derives_embedding_registration_output() {
+        let queue = build_embedding_queue(Arc::new(MockEmbeddingProvider));
+
+        assert_eq!(queue.embedding_worker_count(), 1);
+        assert_eq!(
+            queue.embedding_space_fingerprint(),
+            Some("deterministic/mock@unknown")
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_skips_mismatched_capability_slots() {
+        let queue = InferenceQueueBuilder::new()
+            .with_provider(crate::lemonade::BuiltProvider {
+                name: "mismatched/mock".into(),
+                capability: crate::lemonade::Capability::Transcription,
+                provider: crate::lemonade::ProviderSlot::Embedding(Arc::new(MockEmbeddingProvider)),
+                weight: 100,
+            })
+            .build();
+
+        assert_eq!(queue.embedding_worker_count(), 0);
+        assert_eq!(queue.transcription_worker_count(), 0);
+        assert_eq!(queue.embedding_space_fingerprint(), None);
+    }
+
+    #[tokio::test]
     async fn test_embed_returns_vector() {
         let queue = build_mock_queue();
         let vec = queue.embed("Hello, world!").await;
