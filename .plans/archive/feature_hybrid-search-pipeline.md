@@ -1,10 +1,11 @@
 # Feature: Staged Hybrid Search Pipeline
 
-## Status: Planned — impact rank 1
+## Status: Completed — 2026-08-24
 
-- **Primary candidate:** `CORE-01`
-- **Bundled supporting candidate:** `AGENT-07`
-- **Acceptance outcome:** resolve `ALLOW-11` if the typed request boundary removes the oversized helper signature.
+- **Primary candidate remediated:** `CORE-01`
+- **Bundled supporting candidate remediated:** `AGENT-07`
+- **Acceptance outcome:** `ALLOW-11` removed.
+- **Implementation commits:** `608d8ac`, `9dfde0b`, `f28916a`, `ab70e78`.
 
 ## Goal
 
@@ -18,13 +19,14 @@ This is not complete if the current function is merely divided into similarly st
 
 ## Current authority and affected code
 
-- `crates/u-forge-core/src/search/mod.rs` — public search API, stage outcomes, retrieval, fusion, hydration, and reranking.
+- `crates/u-forge-core/src/search/mod.rs` — public search types and compatibility entry points.
+- `crates/u-forge-core/src/search/pipeline.rs` — staged retrieval, fusion, aggregation, hydration, reranking, and response assembly.
 - `crates/u-forge-core/src/search/sanitize.rs` — FTS-only query sanitization.
-- `crates/u-forge-agent/src/tools/search.rs` — semantic/hybrid tool adapters and `execute_ranked_search`.
-- `crates/u-forge/src/search_panel.rs` — desktop caller and cancellation owner.
-- `crates/u-forge-core/src/queue/dispatch.rs` — cancellable embedding and reranking submissions consumed by search.
+- `crates/u-forge-agent/src/tools/search.rs` — typed semantic/hybrid request adapter.
+- `crates/u-forge/src/search_panel.rs` — desktop cancellation owner.
+- `crates/u-forge-core/src/queue/dispatch.rs` — cancellable embedding and reranking submission boundary consumed by search.
 
-The existing public `SearchResponse`, `SearchStageOutcomes`, and compatibility entry points should remain stable unless a call-site migration proves a narrower API is materially safer.
+The public `SearchResponse`, `SearchStageOutcomes`, and compatibility entry points remained stable.
 
 ## Required invariants
 
@@ -96,12 +98,12 @@ Prefer concrete functions and enums over a generic “pipeline framework.” The
 - RRF insertion exists in one implementation.
 - Stage outcome mutation is owned by stage results or one assembly boundary, not scattered through the coordinator.
 - Agent semantic and hybrid tools share one typed execution adapter without hiding their intentional config differences.
-- `ALLOW-11` is removed if its signature is replaced; otherwise its remaining need is documented and reclassified.
+- `ALLOW-11` was removed with the oversized helper signature.
 - Existing public search behavior and graceful degradation remain compatible.
 
 ## Validation
 
-Run narrow checks first, always serializing test execution:
+Completed serially on 2026-08-24:
 
 ```bash
 cargo test -p u-forge-core search -- --test-threads=1
@@ -110,11 +112,11 @@ make clippy
 make test-ci
 ```
 
-Before remediation is marked complete, run `make test` to exercise the owned embedded runtime and optional live search capabilities. Missing optional models must continue to skip or degrade according to the existing contract.
+Final results: 51 focused search tests and 32 agent tests passed; `make clippy` passed; `make test-ci` passed 348 workspace and 16 patched `cosmic-text` tests; `make test` passed 525 workspace and 16 patched `cosmic-text` tests, with the owned embedded runtime shutting down cleanly.
 
 ## Dependencies and sequencing
 
-The search design can be characterized independently, but implementation should follow or coordinate with `feature_inference-queue-lifecycle.md` so it targets the settled queue submission/completion boundary rather than creating a second lifecycle abstraction.
+The search design was implemented against the existing cancellable queue boundary without creating a second lifecycle abstraction. Any later work from [`feature_inference-queue-lifecycle.md`](../feature_inference-queue-lifecycle.md) must revalidate these submission points.
 
 ## Out of scope
 
