@@ -66,6 +66,7 @@
 //! - Reranker fails at runtime → falls back to RRF-scored results with a warning.
 //! - Neither search path returns results → returns an empty `Vec` (not an error).
 
+mod pipeline;
 mod sanitize;
 
 pub use sanitize::fts5_sanitize;
@@ -73,7 +74,7 @@ pub use sanitize::fts5_sanitize;
 use std::collections::HashMap;
 
 use anyhow::Result;
-use tracing::{debug, info, instrument, warn};
+use tracing::instrument;
 
 use crate::KnowledgeGraph;
 use crate::queue::{CancellationToken, InferenceQueue};
@@ -347,43 +348,6 @@ impl SearchSources {
     }
 }
 
-// ── Internal accumulators ─────────────────────────────────────────────────────
-
-/// Per-chunk state during the RRF merge pass (before node aggregation).
-struct ChunkMerge {
-    /// Object (node) this chunk belongs to, as a UUID string.
-    object_id_str: String,
-    /// Matched chunk id, as a UUID string.
-    chunk_id_str: String,
-    /// Chunk content returned by retrieval.
-    content: String,
-    /// Accumulated RRF score for this chunk.
-    rrf_score: f32,
-    /// FTS5 rank position, if this chunk was found by FTS.
-    fts_rank: Option<usize>,
-    /// Cosine distance, if this chunk was found by 768-dim semantic ANN.
-    semantic_distance: Option<f32>,
-    /// Cosine distance, if this chunk was found by 4096-dim HQ semantic ANN.
-    hq_semantic_distance: Option<f32>,
-}
-
-/// Per-node accumulator produced by grouping chunk-level RRF scores.
-#[derive(Default)]
-struct NodeAccumulator {
-    /// Sum of RRF scores across all matching chunks for this node.
-    total_score: f32,
-    /// Best (lowest) FTS rank among the node's matching chunks.
-    best_fts_rank: Option<usize>,
-    /// Best (lowest) 768-dim semantic distance among the node's matching chunks.
-    best_semantic_distance: Option<f32>,
-    /// Best (lowest) 4096-dim HQ semantic distance among the node's matching chunks.
-    best_hq_semantic_distance: Option<f32>,
-    /// Number of distinct chunks that contributed to this node's score.
-    matching_chunk_count: usize,
-    /// Matched chunks sorted by relevance after chunk-level RRF.
-    matched_chunks: Vec<MatchedChunk>,
-}
-
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 /// Node-centric hybrid search combining FTS5 keyword search, semantic ANN
@@ -456,773 +420,16 @@ pub async fn search_hybrid_response_with_cancellation(
     config: &HybridSearchConfig,
     cancellation: CancellationToken,
 ) -> Result<SearchResponse> {
-    if cancellation.is_cancelled() {
-        return Err(cancellation.error().into());
-    }
     tracing::Span::current().record("query", query);
-
-    let alpha = config.alpha.clamp(0.0, 1.0);
-    let mut outcomes = SearchStageOutcomes {
-        fts: SearchStageOutcome::skipped("FTS5 was not requested"),
-        standard_semantic: SearchStageOutcome::skipped(
-            "standard semantic search was not requested",
-        ),
-        high_quality_semantic: SearchStageOutcome::skipped("HQ semantic search was not requested"),
-        reranking: SearchStageOutcome::skipped("reranking was not requested"),
-    };
-
-    // ── Stage 1: FTS5 search (sync, sub-millisecond) ──────────────────────────
-    // Always run first — it is instant and does not need the embedding RTT.
-    // Skip only when alpha == 1.0 (pure semantic requested).
-
-    let fts_results = if alpha < 1.0 {
-        match fts5_sanitize(query) {
-            None => {
-                debug!("FTS5 stage skipped — query contained no FTS5-safe tokens");
-                outcomes.fts = SearchStageOutcome::skipped(
-                    "FTS5 skipped because the query contained no searchable terms",
-                );
-                Vec::new()
-            }
-            Some(fts_query) => {
-                debug!(
-                    "Running FTS5 search (sanitised query: {:?}, limit {})",
-                    fts_query, config.fts_limit
-                );
-                match graph.search_chunks_fts(&fts_query, config.fts_limit) {
-                    Ok(results) => {
-                        outcomes.fts = SearchStageOutcome::applied();
-                        results
-                    }
-                    Err(error) => {
-                        warn!(%error, "FTS5 search failed; retaining other search paths");
-                        outcomes.fts = SearchStageOutcome::failed(
-                            "FTS5 retrieval failed; other available results were retained",
-                        );
-                        Vec::new()
-                    }
-                }
-            }
-        }
-    } else {
-        debug!("FTS5 stage skipped (alpha = 1.0)");
-        outcomes.fts = SearchStageOutcome::skipped("FTS5 disabled by pure-semantic mode");
-        Vec::new()
-    };
-
-    // ── Stage 2+3: Embed query then ANN search ────────────────────────────────
-    // Skip when alpha == 0.0 (pure FTS) or when no embedding worker exists.
-
-    let standard_space_valid = if alpha == 0.0 {
-        outcomes.standard_semantic =
-            SearchStageOutcome::skipped("standard semantic search disabled by FTS-only mode");
-        false
-    } else if !queue.has_embedding() {
-        outcomes.standard_semantic = SearchStageOutcome::unavailable(
-            "standard semantic search unavailable because no compatible embedding worker exists",
-        );
-        false
-    } else if let Some(fingerprint) = queue.embedding_space_fingerprint() {
-        match graph.ensure_embedding_space(crate::ingest::EmbeddingTarget::Standard, fingerprint) {
-            Ok(()) => true,
-            Err(error) => {
-                warn!(%error, "Standard semantic lane disabled for this search");
-                outcomes.standard_semantic = SearchStageOutcome::unavailable(
-                    "standard semantic search unavailable because its embedding space is incompatible",
-                );
-                false
-            }
-        }
-    } else {
-        outcomes.standard_semantic = SearchStageOutcome::unavailable(
-            "standard semantic search unavailable because its embedding identity is unknown",
-        );
-        false
-    };
-
-    let semantic_results = if standard_space_valid {
-        debug!("Embedding query for semantic ANN search");
-        match queue
-            .submit_embed_with_cancellation(query, cancellation.clone())
-            .await
-        {
-            Err(_e) if cancellation.is_cancelled() => {
-                return Err(cancellation.error().into());
-            }
-            Err(e) => {
-                warn!("Query embedding failed — falling back to FTS-only results: {e}");
-                outcomes.standard_semantic = SearchStageOutcome::failed(
-                    "standard query embedding failed; other available results were retained",
-                );
-                Vec::new()
-            }
-            Ok(query_vec) => {
-                debug!(
-                    "Running semantic ANN search (limit {})",
-                    config.semantic_limit
-                );
-                match graph.search_chunks_semantic(&query_vec, config.semantic_limit) {
-                    Ok(results) => {
-                        outcomes.standard_semantic = SearchStageOutcome::applied();
-                        results
-                    }
-                    Err(_e) if cancellation.is_cancelled() => {
-                        return Err(cancellation.error().into());
-                    }
-                    Err(e) => {
-                        warn!("Semantic ANN search failed — falling back to FTS results: {e}");
-                        outcomes.standard_semantic = SearchStageOutcome::failed(
-                            "standard semantic retrieval failed; other available results were retained",
-                        );
-                        Vec::new()
-                    }
-                }
-            }
-        }
-    } else {
-        if alpha > 0.0 && outcomes.standard_semantic.status == SearchStageStatus::Unavailable {
-            // alpha > 0 but no worker — degrade gracefully.
-            info!(
-                "Semantic search skipped — no embedding workers registered in this \
-                 InferenceQueue. Returning FTS-only results."
-            );
-        } else if alpha == 0.0 {
-            debug!("Semantic stage skipped (alpha = 0.0)");
-        }
-        Vec::new()
-    };
-
-    // ── Stage 2b+3b: HQ embed query then HQ ANN search ───────────────────────
-    // Uses the 4096-dim model when an hq_queue is provided.  Contributes its
-    // own independent RRF signal alongside the standard 768-dim path.
-
-    let hq_semantic_results = if alpha > 0.0 {
-        match hq_queue {
-            None => {
-                outcomes.high_quality_semantic = SearchStageOutcome::unavailable(
-                    "HQ semantic search unavailable because no compatible embedding lane exists",
-                );
-                Vec::new()
-            }
-            Some(hq_q) if !hq_q.has_embedding() => {
-                info!("HQ semantic search skipped — no embedding workers in hq_queue.");
-                outcomes.high_quality_semantic = SearchStageOutcome::unavailable(
-                    "HQ semantic search unavailable because no compatible embedding worker exists",
-                );
-                Vec::new()
-            }
-            Some(hq_q)
-                if hq_q
-                    .embedding_space_fingerprint()
-                    .is_some_and(|fingerprint| {
-                        match graph.ensure_embedding_space(
-                            crate::ingest::EmbeddingTarget::HighQuality,
-                            fingerprint,
-                        ) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                warn!(%error, "HQ semantic lane disabled for this search");
-                                false
-                            }
-                        }
-                    }) =>
-            {
-                debug!("Embedding query for HQ semantic ANN search");
-                match hq_q
-                    .submit_embed_with_cancellation(query, cancellation.clone())
-                    .await
-                {
-                    Err(_e) if cancellation.is_cancelled() => {
-                        return Err(cancellation.error().into());
-                    }
-                    Err(e) => {
-                        warn!("HQ query embedding failed — skipping HQ path: {e}");
-                        outcomes.high_quality_semantic = SearchStageOutcome::failed(
-                            "HQ query embedding failed; other available results were retained",
-                        );
-                        Vec::new()
-                    }
-                    Ok(query_vec) => {
-                        debug!(
-                            "Running HQ semantic ANN search (limit {})",
-                            config.semantic_limit
-                        );
-                        match graph.search_chunks_semantic_hq(&query_vec, config.semantic_limit) {
-                            Ok(results) => {
-                                outcomes.high_quality_semantic = SearchStageOutcome::applied();
-                                results
-                            }
-                            Err(e) => {
-                                warn!("HQ semantic ANN search failed — skipping HQ path: {e}");
-                                outcomes.high_quality_semantic = SearchStageOutcome::failed(
-                                    "HQ semantic retrieval failed; other available results were retained",
-                                );
-                                Vec::new()
-                            }
-                        }
-                    }
-                }
-            }
-            Some(_) => {
-                outcomes.high_quality_semantic = SearchStageOutcome::unavailable(
-                    "HQ semantic search unavailable because its embedding space is incompatible",
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        outcomes.high_quality_semantic =
-            SearchStageOutcome::skipped("HQ semantic search disabled by FTS-only mode");
-        Vec::new()
-    };
-
-    debug!(
-        "Candidate pool: {} FTS chunks, {} semantic chunks, {} HQ semantic chunks",
-        fts_results.len(),
-        semantic_results.len(),
-        hq_semantic_results.len()
-    );
-
-    if cancellation.is_cancelled() {
-        return Err(cancellation.error().into());
-    }
-
-    // ── Diagnostic: Stage 1 (FTS5) results ──────────────────────────────────
-    {
-        use std::fmt::Write as _;
-        let mut buf = format!(
-            "── HYBRID STAGE 1: FTS5 ({} chunks) ──\n",
-            fts_results.len()
-        );
-        for (rank, (chunk_id, obj_id, content)) in fts_results.iter().enumerate() {
-            let snippet: String = content.chars().take(80).collect();
-            let _ = writeln!(
-                buf,
-                "  FTS[{rank}] chunk={} obj={} content={snippet:?}…",
-                chunk_id.hyphenated(),
-                obj_id.hyphenated()
-            );
-        }
-        debug!("{buf}");
-    }
-
-    // ── Diagnostic: Stage 2+3 (Semantic ANN) results ────────────────────────
-    {
-        use std::fmt::Write as _;
-        let mut buf = format!(
-            "── HYBRID STAGE 2+3: Semantic ANN ({} chunks) ──\n",
-            semantic_results.len()
-        );
-        for (rank, (chunk_id, obj_id, content, distance)) in semantic_results.iter().enumerate() {
-            let snippet: String = content.chars().take(80).collect();
-            let _ = writeln!(
-                buf,
-                "  SEM[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
-                chunk_id.hyphenated(),
-                obj_id.hyphenated()
-            );
-        }
-        debug!("{buf}");
-    }
-
-    // ── Diagnostic: Stage 2b+3b (HQ Semantic ANN) results ───────────────────
-    {
-        use std::fmt::Write as _;
-        let mut buf = format!(
-            "── HYBRID STAGE 2b+3b: HQ Semantic ANN ({} chunks) ──\n",
-            hq_semantic_results.len()
-        );
-        for (rank, (chunk_id, obj_id, content, distance)) in hq_semantic_results.iter().enumerate()
-        {
-            let snippet: String = content.chars().take(80).collect();
-            let _ = writeln!(
-                buf,
-                "  HQ[{rank}] chunk={} obj={} dist={distance:.4} content={snippet:?}…",
-                chunk_id.hyphenated(),
-                obj_id.hyphenated()
-            );
-        }
-        debug!("{buf}");
-    }
-
-    // ── Stage 4: Reciprocal Rank Fusion merge (chunk level) ───────────────────
-    //
-    // Deduplicate chunks by chunk_id and accumulate RRF scores from both paths.
-    // k = 60 is the standard RRF constant (Cormack & Clarke, SIGIR 2009).
-    const K: f32 = 60.0;
-
-    let mut chunk_merge: HashMap<String, ChunkMerge> = HashMap::new();
-
-    for (rank, (chunk_id, obj_id, content)) in fts_results.into_iter().enumerate() {
-        let chunk_id_str = chunk_id.hyphenated().to_string();
-        let score = (1.0 - alpha) / (K + rank as f32);
-        let entry = chunk_merge
-            .entry(chunk_id_str.clone())
-            .or_insert_with(|| ChunkMerge {
-                object_id_str: obj_id.hyphenated().to_string(),
-                chunk_id_str,
-                content: content.clone(),
-                rrf_score: 0.0,
-                fts_rank: None,
-                semantic_distance: None,
-                hq_semantic_distance: None,
-            });
-        if entry.content.is_empty() {
-            entry.content = content;
-        }
-        entry.rrf_score += score;
-        entry.fts_rank = Some(rank);
-    }
-
-    for (rank, (chunk_id, obj_id, content, distance)) in semantic_results.into_iter().enumerate() {
-        let chunk_id_str = chunk_id.hyphenated().to_string();
-        let score = alpha / (K + rank as f32);
-        let entry = chunk_merge
-            .entry(chunk_id_str.clone())
-            .or_insert_with(|| ChunkMerge {
-                object_id_str: obj_id.hyphenated().to_string(),
-                chunk_id_str,
-                content: content.clone(),
-                rrf_score: 0.0,
-                fts_rank: None,
-                semantic_distance: None,
-                hq_semantic_distance: None,
-            });
-        if entry.content.is_empty() {
-            entry.content = content;
-        }
-        entry.rrf_score += score;
-        entry.semantic_distance = Some(distance);
-    }
-
-    for (rank, (chunk_id, obj_id, content, distance)) in hq_semantic_results.into_iter().enumerate()
-    {
-        let chunk_id_str = chunk_id.hyphenated().to_string();
-        let score = alpha * config.hq_semantic_boost / (K + rank as f32);
-        let entry = chunk_merge
-            .entry(chunk_id_str.clone())
-            .or_insert_with(|| ChunkMerge {
-                object_id_str: obj_id.hyphenated().to_string(),
-                chunk_id_str,
-                content: content.clone(),
-                rrf_score: 0.0,
-                fts_rank: None,
-                semantic_distance: None,
-                hq_semantic_distance: None,
-            });
-        if entry.content.is_empty() {
-            entry.content = content;
-        }
-        entry.rrf_score += score;
-        entry.hq_semantic_distance = Some(distance);
-    }
-
-    // ── Diagnostic: Stage 4 (RRF merge) results ──────────────────────────────
-    {
-        use std::fmt::Write as _;
-        let mut sorted_chunks: Vec<_> = chunk_merge.iter().collect();
-        sorted_chunks.sort_by(|a, b| {
-            b.1.rrf_score
-                .partial_cmp(&a.1.rrf_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut buf = format!(
-            "── HYBRID STAGE 4: RRF chunk merge ({} unique chunks) ──\n",
-            chunk_merge.len()
-        );
-        for (chunk_key, cm) in &sorted_chunks {
-            let _ = writeln!(
-                buf,
-                "  RRF chunk={chunk_key} obj={} score={:.6} fts_rank={:?} sem_dist={:?}",
-                cm.object_id_str, cm.rrf_score, cm.fts_rank, cm.semantic_distance
-            );
-        }
-        debug!("{buf}");
-    }
-
-    // ── Stage 5: Node-level aggregation ───────────────────────────────────────
-    //
-    // Group chunk RRF scores by parent node.  A node's total score is the sum
-    // of all its matching chunks' RRF scores.  This naturally promotes nodes
-    // that have more matching content or content found by both search paths.
-
-    let mut node_accum: HashMap<String, NodeAccumulator> = HashMap::new();
-
-    let mut merged_chunks: Vec<ChunkMerge> = chunk_merge.into_values().collect();
-    merged_chunks.sort_by(|a, b| {
-        b.rrf_score
-            .partial_cmp(&a.rrf_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    for cm in merged_chunks {
-        let acc = node_accum.entry(cm.object_id_str).or_default();
-        acc.total_score += cm.rrf_score;
-        acc.matching_chunk_count += 1;
-        let content = cm.content;
-        let token_count = crate::text::count_tokens(&content).max(1);
-        acc.matched_chunks.push(MatchedChunk {
-            id: crate::types::ChunkId::parse_str(&cm.chunk_id_str).map_err(|e| {
-                anyhow::anyhow!(
-                    "Invalid chunk UUID '{}' in hybrid search result: {e}",
-                    cm.chunk_id_str
-                )
-            })?,
-            content,
-            token_count,
-            score: cm.rrf_score,
-            fts_rank: cm.fts_rank,
-            semantic_distance: cm.semantic_distance,
-            hq_semantic_distance: cm.hq_semantic_distance,
-        });
-        if let Some(rank) = cm.fts_rank {
-            acc.best_fts_rank = Some(acc.best_fts_rank.map_or(rank, |prev| prev.min(rank)));
-        }
-        if let Some(dist) = cm.semantic_distance {
-            acc.best_semantic_distance = Some(
-                acc.best_semantic_distance
-                    .map_or(dist, |prev| prev.min(dist)),
-            );
-        }
-        if let Some(dist) = cm.hq_semantic_distance {
-            acc.best_hq_semantic_distance = Some(
-                acc.best_hq_semantic_distance
-                    .map_or(dist, |prev| prev.min(dist)),
-            );
-        }
-    }
-
-    // ── Diagnostic: Stage 5 (Node aggregation) before sort ─────────────────
-    {
-        use std::fmt::Write as _;
-        let mut sorted_nodes: Vec<_> = node_accum.iter().collect();
-        sorted_nodes.sort_by(|a, b| {
-            b.1.total_score
-                .partial_cmp(&a.1.total_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut buf = format!(
-            "── HYBRID STAGE 5: Node aggregation ({} nodes, before sort) ──\n",
-            node_accum.len()
-        );
-        for (obj_id, acc) in &sorted_nodes {
-            let _ = writeln!(
-                buf,
-                "  NODE obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
-                acc.total_score,
-                acc.matching_chunk_count,
-                acc.best_fts_rank,
-                acc.best_semantic_distance,
-                acc.best_hq_semantic_distance
-            );
-        }
-        debug!("{buf}");
-    }
-
-    // Sort nodes by descending aggregated score and cap at config.limit.
-    let mut ranked_nodes: Vec<(String, NodeAccumulator)> = node_accum.into_iter().collect();
-    ranked_nodes.sort_by(|a, b| {
-        b.1.total_score
-            .partial_cmp(&a.1.total_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    ranked_nodes.truncate(config.limit);
-
-    debug!(
-        "{} nodes after aggregation (capped at {}), matching chunks per node: [{}]",
-        ranked_nodes.len(),
-        config.limit,
-        ranked_nodes
-            .iter()
-            .map(|(_, acc)| acc.matching_chunk_count.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    // ── Diagnostic: Stage 5 (after sort + truncate) ───────────────────────────
-    {
-        use std::fmt::Write as _;
-        let mut buf = format!(
-            "── HYBRID STAGE 5: After sort + truncate to {} ──\n",
-            config.limit
-        );
-        for (obj_id, acc) in &ranked_nodes {
-            let _ = writeln!(
-                buf,
-                "  KEPT obj={obj_id} score={:.6} chunks={} best_fts_rank={:?} best_sem_dist={:?} best_hq_dist={:?}",
-                acc.total_score,
-                acc.matching_chunk_count,
-                acc.best_fts_rank,
-                acc.best_semantic_distance,
-                acc.best_hq_semantic_distance
-            );
-        }
-        debug!("{buf}");
-    }
-
-    // ── Stage 6: Node hydration ───────────────────────────────────────────────
-    //
-    // For each winning node, load full metadata, all text chunks, all edges,
-    // and resolve connected node names.
-
-    let mut results: Vec<NodeSearchResult> = Vec::with_capacity(ranked_nodes.len());
-
-    for (obj_id_str, acc) in ranked_nodes {
-        let object_id = parse_uuid(&obj_id_str, "object")?;
-
-        let node = match graph.get_object(object_id)? {
-            Some(meta) => meta,
-            None => {
-                warn!(
-                    id = %object_id,
-                    "Winning node disappeared during hydration \
-                     (deleted between search and fetch?); skipping"
-                );
-                continue;
-            }
-        };
-
-        let chunks = graph.get_text_chunks(object_id)?;
-        let edges = graph.get_relationships(object_id)?;
-
-        // Resolve connected node names for display context.
-        let mut connected_node_names: HashMap<ObjectId, ConnectedNode> = HashMap::new();
-        for edge in &edges {
-            let other_id = if edge.from == object_id {
-                edge.to
-            } else {
-                edge.from
-            };
-            if connected_node_names.contains_key(&other_id) {
-                continue;
-            }
-            match graph.get_object(other_id)? {
-                Some(other_meta) => {
-                    connected_node_names.insert(
-                        other_id,
-                        ConnectedNode {
-                            name: other_meta.name,
-                            object_type: other_meta.object_type,
-                        },
-                    );
-                }
-                None => {
-                    warn!(
-                        id = %other_id,
-                        "Edge endpoint node not found; omitting from connected_node_names"
-                    );
-                }
-            }
-        }
-
-        results.push(NodeSearchResult {
-            node,
-            chunks,
-            matched_chunks: acc.matched_chunks,
-            edges,
-            connected_node_names,
-            score: acc.total_score,
-            sources: SearchSources {
-                fts_rank: acc.best_fts_rank,
-                semantic_distance: acc.best_semantic_distance,
-                hq_semantic_distance: acc.best_hq_semantic_distance,
-                rerank_score: None,
-            },
-        });
-    }
-
-    // ── Diagnostic: Stage 6 (Hydrated nodes) ──────────────────────────────────
-    {
-        use std::fmt::Write as _;
-        let mut buf = format!("── HYBRID STAGE 6: Hydrated nodes ({}) ──\n", results.len());
-        for (i, r) in results.iter().enumerate() {
-            let _ = writeln!(
-                buf,
-                "  HYDRATED[{i}] name={:?} type={:?} score={:.6} fts_rank={:?} sem_dist={:?}",
-                r.node.name,
-                r.node.object_type,
-                r.score,
-                r.sources.fts_rank,
-                r.sources.semantic_distance
-            );
-        }
-        debug!("{buf}");
-    }
-
-    // ── Stage 7: Optional reranking ───────────────────────────────────────────
-
-    let do_rerank = config.rerank && queue.has_reranking() && !results.is_empty();
-
-    if !config.rerank {
-        outcomes.reranking = SearchStageOutcome::skipped("reranking disabled by configuration");
-    } else if results.is_empty() {
-        outcomes.reranking =
-            SearchStageOutcome::skipped("reranking skipped because retrieval returned no nodes");
-    } else if !queue.has_reranking() {
-        outcomes.reranking = SearchStageOutcome::unavailable(
-            "reranking unavailable; reciprocal-rank scores were retained",
-        );
-        info!(
-            "Reranking was requested but no reranking worker is registered — \
-             returning RRF-scored results."
-        );
-    }
-
-    if do_rerank {
-        debug!("Submitting {} nodes to reranker", results.len());
-
-        // Build one document per node from metadata, edge summaries, and only
-        // chunks that directly matched retrieval.
-        let documents: Vec<String> = results
-            .iter()
-            .map(|r| {
-                let edge_lines: Vec<String> = r
-                    .edges
-                    .iter()
-                    .filter_map(|e| {
-                        let from_name = if e.from == r.node.id {
-                            r.node.name.clone()
-                        } else {
-                            r.connected_node_names.get(&e.from)?.name.clone()
-                        };
-                        let to_name = if e.to == r.node.id {
-                            r.node.name.clone()
-                        } else {
-                            r.connected_node_names.get(&e.to)?.name.clone()
-                        };
-                        Some(format!(
-                            "{} {} {}",
-                            from_name,
-                            e.edge_type.as_str(),
-                            to_name
-                        ))
-                    })
-                    .collect();
-                let mut document = r.node.flatten_for_embedding(&edge_lines);
-                if !r.matched_chunks.is_empty() {
-                    document.push_str("\nMatched content:");
-                    for chunk in &r.matched_chunks {
-                        document.push('\n');
-                        document.push_str(&chunk.content);
-                    }
-                }
-                document
-            })
-            .collect();
-
-        // ── Diagnostic: Stage 7 (Rerank input) ─────────────────────────────
-        {
-            use std::fmt::Write as _;
-            let mut buf = format!(
-                "── HYBRID STAGE 7: Rerank input ({} docs) ──\n",
-                documents.len()
-            );
-            for (i, doc) in documents.iter().enumerate() {
-                let snippet: String = doc.chars().take(120).collect();
-                let _ = writeln!(buf, "  RERANK_IN[{i}] ({} chars) {snippet:?}…", doc.len());
-            }
-            debug!("{buf}");
-        }
-
-        match queue
-            .submit_rerank_with_cancellation(
-                query,
-                documents,
-                Some(results.len()),
-                cancellation.clone(),
-            )
-            .await
-        {
-            Err(_e) if cancellation.is_cancelled() => {
-                return Err(cancellation.error().into());
-            }
-            Err(e) => {
-                warn!("Reranking failed — returning RRF-scored results instead: {e}");
-                outcomes.reranking = SearchStageOutcome::failed(
-                    "reranking failed; reciprocal-rank scores were retained",
-                );
-                // Fall through — results already in RRF order.
-            }
-            Ok(ranked) => {
-                // `top_n` requests one score per candidate. Treat malformed
-                // successful responses as a failed stage instead of claiming
-                // reranking was applied to a partially scored result set.
-                let mut scores = vec![None; results.len()];
-                let mut invalid_reason = (ranked.len() != results.len())
-                    .then_some("reranker returned an incomplete result set");
-                for rd in &ranked {
-                    if rd.index >= results.len() {
-                        invalid_reason = Some("reranker returned an out-of-bounds index");
-                        break;
-                    }
-                    if !rd.score.is_finite() {
-                        invalid_reason = Some("reranker returned a non-finite score");
-                        break;
-                    }
-                    if scores[rd.index].replace(rd.score).is_some() {
-                        invalid_reason = Some("reranker returned a duplicate index");
-                        break;
-                    }
-                }
-
-                if let Some(reason) = invalid_reason {
-                    warn!(
-                        reason,
-                        "Reranking response was invalid; retaining RRF scores"
-                    );
-                    outcomes.reranking = SearchStageOutcome::failed(
-                        "reranking returned an invalid response; reciprocal-rank scores were retained",
-                    );
-                } else {
-                    outcomes.reranking = SearchStageOutcome::applied();
-                    for (result, score) in results.iter_mut().zip(scores) {
-                        let score =
-                            score.expect("validated reranking response covers every result");
-                        result.sources.rerank_score = Some(score);
-                        result.score = score;
-                    }
-                    results.sort_by(|a, b| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-
-                // ── Diagnostic: Stage 7 (Rerank output) ─────────────────────
-                {
-                    use std::fmt::Write as _;
-                    let mut buf = String::from("── HYBRID STAGE 7: Rerank output ──\n");
-                    for (i, r) in results.iter().enumerate() {
-                        let _ = writeln!(
-                            buf,
-                            "  RERANK_OUT[{i}] name={:?} type={:?} score={:.6} rerank_score={:?} fts_rank={:?} sem_dist={:?}",
-                            r.node.name,
-                            r.node.object_type,
-                            r.score,
-                            r.sources.rerank_score,
-                            r.sources.fts_rank,
-                            r.sources.semantic_distance
-                        );
-                    }
-                    debug!("{buf}");
-                }
-
-                debug!("Returning {} reranked node results", results.len());
-                return Ok(SearchResponse {
-                    query: query.to_string(),
-                    results,
-                    outcomes,
-                });
-            }
-        }
-    }
-
-    debug!("Returning {} RRF-scored node results", results.len());
-    Ok(SearchResponse {
-        query: query.to_string(),
-        results,
-        outcomes,
-    })
+    pipeline::execute(pipeline::SearchRequest::new(
+        graph,
+        queue,
+        hq_queue,
+        query,
+        config,
+        cancellation,
+    ))
+    .await
 }
 
 /// Compatibility entry point for callers that only need ranked nodes.
@@ -1260,19 +467,12 @@ pub async fn search_hybrid_with_cancellation(
     .results)
 }
 
-// ── Private helpers ───────────────────────────────────────────────────────────
-
-fn parse_uuid(s: &str, label: &str) -> Result<ObjectId> {
-    ObjectId::parse_str(s)
-        .map_err(|e| anyhow::anyhow!("Invalid {label} UUID '{s}' in hybrid search result: {e}"))
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use tempfile::TempDir;
@@ -1292,13 +492,23 @@ mod tests {
 
     struct MockEmbeddingProvider;
 
+    struct MockHqEmbeddingProvider;
+
+    struct RecordingEmbeddingProvider {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn mock_embedding(text: &str, dimensions: usize) -> Vec<f32> {
+        let seed = text.len() as f32 + text.chars().next().unwrap_or('a') as u32 as f32;
+        (0..dimensions)
+            .map(|index| ((seed + index as f32) % 1000.0) / 1000.0)
+            .collect()
+    }
+
     #[async_trait]
     impl EmbeddingProvider for MockEmbeddingProvider {
         async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-            let seed = text.len() as f32 + text.chars().next().unwrap_or('a') as u32 as f32;
-            Ok((0..768)
-                .map(|i| ((seed + i as f32) % 1000.0) / 1000.0)
-                .collect())
+            Ok(mock_embedding(text, 768))
         }
 
         async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -1323,11 +533,71 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl EmbeddingProvider for MockHqEmbeddingProvider {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(mock_embedding(text, 4096))
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| mock_embedding(text, 4096))
+                .collect())
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(4096)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for RecordingEmbeddingProvider {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.queries.lock().unwrap().push(text.to_string());
+            Ok(mock_embedding(text, 768))
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|text| mock_embedding(text, 768)).collect())
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(768)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
     struct KeywordRerankProvider {
         keyword: &'static str,
     }
 
     struct FailingEmbeddingProvider;
+
+    struct FailingHqEmbeddingProvider;
 
     #[async_trait]
     impl EmbeddingProvider for FailingEmbeddingProvider {
@@ -1357,6 +627,65 @@ mod tests {
     }
 
     struct WrongDimensionEmbeddingProvider;
+
+    struct CancellingEmbeddingProvider {
+        cancellation: CancellationToken,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for CancellingEmbeddingProvider {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.cancellation.cancel();
+            std::future::pending().await
+        }
+
+        async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("batch embedding is not used by this test provider")
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(768)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for FailingHqEmbeddingProvider {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("secret HQ embedding backend detail")
+        }
+
+        async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("secret HQ embedding backend detail")
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(4096)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
 
     #[async_trait]
     impl EmbeddingProvider for WrongDimensionEmbeddingProvider {
@@ -1389,6 +718,25 @@ mod tests {
 
     struct EmptyRerankProvider;
 
+    struct CancellingRerankProvider {
+        cancellation: CancellationToken,
+    }
+
+    struct RecordingRerankProvider {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MalformedRerankKind {
+        DuplicateIndex,
+        OutOfBoundsIndex,
+        NonFiniteScore,
+    }
+
+    struct MalformedRerankProvider {
+        kind: MalformedRerankKind,
+    }
+
     #[async_trait]
     impl RerankProvider for FailingRerankProvider {
         async fn rerank(
@@ -1410,6 +758,72 @@ mod tests {
             _top_n: Option<usize>,
         ) -> anyhow::Result<Vec<RerankDocument>> {
             Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for CancellingRerankProvider {
+        async fn rerank(
+            &self,
+            _query: &str,
+            _documents: Vec<String>,
+            _top_n: Option<usize>,
+        ) -> anyhow::Result<Vec<RerankDocument>> {
+            self.cancellation.cancel();
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for RecordingRerankProvider {
+        async fn rerank(
+            &self,
+            query: &str,
+            documents: Vec<String>,
+            _top_n: Option<usize>,
+        ) -> anyhow::Result<Vec<RerankDocument>> {
+            self.queries.lock().unwrap().push(query.to_string());
+            Ok(documents
+                .into_iter()
+                .enumerate()
+                .map(|(index, document)| RerankDocument {
+                    index,
+                    score: 1.0 - index as f32 * 0.1,
+                    document: Some(document),
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for MalformedRerankProvider {
+        async fn rerank(
+            &self,
+            _query: &str,
+            documents: Vec<String>,
+            _top_n: Option<usize>,
+        ) -> anyhow::Result<Vec<RerankDocument>> {
+            let len = documents.len();
+            Ok(documents
+                .into_iter()
+                .enumerate()
+                .map(|(position, document)| {
+                    let index = match self.kind {
+                        MalformedRerankKind::DuplicateIndex if position + 1 == len => 0,
+                        MalformedRerankKind::OutOfBoundsIndex if position + 1 == len => len,
+                        _ => position,
+                    };
+                    let score = match self.kind {
+                        MalformedRerankKind::NonFiniteScore if position == 0 => f32::NAN,
+                        _ => 1.0 - position as f32 * 0.1,
+                    };
+                    RerankDocument {
+                        index,
+                        score,
+                        document: Some(document),
+                    }
+                })
+                .collect())
         }
     }
 
@@ -1546,16 +960,29 @@ mod tests {
             .unwrap();
         for oid in [wizard_id, hobbit_id, shire_id, city_id] {
             for chunk in graph.get_text_chunks(oid).unwrap() {
-                let seed = chunk.content.len() as f32
-                    + chunk.content.chars().next().unwrap_or('a') as u32 as f32;
-                let embedding: Vec<f32> = (0..768)
-                    .map(|i| ((seed + i as f32) % 1000.0) / 1000.0)
-                    .collect();
+                let embedding = mock_embedding(&chunk.content, 768);
                 graph.upsert_chunk_embedding(chunk.id, &embedding).unwrap();
             }
         }
 
         (graph, tmp)
+    }
+
+    fn populate_hq_embeddings(graph: &KnowledgeGraph) {
+        graph
+            .ensure_embedding_space(
+                crate::ingest::EmbeddingTarget::HighQuality,
+                "mock-hq@unknown",
+            )
+            .unwrap();
+        for object in graph.get_all_objects().unwrap() {
+            for chunk in graph.get_text_chunks(object.id).unwrap() {
+                let embedding = mock_embedding(&chunk.content, 4096);
+                graph
+                    .upsert_chunk_embedding_hq(chunk.id, &embedding)
+                    .unwrap();
+            }
+        }
     }
 
     fn make_embed_queue() -> InferenceQueue {
@@ -1573,10 +1000,14 @@ mod tests {
     }
 
     fn make_custom_embed_queue(provider: Arc<dyn EmbeddingProvider>) -> InferenceQueue {
+        make_named_embed_queue("mock-embed", provider)
+    }
+
+    fn make_named_embed_queue(name: &str, provider: Arc<dyn EmbeddingProvider>) -> InferenceQueue {
         let built = BuiltProvider {
-            // Keep the fixture's persisted embedding-space fingerprint compatible
-            // so tests exercise runtime embedding/ANN failures, not setup checks.
-            name: "mock-embed".to_string(),
+            // `mock-embed` keeps the fixture's persisted embedding-space
+            // fingerprint compatible; other names exercise mismatch handling.
+            name: name.to_string(),
             capability: Capability::Embedding,
             provider: ProviderSlot::Embedding(provider),
             weight: 100,
@@ -1584,14 +1015,18 @@ mod tests {
         InferenceQueueBuilder::new().with_provider(built).build()
     }
 
-    fn make_failing_rerank_queue() -> InferenceQueue {
+    fn make_custom_rerank_queue(provider: Arc<dyn RerankProvider>) -> InferenceQueue {
         let built = BuiltProvider {
             name: "mock-rerank".to_string(),
             capability: Capability::Reranking,
-            provider: ProviderSlot::Rerank(Arc::new(FailingRerankProvider)),
+            provider: ProviderSlot::Rerank(provider),
             weight: 100,
         };
         InferenceQueueBuilder::new().with_provider(built).build()
+    }
+
+    fn make_failing_rerank_queue() -> InferenceQueue {
+        make_custom_rerank_queue(Arc::new(FailingRerankProvider))
     }
 
     fn make_empty_rerank_queue() -> InferenceQueue {
@@ -1604,14 +1039,44 @@ mod tests {
         InferenceQueueBuilder::new().with_provider(built).build()
     }
 
-    fn make_keyword_rerank_queue(keyword: &'static str) -> InferenceQueue {
+    fn make_cancelling_rerank_queue(cancellation: CancellationToken) -> InferenceQueue {
         let built = BuiltProvider {
             name: "mock-rerank".to_string(),
             capability: Capability::Reranking,
-            provider: ProviderSlot::Rerank(Arc::new(KeywordRerankProvider { keyword })),
+            provider: ProviderSlot::Rerank(Arc::new(CancellingRerankProvider { cancellation })),
             weight: 100,
         };
         InferenceQueueBuilder::new().with_provider(built).build()
+    }
+
+    fn make_keyword_rerank_queue(keyword: &'static str) -> InferenceQueue {
+        make_custom_rerank_queue(Arc::new(KeywordRerankProvider { keyword }))
+    }
+
+    fn make_recording_queue(
+        embedding_queries: Arc<Mutex<Vec<String>>>,
+        reranking_queries: Arc<Mutex<Vec<String>>>,
+    ) -> InferenceQueue {
+        InferenceQueueBuilder::new()
+            .with_providers(vec![
+                BuiltProvider {
+                    name: "mock-embed".to_string(),
+                    capability: Capability::Embedding,
+                    provider: ProviderSlot::Embedding(Arc::new(RecordingEmbeddingProvider {
+                        queries: embedding_queries,
+                    })),
+                    weight: 100,
+                },
+                BuiltProvider {
+                    name: "mock-rerank".to_string(),
+                    capability: Capability::Reranking,
+                    provider: ProviderSlot::Rerank(Arc::new(RecordingRerankProvider {
+                        queries: reranking_queries,
+                    })),
+                    weight: 100,
+                },
+            ])
+            .build()
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1798,6 +1263,149 @@ mod tests {
                 r.sources.fts_rank.is_none(),
                 "Unexpected fts_rank in semantic-only mode"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn dual_semantic_lanes_preserve_independent_evidence() {
+        let (graph, _tmp) = make_graph_with_data();
+        populate_hq_embeddings(&graph);
+        let standard_queue = make_embed_queue();
+        let hq_queue = make_named_embed_queue("mock-hq", Arc::new(MockHqEmbeddingProvider));
+
+        let response = search_hybrid_response(
+            &graph,
+            &standard_queue,
+            Some(&hq_queue),
+            "hobbit homeland hills peaceful",
+            &HybridSearchConfig {
+                alpha: 1.0,
+                rerank: false,
+                limit: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.outcomes.fts.status,
+            SearchStageStatus::IntentionallySkipped
+        );
+        assert_eq!(
+            response.outcomes.standard_semantic.status,
+            SearchStageStatus::Applied
+        );
+        assert_eq!(
+            response.outcomes.high_quality_semantic.status,
+            SearchStageStatus::Applied
+        );
+        assert!(!response.results.is_empty());
+        assert!(response.results.iter().all(|result| {
+            result.sources.semantic_distance.is_some()
+                && result.sources.hq_semantic_distance.is_some()
+                && result.matched_chunks.iter().all(|chunk| {
+                    chunk.semantic_distance.is_some() && chunk.hq_semantic_distance.is_some()
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn semantic_fingerprint_mismatch_disables_only_the_affected_lane() {
+        let (graph, _tmp) = make_graph_with_data();
+        populate_hq_embeddings(&graph);
+
+        for incompatible_standard in [true, false] {
+            let standard_name = if incompatible_standard {
+                "other-standard"
+            } else {
+                "mock-embed"
+            };
+            let hq_name = if incompatible_standard {
+                "mock-hq"
+            } else {
+                "other-hq"
+            };
+            let standard_queue =
+                make_named_embed_queue(standard_name, Arc::new(MockEmbeddingProvider));
+            let hq_queue = make_named_embed_queue(hq_name, Arc::new(MockHqEmbeddingProvider));
+
+            let response = search_hybrid_response(
+                &graph,
+                &standard_queue,
+                Some(&hq_queue),
+                "hobbit",
+                &HybridSearchConfig {
+                    alpha: 1.0,
+                    rerank: false,
+                    limit: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let (standard_status, hq_status) = if incompatible_standard {
+                (SearchStageStatus::Unavailable, SearchStageStatus::Applied)
+            } else {
+                (SearchStageStatus::Applied, SearchStageStatus::Unavailable)
+            };
+            assert_eq!(response.outcomes.standard_semantic.status, standard_status);
+            assert_eq!(response.outcomes.high_quality_semantic.status, hq_status);
+            assert!(!response.results.is_empty());
+            assert!(response.results.iter().all(|result| {
+                result.sources.semantic_distance.is_some() != incompatible_standard
+                    && result.sources.hq_semantic_distance.is_some() == incompatible_standard
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_failure_preserves_results_from_the_other_lane() {
+        let (graph, _tmp) = make_graph_with_data();
+        populate_hq_embeddings(&graph);
+
+        for failing_standard in [true, false] {
+            let standard_provider: Arc<dyn EmbeddingProvider> = if failing_standard {
+                Arc::new(FailingEmbeddingProvider)
+            } else {
+                Arc::new(MockEmbeddingProvider)
+            };
+            let hq_provider: Arc<dyn EmbeddingProvider> = if failing_standard {
+                Arc::new(MockHqEmbeddingProvider)
+            } else {
+                Arc::new(FailingHqEmbeddingProvider)
+            };
+            let standard_queue = make_named_embed_queue("mock-embed", standard_provider);
+            let hq_queue = make_named_embed_queue("mock-hq", hq_provider);
+
+            let response = search_hybrid_response(
+                &graph,
+                &standard_queue,
+                Some(&hq_queue),
+                "hobbit",
+                &HybridSearchConfig {
+                    alpha: 1.0,
+                    rerank: false,
+                    limit: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let (standard_status, hq_status) = if failing_standard {
+                (SearchStageStatus::Failed, SearchStageStatus::Applied)
+            } else {
+                (SearchStageStatus::Applied, SearchStageStatus::Failed)
+            };
+            assert_eq!(response.outcomes.standard_semantic.status, standard_status);
+            assert_eq!(response.outcomes.high_quality_semantic.status, hq_status);
+            assert!(!response.results.is_empty());
+            assert!(response.results.iter().all(|result| {
+                result.sources.semantic_distance.is_some() != failing_standard
+                    && result.sources.hq_semantic_distance.is_some() == failing_standard
+            }));
         }
     }
 
@@ -2129,6 +1737,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_and_punctuation_only_queries_skip_only_fts() {
+        let (graph, _tmp) = make_graph_with_data();
+        let queue = make_embed_queue();
+        let config = HybridSearchConfig {
+            rerank: false,
+            ..Default::default()
+        };
+
+        for query in ["", "?!?!!!"] {
+            let response = search_hybrid_response(&graph, &queue, None, query, &config)
+                .await
+                .unwrap();
+
+            assert_eq!(response.query, query);
+            assert_eq!(
+                response.outcomes.fts.status,
+                SearchStageStatus::IntentionallySkipped
+            );
+            assert_eq!(
+                response.outcomes.standard_semantic.status,
+                SearchStageStatus::Applied
+            );
+            assert_eq!(
+                response.outcomes.high_quality_semantic.status,
+                SearchStageStatus::Unavailable
+            );
+            assert_eq!(
+                response.outcomes.reranking.status,
+                SearchStageStatus::IntentionallySkipped
+            );
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .all(|result| result.sources.fts_rank.is_none())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fingerprint_mismatch_retains_fts_results_and_reports_unavailable_lane() {
+        let (graph, _tmp) = make_graph_with_data();
+        let queue = make_named_embed_queue("other-embed", Arc::new(MockEmbeddingProvider));
+        let config = HybridSearchConfig {
+            rerank: false,
+            ..Default::default()
+        };
+
+        let response = search_hybrid_response(&graph, &queue, None, "wizard", &config)
+            .await
+            .unwrap();
+
+        assert!(!response.results.is_empty());
+        assert_eq!(
+            response.outcomes.standard_semantic.status,
+            SearchStageStatus::Unavailable
+        );
+        assert!(
+            response
+                .results
+                .iter()
+                .all(|result| result.sources.fts_rank.is_some()
+                    && result.sources.semantic_distance.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn only_fts_sanitizes_the_original_query() {
+        let (graph, _tmp) = make_graph_with_data();
+        let embedding_queries = Arc::new(Mutex::new(Vec::new()));
+        let reranking_queries = Arc::new(Mutex::new(Vec::new()));
+        let queue = make_recording_queue(embedding_queries.clone(), reranking_queries.clone());
+        let query = "wizard?!";
+
+        let response = search_hybrid_response(
+            &graph,
+            &queue,
+            None,
+            query,
+            &HybridSearchConfig {
+                rerank: true,
+                limit: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.outcomes.fts.status, SearchStageStatus::Applied);
+        assert_eq!(
+            response.outcomes.standard_semantic.status,
+            SearchStageStatus::Applied
+        );
+        assert_eq!(
+            response.outcomes.reranking.status,
+            SearchStageStatus::Applied
+        );
+        assert_eq!(*embedding_queries.lock().unwrap(), vec![query.to_string()]);
+        assert_eq!(*reranking_queries.lock().unwrap(), vec![query.to_string()]);
+        assert!(
+            response.results.iter().any(|result| {
+                result.sources.fts_rank.is_some() && result.node.name == "Gandalf"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_search_preserves_supersession() {
+        let (graph, _tmp) = make_graph_with_data();
+        let queue = make_embed_queue();
+        let cancellation = CancellationToken::new();
+        cancellation.supersede();
+
+        let error = search_hybrid_response_with_cancellation(
+            &graph,
+            &queue,
+            None,
+            "wizard",
+            &HybridSearchConfig::default(),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::queue::InferenceError>(),
+            Some(crate::queue::InferenceError::Superseded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_embedding_terminates_search() {
+        let (graph, _tmp) = make_graph_with_data();
+        let cancellation = CancellationToken::new();
+        let queue = make_custom_embed_queue(Arc::new(CancellingEmbeddingProvider {
+            cancellation: cancellation.clone(),
+        }));
+
+        let error = search_hybrid_response_with_cancellation(
+            &graph,
+            &queue,
+            None,
+            "wizard",
+            &HybridSearchConfig {
+                rerank: false,
+                ..Default::default()
+            },
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::queue::InferenceError>(),
+            Some(crate::queue::InferenceError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_reranking_terminates_search() {
+        let (graph, _tmp) = make_graph_with_data();
+        let cancellation = CancellationToken::new();
+        let queue = make_cancelling_rerank_queue(cancellation.clone());
+
+        let error = search_hybrid_response_with_cancellation(
+            &graph,
+            &queue,
+            None,
+            "wizard",
+            &HybridSearchConfig {
+                alpha: 0.0,
+                rerank: true,
+                ..Default::default()
+            },
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::queue::InferenceError>(),
+            Some(crate::queue::InferenceError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
     async fn embedding_failure_retains_fts_results_and_reports_safe_outcome() {
         let (graph, _tmp) = make_graph_with_data();
         let queue = make_custom_embed_queue(Arc::new(FailingEmbeddingProvider));
@@ -2244,6 +2038,77 @@ mod tests {
                 .iter()
                 .all(|result| result.sources.rerank_score.is_none())
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_rerank_variants_leave_the_complete_rrf_order_unchanged() {
+        let (graph, _tmp) = make_graph_with_data();
+        let query = "Gandalf OR Frodo OR Shire OR Minas";
+        let baseline = search_hybrid_response(
+            &graph,
+            &make_queue_no_workers(),
+            None,
+            query,
+            &HybridSearchConfig {
+                alpha: 0.0,
+                rerank: false,
+                fts_limit: 20,
+                limit: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(baseline.results.len() >= 2);
+        let expected: Vec<_> = baseline
+            .results
+            .iter()
+            .map(|result| (result.node.id, result.score))
+            .collect();
+
+        for kind in [
+            MalformedRerankKind::DuplicateIndex,
+            MalformedRerankKind::OutOfBoundsIndex,
+            MalformedRerankKind::NonFiniteScore,
+        ] {
+            let queue = make_custom_rerank_queue(Arc::new(MalformedRerankProvider { kind }));
+            let response = search_hybrid_response(
+                &graph,
+                &queue,
+                None,
+                query,
+                &HybridSearchConfig {
+                    alpha: 0.0,
+                    rerank: true,
+                    fts_limit: 20,
+                    limit: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                response.outcomes.reranking.status,
+                SearchStageStatus::Failed,
+                "unexpected outcome for {kind:?}"
+            );
+            assert_eq!(
+                response
+                    .results
+                    .iter()
+                    .map(|result| (result.node.id, result.score))
+                    .collect::<Vec<_>>(),
+                expected,
+                "malformed {kind:?} response changed the RRF results"
+            );
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .all(|result| result.sources.rerank_score.is_none())
+            );
+        }
     }
 
     #[tokio::test]

@@ -186,6 +186,116 @@ impl Tool for FtsSearchTool {
     }
 }
 
+// ── Ranked search adapter ─────────────────────────────────────────────────────
+
+/// Shared dependencies and parent-token ownership for ranked search tools.
+#[derive(Clone)]
+struct RankedSearchContext {
+    graph: Arc<KnowledgeGraph>,
+    queue: Arc<InferenceQueue>,
+    hq_queue: Option<Arc<InferenceQueue>>,
+    cancellation: CancellationToken,
+}
+
+impl RankedSearchContext {
+    fn new(graph: Arc<KnowledgeGraph>, queue: Arc<InferenceQueue>) -> Self {
+        Self {
+            graph,
+            queue,
+            hq_queue: None,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn with_hq_queue(mut self, hq_queue: Option<Arc<InferenceQueue>>) -> Self {
+        self.hq_queue = hq_queue;
+        self
+    }
+
+    fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+}
+
+/// Intentional protocol differences between semantic-only and hybrid tools.
+enum RankedSearchMode {
+    Semantic {
+        limit: usize,
+    },
+    Hybrid {
+        limit: usize,
+        alpha: f32,
+        rerank: bool,
+    },
+}
+
+impl RankedSearchMode {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Semantic { .. } => "Semantic",
+            Self::Hybrid { .. } => "Hybrid",
+        }
+    }
+
+    fn tool_name(&self) -> &'static str {
+        match self {
+            Self::Semantic { .. } => validation::SEMANTIC_NAME,
+            Self::Hybrid { .. } => validation::HYBRID_NAME,
+        }
+    }
+
+    fn config(&self) -> HybridSearchConfig {
+        match *self {
+            Self::Semantic { limit } => HybridSearchConfig {
+                alpha: 1.0,
+                semantic_limit: limit.saturating_mul(4),
+                rerank: false,
+                limit,
+                ..HybridSearchConfig::default()
+            },
+            Self::Hybrid {
+                limit,
+                alpha,
+                rerank,
+            } => HybridSearchConfig {
+                limit,
+                alpha: alpha.clamp(0.0, 1.0),
+                rerank,
+                ..HybridSearchConfig::default()
+            },
+        }
+    }
+}
+
+struct RankedSearchRequest<'a> {
+    context: &'a RankedSearchContext,
+    query: &'a str,
+    mode: RankedSearchMode,
+}
+
+impl RankedSearchRequest<'_> {
+    async fn execute(self) -> Result<String, ToolError> {
+        let label = self.mode.label();
+        let tool_name = self.mode.tool_name();
+        let config = self.mode.config();
+        let response = search_hybrid_response_with_cancellation(
+            &self.context.graph,
+            &self.context.queue,
+            self.context.hq_queue.as_deref(),
+            self.query,
+            &config,
+            self.context.cancellation.clone(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(tool = tool_name, %error, "ranked search tool failed");
+            ToolError(format!("{label} search failed: {error:#}"))
+        })?;
+        format_search_response(label, self.query, response.results, &response.outcomes)
+    }
+}
+
 // ── SemanticSearchTool ────────────────────────────────────────────────────────
 
 /// Arguments for [`SemanticSearchTool`].
@@ -206,29 +316,23 @@ pub struct SemanticSearchArgs {
 /// Requires an embedding-capable [`InferenceQueue`].
 #[derive(Clone)]
 pub struct SemanticSearchTool {
-    graph: Arc<KnowledgeGraph>,
-    queue: Arc<InferenceQueue>,
-    hq_queue: Option<Arc<InferenceQueue>>,
-    cancellation: CancellationToken,
+    context: RankedSearchContext,
 }
 
 impl SemanticSearchTool {
     pub fn new(graph: Arc<KnowledgeGraph>, queue: Arc<InferenceQueue>) -> Self {
         Self {
-            graph,
-            queue,
-            hq_queue: None,
-            cancellation: CancellationToken::new(),
+            context: RankedSearchContext::new(graph, queue),
         }
     }
 
     pub fn with_hq_queue(mut self, hq_queue: Option<Arc<InferenceQueue>>) -> Self {
-        self.hq_queue = hq_queue;
+        self.context = self.context.with_hq_queue(hq_queue);
         self
     }
 
     pub(crate) fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
-        self.cancellation = cancellation;
+        self.context = self.context.with_cancellation(cancellation);
         self
     }
 }
@@ -259,23 +363,14 @@ impl Tool for SemanticSearchTool {
         raw: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let args: SemanticSearchArgs = validation::decode(Self::NAME, raw)?;
-        let config = HybridSearchConfig {
-            alpha: 1.0,
-            semantic_limit: args.limit.unwrap_or(5).saturating_mul(4),
-            rerank: false,
-            limit: args.limit.unwrap_or(5),
-            ..HybridSearchConfig::default()
-        };
-        execute_ranked_search(
-            "Semantic",
-            Self::NAME,
-            &self.graph,
-            &self.queue,
-            self.hq_queue.as_deref(),
-            &args.query,
-            &config,
-            self.cancellation.clone(),
-        )
+        RankedSearchRequest {
+            context: &self.context,
+            query: &args.query,
+            mode: RankedSearchMode::Semantic {
+                limit: args.limit.unwrap_or(5),
+            },
+        }
+        .execute()
         .await
     }
 }
@@ -305,29 +400,23 @@ pub struct HybridSearchArgs {
 /// relationships, and content. Best general-purpose search tool.
 #[derive(Clone)]
 pub struct HybridSearchTool {
-    graph: Arc<KnowledgeGraph>,
-    queue: Arc<InferenceQueue>,
-    hq_queue: Option<Arc<InferenceQueue>>,
-    cancellation: CancellationToken,
+    context: RankedSearchContext,
 }
 
 impl HybridSearchTool {
     pub fn new(graph: Arc<KnowledgeGraph>, queue: Arc<InferenceQueue>) -> Self {
         Self {
-            graph,
-            queue,
-            hq_queue: None,
-            cancellation: CancellationToken::new(),
+            context: RankedSearchContext::new(graph, queue),
         }
     }
 
     pub fn with_hq_queue(mut self, hq_queue: Option<Arc<InferenceQueue>>) -> Self {
-        self.hq_queue = hq_queue;
+        self.context = self.context.with_hq_queue(hq_queue);
         self
     }
 
     pub(crate) fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
-        self.cancellation = cancellation;
+        self.context = self.context.with_cancellation(cancellation);
         self
     }
 }
@@ -358,52 +447,18 @@ impl Tool for HybridSearchTool {
         raw: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let args: HybridSearchArgs = validation::decode(Self::NAME, raw)?;
-        let config = HybridSearchConfig {
-            limit: args.limit.unwrap_or(3),
-            alpha: args.alpha.unwrap_or(0.5).clamp(0.0, 1.0),
-            rerank: args.rerank.unwrap_or(true),
-            ..HybridSearchConfig::default()
-        };
-
-        execute_ranked_search(
-            "Hybrid",
-            Self::NAME,
-            &self.graph,
-            &self.queue,
-            self.hq_queue.as_deref(),
-            &args.query,
-            &config,
-            self.cancellation.clone(),
-        )
+        RankedSearchRequest {
+            context: &self.context,
+            query: &args.query,
+            mode: RankedSearchMode::Hybrid {
+                limit: args.limit.unwrap_or(3),
+                alpha: args.alpha.unwrap_or(0.5),
+                rerank: args.rerank.unwrap_or(true),
+            },
+        }
+        .execute()
         .await
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_ranked_search(
-    label: &str,
-    tool_name: &'static str,
-    graph: &KnowledgeGraph,
-    queue: &InferenceQueue,
-    hq_queue: Option<&InferenceQueue>,
-    query: &str,
-    config: &HybridSearchConfig,
-    cancellation: CancellationToken,
-) -> Result<String, ToolError> {
-    let response = search_hybrid_response_with_cancellation(
-        graph,
-        queue,
-        hq_queue,
-        query,
-        config,
-        cancellation,
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(tool = tool_name, %error, "ranked search tool failed");
-        ToolError(format!("{label} search failed: {error:#}"))
-    })?;
-    format_search_response(label, query, response.results, &response.outcomes)
 }
 
 fn search_stage_diagnostics(outcomes: &SearchStageOutcomes) -> Vec<String> {
@@ -476,4 +531,32 @@ pub(crate) fn format_search_response(
         output.push('\n');
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranked_search_modes_preserve_tool_specific_configuration() {
+        let semantic = RankedSearchMode::Semantic { limit: 7 }.config();
+        assert_eq!(semantic.alpha, 1.0);
+        assert_eq!(semantic.semantic_limit, 28);
+        assert!(!semantic.rerank);
+        assert_eq!(semantic.limit, 7);
+
+        let hybrid = RankedSearchMode::Hybrid {
+            limit: 4,
+            alpha: 2.0,
+            rerank: false,
+        }
+        .config();
+        assert_eq!(hybrid.alpha, 1.0);
+        assert_eq!(
+            hybrid.semantic_limit,
+            HybridSearchConfig::default().semantic_limit
+        );
+        assert!(!hybrid.rerank);
+        assert_eq!(hybrid.limit, 4);
+    }
 }
