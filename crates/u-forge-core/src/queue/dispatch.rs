@@ -363,6 +363,7 @@ impl InferenceQueue {
         cancellation: CancellationToken,
     ) -> InferenceResult<StreamingInferenceJob<StreamToken>> {
         if self.llm_workers == 0 {
+            self.metrics.unavailable();
             return Err(InferenceError::CapabilityUnavailable {
                 capability: "text-generation",
             });
@@ -1021,6 +1022,23 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unavailable_stream_submission_is_accounted_once() {
+        let queue = build_mock_queue();
+        let request = ChatRequest::new(vec![crate::lemonade::ChatMessage::user("test")]);
+
+        assert!(matches!(
+            queue.submit_generate_stream(request),
+            Err(InferenceError::CapabilityUnavailable {
+                capability: "text-generation"
+            })
+        ));
+        let counters = queue.stats().counters;
+        assert_eq!(counters.submitted, 1);
+        assert_eq!(counters.unavailable, 1);
+        assert_eq!(counters.started, 0);
     }
 
     #[tokio::test]

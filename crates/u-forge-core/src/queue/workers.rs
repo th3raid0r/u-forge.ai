@@ -28,8 +28,8 @@ use super::jobs::{
     EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
 };
 use super::lifecycle::{
-    InferenceError, OneShotReporter, TimeoutClass, finish_queue_span, queue_job_span,
-    record_pending_cancellation,
+    InferenceError, OneShotReporter, StreamingReporter, TimeoutClass, finish_queue_span,
+    queue_job_span, record_pending_cancellation,
 };
 use super::weighted::WeightedEmbedDispatcher;
 
@@ -133,115 +133,83 @@ pub(super) async fn run_llm_stream_worker(
         let provider = provider.clone();
         let device_name = device_name.clone();
         async move {
-            if job.context.cancellation.is_cancelled() {
-                let error = job.context.cancellation.error();
-                record_pending_cancellation(
-                    &job.context,
-                    "text_generation_stream",
-                    &device_name,
-                    &error,
-                );
-                let _ = job.completion.send(Err(error));
+            let GenerateStreamJob {
+                context,
+                request,
+                response,
+                completion,
+            } = job;
+            let Some(reporter) = StreamingReporter::begin(
+                context,
+                response,
+                completion,
+                "text_generation_stream",
+                &device_name,
+            ) else {
                 return;
-            }
-            let span = queue_job_span(&job.context, "text_generation_stream", &device_name, false);
-            let start = job.context.begin(false);
-            let requested_model = job.request.model.as_deref();
-            if requested_model.is_some_and(|model| model != provider.profile.model_id) {
-                let error = InferenceError::provider(anyhow::anyhow!(
-                    "queued provider {} cannot serve requested model {}",
-                    provider.profile.model_id,
-                    requested_model.unwrap_or_default()
-                ));
-                let _ = job
-                    .response
-                    .send(Err(InferenceError::provider(&error)))
-                    .await;
-                let terminal = Err(error);
-                let service_us = start.elapsed().as_micros() as u64;
-                job.context
-                    .metrics
-                    .finished(&terminal.as_ref().map(|_| ()), service_us);
-                finish_queue_span(&span, &terminal, service_us);
-                let _ = job.completion.send(terminal);
-                return;
-            }
-            let mut profile = provider.profile.clone();
-            profile.reasoning = reasoning_policy(job.request.enable_thinking);
-            let lease = tokio::select! {
-                _ = job.context.cancellation.cancelled() => {
-                    let error = job.context.cancellation.error();
-                    let terminal = Err(error);
-                    let service_us = start.elapsed().as_micros() as u64;
-                    job.context.metrics.finished(
-                        &terminal.as_ref().map(|_| ()),
-                        service_us,
-                    );
-                    finish_queue_span(&span, &terminal, service_us);
-                    let _ = job.completion.send(terminal);
-                    return;
+            };
+            let cancellation = reporter.cancellation().clone();
+            let terminal = async {
+                let requested_model = request.model.as_deref();
+                if requested_model.is_some_and(|model| model != provider.profile.model_id) {
+                    let error = InferenceError::provider(anyhow::anyhow!(
+                        "queued provider {} cannot serve requested model {}",
+                        provider.profile.model_id,
+                        requested_model.unwrap_or_default()
+                    ));
+                    reporter.send_item(Err(error.clone())).await?;
+                    return Err(error);
                 }
-                result = provider.runtime.acquire_with_cancellation(
-                    &profile,
-                    &job.context.cancellation,
-                ) => match result {
+
+                let mut profile = provider.profile.clone();
+                profile.reasoning = reasoning_policy(request.enable_thinking);
+                let lease = match provider
+                    .runtime
+                    .acquire_with_cancellation(&profile, &cancellation)
+                    .await
+                {
                     Ok(lease) => lease,
                     Err(error) => {
-                        let _ = job.response.send(Err(InferenceError::provider(&error))).await;
-                        let terminal = Err(error);
-                        let service_us = start.elapsed().as_micros() as u64;
-                        job.context.metrics.finished(
-                            &terminal.as_ref().map(|_| ()),
-                            service_us,
-                        );
-                        finish_queue_span(&span, &terminal, service_us);
-                        let _ = job.completion.send(terminal);
-                        return;
+                        reporter.send_item(Err(error.clone())).await?;
+                        return Err(error);
+                    }
+                };
+                let mut stream = provider
+                    .provider
+                    .complete_stream_with_lease_and_cancellation(
+                        request,
+                        lease,
+                        cancellation.clone(),
+                    );
+                loop {
+                    let item = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            return Err(cancellation.error());
+                        }
+                        item = stream.recv() => item,
+                    };
+                    match item {
+                        None => return Ok(()),
+                        Some(Ok(token)) => reporter.send_item(Ok(token)).await?,
+                        Some(Err(error)) => {
+                            let error =
+                                InferenceError::classify_timeout(error, TimeoutClass::Provider);
+                            reporter.send_item(Err(error.clone())).await?;
+                            return Err(error);
+                        }
                     }
                 }
-            };
-            let mut stream = provider
-                .provider
-                .complete_stream_with_lease_and_cancellation(
-                    job.request,
-                    lease,
-                    job.context.cancellation.clone(),
-                );
-            let terminal = loop {
-                let item = tokio::select! {
-                    _ = job.context.cancellation.cancelled() => {
-                        break Err(job.context.cancellation.error());
-                    }
-                    item = stream.recv() => item,
-                };
-                let Some(item) = item else {
-                    break Ok(());
-                };
-                let item = item.map_err(|error| {
-                    InferenceError::classify_timeout(error, TimeoutClass::Provider)
-                });
-                let failed = item.is_err();
-                if job.response.send(item).await.is_err() {
-                    job.context.cancellation.cancel();
-                    break Err(job.context.cancellation.error());
-                }
-                if failed {
-                    break Err(InferenceError::provider("stream provider failed"));
-                }
-            };
-            job.context.metrics.finished(
-                &terminal.as_ref().map(|_| ()),
-                start.elapsed().as_micros() as u64,
-            );
-            finish_queue_span(&span, &terminal, start.elapsed().as_micros() as u64);
+            }
+            .instrument(reporter.span().clone())
+            .await;
             debug!(
-                job_id = job.context.id,
+                job_id = reporter.job_id(),
                 device = %device_name,
                 ok = terminal.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
+                duration_ms = reporter.elapsed().as_millis(),
                 "LLM streaming job complete"
             );
-            let _ = job.completion.send(terminal);
+            reporter.finish(terminal);
         }
     })
     .await;
