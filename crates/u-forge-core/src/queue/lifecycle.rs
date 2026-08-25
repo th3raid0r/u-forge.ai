@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -304,6 +305,156 @@ where
     }
 }
 
+/// Single terminal authority for an accepted one-shot job.
+pub(super) struct OneShotReporter<T> {
+    context: JobContext,
+    response: Option<oneshot::Sender<InferenceResult<T>>>,
+    span: tracing::Span,
+    started_at: Instant,
+}
+
+impl<T> OneShotReporter<T> {
+    /// Skip pending cancellation without starting service, otherwise begin the
+    /// job exactly once and return its terminal reporter.
+    pub(super) fn begin(
+        context: JobContext,
+        response: oneshot::Sender<InferenceResult<T>>,
+        capability: &'static str,
+        device_name: &str,
+        stolen: bool,
+    ) -> Option<Self> {
+        if context.cancellation.is_cancelled() {
+            let error = context.cancellation.error();
+            record_pending_cancellation(&context, capability, device_name, &error);
+            let _ = response.send(Err(error));
+            return None;
+        }
+
+        let span = queue_job_span(&context, capability, device_name, stolen);
+        let started_at = context.begin(stolen);
+        Some(Self {
+            context,
+            response: Some(response),
+            span,
+            started_at,
+        })
+    }
+
+    pub(super) fn cancellation(&self) -> &CancellationToken {
+        &self.context.cancellation
+    }
+
+    pub(super) fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    pub(super) fn job_id(&self) -> u64 {
+        self.context.id
+    }
+
+    pub(super) fn elapsed(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
+    pub(super) fn finish(mut self, result: InferenceResult<T>) {
+        self.record_terminal(&result);
+        if let Some(response) = self.response.take() {
+            let _ = response.send(result);
+        }
+    }
+
+    fn record_terminal(&self, result: &InferenceResult<T>) {
+        let service_us = self.elapsed().as_micros() as u64;
+        self.context
+            .metrics
+            .finished(&result.as_ref().map(|_| ()), service_us);
+        finish_queue_span(&self.span, result, service_us);
+    }
+}
+
+impl<T> Drop for OneShotReporter<T> {
+    fn drop(&mut self) {
+        let Some(response) = self.response.take() else {
+            return;
+        };
+        let result = Err(InferenceError::WorkerDropped);
+        self.record_terminal(&result);
+        let _ = response.send(result);
+    }
+}
+
+pub(super) fn queue_job_span(
+    context: &JobContext,
+    capability: &'static str,
+    device_name: &str,
+    stolen: bool,
+) -> tracing::Span {
+    tracing::info_span!(
+        "inference_queue_job",
+        job_id = context.id,
+        capability,
+        selected_worker = device_name,
+        stolen,
+        queue_wait_us = context.enqueued_at.elapsed().as_micros() as u64,
+        service_time_us = tracing::field::Empty,
+        retries = 0_u32,
+        cancellation_point = tracing::field::Empty,
+        timeout_class = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    )
+}
+
+pub(super) fn finish_queue_span<T>(
+    span: &tracing::Span,
+    result: &InferenceResult<T>,
+    service_us: u64,
+) {
+    span.record("service_time_us", service_us);
+    let (outcome, cancellation_point, timeout_class) = match result {
+        Ok(_) => ("succeeded", None, None),
+        Err(InferenceError::Cancelled) => ("cancelled", Some("active_provider"), None),
+        Err(InferenceError::Superseded) => ("superseded", Some("active_provider"), None),
+        Err(InferenceError::TimedOut { class }) => (
+            "timed_out",
+            Some("active_provider"),
+            Some(class.to_string()),
+        ),
+        Err(InferenceError::ProviderFailed { .. }) => ("provider_failed", None, None),
+        Err(InferenceError::WorkerDropped) => ("worker_dropped", None, None),
+        Err(InferenceError::CapabilityUnavailable { .. }) => ("unavailable", None, None),
+    };
+    span.record("outcome", outcome);
+    if let Some(point) = cancellation_point {
+        span.record("cancellation_point", point);
+    }
+    if let Some(class) = timeout_class {
+        span.record("timeout_class", class);
+    }
+}
+
+pub(super) fn record_pending_cancellation(
+    context: &JobContext,
+    capability: &'static str,
+    device_name: &str,
+    error: &InferenceError,
+) {
+    context.metrics.cancelled_pending(error);
+    let outcome = match error {
+        InferenceError::Superseded => "superseded",
+        InferenceError::TimedOut { .. } => "timed_out",
+        _ => "cancelled",
+    };
+    tracing::info!(
+        job_id = context.id,
+        capability,
+        selected_worker = device_name,
+        queue_wait_us = context.enqueued_at.elapsed().as_micros() as u64,
+        cancellation_point = "pending",
+        outcome,
+        "Inference queue job skipped before provider invocation"
+    );
+}
+
 /// Streaming queue submission with explicit cancellation and termination.
 pub struct StreamingInferenceJob<T> {
     pub cancellation: CancellationToken,
@@ -361,6 +512,94 @@ mod tests {
         assert_eq!(counters.submitted, 1);
         assert_eq!(counters.unavailable, 1);
         assert_eq!(counters.started, 0);
+    }
+
+    #[tokio::test]
+    async fn one_shot_reporter_owns_started_terminal_accounting() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let cancellation = CancellationToken::new();
+        let (response, receiver) = oneshot::channel();
+        let completion = JobCompletion::from_receiver(
+            cancellation.clone(),
+            receiver,
+            Some(Arc::clone(&metrics)),
+        );
+        let reporter = OneShotReporter::begin(
+            JobContext::new(cancellation, Arc::clone(&metrics)),
+            response,
+            "test",
+            "worker",
+            false,
+        )
+        .unwrap();
+
+        reporter.finish(Ok(42));
+        assert_eq!(completion.await.unwrap(), 42);
+        let counters = metrics.snapshot();
+        assert_eq!(counters.submitted, 1);
+        assert_eq!(counters.started, 1);
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.service_time.samples, 1);
+    }
+
+    #[tokio::test]
+    async fn one_shot_reporter_drop_delivers_worker_dropped_once() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let cancellation = CancellationToken::new();
+        let (response, receiver) = oneshot::channel::<InferenceResult<()>>();
+        let completion = JobCompletion::from_receiver(
+            cancellation.clone(),
+            receiver,
+            Some(Arc::clone(&metrics)),
+        );
+        let reporter = OneShotReporter::begin(
+            JobContext::new(cancellation, Arc::clone(&metrics)),
+            response,
+            "test",
+            "worker",
+            false,
+        )
+        .unwrap();
+
+        drop(reporter);
+        assert!(matches!(
+            completion.await,
+            Err(InferenceError::WorkerDropped)
+        ));
+        let counters = metrics.snapshot();
+        assert_eq!(counters.started, 1);
+        assert_eq!(counters.worker_dropped, 1);
+        assert_eq!(counters.service_time.samples, 1);
+    }
+
+    #[tokio::test]
+    async fn one_shot_reporter_skips_pending_cancellation() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (response, receiver) = oneshot::channel::<InferenceResult<()>>();
+        let completion = JobCompletion::from_receiver(
+            cancellation.clone(),
+            receiver,
+            Some(Arc::clone(&metrics)),
+        );
+
+        assert!(
+            OneShotReporter::begin(
+                JobContext::new(cancellation, Arc::clone(&metrics)),
+                response,
+                "test",
+                "worker",
+                false,
+            )
+            .is_none()
+        );
+        assert!(matches!(completion.await, Err(InferenceError::Cancelled)));
+        let counters = metrics.snapshot();
+        assert_eq!(counters.submitted, 1);
+        assert_eq!(counters.started, 0);
+        assert_eq!(counters.cancelled_pending, 1);
+        assert_eq!(counters.service_time.samples, 0);
     }
 
     #[tokio::test]

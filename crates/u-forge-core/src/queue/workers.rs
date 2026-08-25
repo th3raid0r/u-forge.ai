@@ -27,7 +27,10 @@ use crate::lemonade::{
 use super::jobs::{
     EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
 };
-use super::lifecycle::{InferenceError, TimeoutClass};
+use super::lifecycle::{
+    InferenceError, OneShotReporter, TimeoutClass, finish_queue_span, queue_job_span,
+    record_pending_cancellation,
+};
 use super::weighted::WeightedEmbedDispatcher;
 
 /// Maximum number of attempts for a single embed job before the error is
@@ -43,74 +46,6 @@ const EMBED_RETRY_BASE_MS: u64 = 100;
 // deterministic workers recover concurrently in the same bounded 300 ms
 // backoff window as one worker. No shared-provider contention appeared, so
 // adding random jitter would add variance without evidence of benefit.
-
-fn queue_job_span(
-    context: &super::jobs::JobContext,
-    capability: &'static str,
-    device_name: &str,
-    stolen: bool,
-) -> tracing::Span {
-    tracing::info_span!(
-        "inference_queue_job",
-        job_id = context.id,
-        capability,
-        selected_worker = device_name,
-        stolen,
-        queue_wait_us = context.enqueued_at.elapsed().as_micros() as u64,
-        service_time_us = tracing::field::Empty,
-        retries = 0_u32,
-        cancellation_point = tracing::field::Empty,
-        timeout_class = tracing::field::Empty,
-        outcome = tracing::field::Empty,
-    )
-}
-
-fn finish_queue_span<T>(span: &tracing::Span, result: &Result<T, InferenceError>, service_us: u64) {
-    span.record("service_time_us", service_us);
-    let (outcome, cancellation_point, timeout_class) = match result {
-        Ok(_) => ("succeeded", None, None),
-        Err(InferenceError::Cancelled) => ("cancelled", Some("active_provider"), None),
-        Err(InferenceError::Superseded) => ("superseded", Some("active_provider"), None),
-        Err(InferenceError::TimedOut { class }) => (
-            "timed_out",
-            Some("active_provider"),
-            Some(class.to_string()),
-        ),
-        Err(InferenceError::ProviderFailed { .. }) => ("provider_failed", None, None),
-        Err(InferenceError::WorkerDropped) => ("worker_dropped", None, None),
-        Err(InferenceError::CapabilityUnavailable { .. }) => ("unavailable", None, None),
-    };
-    span.record("outcome", outcome);
-    if let Some(point) = cancellation_point {
-        span.record("cancellation_point", point);
-    }
-    if let Some(class) = timeout_class {
-        span.record("timeout_class", class);
-    }
-}
-
-fn record_pending_cancellation(
-    context: &super::jobs::JobContext,
-    capability: &'static str,
-    device_name: &str,
-    error: &InferenceError,
-) {
-    context.metrics.cancelled_pending(error);
-    let outcome = match error {
-        InferenceError::Superseded => "superseded",
-        InferenceError::TimedOut { .. } => "timed_out",
-        _ => "cancelled",
-    };
-    tracing::info!(
-        job_id = context.id,
-        capability,
-        selected_worker = device_name,
-        queue_wait_us = context.enqueued_at.elapsed().as_micros() as u64,
-        cancellation_point = "pending",
-        outcome,
-        "Inference queue job skipped before provider invocation"
-    );
-}
 
 /// Generic single-consumer worker loop shared by all non-embedding workers.
 ///
@@ -149,41 +84,41 @@ pub(super) async fn run_llm_worker(
         let provider = provider.clone();
         let device_name = device_name.clone();
         async move {
-            if job.context.cancellation.is_cancelled() {
-                let error = job.context.cancellation.error();
-                record_pending_cancellation(&job.context, "text_generation", &device_name, &error);
-                let _ = job.response.send(Err(error));
+            let GenerateJob {
+                context,
+                request,
+                response,
+            } = job;
+            let Some(reporter) = OneShotReporter::begin(
+                context,
+                response,
+                "text_generation",
+                &device_name,
+                false,
+            ) else {
                 return;
-            }
-            let span = queue_job_span(&job.context, "text_generation", &device_name, false);
-            let start = job.context.begin(false);
-            let n_messages = job.request.messages.len();
+            };
+            let n_messages = request.messages.len();
+            let cancellation = reporter.cancellation().clone();
             let result = async {
                 tokio::select! {
-                    _ = job.context.cancellation.cancelled() => {
-                        Err(job.context.cancellation.error())
-                    }
-                    result = complete_coordinated(&provider, job.request) => {
+                    _ = cancellation.cancelled() => Err(cancellation.error()),
+                    result = complete_coordinated(&provider, request) => {
                         result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
                     }
                 }
             }
-            .instrument(span.clone())
+            .instrument(reporter.span().clone())
             .await;
-            finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
-            job.context.metrics.finished(
-                &result.as_ref().map(|_| ()),
-                start.elapsed().as_micros() as u64,
-            );
             debug!(
-                job_id = job.context.id,
+                job_id = reporter.job_id(),
                 device = %device_name,
                 n_messages,
                 ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
+                duration_ms = reporter.elapsed().as_millis(),
                 "LLM generation job complete"
             );
-            let _ = job.response.send(result);
+            reporter.finish(result);
         }
     })
     .await;
@@ -350,42 +285,40 @@ pub(super) async fn run_rerank_worker(
         let provider = Arc::clone(&provider);
         let device_name = device_name.clone();
         async move {
-            if job.context.cancellation.is_cancelled() {
-                let error = job.context.cancellation.error();
-                record_pending_cancellation(&job.context, "reranking", &device_name, &error);
-                let _ = job.response.send(Err(error));
+            let RerankJob {
+                context,
+                query,
+                documents,
+                top_n,
+                response,
+            } = job;
+            let Some(reporter) =
+                OneShotReporter::begin(context, response, "reranking", &device_name, false)
+            else {
                 return;
-            }
-            let span = queue_job_span(&job.context, "reranking", &device_name, false);
-            let start = job.context.begin(false);
-            let n_docs = job.documents.len();
+            };
+            let n_docs = documents.len();
+            let cancellation = reporter.cancellation().clone();
             let result = async {
                 tokio::select! {
-                    _ = job.context.cancellation.cancelled() => {
-                        Err(job.context.cancellation.error())
-                    }
-                    result = provider.rerank(&job.query, job.documents, job.top_n) => {
+                    _ = cancellation.cancelled() => Err(cancellation.error()),
+                    result = provider.rerank(&query, documents, top_n) => {
                         result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
                     }
                 }
             }
-            .instrument(span.clone())
+            .instrument(reporter.span().clone())
             .await;
-            finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
-            job.context.metrics.finished(
-                &result.as_ref().map(|_| ()),
-                start.elapsed().as_micros() as u64,
-            );
             debug!(
-                job_id = job.context.id,
+                job_id = reporter.job_id(),
                 device = %device_name,
                 n_docs,
-                top_n = ?job.top_n,
+                top_n = ?top_n,
                 ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
+                duration_ms = reporter.elapsed().as_millis(),
                 "Rerank job complete"
             );
-            let _ = job.response.send(result);
+            reporter.finish(result);
         }
     })
     .await;
@@ -584,40 +517,37 @@ pub(super) async fn run_transcribe_worker(
         let provider = Arc::clone(&provider);
         let device_name = device_name.clone();
         async move {
-            if job.context.cancellation.is_cancelled() {
-                let error = job.context.cancellation.error();
-                record_pending_cancellation(&job.context, "transcription", &device_name, &error);
-                let _ = job.response.send(Err(error));
+            let TranscribeJob {
+                context,
+                audio_bytes,
+                filename,
+                response,
+            } = job;
+            let Some(reporter) =
+                OneShotReporter::begin(context, response, "transcription", &device_name, false)
+            else {
                 return;
-            }
-            let span = queue_job_span(&job.context, "transcription", &device_name, false);
-            let start = job.context.begin(false);
+            };
+            let cancellation = reporter.cancellation().clone();
             let result = async {
                 tokio::select! {
-                    _ = job.context.cancellation.cancelled() => {
-                        Err(job.context.cancellation.error())
-                    }
-                    result = provider.transcribe(job.audio_bytes, &job.filename) => {
+                    _ = cancellation.cancelled() => Err(cancellation.error()),
+                    result = provider.transcribe(audio_bytes, &filename) => {
                         result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
                     }
                 }
             }
-            .instrument(span.clone())
+            .instrument(reporter.span().clone())
             .await;
-            finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
-            job.context.metrics.finished(
-                &result.as_ref().map(|_| ()),
-                start.elapsed().as_micros() as u64,
-            );
             debug!(
-                job_id = job.context.id,
+                job_id = reporter.job_id(),
                 device = %device_name,
-                filename = %job.filename,
+                filename = %filename,
                 ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
+                duration_ms = reporter.elapsed().as_millis(),
                 "Transcription job complete"
             );
-            let _ = job.response.send(result);
+            reporter.finish(result);
         }
     })
     .await;
@@ -632,47 +562,44 @@ pub(super) async fn run_tts_worker(
         let tts = tts.clone();
         let device_name = device_name.clone();
         async move {
-            if job.context.cancellation.is_cancelled() {
-                let error = job.context.cancellation.error();
-                record_pending_cancellation(&job.context, "text_to_speech", &device_name, &error);
-                let _ = job.response.send(Err(error));
+            let SynthesizeJob {
+                context,
+                text,
+                voice,
+                response,
+            } = job;
+            let Some(reporter) =
+                OneShotReporter::begin(context, response, "text_to_speech", &device_name, false)
+            else {
                 return;
-            }
-            let span = queue_job_span(&job.context, "text_to_speech", &device_name, false);
-            let start = job.context.begin(false);
+            };
             let provider_call = async {
-                match &job.voice {
-                    Some(voice) => tts.synthesize(&job.text, Some(voice)).await,
-                    None => tts.synthesize_default(&job.text).await,
+                match &voice {
+                    Some(voice) => tts.synthesize(&text, Some(voice)).await,
+                    None => tts.synthesize_default(&text).await,
                 }
             };
+            let cancellation = reporter.cancellation().clone();
             let result = async {
                 tokio::select! {
-                    _ = job.context.cancellation.cancelled() => {
-                        Err(job.context.cancellation.error())
-                    }
+                    _ = cancellation.cancelled() => Err(cancellation.error()),
                     result = provider_call => result.map_err(|error| {
                         InferenceError::classify_timeout(error, TimeoutClass::Provider)
                     }),
                 }
             }
-            .instrument(span.clone())
+            .instrument(reporter.span().clone())
             .await;
-            finish_queue_span(&span, &result, start.elapsed().as_micros() as u64);
-            job.context.metrics.finished(
-                &result.as_ref().map(|_| ()),
-                start.elapsed().as_micros() as u64,
-            );
             debug!(
-                job_id = job.context.id,
+                job_id = reporter.job_id(),
                 device = %device_name,
-                text_len = job.text.len(),
-                voice = job.voice.as_ref().map(|v| v.as_str()).unwrap_or("default"),
+                text_len = text.len(),
+                voice = voice.as_ref().map(|v| v.as_str()).unwrap_or("default"),
                 ok = result.is_ok(),
-                duration_ms = start.elapsed().as_millis(),
+                duration_ms = reporter.elapsed().as_millis(),
                 "TTS job complete"
             );
-            let _ = job.response.send(result);
+            reporter.finish(result);
         }
     })
     .await;
