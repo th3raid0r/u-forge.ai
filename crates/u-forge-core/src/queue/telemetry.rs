@@ -155,3 +155,151 @@ impl QueueMetrics {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::{InferenceResult, TimeoutClass};
+
+    #[test]
+    fn pending_terminal_matrix_records_one_classification_per_submission() {
+        let cases = [
+            (InferenceError::Cancelled, 0, 0),
+            (InferenceError::Superseded, 1, 0),
+            (
+                InferenceError::TimedOut {
+                    class: TimeoutClass::QueueWait,
+                },
+                0,
+                1,
+            ),
+        ];
+
+        for (error, superseded, timed_out) in cases {
+            let metrics = QueueMetrics::default();
+            metrics.submitted();
+            metrics.cancelled_pending(&error);
+
+            let counters = metrics.snapshot();
+            assert_eq!(counters.submitted, 1);
+            assert_eq!(counters.started, 0);
+            assert_eq!(counters.cancelled_pending, 1);
+            assert_eq!(counters.cancelled_active, 0);
+            assert_eq!(counters.superseded, superseded);
+            assert_eq!(counters.timed_out, timed_out);
+            assert_eq!(counters.queue_wait.samples, 0);
+            assert_eq!(counters.service_time.samples, 0);
+        }
+    }
+
+    #[test]
+    fn started_terminal_matrix_records_one_service_transition() {
+        struct Case {
+            result: InferenceResult<()>,
+            succeeded: u64,
+            provider_failed: u64,
+            cancelled_active: u64,
+            timed_out: u64,
+            superseded: u64,
+            worker_dropped: u64,
+        }
+
+        let cases = [
+            Case {
+                result: Ok(()),
+                succeeded: 1,
+                provider_failed: 0,
+                cancelled_active: 0,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::ProviderFailed {
+                    message: "provider failed".into(),
+                }),
+                succeeded: 0,
+                provider_failed: 1,
+                cancelled_active: 0,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::Cancelled),
+                succeeded: 0,
+                provider_failed: 0,
+                cancelled_active: 1,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::Superseded),
+                succeeded: 0,
+                provider_failed: 0,
+                cancelled_active: 1,
+                timed_out: 0,
+                superseded: 1,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::TimedOut {
+                    class: TimeoutClass::Provider,
+                }),
+                succeeded: 0,
+                provider_failed: 0,
+                cancelled_active: 1,
+                timed_out: 1,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+            Case {
+                result: Err(InferenceError::WorkerDropped),
+                succeeded: 0,
+                provider_failed: 0,
+                cancelled_active: 0,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 1,
+            },
+            Case {
+                result: Err(InferenceError::CapabilityUnavailable { capability: "test" }),
+                succeeded: 0,
+                provider_failed: 1,
+                cancelled_active: 0,
+                timed_out: 0,
+                superseded: 0,
+                worker_dropped: 0,
+            },
+        ];
+
+        for case in cases {
+            let metrics = QueueMetrics::default();
+            metrics.submitted();
+            metrics.started(17, false);
+            metrics.finished(&case.result.as_ref().map(|_| ()), 23);
+
+            let counters = metrics.snapshot();
+            assert_eq!(counters.submitted, 1);
+            assert_eq!(counters.started, 1);
+            assert_eq!(counters.succeeded, case.succeeded);
+            assert_eq!(counters.provider_failed, case.provider_failed);
+            assert_eq!(counters.cancelled_active, case.cancelled_active);
+            assert_eq!(counters.timed_out, case.timed_out);
+            assert_eq!(counters.superseded, case.superseded);
+            assert_eq!(counters.worker_dropped, case.worker_dropped);
+            assert_eq!(counters.queue_wait.samples, 1);
+            assert_eq!(counters.queue_wait.total_us, 17);
+            assert_eq!(counters.service_time.samples, 1);
+            assert_eq!(counters.service_time.total_us, 23);
+            assert_eq!(
+                counters.started,
+                counters.succeeded
+                    + counters.provider_failed
+                    + counters.cancelled_active
+                    + counters.worker_dropped
+            );
+        }
+    }
+}
