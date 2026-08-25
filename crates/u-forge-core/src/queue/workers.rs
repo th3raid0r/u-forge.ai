@@ -57,12 +57,19 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     loop {
-        let notified = queue.notify.notified();
-        if let Some(job) = queue.try_pop() {
-            drop(notified);
+        let job = {
+            let notified = queue.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(job) = queue.try_pop() {
+                Some(job)
+            } else {
+                notified.await;
+                None
+            }
+        };
+        if let Some(job) = job {
             process(job).await;
-        } else {
-            notified.await;
         }
     }
 }
@@ -86,7 +93,7 @@ pub(super) async fn run_llm_worker(
                 request,
                 response,
             } = job;
-            let Some(reporter) = OneShotReporter::begin(
+            let Some(mut reporter) = OneShotReporter::begin(
                 context,
                 response,
                 "text_generation",
@@ -97,15 +104,17 @@ pub(super) async fn run_llm_worker(
             };
             let n_messages = request.messages.len();
             let cancellation = reporter.cancellation().clone();
+            let span = reporter.span().clone();
             let result = async {
                 tokio::select! {
                     _ = cancellation.cancelled() => Err(cancellation.error()),
+                    error = reporter.receiver_closed() => Err(error),
                     result = complete_coordinated(&provider, request) => {
                         result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
                     }
                 }
             }
-            .instrument(reporter.span().clone())
+            .instrument(span)
             .await;
             debug!(
                 job_id = reporter.job_id(),
@@ -256,22 +265,24 @@ pub(super) async fn run_rerank_worker(
                 top_n,
                 response,
             } = job;
-            let Some(reporter) =
+            let Some(mut reporter) =
                 OneShotReporter::begin(context, response, "reranking", &device_name, false)
             else {
                 return;
             };
             let n_docs = documents.len();
             let cancellation = reporter.cancellation().clone();
+            let span = reporter.span().clone();
             let result = async {
                 tokio::select! {
                     _ = cancellation.cancelled() => Err(cancellation.error()),
+                    error = reporter.receiver_closed() => Err(error),
                     result = provider.rerank(&query, documents, top_n) => {
                         result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
                     }
                 }
             }
-            .instrument(reporter.span().clone())
+            .instrument(span)
             .await;
             debug!(
                 job_id = reporter.job_id(),
@@ -303,16 +314,18 @@ async fn execute_embed_job(
         text,
         response,
     } = job;
-    let Some(reporter) =
+    let Some(mut reporter) =
         OneShotReporter::begin(context, response, "embedding", device_name, stolen)
     else {
         return;
     };
     let cancellation = reporter.cancellation().clone();
+    let span = reporter.span().clone();
     let final_result = async {
         for attempt in 1..=EMBED_MAX_ATTEMPTS {
             let attempt_result = tokio::select! {
                 _ = cancellation.cancelled() => Err(cancellation.error()),
+                error = reporter.receiver_closed() => Err(error),
                 result = provider.embed(&text) => result.map_err(|error| {
                     InferenceError::classify_timeout(error, TimeoutClass::Provider)
                 }),
@@ -340,6 +353,7 @@ async fn execute_embed_job(
                     reporter.record_retry(attempt);
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(cancellation.error()),
+                        error = reporter.receiver_closed() => return Err(error),
                         _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
                     }
                 }
@@ -349,7 +363,7 @@ async fn execute_embed_job(
             "embed failed with no error detail",
         ))
     }
-    .instrument(reporter.span().clone())
+    .instrument(span)
     .await;
 
     let elapsed_us = reporter.elapsed().as_micros() as u64;
@@ -407,29 +421,33 @@ pub(super) async fn run_embed_worker(
     dispatcher: Arc<WeightedEmbedDispatcher>,
 ) {
     loop {
-        // Register interest in both notifiers BEFORE any queue checks so we
-        // cannot miss a wakeup that fires between checking and sleeping.
-        let local_notified = queue.notify.notified();
-        let global_notified = dispatcher.global_notify.notified();
+        let job = {
+            // Register both waiters before queue checks, but destroy them before
+            // provider execution so a busy worker cannot consume a later permit.
+            let local_notified = queue.notify.notified();
+            let global_notified = dispatcher.global_notify.notified();
+            tokio::pin!(local_notified, global_notified);
+            local_notified.as_mut().enable();
+            global_notified.as_mut().enable();
 
-        // Own queue first.
-        if let Some(job) = queue.try_pop() {
-            execute_embed_job(job, &provider, &device_name, &ewma_us, false).await;
-            continue;
-        }
+            if let Some(job) = queue.try_pop() {
+                Some((job, false))
+            } else if let Some(job) = dispatcher.steal_from_busiest(&queue) {
+                Some((job, true))
+            } else {
+                tokio::select! {
+                    _ = local_notified => {}
+                    _ = global_notified => {}
+                }
+                None
+            }
+        };
 
-        // Try to steal from the most-loaded other worker.  This drains
-        // backlogged neighbours without any additional synchronisation.
-        if let Some(job) = dispatcher.steal_from_busiest(&queue) {
-            debug!(device = %device_name, "Work-stealing embed job from neighbour queue");
-            execute_embed_job(job, &provider, &device_name, &ewma_us, true).await;
-            continue;
-        }
-
-        // Nothing to do — sleep until our queue or any other queue gets work.
-        tokio::select! {
-            _ = local_notified => {}
-            _ = global_notified => {}
+        if let Some((job, stolen)) = job {
+            if stolen {
+                debug!(device = %device_name, "Work-stealing embed job from neighbour queue");
+            }
+            execute_embed_job(job, &provider, &device_name, &ewma_us, stolen).await;
         }
     }
 }
@@ -449,21 +467,23 @@ pub(super) async fn run_transcribe_worker(
                 filename,
                 response,
             } = job;
-            let Some(reporter) =
+            let Some(mut reporter) =
                 OneShotReporter::begin(context, response, "transcription", &device_name, false)
             else {
                 return;
             };
             let cancellation = reporter.cancellation().clone();
+            let span = reporter.span().clone();
             let result = async {
                 tokio::select! {
                     _ = cancellation.cancelled() => Err(cancellation.error()),
+                    error = reporter.receiver_closed() => Err(error),
                     result = provider.transcribe(audio_bytes, &filename) => {
                         result.map_err(|error| InferenceError::classify_timeout(error, TimeoutClass::Provider))
                     }
                 }
             }
-            .instrument(reporter.span().clone())
+            .instrument(span)
             .await;
             debug!(
                 job_id = reporter.job_id(),
@@ -494,7 +514,7 @@ pub(super) async fn run_tts_worker(
                 voice,
                 response,
             } = job;
-            let Some(reporter) =
+            let Some(mut reporter) =
                 OneShotReporter::begin(context, response, "text_to_speech", &device_name, false)
             else {
                 return;
@@ -506,15 +526,17 @@ pub(super) async fn run_tts_worker(
                 }
             };
             let cancellation = reporter.cancellation().clone();
+            let span = reporter.span().clone();
             let result = async {
                 tokio::select! {
                     _ = cancellation.cancelled() => Err(cancellation.error()),
+                    error = reporter.receiver_closed() => Err(error),
                     result = provider_call => result.map_err(|error| {
                         InferenceError::classify_timeout(error, TimeoutClass::Provider)
                     }),
                 }
             }
-            .instrument(reporter.span().clone())
+            .instrument(span)
             .await;
             debug!(
                 job_id = reporter.job_id(),

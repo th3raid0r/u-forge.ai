@@ -230,6 +230,23 @@ impl<T: Send + 'static> JobCompletion<T> {
         }
     }
 
+    pub(crate) fn from_terminal_receiver(
+        receiver: oneshot::Receiver<InferenceResult<T>>,
+        metrics: Arc<QueueMetrics>,
+    ) -> Self {
+        Self {
+            future: Box::pin(async move {
+                match receiver.await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        metrics.worker_dropped();
+                        Err(InferenceError::WorkerDropped)
+                    }
+                }
+            }),
+        }
+    }
+
     pub(crate) fn ready(result: InferenceResult<T>) -> Self {
         Self {
             future: Box::pin(std::future::ready(result)),
@@ -329,6 +346,12 @@ impl<T> OneShotReporter<T> {
             let _ = response.send(Err(error));
             return None;
         }
+        if response.is_closed() {
+            context.cancellation.cancel();
+            let error = context.cancellation.error();
+            record_pending_cancellation(&context, capability, device_name, &error);
+            return None;
+        }
 
         let span = queue_job_span(&context, capability, device_name, stolen);
         let started_at = context.begin(stolen);
@@ -359,6 +382,16 @@ impl<T> OneShotReporter<T> {
     pub(super) fn record_retry(&self, attempt: u32) {
         self.context.metrics.retry();
         self.span.record("retries", attempt);
+    }
+
+    pub(super) async fn receiver_closed(&mut self) -> InferenceError {
+        self.response
+            .as_mut()
+            .expect("active reporter retains its response sender")
+            .closed()
+            .await;
+        self.context.cancellation.cancel();
+        self.context.cancellation.error()
     }
 
     pub(super) fn finish(mut self, result: InferenceResult<T>) {
@@ -412,6 +445,13 @@ impl<T> StreamingReporter<T> {
             let _ = completion.send(Err(error));
             return None;
         }
+        if response.is_closed() {
+            context.cancellation.cancel();
+            let error = context.cancellation.error();
+            record_pending_cancellation(&context, capability, device_name, &error);
+            let _ = completion.send(Err(error));
+            return None;
+        }
 
         let span = queue_job_span(&context, capability, device_name, false);
         let started_at = context.begin(false);
@@ -443,11 +483,19 @@ impl<T> StreamingReporter<T> {
     /// Forward one stream item. Closing the item channel cancels the operation
     /// but leaves terminal completion owned by the reporter.
     pub(super) async fn send_item(&self, item: InferenceResult<T>) -> InferenceResult<()> {
-        if self.response.send(item).await.is_err() {
-            self.context.cancellation.cancel();
-            Err(self.context.cancellation.error())
-        } else {
-            Ok(())
+        tokio::select! {
+            biased;
+            _ = self.context.cancellation.cancelled() => {
+                Err(self.context.cancellation.error())
+            }
+            result = self.response.send(item) => {
+                if result.is_err() {
+                    self.context.cancellation.cancel();
+                    Err(self.context.cancellation.error())
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -616,6 +664,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_shot_reporter_treats_closed_receiver_as_pending_cancellation() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let cancellation = CancellationToken::new();
+        let (response, receiver) = oneshot::channel::<InferenceResult<()>>();
+        drop(receiver);
+
+        assert!(
+            OneShotReporter::begin(
+                JobContext::new(cancellation.clone(), Arc::clone(&metrics)),
+                response,
+                "test",
+                "worker",
+                false,
+            )
+            .is_none()
+        );
+        assert!(cancellation.is_cancelled());
+        let counters = metrics.snapshot();
+        assert_eq!(counters.started, 0);
+        assert_eq!(counters.cancelled_pending, 1);
+        assert_eq!(counters.service_time.samples, 0);
+    }
+
+    #[tokio::test]
+    async fn one_shot_reporter_observes_active_receiver_drop() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let cancellation = CancellationToken::new();
+        let (response, receiver) = oneshot::channel::<InferenceResult<()>>();
+        let mut reporter = OneShotReporter::begin(
+            JobContext::new(cancellation.clone(), Arc::clone(&metrics)),
+            response,
+            "test",
+            "worker",
+            false,
+        )
+        .unwrap();
+        drop(receiver);
+
+        let error = reporter.receiver_closed().await;
+        assert!(matches!(error, InferenceError::Cancelled));
+        reporter.finish(Err(error));
+        assert!(cancellation.is_cancelled());
+        let counters = metrics.snapshot();
+        assert_eq!(counters.started, 1);
+        assert_eq!(counters.cancelled_active, 1);
+        assert_eq!(counters.service_time.samples, 1);
+    }
+
+    #[tokio::test]
     async fn one_shot_reporter_owns_started_terminal_accounting() {
         let metrics = Arc::new(QueueMetrics::default());
         let cancellation = CancellationToken::new();
@@ -701,6 +798,32 @@ mod tests {
         assert_eq!(counters.started, 0);
         assert_eq!(counters.cancelled_pending, 1);
         assert_eq!(counters.service_time.samples, 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_reporter_treats_closed_item_receiver_as_pending() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let cancellation = CancellationToken::new();
+        let (item_tx, item_rx) = mpsc::channel::<InferenceResult<()>>(1);
+        drop(item_rx);
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let completion = JobCompletion::from_terminal_receiver(completion_rx, Arc::clone(&metrics));
+
+        assert!(
+            StreamingReporter::begin(
+                JobContext::new(cancellation.clone(), Arc::clone(&metrics)),
+                item_tx,
+                completion_tx,
+                "test_stream",
+                "worker",
+            )
+            .is_none()
+        );
+        assert!(matches!(completion.await, Err(InferenceError::Cancelled)));
+        assert!(cancellation.is_cancelled());
+        let counters = metrics.snapshot();
+        assert_eq!(counters.started, 0);
+        assert_eq!(counters.cancelled_pending, 1);
     }
 
     #[tokio::test]
@@ -842,17 +965,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_send_backpressure_is_interrupted_by_cancellation() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let cancellation = CancellationToken::new();
+        let (item_tx, _item_rx) = mpsc::channel(1);
+        let (completion_tx, _completion_rx) = oneshot::channel();
+        let reporter = StreamingReporter::begin(
+            JobContext::new(cancellation.clone(), metrics),
+            item_tx,
+            completion_tx,
+            "test_stream",
+            "worker",
+        )
+        .unwrap();
+        reporter.send_item(Ok(1)).await.unwrap();
+
+        cancellation.cancel();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reporter.send_item(Ok(2)),
+        )
+        .await
+        .expect("cancelled stream send remained blocked");
+        assert!(matches!(result, Err(InferenceError::Cancelled)));
+        reporter.finish(Err(InferenceError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn streaming_completion_waits_for_reporter_terminal_transition() {
+        let metrics = Arc::new(QueueMetrics::default());
+        let cancellation = CancellationToken::new();
+        let (item_tx, _item_rx) = mpsc::channel::<InferenceResult<()>>(1);
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let mut completion =
+            JobCompletion::from_terminal_receiver(completion_rx, Arc::clone(&metrics));
+        let reporter = StreamingReporter::begin(
+            JobContext::new(cancellation.clone(), metrics),
+            item_tx,
+            completion_tx,
+            "test_stream",
+            "worker",
+        )
+        .unwrap();
+
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut completion)
+                .await
+                .is_err(),
+            "stream completion resolved before reporter termination"
+        );
+        reporter.finish(Err(InferenceError::Cancelled));
+        assert!(matches!(completion.await, Err(InferenceError::Cancelled)));
+    }
+
+    #[tokio::test]
     async fn streaming_item_receiver_closure_cancels_and_completes() {
         let metrics = Arc::new(QueueMetrics::default());
         let cancellation = CancellationToken::new();
         let (item_tx, item_rx) = mpsc::channel::<InferenceResult<()>>(1);
-        drop(item_rx);
         let (completion_tx, completion_rx) = oneshot::channel();
-        let completion = JobCompletion::from_receiver(
-            cancellation.clone(),
-            completion_rx,
-            Some(Arc::clone(&metrics)),
-        );
+        let completion = JobCompletion::from_terminal_receiver(completion_rx, Arc::clone(&metrics));
         let reporter = StreamingReporter::begin(
             JobContext::new(cancellation.clone(), Arc::clone(&metrics)),
             item_tx,
@@ -861,6 +1034,7 @@ mod tests {
             "worker",
         )
         .unwrap();
+        drop(item_rx);
 
         let terminal = reporter.item_receiver_closed().await;
         assert!(matches!(terminal, InferenceError::Cancelled));

@@ -377,10 +377,9 @@ impl InferenceQueue {
             completion: completion_tx,
         });
         Ok(StreamingInferenceJob {
-            completion: JobCompletion::from_receiver(
-                cancellation.clone(),
+            completion: JobCompletion::from_terminal_receiver(
                 completion_rx,
-                Some(Arc::clone(&self.metrics)),
+                Arc::clone(&self.metrics),
             ),
             cancellation,
             stream: rx,
