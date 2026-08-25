@@ -933,6 +933,7 @@ pub(super) async fn execute(request: SearchRequest<'_>) -> Result<SearchResponse
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectBuilder;
     use tempfile::TempDir;
 
     fn evidence(
@@ -1009,6 +1010,110 @@ mod tests {
         let nodes = aggregate_nodes(fused, 3);
         assert_eq!(nodes[0].0, shared_node);
         assert_eq!(nodes[0].1.matched_chunks.len(), 1);
+    }
+
+    #[test]
+    fn equal_scores_use_stable_identifier_tie_breakers() {
+        let low_object = ObjectId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let high_object = ObjectId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let low_chunk = ChunkId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let high_chunk = ChunkId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let fts = RetrievalStageResult::applied(
+            RetrievalLane::Fts,
+            vec![evidence(
+                RetrievalLane::Fts,
+                0,
+                high_chunk,
+                high_object,
+                None,
+            )],
+        );
+        let standard = RetrievalStageResult::applied(
+            RetrievalLane::StandardSemantic,
+            vec![evidence(
+                RetrievalLane::StandardSemantic,
+                0,
+                low_chunk,
+                low_object,
+                Some(0.1),
+            )],
+        );
+        let high_quality =
+            RetrievalStageResult::applied(RetrievalLane::HighQualitySemantic, Vec::new());
+        let config = NormalizedSearchConfig {
+            alpha: 0.5,
+            fts_limit: 20,
+            semantic_limit: 20,
+            rerank: false,
+            limit: 3,
+            hq_semantic_boost: 3.0,
+        };
+
+        let fused = fuse_ranked_evidence([&fts, &standard, &high_quality], config);
+        assert_eq!(
+            fused.iter().map(|chunk| chunk.chunk_id).collect::<Vec<_>>(),
+            vec![low_chunk, high_chunk]
+        );
+        let nodes = aggregate_nodes(fused, 3);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|(object_id, _)| *object_id)
+                .collect::<Vec<_>>(),
+            vec![low_object, high_object]
+        );
+    }
+
+    #[test]
+    fn equal_rerank_scores_use_stable_node_identifier_tie_breaker() {
+        let temp = TempDir::new().unwrap();
+        let graph = KnowledgeGraph::new(temp.path()).unwrap();
+        let first = ObjectBuilder::character("First".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        let second = ObjectBuilder::character("Second".to_string())
+            .add_to_graph(&graph)
+            .unwrap();
+        let ranked = vec![
+            (
+                second,
+                NodeAccumulator {
+                    total_score: 1.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                first,
+                NodeAccumulator {
+                    total_score: 1.0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let mut results = hydrate_nodes(&graph, ranked).unwrap();
+        let scores = vec![
+            RerankDocument {
+                index: 1,
+                score: 0.5,
+                document: None,
+            },
+            RerankDocument {
+                index: 0,
+                score: 0.5,
+                document: None,
+            },
+        ];
+
+        apply_rerank_scores(&mut results, &scores).unwrap();
+        let mut expected = vec![first, second];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.node.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]

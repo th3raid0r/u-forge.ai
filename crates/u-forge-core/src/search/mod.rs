@@ -472,7 +472,7 @@ pub async fn search_hybrid_with_cancellation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use tempfile::TempDir;
@@ -492,13 +492,23 @@ mod tests {
 
     struct MockEmbeddingProvider;
 
+    struct MockHqEmbeddingProvider;
+
+    struct RecordingEmbeddingProvider {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn mock_embedding(text: &str, dimensions: usize) -> Vec<f32> {
+        let seed = text.len() as f32 + text.chars().next().unwrap_or('a') as u32 as f32;
+        (0..dimensions)
+            .map(|index| ((seed + index as f32) % 1000.0) / 1000.0)
+            .collect()
+    }
+
     #[async_trait]
     impl EmbeddingProvider for MockEmbeddingProvider {
         async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-            let seed = text.len() as f32 + text.chars().next().unwrap_or('a') as u32 as f32;
-            Ok((0..768)
-                .map(|i| ((seed + i as f32) % 1000.0) / 1000.0)
-                .collect())
+            Ok(mock_embedding(text, 768))
         }
 
         async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -523,11 +533,71 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl EmbeddingProvider for MockHqEmbeddingProvider {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(mock_embedding(text, 4096))
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| mock_embedding(text, 4096))
+                .collect())
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(4096)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for RecordingEmbeddingProvider {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.queries.lock().unwrap().push(text.to_string());
+            Ok(mock_embedding(text, 768))
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|text| mock_embedding(text, 768)).collect())
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(768)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
     struct KeywordRerankProvider {
         keyword: &'static str,
     }
 
     struct FailingEmbeddingProvider;
+
+    struct FailingHqEmbeddingProvider;
 
     #[async_trait]
     impl EmbeddingProvider for FailingEmbeddingProvider {
@@ -591,6 +661,33 @@ mod tests {
     }
 
     #[async_trait]
+    impl EmbeddingProvider for FailingHqEmbeddingProvider {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("secret HQ embedding backend detail")
+        }
+
+        async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("secret HQ embedding backend detail")
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(4096)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
+    #[async_trait]
     impl EmbeddingProvider for WrongDimensionEmbeddingProvider {
         async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             Ok(vec![1.0])
@@ -623,6 +720,21 @@ mod tests {
 
     struct CancellingRerankProvider {
         cancellation: CancellationToken,
+    }
+
+    struct RecordingRerankProvider {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MalformedRerankKind {
+        DuplicateIndex,
+        OutOfBoundsIndex,
+        NonFiniteScore,
+    }
+
+    struct MalformedRerankProvider {
+        kind: MalformedRerankKind,
     }
 
     #[async_trait]
@@ -659,6 +771,59 @@ mod tests {
         ) -> anyhow::Result<Vec<RerankDocument>> {
             self.cancellation.cancel();
             std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for RecordingRerankProvider {
+        async fn rerank(
+            &self,
+            query: &str,
+            documents: Vec<String>,
+            _top_n: Option<usize>,
+        ) -> anyhow::Result<Vec<RerankDocument>> {
+            self.queries.lock().unwrap().push(query.to_string());
+            Ok(documents
+                .into_iter()
+                .enumerate()
+                .map(|(index, document)| RerankDocument {
+                    index,
+                    score: 1.0 - index as f32 * 0.1,
+                    document: Some(document),
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for MalformedRerankProvider {
+        async fn rerank(
+            &self,
+            _query: &str,
+            documents: Vec<String>,
+            _top_n: Option<usize>,
+        ) -> anyhow::Result<Vec<RerankDocument>> {
+            let len = documents.len();
+            Ok(documents
+                .into_iter()
+                .enumerate()
+                .map(|(position, document)| {
+                    let index = match self.kind {
+                        MalformedRerankKind::DuplicateIndex if position + 1 == len => 0,
+                        MalformedRerankKind::OutOfBoundsIndex if position + 1 == len => len,
+                        _ => position,
+                    };
+                    let score = match self.kind {
+                        MalformedRerankKind::NonFiniteScore if position == 0 => f32::NAN,
+                        _ => 1.0 - position as f32 * 0.1,
+                    };
+                    RerankDocument {
+                        index,
+                        score,
+                        document: Some(document),
+                    }
+                })
+                .collect())
         }
     }
 
@@ -795,16 +960,29 @@ mod tests {
             .unwrap();
         for oid in [wizard_id, hobbit_id, shire_id, city_id] {
             for chunk in graph.get_text_chunks(oid).unwrap() {
-                let seed = chunk.content.len() as f32
-                    + chunk.content.chars().next().unwrap_or('a') as u32 as f32;
-                let embedding: Vec<f32> = (0..768)
-                    .map(|i| ((seed + i as f32) % 1000.0) / 1000.0)
-                    .collect();
+                let embedding = mock_embedding(&chunk.content, 768);
                 graph.upsert_chunk_embedding(chunk.id, &embedding).unwrap();
             }
         }
 
         (graph, tmp)
+    }
+
+    fn populate_hq_embeddings(graph: &KnowledgeGraph) {
+        graph
+            .ensure_embedding_space(
+                crate::ingest::EmbeddingTarget::HighQuality,
+                "mock-hq@unknown",
+            )
+            .unwrap();
+        for object in graph.get_all_objects().unwrap() {
+            for chunk in graph.get_text_chunks(object.id).unwrap() {
+                let embedding = mock_embedding(&chunk.content, 4096);
+                graph
+                    .upsert_chunk_embedding_hq(chunk.id, &embedding)
+                    .unwrap();
+            }
+        }
     }
 
     fn make_embed_queue() -> InferenceQueue {
@@ -837,14 +1015,18 @@ mod tests {
         InferenceQueueBuilder::new().with_provider(built).build()
     }
 
-    fn make_failing_rerank_queue() -> InferenceQueue {
+    fn make_custom_rerank_queue(provider: Arc<dyn RerankProvider>) -> InferenceQueue {
         let built = BuiltProvider {
             name: "mock-rerank".to_string(),
             capability: Capability::Reranking,
-            provider: ProviderSlot::Rerank(Arc::new(FailingRerankProvider)),
+            provider: ProviderSlot::Rerank(provider),
             weight: 100,
         };
         InferenceQueueBuilder::new().with_provider(built).build()
+    }
+
+    fn make_failing_rerank_queue() -> InferenceQueue {
+        make_custom_rerank_queue(Arc::new(FailingRerankProvider))
     }
 
     fn make_empty_rerank_queue() -> InferenceQueue {
@@ -868,13 +1050,33 @@ mod tests {
     }
 
     fn make_keyword_rerank_queue(keyword: &'static str) -> InferenceQueue {
-        let built = BuiltProvider {
-            name: "mock-rerank".to_string(),
-            capability: Capability::Reranking,
-            provider: ProviderSlot::Rerank(Arc::new(KeywordRerankProvider { keyword })),
-            weight: 100,
-        };
-        InferenceQueueBuilder::new().with_provider(built).build()
+        make_custom_rerank_queue(Arc::new(KeywordRerankProvider { keyword }))
+    }
+
+    fn make_recording_queue(
+        embedding_queries: Arc<Mutex<Vec<String>>>,
+        reranking_queries: Arc<Mutex<Vec<String>>>,
+    ) -> InferenceQueue {
+        InferenceQueueBuilder::new()
+            .with_providers(vec![
+                BuiltProvider {
+                    name: "mock-embed".to_string(),
+                    capability: Capability::Embedding,
+                    provider: ProviderSlot::Embedding(Arc::new(RecordingEmbeddingProvider {
+                        queries: embedding_queries,
+                    })),
+                    weight: 100,
+                },
+                BuiltProvider {
+                    name: "mock-rerank".to_string(),
+                    capability: Capability::Reranking,
+                    provider: ProviderSlot::Rerank(Arc::new(RecordingRerankProvider {
+                        queries: reranking_queries,
+                    })),
+                    weight: 100,
+                },
+            ])
+            .build()
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1061,6 +1263,149 @@ mod tests {
                 r.sources.fts_rank.is_none(),
                 "Unexpected fts_rank in semantic-only mode"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn dual_semantic_lanes_preserve_independent_evidence() {
+        let (graph, _tmp) = make_graph_with_data();
+        populate_hq_embeddings(&graph);
+        let standard_queue = make_embed_queue();
+        let hq_queue = make_named_embed_queue("mock-hq", Arc::new(MockHqEmbeddingProvider));
+
+        let response = search_hybrid_response(
+            &graph,
+            &standard_queue,
+            Some(&hq_queue),
+            "hobbit homeland hills peaceful",
+            &HybridSearchConfig {
+                alpha: 1.0,
+                rerank: false,
+                limit: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.outcomes.fts.status,
+            SearchStageStatus::IntentionallySkipped
+        );
+        assert_eq!(
+            response.outcomes.standard_semantic.status,
+            SearchStageStatus::Applied
+        );
+        assert_eq!(
+            response.outcomes.high_quality_semantic.status,
+            SearchStageStatus::Applied
+        );
+        assert!(!response.results.is_empty());
+        assert!(response.results.iter().all(|result| {
+            result.sources.semantic_distance.is_some()
+                && result.sources.hq_semantic_distance.is_some()
+                && result.matched_chunks.iter().all(|chunk| {
+                    chunk.semantic_distance.is_some() && chunk.hq_semantic_distance.is_some()
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn semantic_fingerprint_mismatch_disables_only_the_affected_lane() {
+        let (graph, _tmp) = make_graph_with_data();
+        populate_hq_embeddings(&graph);
+
+        for incompatible_standard in [true, false] {
+            let standard_name = if incompatible_standard {
+                "other-standard"
+            } else {
+                "mock-embed"
+            };
+            let hq_name = if incompatible_standard {
+                "mock-hq"
+            } else {
+                "other-hq"
+            };
+            let standard_queue =
+                make_named_embed_queue(standard_name, Arc::new(MockEmbeddingProvider));
+            let hq_queue = make_named_embed_queue(hq_name, Arc::new(MockHqEmbeddingProvider));
+
+            let response = search_hybrid_response(
+                &graph,
+                &standard_queue,
+                Some(&hq_queue),
+                "hobbit",
+                &HybridSearchConfig {
+                    alpha: 1.0,
+                    rerank: false,
+                    limit: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let (standard_status, hq_status) = if incompatible_standard {
+                (SearchStageStatus::Unavailable, SearchStageStatus::Applied)
+            } else {
+                (SearchStageStatus::Applied, SearchStageStatus::Unavailable)
+            };
+            assert_eq!(response.outcomes.standard_semantic.status, standard_status);
+            assert_eq!(response.outcomes.high_quality_semantic.status, hq_status);
+            assert!(!response.results.is_empty());
+            assert!(response.results.iter().all(|result| {
+                result.sources.semantic_distance.is_some() != incompatible_standard
+                    && result.sources.hq_semantic_distance.is_some() == incompatible_standard
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_failure_preserves_results_from_the_other_lane() {
+        let (graph, _tmp) = make_graph_with_data();
+        populate_hq_embeddings(&graph);
+
+        for failing_standard in [true, false] {
+            let standard_provider: Arc<dyn EmbeddingProvider> = if failing_standard {
+                Arc::new(FailingEmbeddingProvider)
+            } else {
+                Arc::new(MockEmbeddingProvider)
+            };
+            let hq_provider: Arc<dyn EmbeddingProvider> = if failing_standard {
+                Arc::new(MockHqEmbeddingProvider)
+            } else {
+                Arc::new(FailingHqEmbeddingProvider)
+            };
+            let standard_queue = make_named_embed_queue("mock-embed", standard_provider);
+            let hq_queue = make_named_embed_queue("mock-hq", hq_provider);
+
+            let response = search_hybrid_response(
+                &graph,
+                &standard_queue,
+                Some(&hq_queue),
+                "hobbit",
+                &HybridSearchConfig {
+                    alpha: 1.0,
+                    rerank: false,
+                    limit: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let (standard_status, hq_status) = if failing_standard {
+                (SearchStageStatus::Failed, SearchStageStatus::Applied)
+            } else {
+                (SearchStageStatus::Applied, SearchStageStatus::Failed)
+            };
+            assert_eq!(response.outcomes.standard_semantic.status, standard_status);
+            assert_eq!(response.outcomes.high_quality_semantic.status, hq_status);
+            assert!(!response.results.is_empty());
+            assert!(response.results.iter().all(|result| {
+                result.sources.semantic_distance.is_some() != failing_standard
+                    && result.sources.hq_semantic_distance.is_some() == failing_standard
+            }));
         }
     }
 
@@ -1459,6 +1804,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_fts_sanitizes_the_original_query() {
+        let (graph, _tmp) = make_graph_with_data();
+        let embedding_queries = Arc::new(Mutex::new(Vec::new()));
+        let reranking_queries = Arc::new(Mutex::new(Vec::new()));
+        let queue = make_recording_queue(embedding_queries.clone(), reranking_queries.clone());
+        let query = "wizard?!";
+
+        let response = search_hybrid_response(
+            &graph,
+            &queue,
+            None,
+            query,
+            &HybridSearchConfig {
+                rerank: true,
+                limit: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.outcomes.fts.status, SearchStageStatus::Applied);
+        assert_eq!(
+            response.outcomes.standard_semantic.status,
+            SearchStageStatus::Applied
+        );
+        assert_eq!(
+            response.outcomes.reranking.status,
+            SearchStageStatus::Applied
+        );
+        assert_eq!(*embedding_queries.lock().unwrap(), vec![query.to_string()]);
+        assert_eq!(*reranking_queries.lock().unwrap(), vec![query.to_string()]);
+        assert!(
+            response.results.iter().any(|result| {
+                result.sources.fts_rank.is_some() && result.node.name == "Gandalf"
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn pre_cancelled_search_preserves_supersession() {
         let (graph, _tmp) = make_graph_with_data();
         let queue = make_embed_queue();
@@ -1653,6 +2038,77 @@ mod tests {
                 .iter()
                 .all(|result| result.sources.rerank_score.is_none())
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_rerank_variants_leave_the_complete_rrf_order_unchanged() {
+        let (graph, _tmp) = make_graph_with_data();
+        let query = "Gandalf OR Frodo OR Shire OR Minas";
+        let baseline = search_hybrid_response(
+            &graph,
+            &make_queue_no_workers(),
+            None,
+            query,
+            &HybridSearchConfig {
+                alpha: 0.0,
+                rerank: false,
+                fts_limit: 20,
+                limit: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(baseline.results.len() >= 2);
+        let expected: Vec<_> = baseline
+            .results
+            .iter()
+            .map(|result| (result.node.id, result.score))
+            .collect();
+
+        for kind in [
+            MalformedRerankKind::DuplicateIndex,
+            MalformedRerankKind::OutOfBoundsIndex,
+            MalformedRerankKind::NonFiniteScore,
+        ] {
+            let queue = make_custom_rerank_queue(Arc::new(MalformedRerankProvider { kind }));
+            let response = search_hybrid_response(
+                &graph,
+                &queue,
+                None,
+                query,
+                &HybridSearchConfig {
+                    alpha: 0.0,
+                    rerank: true,
+                    fts_limit: 20,
+                    limit: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                response.outcomes.reranking.status,
+                SearchStageStatus::Failed,
+                "unexpected outcome for {kind:?}"
+            );
+            assert_eq!(
+                response
+                    .results
+                    .iter()
+                    .map(|result| (result.node.id, result.score))
+                    .collect::<Vec<_>>(),
+                expected,
+                "malformed {kind:?} response changed the RRF results"
+            );
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .all(|result| result.sources.rerank_score.is_none())
+            );
+        }
     }
 
     #[tokio::test]
