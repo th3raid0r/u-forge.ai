@@ -747,7 +747,7 @@ mod tests {
         let synthesize_queue = Arc::new(WorkQueue::new());
 
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider);
-        let (embed_q, embed_idle, embed_ewma) = embed_dispatcher.add_worker(100, "mock-npu");
+        let (embed_q, embed_ewma) = embed_dispatcher.add_worker(100, "mock-npu");
 
         // Wrap before spawning so the worker can call steal_from_busiest.
         let embed_dispatcher = Arc::new(embed_dispatcher);
@@ -758,7 +758,6 @@ mod tests {
                     embed_q,
                     provider,
                     "mock-npu".to_string(),
-                    embed_idle,
                     embed_ewma,
                     dispatcher,
                 )
@@ -1138,12 +1137,12 @@ mod tests {
 
         let mut embed_dispatcher = WeightedEmbedDispatcher::new();
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(SlowProvider);
-        let (q, idle, ewma) = embed_dispatcher.add_worker(100, "slow-npu");
+        let (q, ewma) = embed_dispatcher.add_worker(100, "slow-npu");
         let embed_dispatcher = Arc::new(embed_dispatcher);
         {
             let dispatcher = Arc::clone(&embed_dispatcher);
             tokio::spawn(async move {
-                run_embed_worker(q, provider, "slow-npu".to_string(), idle, ewma, dispatcher).await;
+                run_embed_worker(q, provider, "slow-npu".to_string(), ewma, dispatcher).await;
             });
         }
 

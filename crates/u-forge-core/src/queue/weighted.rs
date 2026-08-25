@@ -51,7 +51,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 use tokio::sync::Notify;
@@ -66,9 +66,7 @@ struct WeightedWorkerSlot {
     /// Human-readable device name (e.g. "NPU", "GPU").  Emitted as a span
     /// field (`selected_worker_id`) by [`WeightedEmbedDispatcher::submit`].
     name: String,
-    /// Idle flag shared with and owned alongside the worker task.
-    #[allow(dead_code)]
-    idle: Arc<AtomicBool>,
+
     /// EWMA job duration in microseconds.  `0` = no completed job yet.
     ewma_us: Arc<AtomicU64>,
 }
@@ -99,26 +97,23 @@ impl WeightedEmbedDispatcher {
 
     /// Register a new worker.
     ///
-    /// Returns `(queue, idle_flag, ewma_us)` — pass all three to
-    /// [`run_embed_worker`](super::workers::run_embed_worker).
+    /// Returns `(queue, ewma_us)` for the worker task.
     pub(super) fn add_worker(
         &mut self,
         weight: u32,
         name: impl Into<String>,
-    ) -> (Arc<WorkQueue<EmbedJob>>, Arc<AtomicBool>, Arc<AtomicU64>) {
+    ) -> (Arc<WorkQueue<EmbedJob>>, Arc<AtomicU64>) {
         let queue = Arc::new(WorkQueue::<EmbedJob>::new());
-        let idle = Arc::new(AtomicBool::new(false));
         let ewma_us = Arc::new(AtomicU64::new(0));
 
         self.workers.push(WeightedWorkerSlot {
             queue: Arc::clone(&queue),
             weight,
             name: name.into(),
-            idle: Arc::clone(&idle),
             ewma_us: Arc::clone(&ewma_us),
         });
 
-        (queue, idle, ewma_us)
+        (queue, ewma_us)
     }
 
     /// Submit a job to the worker with the lowest predicted completion time.
@@ -224,17 +219,16 @@ mod tests {
     }
 
     #[test]
-    fn test_add_worker_returns_queue_idle_and_ewma() {
+    fn test_add_worker_returns_queue_and_ewma() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (_q, idle, ewma) = d.add_worker(100, "NPU");
-        assert!(!idle.load(Ordering::Relaxed));
+        let (_q, ewma) = d.add_worker(100, "NPU");
         assert_eq!(ewma.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn test_single_worker_receives_job() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q, _idle, _ewma) = d.add_worker(100, "NPU");
+        let (q, _ewma) = d.add_worker(100, "NPU");
         let (job, _rx) = make_job();
         d.submit(job);
         assert_eq!(q.pending(), 1);
@@ -246,8 +240,8 @@ mod tests {
     #[test]
     fn test_no_data_prefers_highest_weight_when_all_empty() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, _) = d.add_worker(100, "NPU");
-        let (q_gpu, _, _) = d.add_worker(50, "GPU");
+        let (q_npu, _) = d.add_worker(100, "NPU");
+        let (q_gpu, _) = d.add_worker(50, "GPU");
         let (job, _) = make_job();
         d.submit(job);
         assert_eq!(q_npu.pending(), 1, "NPU wins weight tiebreak");
@@ -257,8 +251,8 @@ mod tests {
     #[test]
     fn test_no_data_burst_spreads_across_workers() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, _) = d.add_worker(100, "NPU");
-        let (q_gpu, _, _) = d.add_worker(50, "GPU");
+        let (q_npu, _) = d.add_worker(100, "NPU");
+        let (q_gpu, _) = d.add_worker(50, "GPU");
         let (j1, _) = make_job();
         let (j2, _) = make_job();
         d.submit(j1);
@@ -270,8 +264,8 @@ mod tests {
     #[test]
     fn test_no_data_routes_to_least_loaded() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, _) = d.add_worker(100, "NPU");
-        let (q_gpu, _, _) = d.add_worker(50, "GPU");
+        let (q_npu, _) = d.add_worker(100, "NPU");
+        let (q_gpu, _) = d.add_worker(50, "GPU");
         for _ in 0..3 {
             let (j, _) = make_job();
             q_npu.push(j);
@@ -289,8 +283,8 @@ mod tests {
     #[test]
     fn test_faster_worker_wins_when_both_empty() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, ewma_npu) = d.add_worker(100, "NPU");
-        let (q_gpu, _, ewma_gpu) = d.add_worker(50, "GPU");
+        let (q_npu, ewma_npu) = d.add_worker(100, "NPU");
+        let (q_gpu, ewma_gpu) = d.add_worker(50, "GPU");
         ewma_npu.store(500_000, Ordering::Relaxed);
         ewma_gpu.store(50_000, Ordering::Relaxed);
         let (job, _) = make_job();
@@ -302,8 +296,8 @@ mod tests {
     #[test]
     fn test_npu_takes_overflow_at_equilibrium() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, ewma_npu) = d.add_worker(100, "NPU");
-        let (q_gpu, _, ewma_gpu) = d.add_worker(50, "GPU");
+        let (q_npu, ewma_npu) = d.add_worker(100, "NPU");
+        let (q_gpu, ewma_gpu) = d.add_worker(50, "GPU");
         ewma_npu.store(500_000, Ordering::Relaxed);
         ewma_gpu.store(50_000, Ordering::Relaxed);
         for _ in 0..9 {
@@ -320,8 +314,8 @@ mod tests {
     #[test]
     fn test_npu_does_not_take_overflow_before_saturation() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, ewma_npu) = d.add_worker(100, "NPU");
-        let (q_gpu, _, ewma_gpu) = d.add_worker(50, "GPU");
+        let (q_npu, ewma_npu) = d.add_worker(100, "NPU");
+        let (q_gpu, ewma_gpu) = d.add_worker(50, "GPU");
         ewma_npu.store(500_000, Ordering::Relaxed);
         ewma_gpu.store(50_000, Ordering::Relaxed);
         for _ in 0..8 {
@@ -340,8 +334,8 @@ mod tests {
     #[test]
     fn test_steal_from_busiest_returns_job_from_other_queue() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, _) = d.add_worker(100, "NPU");
-        let (q_gpu, _, _) = d.add_worker(50, "GPU");
+        let (q_npu, _) = d.add_worker(100, "NPU");
+        let (q_gpu, _) = d.add_worker(50, "GPU");
         // Put two jobs in NPU's queue
         for _ in 0..2 {
             let (j, _) = make_job();
@@ -356,8 +350,8 @@ mod tests {
     #[test]
     fn test_steal_does_not_steal_from_self() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (_q_npu, _, _) = d.add_worker(100, "NPU");
-        let (q_gpu, _, _) = d.add_worker(50, "GPU");
+        let (_q_npu, _) = d.add_worker(100, "NPU");
+        let (q_gpu, _) = d.add_worker(50, "GPU");
         // Only GPU has work
         for _ in 0..2 {
             let (j, _) = make_job();
@@ -372,8 +366,8 @@ mod tests {
     #[test]
     fn test_steal_returns_none_when_others_empty() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, _) = d.add_worker(100, "NPU");
-        let (q_gpu, _, _) = d.add_worker(50, "GPU");
+        let (q_npu, _) = d.add_worker(100, "NPU");
+        let (q_gpu, _) = d.add_worker(50, "GPU");
         // Both empty
         assert!(d.steal_from_busiest(&q_gpu).is_none());
         assert!(d.steal_from_busiest(&q_npu).is_none());
@@ -382,9 +376,9 @@ mod tests {
     #[test]
     fn test_steal_picks_most_loaded_queue() {
         let mut d = WeightedEmbedDispatcher::new();
-        let (q_npu, _, _) = d.add_worker(100, "NPU");
-        let (q_gpu, _, _) = d.add_worker(50, "GPU");
-        let (q_cpu, _, _) = d.add_worker(10, "CPU");
+        let (q_npu, _) = d.add_worker(100, "NPU");
+        let (q_gpu, _) = d.add_worker(50, "GPU");
+        let (q_cpu, _) = d.add_worker(10, "CPU");
         // NPU: 5 jobs, GPU: 2 jobs
         for _ in 0..5 {
             let (j, _) = make_job();

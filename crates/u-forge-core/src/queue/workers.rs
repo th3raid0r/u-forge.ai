@@ -13,7 +13,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 use tracing::{Instrument, debug};
@@ -291,13 +291,6 @@ pub(super) async fn run_rerank_worker(
 
 /// Embedding worker loop.
 ///
-/// `idle` is an `AtomicBool` shared with the [`WeightedEmbedDispatcher`](super::weighted::WeightedEmbedDispatcher).
-/// The worker sets it `true` before sleeping (so the dispatcher can see that it
-/// is free) and `false` immediately after popping a job.  The window between
-/// the `false` store and the actual pop is negligible; the window between job
-/// completion and the `true` store is also small (just before `notified.await`).
-/// Both races are acceptable — they cause a job to go to a slightly non-optimal
-/// worker, never to be lost.
 /// Execute a single embedding job: retry loop, EWMA update, send result.
 async fn execute_embed_job(
     job: EmbedJob,
@@ -411,7 +404,6 @@ pub(super) async fn run_embed_worker(
     queue: Arc<WorkQueue<EmbedJob>>,
     provider: Arc<dyn EmbeddingProvider>,
     device_name: String,
-    idle: Arc<AtomicBool>,
     ewma_us: Arc<AtomicU64>,
     dispatcher: Arc<WeightedEmbedDispatcher>,
 ) {
@@ -423,7 +415,6 @@ pub(super) async fn run_embed_worker(
 
         // Own queue first.
         if let Some(job) = queue.try_pop() {
-            idle.store(false, Ordering::Relaxed);
             execute_embed_job(job, &provider, &device_name, &ewma_us, false).await;
             continue;
         }
@@ -431,14 +422,12 @@ pub(super) async fn run_embed_worker(
         // Try to steal from the most-loaded other worker.  This drains
         // backlogged neighbours without any additional synchronisation.
         if let Some(job) = dispatcher.steal_from_busiest(&queue) {
-            idle.store(false, Ordering::Relaxed);
             debug!(device = %device_name, "Work-stealing embed job from neighbour queue");
             execute_embed_job(job, &provider, &device_name, &ewma_us, true).await;
             continue;
         }
 
         // Nothing to do — sleep until our queue or any other queue gets work.
-        idle.store(true, Ordering::Relaxed);
         tokio::select! {
             _ = local_notified => {}
             _ = global_notified => {}

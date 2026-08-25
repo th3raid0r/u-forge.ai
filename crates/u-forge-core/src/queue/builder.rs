@@ -1,9 +1,6 @@
 //! [`InferenceQueueBuilder`] — register providers and spawn background tasks.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64},
-};
+use std::sync::{Arc, atomic::AtomicU64};
 
 use tracing::{debug, warn};
 
@@ -26,7 +23,6 @@ use super::workers::{
 /// dispatcher is fully built and wrapped in an `Arc`.
 struct EmbedWorkerSpec {
     queue: Arc<WorkQueue<EmbedJob>>,
-    idle: Arc<AtomicBool>,
     ewma_us: Arc<AtomicU64>,
     provider: Arc<dyn EmbeddingProvider>,
     name: String,
@@ -143,12 +139,10 @@ impl InferenceQueueBuilder {
                     } else {
                         embedding_models.push(format!("{}@unknown", built.name));
                     }
-                    let (queue, idle, ewma_us) =
-                        embed_dispatcher.add_worker(built.weight, &built.name);
+                    let (queue, ewma_us) = embed_dispatcher.add_worker(built.weight, &built.name);
                     debug!(name = %built.name, weight = built.weight, "Registered embedding worker");
                     embed_specs.push(EmbedWorkerSpec {
                         queue,
-                        idle,
                         ewma_us,
                         provider,
                         name: built.name,
@@ -227,7 +221,6 @@ impl InferenceQueueBuilder {
                     spec.queue,
                     spec.provider,
                     spec.name,
-                    spec.idle,
                     spec.ewma_us,
                     dispatcher,
                 )
