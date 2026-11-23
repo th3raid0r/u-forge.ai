@@ -10147,7 +10147,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
- "dashmap",
  "futures",
  "libc",
  "mime_guess",
@@ -10166,7 +10165,6 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

@@ -63,7 +63,7 @@ impl EmbeddingProvider for TimedProvider {
         tokio::time::sleep(self.activation_delay).await;
         if self
             .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
