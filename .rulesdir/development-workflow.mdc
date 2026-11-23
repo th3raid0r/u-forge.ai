@@ -110,6 +110,11 @@ control variable.
 
 ## CI commands
 
+For a PR with changes beyond `.md` and `.mdc` files, mark it ready for review
+and apply `ready for merge` (in either order) to start hosted CI. New commits
+rerun CI while the PR is eligible. Removing the label or converting the PR to
+a draft cancels an in-progress run.
+
 ```bash
 make fmt-check
 make check
