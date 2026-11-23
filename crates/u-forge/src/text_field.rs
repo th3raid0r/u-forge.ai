@@ -659,7 +659,7 @@ impl Render for TextFieldView {
             move |bounds, window, cx| {
                 let rem_size = window.rem_size();
                 let font_size = rem_size; // text_base = 1.0rem
-                let line_height = (font_size * 1.618_034).round();
+                let line_height = (font_size * std::f32::consts::GOLDEN_RATIO).round();
                 let mono_font = font(".SystemUIMonospacedFont");
 
                 // Determine display text and color.
