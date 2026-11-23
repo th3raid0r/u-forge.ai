@@ -103,7 +103,7 @@ async fn import_loaded_data<P: AsRef<Path>>(
     let data_file = data_file.as_ref();
     info!(data_file = %data_file.display(), "Importing data");
     let import_start = Instant::now();
-    let mut ingestion = DataIngestion::new(graph);
+    let mut ingestion = DataIngestion::for_indexed_import(graph);
     ingestion
         .import_json_data_with_cancellation(data_file, cancellation)
         .await?;
@@ -134,34 +134,7 @@ async fn import_loaded_data<P: AsRef<Path>>(
         "Data imported"
     );
 
-    info!("Indexing text for full-text search");
-    cancellation.check_cancelled()?;
-    let index_start = Instant::now();
-    let affected = &ingestion.affected_objects;
-    let mut replacements = Vec::with_capacity(affected.len());
-    for &id in affected {
-        cancellation.check_cancelled()?;
-        let object = graph
-            .get_object(id)?
-            .ok_or_else(|| anyhow::anyhow!("Missing imported object {id}"))?;
-        let text = object.flatten_for_embedding(&graph.storage.import_edge_lines(id)?);
-        let chunks = split_text_with_counts(&text)
-            .into_iter()
-            .map(|(piece, count)| {
-                TextChunk::with_token_count(id, piece, ChunkType::Imported, count)
-            })
-            .collect();
-        replacements.push((id, chunks));
-    }
-    cancellation.check_cancelled()?;
-    let chunks_indexed = graph.storage.replace_imported_chunks(replacements)?;
-    let index_duration_ms = index_start.elapsed().as_millis() as u64;
-    info!(
-        chunks_indexed,
-        objects_indexed = affected.len(),
-        duration_ms = index_duration_ms,
-        "FTS indexing complete"
-    );
+    let chunks_indexed = index_committed_imports(graph, cancellation)?;
 
     Ok(SetupResult {
         fresh_import: true,
@@ -175,6 +148,35 @@ async fn import_loaded_data<P: AsRef<Path>>(
         diagnostics_path,
         chunks_indexed,
     })
+}
+
+/// Finish only work journaled by committed imports, including interrupted ones.
+fn index_committed_imports(
+    graph: &KnowledgeGraph,
+    cancellation: &CancellationToken,
+) -> Result<usize> {
+    cancellation.check_cancelled()?;
+    let pending = graph.storage.pending_import_index()?;
+    let mut replacements = Vec::with_capacity(pending.len());
+    for ticket in pending {
+        cancellation.check_cancelled()?;
+        let id = ticket.object;
+        let Some(object) = graph.get_object(id)? else {
+            continue; // Node deletion cascades to the ticket.
+        };
+        let text = object.flatten_for_embedding(&graph.storage.import_edge_lines(id)?);
+        let chunks = split_text_with_counts(&text)
+            .into_iter()
+            .map(|(piece, count)| {
+                TextChunk::with_token_count(id, piece, ChunkType::Imported, count)
+            })
+            .collect();
+        replacements.push((ticket, chunks));
+    }
+    cancellation.check_cancelled()?;
+    graph
+        .storage
+        .replace_imported_chunks(replacements, cancellation)
 }
 
 /// Load schemas, import data, and index all objects for FTS5 full-text search.
@@ -220,7 +222,7 @@ pub async fn setup_and_index_with_cancellation(
             dropped_properties: 0,
             validation_errors: 0,
             diagnostics_path: None,
-            chunks_indexed: 0,
+            chunks_indexed: index_committed_imports(graph, &cancellation)?,
         });
     }
 

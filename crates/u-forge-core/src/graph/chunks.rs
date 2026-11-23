@@ -6,11 +6,31 @@ use rusqlite::params;
 
 use crate::types::{ObjectId, TextChunk};
 
+pub(crate) struct ImportIndexTicket {
+    pub(crate) object: ObjectId,
+    version: Vec<u8>,
+}
+
 impl KnowledgeGraphStorage {
+    pub(crate) fn pending_import_index(&self) -> Result<Vec<ImportIndexTicket>> {
+        let conn = self.conn.lock();
+        let mut query = conn.prepare("SELECT object_id, ticket FROM pending_import_index")?;
+        let mut rows = query.query([])?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next()? {
+            pending.push(ImportIndexTicket {
+                object: ObjectId::parse_str(&row.get::<_, String>(0)?)?,
+                version: row.get(1)?,
+            });
+        }
+        Ok(pending)
+    }
+
     /// Replace derived import text atomically; delete triggers retire its FTS and vector rows.
     pub(crate) fn replace_imported_chunks(
         &self,
-        replacements: Vec<(ObjectId, Vec<TextChunk>)>,
+        replacements: Vec<(ImportIndexTicket, Vec<TextChunk>)>,
+        cancellation: &crate::queue::CancellationToken,
     ) -> Result<usize> {
         if replacements.is_empty() {
             return Ok(0);
@@ -22,8 +42,15 @@ impl KnowledgeGraphStorage {
             let mut delete =
                 tx.prepare("DELETE FROM chunks WHERE object_id = ?1 AND chunk_type = 'imported'")?;
             let mut insert = tx.prepare("INSERT INTO chunks (id, object_id, chunk_type, content, token_count, created_at) VALUES (?1, ?2, 'imported', ?3, ?4, ?5)")?;
-            for (object_id, chunks) in replacements {
-                let key = object_id.to_string();
+            let mut acknowledge = tx
+                .prepare("DELETE FROM pending_import_index WHERE object_id = ?1 AND ticket = ?2")?;
+            for (ticket, chunks) in replacements {
+                cancellation.check_cancelled()?;
+                let key = ticket.object.to_string();
+                // Another writer refreshed or consumed the ticket after our snapshot.
+                if acknowledge.execute(params![key, ticket.version])? == 0 {
+                    continue;
+                }
                 delete.execute([&key])?;
                 for chunk in chunks {
                     written += insert.execute(params![
@@ -36,6 +63,7 @@ impl KnowledgeGraphStorage {
                 }
             }
         }
+        cancellation.check_cancelled()?;
         tx.commit()?;
         Ok(written)
     }

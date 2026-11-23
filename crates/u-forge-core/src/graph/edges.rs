@@ -28,6 +28,10 @@ impl KnowledgeGraphStorage {
 
     /// Atomically insert or update a batch of edges.
     pub fn upsert_edges(&self, edges: &[Edge]) -> Result<()> {
+        self.write_import_edges(edges, false)
+    }
+
+    pub(crate) fn write_import_edges(&self, edges: &[Edge], index: bool) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("Failed to begin edge batch")?;
         {
@@ -47,6 +51,10 @@ impl KnowledgeGraphStorage {
                     metadata,
                     edge.created_at.to_rfc3339(),
                 ])?;
+                if index {
+                    mark_import_index(&tx, edge.from)?;
+                    mark_import_index(&tx, edge.to)?;
+                }
             }
         }
         tx.commit().context("Failed to commit edge batch")?;

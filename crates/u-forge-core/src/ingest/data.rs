@@ -25,7 +25,7 @@ use crate::types::*;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,7 +69,7 @@ pub struct IngestionStats {
 pub struct DataIngestion<'a> {
     graph: &'a KnowledgeGraph,
     stats: IngestionStats,
-    pub(super) affected_objects: HashSet<ObjectId>,
+    index_on_commit: bool,
     validation_diagnostics: BTreeMap<String, ImportDiagnosticSummary>,
     dropped_property_diagnostics: BTreeMap<String, ImportDiagnosticSummary>,
     reused_object_diagnostics: BTreeMap<String, ImportDiagnosticSummary>,
@@ -171,7 +171,7 @@ impl<'a> DataIngestion<'a> {
     pub fn new(graph: &'a KnowledgeGraph) -> Self {
         Self {
             graph,
-            affected_objects: HashSet::new(),
+            index_on_commit: false,
             stats: IngestionStats {
                 nodes_parsed: 0,
                 edges_parsed: 0,
@@ -190,6 +190,13 @@ impl<'a> DataIngestion<'a> {
             reused_object_diagnostics: BTreeMap::new(),
             diagnostic_records: Vec::new(),
             schema_cache: None,
+        }
+    }
+
+    pub(super) fn for_indexed_import(graph: &'a KnowledgeGraph) -> Self {
+        Self {
+            index_on_commit: true,
+            ..Self::new(graph)
         }
     }
 
@@ -499,7 +506,11 @@ impl<'a> DataIngestion<'a> {
             .iter()
             .map(|pending| pending.metadata.clone())
             .collect::<Vec<_>>();
-        if self.graph.add_objects(metadata).is_ok() {
+        if self
+            .graph
+            .import_objects(metadata, self.index_on_commit)
+            .is_ok()
+        {
             for pending in pending {
                 let candidate = ResolutionCandidate {
                     id: pending.metadata.id,
@@ -509,7 +520,6 @@ impl<'a> DataIngestion<'a> {
                 push_candidate(name_to_candidates, candidate.clone());
                 push_source_candidate(source_id_to_candidates, &pending.source_id, candidate);
                 id_to_type.insert(pending.metadata.id, pending.node_type);
-                self.affected_objects.insert(pending.metadata.id);
                 self.stats.objects_created += 1;
             }
             return Ok(());
@@ -517,8 +527,12 @@ impl<'a> DataIngestion<'a> {
 
         for pending in pending {
             cancellation.check_cancelled()?;
-            match self.graph.add_object(pending.metadata.clone()) {
-                Ok(id) => {
+            match self
+                .graph
+                .import_objects(vec![pending.metadata.clone()], self.index_on_commit)
+            {
+                Ok(()) => {
+                    let id = pending.metadata.id;
                     let candidate = ResolutionCandidate {
                         id,
                         object_type: pending.node_type.clone(),
@@ -527,7 +541,6 @@ impl<'a> DataIngestion<'a> {
                     push_candidate(name_to_candidates, candidate.clone());
                     push_source_candidate(source_id_to_candidates, &pending.source_id, candidate);
                     id_to_type.insert(id, pending.node_type);
-                    self.affected_objects.insert(id);
                     self.stats.objects_created += 1;
                 }
                 Err(e) => {
@@ -703,25 +716,19 @@ impl<'a> DataIngestion<'a> {
             .iter()
             .map(|pending| pending.edge.clone())
             .collect::<Vec<_>>();
-        if self.graph.connect_edges(edges).is_ok() {
-            for item in &pending {
-                self.affected_objects.extend([item.edge.from, item.edge.to]);
-            }
+        if self.graph.import_edges(edges, self.index_on_commit).is_ok() {
             self.stats.relationships_created += pending.len();
             return Ok(());
         }
 
         for pending in pending {
             cancellation.check_cancelled()?;
-            match self.graph.connect_objects_str(
-                pending.edge.from,
-                pending.edge.to,
-                &pending.edge_type,
-            ) {
+            match self
+                .graph
+                .import_edges(vec![pending.edge.clone()], self.index_on_commit)
+            {
                 Ok(()) => {
                     self.stats.relationships_created += 1;
-                    self.affected_objects
-                        .extend([pending.edge.from, pending.edge.to]);
                 }
                 Err(e) => {
                     let error = e.to_string();

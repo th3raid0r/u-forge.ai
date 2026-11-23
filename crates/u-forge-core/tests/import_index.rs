@@ -4,15 +4,7 @@ use u_forge_core::{
     StorageConfig, ingest::import_data_only,
 };
 
-#[tokio::test]
-async fn unchanged_location_does_not_append_chunks() {
-    let dir = TempDir::new().unwrap();
-    let graph = KnowledgeGraph::with_storage_config(&StorageConfig {
-        db_path: dir.path().into(),
-        embedding_dimensions: 4,
-        high_quality_embedding_dimensions: 8,
-    })
-    .unwrap();
+fn save_schema(graph: &KnowledgeGraph) {
     let mut schema = SchemaDefinition::new("world".into(), "1".into(), "fixture".into());
     schema.add_object_type(
         "location".into(),
@@ -27,6 +19,107 @@ async fn unchanged_location_does_not_append_chunks() {
             .with_target_types(vec!["location".into()]),
     );
     graph.get_schema_manager().save_schema(&schema).unwrap();
+}
+
+#[tokio::test]
+async fn same_file_retry_indexes_reused_node_after_failed_diagnostics() {
+    let dir = TempDir::new().unwrap();
+    let graph = KnowledgeGraph::new(dir.path()).unwrap();
+    save_schema(&graph);
+    let input = dir.path().join("world.jsonl");
+    std::fs::write(&input, concat!(
+        r#"{"entitytype":"node","id":"town","nodetype":"location","properties":{"name":"Westhaven"}}"#,
+        "\n",
+        r#"{"entitytype":"node","id":"invalid","nodetype":"location","properties":{}}"#,
+    )).unwrap();
+    let obstruction = dir.path().join(".u-forge-import-diagnostics");
+    std::fs::write(&obstruction, "").unwrap();
+    assert!(
+        import_data_only(&graph, &input)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("diagnostics directory")
+    );
+    assert_eq!(graph.get_stats().unwrap().chunk_count, 0);
+    std::fs::remove_file(obstruction).unwrap();
+    // An index-write failure must roll back the ticket acknowledgement too.
+    let db = rusqlite::Connection::open(dir.path().join("knowledge.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_import BEFORE INSERT ON chunks BEGIN SELECT RAISE(ABORT, 'forced index failure'); END;").unwrap();
+    assert!(
+        import_data_only(&graph, &input)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("forced index failure")
+    );
+    db.execute_batch("DROP TRIGGER reject_import").unwrap();
+    let retry = import_data_only(&graph, &input).await.unwrap();
+    assert_eq!(
+        (
+            retry.objects_created,
+            retry.objects_reused,
+            retry.object_records_skipped
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(retry.chunks_indexed, 1);
+    let hits = graph.search_chunks_fts("Westhaven", 4).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        import_data_only(&graph, &input)
+            .await
+            .unwrap()
+            .chunks_indexed,
+        0
+    );
+    assert_eq!(graph.search_chunks_fts("Westhaven", 4).unwrap(), hits);
+}
+
+#[tokio::test]
+async fn retry_after_diagnostics_failure_recovers_committed_index_work() {
+    let dir = TempDir::new().unwrap();
+    let graph = KnowledgeGraph::new(dir.path()).unwrap();
+    save_schema(&graph);
+    let input = dir.path().join("world.jsonl");
+    let town =
+        r#"{"entitytype":"node","id":"town","nodetype":"location","properties":{"name":"Town"}}"#;
+    let port =
+        r#"{"entitytype":"node","id":"port","nodetype":"location","properties":{"name":"Port"}}"#;
+    let edge = r#"{"entitytype":"edge","from":"Port","to":"Town","edgeType":"borders"}"#;
+    std::fs::write(&input, town).unwrap();
+    import_data_only(&graph, &input).await.unwrap();
+    let obstruction = dir.path().join(".u-forge-import-diagnostics");
+    std::fs::write(&obstruction, "not a directory").unwrap();
+    // Reused Town emits a diagnostic after Port and its edge commit.
+    std::fs::write(&input, [town, port, edge].join("\n")).unwrap();
+    let error = import_data_only(&graph, &input).await.unwrap_err();
+    assert!(error.to_string().contains("diagnostics directory"));
+    assert_eq!(graph.get_stats().unwrap().node_count, 2);
+    assert!(graph.search_chunks_fts("Port", 4).unwrap().is_empty());
+    drop(graph);
+    let graph = KnowledgeGraph::new(dir.path()).unwrap();
+    std::fs::remove_file(obstruction).unwrap();
+    // A corrected retry need not replay the edge to repair both endpoints.
+    std::fs::write(&input, port).unwrap();
+    let retry = import_data_only(&graph, &input).await.unwrap();
+    assert_eq!(retry.objects_reused, 1);
+    assert_eq!(retry.chunks_indexed, 2);
+    assert_eq!(graph.search_chunks_fts("borders", 4).unwrap().len(), 2);
+    let repeat = import_data_only(&graph, &input).await.unwrap();
+    assert_eq!(repeat.chunks_indexed, 0);
+}
+
+#[tokio::test]
+async fn unchanged_location_does_not_append_chunks() {
+    let dir = TempDir::new().unwrap();
+    let graph = KnowledgeGraph::with_storage_config(&StorageConfig {
+        db_path: dir.path().into(),
+        embedding_dimensions: 4,
+        high_quality_embedding_dimensions: 8,
+    })
+    .unwrap();
+    save_schema(&graph);
     let input = dir.path().join("locations.jsonl");
     let record = |i| {
         format!(
