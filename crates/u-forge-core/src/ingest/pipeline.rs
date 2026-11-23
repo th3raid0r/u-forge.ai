@@ -4,7 +4,6 @@
 //! with schemas, data, and FTS5 text chunks in a single call.
 
 use anyhow::Result;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{info, warn};
@@ -13,7 +12,8 @@ use crate::KnowledgeGraph;
 use crate::ingest::DataIngestion;
 use crate::queue::CancellationToken;
 use crate::schema::SchemaIngestion;
-use crate::types::{ChunkType, ObjectId};
+use crate::text::split_text_with_counts;
+use crate::types::{ChunkType, TextChunk};
 
 /// Outcome of a [`setup_and_index`] call.
 #[derive(Debug)]
@@ -137,57 +137,28 @@ async fn import_loaded_data<P: AsRef<Path>>(
     info!("Indexing text for full-text search");
     cancellation.check_cancelled()?;
     let index_start = Instant::now();
-    let load_objects_start = Instant::now();
-    let all_objects = graph.get_all_objects()?;
-    let load_objects_duration_ms = load_objects_start.elapsed().as_millis() as u64;
-
-    let edge_context_start = Instant::now();
-    let id_to_name: HashMap<ObjectId, String> =
-        all_objects.iter().map(|o| (o.id, o.name.clone())).collect();
-    let mut edges_by_object: HashMap<ObjectId, Vec<String>> = HashMap::new();
-    let all_edges = graph.get_all_edges()?;
-    let all_edges_count = all_edges.len();
-    for edge in all_edges {
+    let affected = &ingestion.affected_objects;
+    let mut replacements = Vec::with_capacity(affected.len());
+    for &id in affected {
         cancellation.check_cancelled()?;
-        let Some(from_name) = id_to_name.get(&edge.from) else {
-            continue;
-        };
-        let Some(to_name) = id_to_name.get(&edge.to) else {
-            continue;
-        };
-        let line = format!("{} {} {}", from_name, edge.edge_type.as_str(), to_name);
-        edges_by_object
-            .entry(edge.from)
-            .or_default()
-            .push(line.clone());
-        edges_by_object.entry(edge.to).or_default().push(line);
+        let object = graph
+            .get_object(id)?
+            .ok_or_else(|| anyhow::anyhow!("Missing imported object {id}"))?;
+        let text = object.flatten_for_embedding(&graph.storage.import_edge_lines(id)?);
+        let chunks = split_text_with_counts(&text)
+            .into_iter()
+            .map(|(piece, count)| {
+                TextChunk::with_token_count(id, piece, ChunkType::Imported, count)
+            })
+            .collect();
+        replacements.push((id, chunks));
     }
-    let edge_context_duration_ms = edge_context_start.elapsed().as_millis() as u64;
-
-    let flatten_start = Instant::now();
-    let mut chunks_indexed = 0usize;
-    let mut chunk_inputs = Vec::with_capacity(all_objects.len());
-    for obj in &all_objects {
-        cancellation.check_cancelled()?;
-        let edge_lines = edges_by_object.remove(&obj.id).unwrap_or_default();
-        let text = obj.flatten_for_embedding(&edge_lines);
-        chunk_inputs.push((obj.id, text, ChunkType::Imported));
-    }
-    let flatten_duration_ms = flatten_start.elapsed().as_millis() as u64;
-
-    let chunk_write_start = Instant::now();
     cancellation.check_cancelled()?;
-    chunks_indexed += graph.add_text_chunks(chunk_inputs)?.len();
-    let chunk_write_duration_ms = chunk_write_start.elapsed().as_millis() as u64;
+    let chunks_indexed = graph.storage.replace_imported_chunks(replacements)?;
     let index_duration_ms = index_start.elapsed().as_millis() as u64;
     info!(
         chunks_indexed,
-        objects_indexed = all_objects.len(),
-        edges_indexed = all_edges_count,
-        load_objects_duration_ms,
-        edge_context_duration_ms,
-        flatten_duration_ms,
-        chunk_write_duration_ms,
+        objects_indexed = affected.len(),
         duration_ms = index_duration_ms,
         "FTS indexing complete"
     );

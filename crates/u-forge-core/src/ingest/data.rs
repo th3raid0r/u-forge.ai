@@ -25,7 +25,7 @@ use crate::types::*;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,6 +69,7 @@ pub struct IngestionStats {
 pub struct DataIngestion<'a> {
     graph: &'a KnowledgeGraph,
     stats: IngestionStats,
+    pub(super) affected_objects: HashSet<ObjectId>,
     validation_diagnostics: BTreeMap<String, ImportDiagnosticSummary>,
     dropped_property_diagnostics: BTreeMap<String, ImportDiagnosticSummary>,
     reused_object_diagnostics: BTreeMap<String, ImportDiagnosticSummary>,
@@ -170,6 +171,7 @@ impl<'a> DataIngestion<'a> {
     pub fn new(graph: &'a KnowledgeGraph) -> Self {
         Self {
             graph,
+            affected_objects: HashSet::new(),
             stats: IngestionStats {
                 nodes_parsed: 0,
                 edges_parsed: 0,
@@ -507,6 +509,7 @@ impl<'a> DataIngestion<'a> {
                 push_candidate(name_to_candidates, candidate.clone());
                 push_source_candidate(source_id_to_candidates, &pending.source_id, candidate);
                 id_to_type.insert(pending.metadata.id, pending.node_type);
+                self.affected_objects.insert(pending.metadata.id);
                 self.stats.objects_created += 1;
             }
             return Ok(());
@@ -524,6 +527,7 @@ impl<'a> DataIngestion<'a> {
                     push_candidate(name_to_candidates, candidate.clone());
                     push_source_candidate(source_id_to_candidates, &pending.source_id, candidate);
                     id_to_type.insert(id, pending.node_type);
+                    self.affected_objects.insert(id);
                     self.stats.objects_created += 1;
                 }
                 Err(e) => {
@@ -700,6 +704,9 @@ impl<'a> DataIngestion<'a> {
             .map(|pending| pending.edge.clone())
             .collect::<Vec<_>>();
         if self.graph.connect_edges(edges).is_ok() {
+            for item in &pending {
+                self.affected_objects.extend([item.edge.from, item.edge.to]);
+            }
             self.stats.relationships_created += pending.len();
             return Ok(());
         }
@@ -713,6 +720,8 @@ impl<'a> DataIngestion<'a> {
             ) {
                 Ok(()) => {
                     self.stats.relationships_created += 1;
+                    self.affected_objects
+                        .extend([pending.edge.from, pending.edge.to]);
                 }
                 Err(e) => {
                     let error = e.to_string();

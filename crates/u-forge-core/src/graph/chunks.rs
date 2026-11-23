@@ -7,6 +7,39 @@ use rusqlite::params;
 use crate::types::{ObjectId, TextChunk};
 
 impl KnowledgeGraphStorage {
+    /// Replace derived import text atomically; delete triggers retire its FTS and vector rows.
+    pub(crate) fn replace_imported_chunks(
+        &self,
+        replacements: Vec<(ObjectId, Vec<TextChunk>)>,
+    ) -> Result<usize> {
+        if replacements.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut written = 0;
+        {
+            let mut delete =
+                tx.prepare("DELETE FROM chunks WHERE object_id = ?1 AND chunk_type = 'imported'")?;
+            let mut insert = tx.prepare("INSERT INTO chunks (id, object_id, chunk_type, content, token_count, created_at) VALUES (?1, ?2, 'imported', ?3, ?4, ?5)")?;
+            for (object_id, chunks) in replacements {
+                let key = object_id.to_string();
+                delete.execute([&key])?;
+                for chunk in chunks {
+                    written += insert.execute(params![
+                        chunk.id.to_string(),
+                        key,
+                        chunk.content,
+                        chunk.token_count as i64,
+                        chunk.created_at.to_rfc3339()
+                    ])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
     /// Insert or update a text chunk.
     ///
     /// Uses `ON CONFLICT(id) DO UPDATE SET …` rather than `INSERT OR REPLACE`
