@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, labeled, unlabeled]
     paths-ignore:
       - '**/*.md'
       - '**/*.mdc'
@@ -10,11 +11,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Unrelated label changes must not cancel a real build for this PR.
+  group: ci-${{ github.event.label.name && github.event.label.name != 'ready for merge' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 jobs:
   canonical:
+    if: >-
+      github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'ready for merge') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ready for merge') &&
+      github.event.action != 'unlabeled'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
