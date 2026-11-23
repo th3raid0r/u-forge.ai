@@ -9,6 +9,14 @@ use crate::types::{ObjectId, ObjectMetadata};
 impl KnowledgeGraphStorage {
     /// Atomically insert or update a batch of nodes.
     pub fn upsert_nodes(&self, metadata: &[ObjectMetadata]) -> Result<()> {
+        self.write_import_nodes(metadata, false)
+    }
+
+    pub(crate) fn write_import_nodes(
+        &self,
+        metadata: &[ObjectMetadata],
+        index: bool,
+    ) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("Failed to begin node batch")?;
         {
@@ -33,6 +41,9 @@ impl KnowledgeGraphStorage {
                     node.created_at.to_rfc3339(),
                     node.updated_at.to_rfc3339(),
                 ])?;
+                if index {
+                    mark_import_index(&tx, node.id)?;
+                }
             }
         }
         tx.commit().context("Failed to commit node batch")?;

@@ -214,7 +214,12 @@ impl KnowledgeGraph {
         Ok(id)
     }
 
+    #[cfg(test)]
     pub(crate) fn add_objects(&self, metadata: Vec<ObjectMetadata>) -> Result<()> {
+        self.import_objects(metadata, false)
+    }
+
+    fn import_objects(&self, metadata: Vec<ObjectMetadata>, index: bool) -> Result<()> {
         for node in &metadata {
             self.schema_manager.validate_object_cached_strict(node)?;
         }
@@ -227,7 +232,7 @@ impl KnowledgeGraph {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.storage.upsert_nodes(&metadata)?;
+        self.storage.write_import_nodes(&metadata, index)?;
         for change in changes {
             self.emit_change(change);
         }
@@ -299,11 +304,11 @@ impl KnowledgeGraph {
         self.upsert_edge_validated(Edge::new(from, to, EdgeType::new(edge_type)))
     }
 
-    pub(crate) fn connect_edges(&self, edges: Vec<Edge>) -> Result<()> {
+    fn import_edges(&self, edges: Vec<Edge>, index: bool) -> Result<()> {
         for edge in &edges {
             self.validate_edge_for_mutation(edge)?;
         }
-        self.storage.upsert_edges(&edges)?;
+        self.storage.write_import_edges(&edges, index)?;
         for edge in edges {
             self.emit_change(GraphChange::EdgeUpserted(edge));
         }

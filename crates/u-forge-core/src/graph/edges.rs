@@ -7,8 +7,31 @@ use rusqlite::params;
 use crate::types::{Edge, ObjectId};
 
 impl KnowledgeGraphStorage {
+    /// Fetch complete relationship lines for one object's import index.
+    pub(crate) fn import_edge_lines(&self, id: ObjectId) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT src.name, e.edge_type, dst.name FROM edges e
+             JOIN nodes src ON src.id = e.source_id JOIN nodes dst ON dst.id = e.target_id
+             WHERE e.source_id = ?1 OR e.target_id = ?1 ORDER BY e.rowid",
+        )?;
+        let lines = stmt.query_map([id.to_string()], |row| {
+            Ok(format!(
+                "{} {} {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?
+            ))
+        })?;
+        Ok(lines.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Atomically insert or update a batch of edges.
     pub fn upsert_edges(&self, edges: &[Edge]) -> Result<()> {
+        self.write_import_edges(edges, false)
+    }
+
+    pub(crate) fn write_import_edges(&self, edges: &[Edge], index: bool) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("Failed to begin edge batch")?;
         {
@@ -28,6 +51,10 @@ impl KnowledgeGraphStorage {
                     metadata,
                     edge.created_at.to_rfc3339(),
                 ])?;
+                if index {
+                    mark_import_index(&tx, edge.from)?;
+                    mark_import_index(&tx, edge.to)?;
+                }
             }
         }
         tx.commit().context("Failed to commit edge batch")?;

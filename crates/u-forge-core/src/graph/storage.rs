@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS edges (
     UNIQUE(source_id, target_id, edge_type)
 );
 
+-- Only indexed imports enqueue work. A new ticket invalidates older snapshots
+-- even when an object is dirtied again while another importer flattens it.
+CREATE TABLE IF NOT EXISTS pending_import_index (
+    object_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    ticket BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS chunks (
     id          TEXT PRIMARY KEY,
     object_id   TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -289,6 +296,13 @@ pub struct GraphStats {
 }
 
 // ─── Helper functions (pub(super) for sibling modules) ────────────────────────
+
+pub(super) fn mark_import_index(tx: &rusqlite::Transaction<'_>, id: ObjectId) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT OR REPLACE INTO pending_import_index(object_id, ticket) VALUES (?1, randomblob(16))",
+    )?.execute([id.to_string()])?;
+    Ok(())
+}
 
 /// Serialise a `ChunkType` to its snake_case storage string.
 pub(super) fn chunk_type_to_str(ct: &ChunkType) -> &'static str {
