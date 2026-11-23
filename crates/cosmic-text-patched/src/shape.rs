@@ -1481,7 +1481,7 @@ impl ShapeLine {
         }
 
         // Create the LayoutLines using the ranges inside visual lines
-        let align = align.unwrap_or({ if self.rtl { Align::Right } else { Align::Left } });
+        let align = align.unwrap_or(if self.rtl { Align::Right } else { Align::Left });
 
         let line_width = match width_opt {
             Some(width) => width,
