@@ -259,11 +259,12 @@ impl GraphAgent {
         cancellation: CancellationToken,
         budget: budget::BudgetController,
     ) -> rig::agent::Agent<rig::providers::openai::CompletionModel> {
-        let initial_preamble = budget.initial_preamble();
+        // The hook adds schema context after measuring the first (and every
+        // subsequent) request, so don't format a provisional schema here.
         let mut builder = self
             .client
             .agent(model_id)
-            .preamble(&initial_preamble)
+            .preamble(&budget.base_preamble())
             .add_hook(budget);
         if let Some(temp) = params.temperature {
             builder = builder.temperature(temp);
