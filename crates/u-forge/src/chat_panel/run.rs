@@ -179,19 +179,24 @@ impl ChatRunReducer {
 }
 
 impl ChatPanel {
-    pub(super) fn shutdown_run(&mut self, cx: &mut App) {
-        let Some(parent) = self.stream_cancellation.take() else {
-            return;
-        };
-        parent.cancel();
+    pub(crate) fn shutdown_run(&mut self, cx: &mut App) {
+        let parent = self.stream_cancellation.take();
+        if let Some(parent) = &parent {
+            parent.cancel();
+        }
         // No GPUI work is needed for producer termination. Quit observers
         // have a short polling deadline, so join before returning to GPUI.
-        if let Some(completion) = self.stream_completion.take() {
+        for completion in self
+            .retired_runs
+            .drain(..)
+            .chain(self.stream_completion.take())
+        {
             let _ = self.tokio_rt.block_on(completion);
         }
-        if let Some(ChatRunEvent::Terminal(terminal)) = self
-            .run_reducer
-            .admit(ChatRunEvent::Terminal(ChatRunTerminal::Cancelled))
+        if parent.is_some()
+            && let Some(ChatRunEvent::Terminal(terminal)) = self
+                .run_reducer
+                .admit(ChatRunEvent::Terminal(ChatRunTerminal::Cancelled))
         {
             self.apply_run_terminal(terminal, cx);
         }

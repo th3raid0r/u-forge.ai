@@ -257,10 +257,7 @@ fn prepare_lemonade_chat(
         })
         .collect::<Vec<_>>();
     let gpu_manager = GpuResourceManager::new();
-    let provider = all_llm.get(preferred_idx).map(|selected| {
-        let gpu = (selected_model_device(selected) == "gpu").then(|| Arc::clone(&gpu_manager));
-        LemonadeChatProvider::from_connection(connection.clone(), &selected.model_id, gpu)
-    });
+    let provider = picker_provider(&connection, all_llm.get(preferred_idx), gpu_manager);
     LemonadeChatActivation {
         provider,
         models,
@@ -418,10 +415,7 @@ async fn activate_lemonade_capabilities(
         })
         .collect::<Vec<_>>();
 
-    let chat_provider = all_llm.get(preferred_idx).map(|selected| {
-        let gpu = (selected_model_device(selected) == "gpu").then(|| Arc::clone(&gpu_manager));
-        LemonadeChatProvider::from_connection(connection.clone(), &selected.model_id, gpu)
-    });
+    let chat_provider = picker_provider(&connection, all_llm.get(preferred_idx), gpu_manager);
     tracing::debug!(
         llm_count = all_llm.len(),
         preferred_idx,
@@ -434,6 +428,18 @@ async fn activate_lemonade_capabilities(
         llm_models,
         preferred_idx,
         runtime: Arc::new(LemonadeRuntime::from_connection(connection)),
+    })
+}
+
+// The picker may switch devices after discovery. Keep the shared manager
+// available regardless of the preferred model; select the guard per run.
+fn picker_provider(
+    connection: &Arc<LemonadeConnection>,
+    preferred: Option<&u_forge_core::lemonade::SelectedModel>,
+    gpu: Arc<GpuResourceManager>,
+) -> Option<LemonadeChatProvider> {
+    preferred.map(|model| {
+        LemonadeChatProvider::from_connection(connection.clone(), &model.model_id, Some(gpu))
     })
 }
 
@@ -1165,18 +1171,13 @@ impl AppView {
             panel.set_queues(Some(queue.clone()), hq_queue);
         });
 
-        let agent_gpu = chat_provider
-            .as_ref()
-            .and_then(|provider| provider.gpu.clone());
-
         if has_chat {
-            match GraphAgent::new_with_connection_and_gpu(
+            match GraphAgent::new_with_connection(
                 runtime.connection().clone(),
                 self.state.graph.clone(),
                 Arc::new(queue),
                 hq_arc,
                 self.state.app_config.chat.system_prompt.clone(),
-                agent_gpu,
             ) {
                 Ok(agent) => self
                     .chat_panel
@@ -1505,6 +1506,15 @@ mod tests {
             reasoning_capable: false,
             diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn preferred_npu_keeps_shared_device_available_for_gpu_selection() {
+        let connection = Arc::new(LemonadeConnection::external("http://127.0.0.1:1/v1").unwrap());
+        let manager = GpuResourceManager::new();
+        let npu = selected("npu", "flm", None);
+        let picker = picker_provider(&connection, Some(&npu), manager.clone()).unwrap();
+        assert!(Arc::ptr_eq(&manager, picker.gpu.as_ref().unwrap()));
     }
 
     #[test]

@@ -34,6 +34,8 @@ pub type ChatRunOutcome = Result<Option<String>, ChatRunError>;
 pub type ChatRunCompletion = Shared<BoxFuture<'static, ChatRunOutcome>>;
 
 pub struct ChatRunContext {
+    /// The shared manager for this run's selected device, not the picker default.
+    pub gpu: Option<Arc<super::GpuResourceManager>>,
     pub profile: Option<(Arc<LemonadeRuntime>, LemonadeRuntimeProfile)>,
     pub cancellation: CancellationToken,
 }
@@ -75,7 +77,7 @@ impl ChatRunContext {
     /// destruction of its futures and guards, not just a protocol finish tag.
     pub fn start<F, Fut>(self, drive: F) -> ChatRunHandle
     where
-        F: FnOnce(ChatEventSink) -> Fut + Send + 'static,
+        F: FnOnce(ChatEventSink, Option<Arc<super::GpuResourceManager>>) -> Fut + Send + 'static,
         Fut: Future<Output = ChatRunOutcome> + Send + 'static,
     {
         let (tx, events) = mpsc::channel(64);
@@ -92,10 +94,13 @@ impl ChatRunContext {
                     ),
                     None => None,
                 };
-                drive(ChatEventSink {
-                    tx: tx.clone(),
-                    cancellation: parent.clone(),
-                })
+                drive(
+                    ChatEventSink {
+                        tx: tx.clone(),
+                        cancellation: parent.clone(),
+                    },
+                    self.gpu,
+                )
                 .await
             };
             let outcome = tokio::select! {

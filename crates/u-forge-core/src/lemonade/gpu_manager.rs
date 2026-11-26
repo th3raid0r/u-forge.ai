@@ -110,6 +110,10 @@ impl GpuResourceManager {
     /// It will never return an error — it simply waits for the GPU to become available.
     pub async fn begin_llm(self: &Arc<Self>) -> LlmGuard {
         loop {
+            // notify_waiters() stores no permit. Create the future before
+            // inspecting the device so a release between unlock and await
+            // cannot strand the next model turn on an already idle GPU.
+            let released = self.notify.notified();
             // Scope: hold the parking_lot mutex only briefly, never across .await.
             {
                 let mut w = self.workload.lock();
@@ -135,7 +139,7 @@ impl GpuResourceManager {
                 }
             }
             // Suspend and wake up when a guard is dropped.
-            self.notify.notified().await;
+            released.await;
         }
     }
 

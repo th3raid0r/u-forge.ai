@@ -103,7 +103,6 @@ pub struct GraphAgent {
     tool_guidance: String,
     schema: Option<u_forge_core::SchemaDefinition>,
     tool_definition_tokens: TokenEstimate,
-    pub(crate) gpu: Option<Arc<u_forge_core::GpuResourceManager>>,
 }
 
 impl GraphAgent {
@@ -128,17 +127,6 @@ impl GraphAgent {
         queue: Arc<InferenceQueue>,
         hq_queue: Option<Arc<InferenceQueue>>,
         system_prompt: impl Into<String>,
-    ) -> anyhow::Result<Self> {
-        Self::new_with_connection_and_gpu(connection, graph, queue, hq_queue, system_prompt, None)
-    }
-
-    pub fn new_with_connection_and_gpu(
-        connection: Arc<u_forge_core::lemonade::LemonadeConnection>,
-        graph: Arc<KnowledgeGraph>,
-        queue: Arc<InferenceQueue>,
-        hq_queue: Option<Arc<InferenceQueue>>,
-        system_prompt: impl Into<String>,
-        gpu: Option<Arc<u_forge_core::GpuResourceManager>>,
     ) -> anyhow::Result<Self> {
         let client = CompletionsClient::builder()
             .api_key(connection.api_credential().unwrap_or("lemonade"))
@@ -172,7 +160,6 @@ impl GraphAgent {
             tool_guidance,
             schema,
             tool_definition_tokens: budget::estimate_tool_definitions(&tool_definitions),
-            gpu,
         })
     }
 

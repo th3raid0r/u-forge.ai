@@ -19,13 +19,12 @@ async fn run_request(url: &str, params: AgentParams) -> ChatRunOutcome {
     let graph = Arc::new(u_forge_core::KnowledgeGraph::new(temp.path()).unwrap());
     let queue = Arc::new(u_forge_core::queue::InferenceQueueBuilder::new().build());
     let agent = GraphAgent::new(url, graph, queue, None, "system").unwrap();
-    let mut run = agent.start_run(AgentRunRequest {
+    let mut run = Arc::new(agent).start_run(AgentRunRequest {
         model_id: "model".into(),
         prompt: "search".into(),
         history: vec![],
         reasoning: ReasoningPolicy::Default,
         params,
-        uses_gpu: false,
         context: context(),
     });
     while run.events.recv().await.is_some() {}
@@ -77,15 +76,29 @@ async fn unchanged_tool_call_ends_with_repeat_not_rig_failure() {
     server.await.unwrap();
 }
 
+#[test]
+fn pending_repeat_observation_does_not_mask_completion_error() {
+    let error = rig::completion::CompletionError::ResponseError("upstream unavailable".into());
+    let result = agent_error(
+        error.into(),
+        Some(BudgetTermination::Repeat("repeat".into())),
+        Default::default(),
+    );
+    assert!(
+        matches!(result, ChatRunError::Provider(message) if message.contains("upstream unavailable"))
+    );
+}
+
 fn context() -> ChatRunContext {
     ChatRunContext {
         profile: None,
+        gpu: None,
         cancellation: CancellationToken::new(),
     }
 }
 
 fn run(stream: StreamingResult<()>, gpu: Arc<GpuResourceManager>) -> ChatRunHandle {
-    context().start(move |sink| async move {
+    context().start(move |sink, _| async move {
         let budget = BudgetController::new(
             Default::default(),
             None,

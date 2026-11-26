@@ -23,19 +23,17 @@ pub struct AgentRunRequest {
     pub history: Vec<HistoryMessage>,
     pub reasoning: ReasoningPolicy,
     pub params: AgentParams,
-    pub uses_gpu: bool,
     pub context: ChatRunContext,
 }
 
 impl GraphAgent {
     /// Start the whole Rig operation, including profile acquisition, on Tokio.
-    pub fn start_run(&self, request: AgentRunRequest) -> ChatRunHandle {
-        let graph_agent = self.clone();
+    pub fn start_run(self: Arc<Self>, request: AgentRunRequest) -> ChatRunHandle {
         let parent = request.context.cancellation.clone();
-        request.context.start(move |sink| async move {
+        request.context.start(move |sink, gpu| async move {
             let (budget, history) =
-                graph_agent.prepare_budget(&request.prompt, &request.history, &request.params);
-            let agent = graph_agent.build_agent_with_params(
+                self.prepare_budget(&request.prompt, &request.history, &request.params);
+            let agent = self.build_agent_with_params(
                 &request.model_id,
                 request.reasoning,
                 &request.params,
@@ -50,7 +48,7 @@ impl GraphAgent {
                     _ => rig::completion::message::Message::user(&m.content),
                 })
                 .collect();
-            let gpu = graph_agent.gpu.as_ref().filter(|_| request.uses_gpu);
+            let gpu = gpu.as_ref();
             let guard = acquire_gpu(gpu).await;
             let stream = agent
                 .stream_prompt(&request.prompt)
@@ -69,13 +67,16 @@ async fn acquire_gpu(gpu: Option<&Arc<GpuResourceManager>>) -> Option<LlmGuard> 
     }
 }
 
-fn agent_error(error: StreamingError, budget: &BudgetController) -> ChatRunError {
+fn agent_error(
+    error: StreamingError,
+    stop: Option<BudgetTermination>,
+    diagnostics: u_forge_core::lemonade::AgentBudgetDiagnostics,
+) -> ChatRunError {
     // Only a deliberate hook stop can turn a Rig error into a policy outcome.
     // A transport/tool failure must not inherit a pending repeat observation.
     if matches!(&error, StreamingError::Prompt(e) if matches!(**e, PromptError::PromptCancelled { .. }))
     {
-        let diagnostics = budget.diagnostics();
-        match budget.termination() {
+        match stop {
             Some(BudgetTermination::Budget(reason)) => {
                 return ChatRunError::ContextOverflow {
                     reason,
@@ -116,7 +117,7 @@ async fn drive_turns<R>(
             .next()
             .await
             .ok_or(ChatRunError::Incomplete("Agent"))?
-            .map_err(|e| agent_error(e, budget))?;
+            .map_err(|e| agent_error(e, budget.termination(), budget.diagnostics()))?;
         match item {
             MultiTurnStreamItem::StreamAssistantItem(content) => match content {
                 StreamedAssistantContent::Text(t) => {

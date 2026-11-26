@@ -481,8 +481,9 @@ impl LemonadeChatProvider {
     /// Direct chat uses the same ordered events and joined completion as Rig,
     /// without routing either producer through the other's protocol.
     pub fn start_run(&self, req: ChatRequest, context: ChatRunContext) -> ChatRunHandle {
-        let provider = self.clone();
-        context.start(move |sink| async move {
+        let mut provider = self.clone();
+        context.start(move |sink, gpu| async move {
+            provider.gpu = gpu;
             let finished = provider
                 .drive_stream(req, |token| send_direct_event(&sink, token))
                 .await
@@ -971,6 +972,7 @@ mod tests {
             let mut run = provider.start_run(
                 ChatRequest::new(vec![ChatMessage::user("ping")]),
                 ChatRunContext {
+                    gpu: Some(gpu.clone()),
                     profile: None,
                     cancellation: Default::default(),
                 },

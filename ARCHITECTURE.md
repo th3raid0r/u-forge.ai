@@ -418,7 +418,8 @@ AppView
 an awaitable driver outcome. Completion witnesses release of the profile lease
 and device guard. Direct finish reasons do not truncate trailing usage. Rig
 releases the GPU for a whole tool batch and reacquires before the next turn.
-Stop/close cancels the parent (also passed to queue-backed tools); receiver
+Stop or panel destruction cancels the parent (also passed to queue-backed
+tools); hiding the dock is a visibility change, not destruction. Receiver
 closure is a fallback. One GPUI observer drains events before awaiting
 completion. Superseded observers finish without presenting into later
 generations. The reducer admits one terminal transition and persists it;

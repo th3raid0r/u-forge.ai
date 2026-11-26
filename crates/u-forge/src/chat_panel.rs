@@ -99,6 +99,9 @@ pub(crate) struct ChatPanel {
     streaming: bool,
     /// UI observer. Retired observers drain to completion without presenting.
     stream_completion: Option<ChatRunCompletion>,
+    // Superseded observers normally join themselves. Keep their completion
+    // available if shutdown races their last poll.
+    retired_runs: Vec<ChatRunCompletion>,
     stream_task: Option<gpui::Task<()>>,
     /// Explicit owner for runtime loading, provider streams, and agent tools.
     stream_cancellation: Option<CancellationToken>,
@@ -324,11 +327,6 @@ impl ChatPanel {
 
         cx.on_release(|panel: &mut Self, app| panel.shutdown_run(app))
             .detach();
-        cx.on_app_quit(|panel: &mut Self, cx| {
-            panel.shutdown_run(cx);
-            async {}
-        })
-        .detach();
 
         let submit_sub = cx.subscribe(&input_field, |this: &mut Self, _, _ev: &TextSubmit, cx| {
             this.do_send(cx);
@@ -374,6 +372,7 @@ impl ChatPanel {
             streaming: false,
             stream_task: None,
             stream_completion: None,
+            retired_runs: Vec::new(),
             stream_cancellation: None,
             run_reducer: ChatRunReducer::default(),
             streaming_thinking: None,
@@ -762,6 +761,8 @@ impl ChatPanel {
         self.toolbar_menu_open = false;
         if let Some(previous) = self.stream_cancellation.take() {
             previous.supersede();
+            self.retired_runs.retain(|run| run.peek().is_none());
+            self.retired_runs.extend(self.stream_completion.take());
             if let Some(observer) = self.stream_task.take() {
                 observer.detach();
             }
@@ -816,17 +817,22 @@ impl ChatPanel {
         cancellation: CancellationToken,
         cx: &mut Context<Self>,
     ) {
+        let selected = self.available_models.get(self.selected_model_idx);
         let context = ChatRunContext {
             profile: self.runtime.clone().zip(self.selected_runtime_profile()),
+            gpu: self
+                .chat_provider
+                .as_ref()
+                .and_then(|p| p.gpu.clone())
+                .filter(|_| selected.is_none_or(AvailableModel::uses_gpu)),
             cancellation,
         };
-        let selected = self.available_models.get(self.selected_model_idx);
         let runtime = self.tokio_rt.clone();
         let _entered = runtime.enter();
         let handle = if let (Some(agent), Some(model)) =
             (&self.agent, selected.filter(|m| m.tool_capable))
         {
-            agent.start_run(AgentRunRequest {
+            agent.clone().start_run(AgentRunRequest {
                 model_id: model.model_id.clone(),
                 prompt: text,
                 history,
@@ -836,7 +842,6 @@ impl ChatPanel {
                     ReasoningPolicy::Disabled
                 },
                 params: model.agent_params(),
-                uses_gpu: model.uses_gpu(),
                 context,
             })
         } else if let Some(provider) = &self.chat_provider {
@@ -1137,24 +1142,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
         let panel = cx.new(|cx| ChatPanel::new("system".into(), dir.path(), rt.clone(), false, cx));
-        let completion = panel.update(cx, |panel, cx| {
+        let (old, active) = panel.update(cx, |panel, cx| {
             panel.begin_capability_initialization();
             // The session-title byte boundary splits the final character.
             panel.send_with_text(format!("{}é", "a".repeat(59)), cx);
             let _entered = rt.enter();
-            let run = ChatRunContext {
-                cancellation: panel.stream_cancellation.clone().unwrap(),
-                profile: None,
-            }
-            .start(|_| std::future::pending());
-            let joined = run.completion.clone();
-            panel.observe_run(run, cx);
-            joined
+            let observe_pending = |panel: &mut ChatPanel, cx: &mut Context<ChatPanel>| {
+                let run = ChatRunContext {
+                    gpu: None,
+                    cancellation: panel.stream_cancellation.clone().unwrap(),
+                    profile: None,
+                }
+                .start(|_, _| std::future::pending());
+                let completion = run.completion.clone();
+                panel.observe_run(run, cx);
+                completion
+            };
+            let old = observe_pending(panel, cx);
+            panel.send_with_text("replacement".into(), cx);
+            let active = observe_pending(panel, cx);
+            panel.stop_stream(cx);
+            assert!(panel.streaming, "Stop must leave the join observed");
+            (old, active)
         });
         drop(panel);
         cx.update(|_| ());
         assert!(matches!(
-            completion.peek(),
+            old.peek(),
+            Some(Err(u_forge_core::lemonade::ChatRunError::Interrupted(
+                u_forge_core::queue::InferenceError::Superseded
+            )))
+        ));
+        assert!(matches!(
+            active.peek(),
             Some(Err(u_forge_core::lemonade::ChatRunError::Interrupted(
                 u_forge_core::queue::InferenceError::Cancelled
             )))
@@ -1163,8 +1183,10 @@ mod tests {
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         let messages = store.load_messages(&sessions[0].id).unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].text, "[Cancelled]");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].text, "[Superseded]");
+        assert_eq!(messages[2].text, "replacement");
+        assert_eq!(messages[3].text, "[Cancelled]");
     }
 
     #[gpui::test]
@@ -1177,6 +1199,8 @@ mod tests {
             ChatPanel::new("Test assistant".into(), &db_path, runtime, false, cx)
         });
 
+        let db = rusqlite::Connection::open(temp_dir.path().join("chat_history.db")).unwrap();
+        db.execute_batch("CREATE TABLE saves (n INTEGER); CREATE TRIGGER count_saves AFTER UPDATE ON chat_sessions BEGIN INSERT INTO saves VALUES (1); END;").unwrap();
         cx.update(|_window, app| {
             panel.update(app, |panel, cx| {
                 panel.run_reducer.begin();
@@ -1213,12 +1237,29 @@ mod tests {
                 panel.apply_run_event(ChatRunEvent::ReasoningDelta("more reasoning".into()), cx);
                 panel.apply_run_event(ChatRunEvent::TextDelta("tail".into()), cx);
                 panel.apply_run_event(
-                    ChatRunEvent::Terminal(ChatRunTerminal::Success { full_text: None }),
+                    ChatRunEvent::ToolCallStart {
+                        internal_id: "call-2".into(),
+                        name: "search_graph".into(),
+                        args_display: "{}".into(),
+                    },
+                    cx,
+                );
+                panel.apply_run_event(
+                    ChatRunEvent::ToolResult {
+                        internal_id: "call-2".into(),
+                        content: "found again".into(),
+                    },
+                    cx,
+                );
+                panel.apply_run_event(
+                    ChatRunEvent::Terminal(ChatRunTerminal::Success {
+                        full_text: Some("final answer".into()),
+                    }),
                     cx,
                 );
 
                 assert!(!panel.streaming);
-                assert_eq!(panel.messages.len(), 6);
+                assert_eq!(panel.messages.len(), 8);
                 assert_eq!(panel.messages[0].read(cx).role, ChatMessageRole::Assistant);
                 assert_eq!(panel.messages[0].read(cx).text(), "before");
                 assert_eq!(panel.messages[1].read(cx).role, ChatMessageRole::ToolCall);
@@ -1235,9 +1276,23 @@ mod tests {
                 );
                 assert_eq!(panel.current_session_id, session_id);
                 assert_eq!(panel.session_list.len(), session_count);
-                assert_eq!(panel.messages.len(), 6);
+                assert_eq!(panel.messages.len(), 8);
             });
         });
+        let saves: i64 = db
+            .query_row("SELECT count(*) FROM saves", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(saves, 1);
+        let store = ChatHistoryStore::open(temp_dir.path()).unwrap();
+        let rows = store
+            .load_messages(&store.list_sessions().unwrap()[0].id)
+            .unwrap();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(
+            rows[6].tool_call.as_ref().unwrap().result.as_deref(),
+            Some("found again")
+        );
+        assert_eq!(rows[7].text, "final answer");
     }
 
     #[test]
