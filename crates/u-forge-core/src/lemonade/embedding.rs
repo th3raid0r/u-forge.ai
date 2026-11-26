@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use async_openai::types::embeddings::{CreateEmbeddingRequest, EmbeddingInput};
+use async_openai::types::embeddings::{CreateEmbeddingRequest, Embedding, EmbeddingInput};
 use async_openai::{Client, config::OpenAIConfig};
 use async_trait::async_trait;
 use tracing::info;
@@ -177,27 +177,22 @@ impl EmbeddingProvider for LemonadeProvider {
 
         let resp = self.client.embeddings().create(req).await?;
 
-        if resp.data.len() != texts.len() {
-            tracing::debug!(
-                expected = texts.len(),
-                got = resp.data.len(),
-                model = %self.model,
-                "Batch size mismatch — falling back to sequential single-embed calls"
-            );
-            let mut results = Vec::with_capacity(texts.len());
-            for text in &texts {
-                results.push(self.embed(text).await?);
-            }
-            return Ok(results);
+        let received = resp.data.len();
+        if let Some(vectors) = order_batch_response(resp.data, texts.len()) {
+            return Ok(vectors);
         }
 
-        let mut embeddings: Vec<(usize, Vec<f32>)> = resp
-            .data
-            .into_iter()
-            .map(|e| (e.index as usize, e.embedding))
-            .collect();
-        embeddings.sort_unstable_by_key(|(idx, _)| *idx);
-        Ok(embeddings.into_iter().map(|(_, v)| v).collect())
+        tracing::debug!(
+            expected = texts.len(),
+            received,
+            model = %self.model,
+            "Invalid batch indexes or count — falling back to sequential single-embed calls"
+        );
+        let mut results = Vec::with_capacity(texts.len());
+        for text in &texts {
+            results.push(self.embed(text).await?);
+        }
+        Ok(results)
     }
 
     fn dimensions(&self) -> Result<usize> {
@@ -218,5 +213,38 @@ impl EmbeddingProvider for LemonadeProvider {
             dimensions: self.dimensions,
             description: Some(format!("Lemonade Server model at {}", self.base_url)),
         })
+    }
+}
+
+fn order_batch_response(mut data: Vec<Embedding>, expected: usize) -> Option<Vec<Vec<f32>>> {
+    if data.len() != expected {
+        return None;
+    }
+    data.sort_unstable_by_key(|item| item.index);
+    // Exactly one result must address each input, even when the counts match.
+    data.into_iter()
+        .enumerate()
+        .map(|(index, item)| (index == item.index as usize).then_some(item.embedding))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_response_requires_one_vector_per_input_index() {
+        let item = |index, value| Embedding {
+            index,
+            object: "embedding".into(),
+            embedding: vec![value],
+        };
+        assert_eq!(
+            order_batch_response(vec![item(1, 20.0), item(0, 10.0)], 2),
+            Some(vec![vec![10.0], vec![20.0]])
+        );
+        assert!(order_batch_response(vec![item(0, 10.0)], 2).is_none());
+        assert!(order_batch_response(vec![item(0, 10.0), item(0, 20.0)], 2).is_none());
+        assert!(order_batch_response(vec![item(0, 10.0), item(2, 20.0)], 2).is_none());
     }
 }

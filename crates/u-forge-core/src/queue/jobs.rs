@@ -14,7 +14,7 @@ use crate::lemonade::{
     ChatCompletionResponse, ChatRequest, KokoroVoice, RerankDocument, StreamToken,
 };
 
-use super::lifecycle::{CancellationToken, InferenceResult};
+use super::lifecycle::{CancellationToken, InferenceError, InferenceResult};
 use super::telemetry::QueueMetrics;
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
@@ -24,6 +24,7 @@ pub(super) struct JobContext {
     pub(super) cancellation: CancellationToken,
     pub(super) enqueued_at: Instant,
     pub(super) metrics: Arc<QueueMetrics>,
+    isolate_receiver_drop: bool,
 }
 
 impl JobContext {
@@ -34,7 +35,21 @@ impl JobContext {
             cancellation,
             enqueued_at: Instant::now(),
             metrics,
+            isolate_receiver_drop: false,
         }
+    }
+
+    /// A failed backfill batch drops its siblings without cancelling the parent.
+    pub(super) fn isolate_receiver_drop(mut self) -> Self {
+        self.isolate_receiver_drop = true;
+        self
+    }
+
+    pub(super) fn on_receiver_drop(&self) -> InferenceError {
+        if !self.isolate_receiver_drop {
+            self.cancellation.cancel();
+        }
+        self.cancellation.error()
     }
 
     pub(super) fn begin(&self, stolen: bool) -> Instant {
@@ -46,11 +61,18 @@ impl JobContext {
 
 // ── Internal job types ────────────────────────────────────────────────────────
 
-/// A single text embedding job.
-pub(super) struct EmbedJob {
-    pub(super) context: JobContext,
-    pub(super) text: String,
-    pub(super) response: oneshot::Sender<InferenceResult<Vec<f32>>>,
+/// An interactive embedding or one bounded provider request from a backfill.
+pub(super) enum EmbedJob {
+    Single {
+        context: JobContext,
+        text: String,
+        response: oneshot::Sender<InferenceResult<Vec<f32>>>,
+    },
+    Batch {
+        context: JobContext,
+        texts: Vec<String>,
+        response: oneshot::Sender<InferenceResult<Vec<Vec<f32>>>>,
+    },
 }
 
 /// A single audio transcription job.

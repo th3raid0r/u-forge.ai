@@ -347,8 +347,7 @@ impl<T> OneShotReporter<T> {
             return None;
         }
         if response.is_closed() {
-            context.cancellation.cancel();
-            let error = context.cancellation.error();
+            let error = context.on_receiver_drop();
             record_pending_cancellation(&context, capability, device_name, &error);
             return None;
         }
@@ -390,8 +389,7 @@ impl<T> OneShotReporter<T> {
             .expect("active reporter retains its response sender")
             .closed()
             .await;
-        self.context.cancellation.cancel();
-        self.context.cancellation.error()
+        self.context.on_receiver_drop()
     }
 
     pub(super) fn finish(mut self, result: InferenceResult<T>) {
