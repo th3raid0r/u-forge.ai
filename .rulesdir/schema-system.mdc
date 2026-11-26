@@ -28,8 +28,10 @@ do not make callers await the synchronous save path.
 
 ## Schema file contract
 
-Files in `defaults/schemas/` use the MCP-shaped external name and per-property
-required flag:
+A schema set lives in a directory such as
+[`defaults/schemas/Sine Nomine/`](../defaults/schemas/Sine%20Nomine/). Its
+`.schema.json` files use the MCP-shaped external `name` and per-property
+`required` flag:
 
 ```json
 {
@@ -127,27 +129,24 @@ unknown type, preserve undeclared fields, or choose an endpoint outside the
 declared source/target sets. Accepted shape changes require an explicit schema
 edit and schema import.
 
-`DataIngestion` retains a legacy schema-less compatibility mode when its graph
-contains no persisted schema: it maps known node kinds through `ObjectBuilder`
-and stores open properties. The desktop UI prevents entry into this mode by
-disabling data import until a non-default schema is present. Core callers that
-need authoritative validation must also persist a schema before invoking
-`import_data_only`; the low-level compatibility behavior is not a strict import.
+When no schema is persisted, `DataIngestion` retains a compatibility path:
+it maps legacy kinds through `ObjectBuilder`, accepts custom types, and stores
+open properties. This is a schema-presence check, not a node-count check.
+`import_data_only` delegates to that importer without loading or requiring
+schemas itself. Core callers that need strict validation must persist a schema
+first. The desktop prevents entry to the compatibility path by requiring a
+non-default persisted schema before enabling data import.
 
 ## Persistence and UI import
 
 The desktop app does not auto-import `defaults/schemas` on startup. **File →
 Import Schema…** loads the selected directory into the `imported_schemas`
-namespace. **File → Import Data…** is enabled only when persisted schemas are
-present. Core callers use `SchemaIngestion::load_schemas_from_directory`
-followed by synchronous `SchemaManager::save_schema`.
-
-The included schema types are: `npc`, `player_character`, `location`,
-`faction`, `quest`, `artifact`, `currency`, `inventory`, `skills`, `temporal`,
-`setting_reference`, `system_reference`, and `transportation`.
+namespace. Core callers use `SchemaIngestion::load_schemas_from_directory`
+followed by synchronous `SchemaManager::save_schema`. Import the schema set
+before importing its JSONL data.
 
 ## Naming constraint
 
-The `add_` prefix is an external MCP action convention retained in schema file
-names. Internal graph types never include it. Keep prefix stripping at the
-ingestion boundary rather than leaking action names into stored object types.
+The `add_` prefix is an external MCP action convention in the JSON `name`
+field, not the filename. Internal graph types omit it. Keep prefix stripping
+at the schema ingestion boundary.

@@ -1,116 +1,39 @@
 ---
-alwaysApply: true
+description: Inference wiring and cross-crate integration boundaries
 ---
 
-# u-forge.ai Project Structure Guide
+# Integration Boundaries
 
-Local-first TTRPG worldbuilding tool with AI-powered knowledge graphs.
+See [ARCHITECTURE.md](../ARCHITECTURE.md) for the crate map and the storage,
+schema, UI, and inference design. The graph facade is synchronous and usable
+without a server: do not give `KnowledgeGraph` an `InferenceQueue` or a
+provider. Callers opt into AI separately.
 
-Full workspace layout, SQLite schema, inference architecture, and design
-decisions live in [ARCHITECTURE.md](mdc:ARCHITECTURE.md). Source files are
-thoroughly commented — read them for file-level detail. This guide covers
-cross-cutting integration rules that aren't obvious from any single file.
+## Wiring a capability
 
----
+`AppView::do_init_lemonade()` in
+[app_view/lemonade.rs](../crates/u-forge/src/app_view/lemonade.rs) is the
+desktop example. Follow the same discovery and activation boundaries:
 
-## Key Integration Points
+1. Share one `Arc<LemonadeConnection>` for the normalized API URL, ownership,
+   and separate inference and admin credentials. See
+   [runtime selection](environment-config.mdc#lemonade-connection-selection)
+   for the distinction between desktop startup and loopback probing.
+2. Use `LemonadeServerCatalog::discover_with_connection` before selecting
+   capabilities. `/models` is required; `/system-info` and `/health` enrich
+   the snapshot independently and retain failures in `CatalogDiagnostics`.
+   Do not infer installed models, backends, or device presence from defaults.
+3. Build a `ModelSelector` from the snapshot and app configuration to select
+   downloaded models per capability and device slot.
+4. Implement the capability trait and construct providers through
+   `ProviderFactory::build_with_connection`. The factory handles GPU
+   contention and coordinated chat runtime profiles. Catalog-loaded model
+   IDs are warm-start hints; reuse requires a live profile check at lease
+   acquisition. Do not add a separate device worker layer.
+5. Register the built provider with `InferenceQueueBuilder::with_provider`.
+   Keep HTTP details out of business logic. Missing inference should disable
+   only the affected capabilities, not graph operations.
 
-### `EmbeddingProvider` is the only abstraction for embedding work
-
-Lives in `crates/u-forge-core/src/ai/embeddings.rs`. `LemonadeProvider`
-(`lemonade/embedding.rs`) is the only impl. **Do NOT bypass the trait** by
-calling HTTP clients directly from business logic — the queue, search, and
-ingest pipelines consume the trait object.
-
-### `TranscriptionProvider` has two impls, picked by contention
-
-- `LemonadeTranscriptionProvider` (`lemonade/transcription.rs`) — simple, no GPU
-  lock. Standalone use or NPU FLM whisper.
-- `LemonadeSttProvider` (`lemonade/stt.rs`) — GPU-managed, shares
-  `GpuResourceManager` with the chat provider. Use when STT may contend with
-  LLM on the same GPU.
-
-Both implement the trait. Do NOT bypass it.
-
-### The hardware abstraction layer is gone
-
-**There is no `DeviceWorker` trait and no `hardware/` module.** Removed in the
-hardware refactor. Physical device differences are handled by `ModelSelector`
-(picks the right recipe/backend per device slot) and `ProviderFactory`
-(constructs the appropriate provider type). See `lemonade/selector.rs` and
-`lemonade/provider_factory.rs`.
-
-### New AI capability wiring
-
-The end-to-end path for embedding, transcription, TTS, LLM generation, or
-reranking is always:
-
-1. Construct one shared `Arc<LemonadeConnection>` carrying the normalized API
-   origin, ownership, and split inference/admin authentication.
-2. `LemonadeServerCatalog::discover(connection)` — requires `/models` and
-   independently enriches the snapshot from `/system-info` and `/health`.
-   Optional endpoint failures remain in `CatalogDiagnostics`.
-3. `ModelSelector::new(catalog, config)` — picks the best downloaded model per
-   capability + device slot; deduplicates to one provider per slot.
-4. `ProviderFactory::build_with_connection(...)` — creates the provider and,
-   for chat, the coordinated runtime/profile wrapper. Catalog-loaded IDs are a
-   warm-start hint; the runtime lease still compares live effective state.
-5. `InferenceQueueBuilder::with_provider(built_provider)` — registers the
-   provider on the capability queue.
-
-`AppView::do_init_lemonade()` is the canonical example: fetch → select → build
-providers → degrade gracefully on any failure.
-
-### `KnowledgeGraph` has no AI dependency
-
-No `InferenceQueue`, no embedding field, no Lemonade dependency. Storage and
-schema operations are fully synchronous and work with zero running services.
-AI capabilities are opt-in — construct them separately. **Do not regress this.**
-
-### GPU manager attachment is automatic
-
-`LemonadeChatProvider` holds an `Option<Arc<GpuResourceManager>>`.
-`ProviderFactory` attaches the manager for llamacpp:rocm/vulkan/metal recipes
-and omits it for FLM (NPU) and kokoro (CPU). Do not set this field manually.
-
-### Inference operations have explicit lifetime ownership
-
-Await-only queue methods are conveniences for one-shot calls. UI operations,
-imports, search, chat, and other parent workflows create one
-`queue::CancellationToken`, pass it to every `*_with_cancellation` call, and
-retain the GPUI task until termination is observed. Cancellation is checked
-while pending, during retry backoff, model activation, active provider work,
-stream startup/read, and bounded embedding fan-out.
-
-`InferenceError` distinguishes cancellation, supersession, timeout class,
-provider failure, unavailable capability, and worker loss. Preserve those
-variants at subsystem and UI boundaries; expected user cancellation is not a
-provider error.
-
----
-
-## Integration Test Threading
-
-`make test` owns one pinned Lemonade runtime across all test binaries. The
-hardware-backed suite is serial because concurrent modules otherwise contend
-for the same GPU/NPU server resources.
-
-```bash
-make test
-cargo test --workspace -- --test-threads=1 # narrow direct iteration
-```
-
----
-
-## Cross-cutting files worth knowing
-
-- [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — workspace layout, SQLite schema,
-  inference design, design decisions. **Read this first** for any architectural
-  work.
-- [defaults/schemas/](mdc:defaults/schemas/) — 13 TTRPG JSON schema files
-  (workspace root, not inside any crate).
-- [defaults/data/memory.jsonl](mdc:defaults/data/memory.jsonl) — Foundation
-  universe sample data. Canonical JSONL format.
-
-All per-file roles and types are covered by comments inside each source file.
-Browse the crate source directly rather than duplicating a file index here.
+See [Rust patterns](rust-patterns.mdc) for the provider split, cancellation
+ownership, and typed error boundaries. See
+[testing and debugging](testing-debugging.mdc) for live-provider fixtures.

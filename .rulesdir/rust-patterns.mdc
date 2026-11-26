@@ -4,9 +4,9 @@ globs: crates/**/*.rs,crates/**/examples/*.rs
 
 # Rust Code Patterns for u-forge.ai
 
-Design decisions and hard-won rules. Source files are thoroughly commented — read
-them for the mechanics. This file exists so the *why* can be intuited without
-re-reading the code.
+Implementation contracts for storage, inference, and the in-app agent. See
+[Integration boundaries](project-structure.mdc) for provider wiring and
+[Testing and debugging](testing-debugging.mdc) for fixtures.
 
 ---
 
@@ -62,25 +62,6 @@ go through `ProviderFactory::build_with_connection` with
 
 ---
 
-## `KnowledgeGraph` invariants
-
-- `::new(db_path: impl AsRef<Path>)` is **synchronous** and takes **one argument**. Creates
-  `<db_path>/knowledge.db` automatically. No async, no server needed.
-- Holds `Arc<KnowledgeGraphStorage>` and `Arc<SchemaManager>` — no embedding
-  field, no `InferenceQueue`, no Lemonade dependency.
-
-Why: storage and schema operations must work in tests and in the UI with zero
-external services. AI is opt-in at the caller. Do not regress this by adding an
-embedding field to `KnowledgeGraph`.
-
-Removed in earlier refactors — **these do not exist, do not reference them:**
-`embedding_manager` field, `get_embedding_provider()` method,
-`embedding_cache_dir` constructor arg, `FastEmbedProvider`,
-`try_new_local_default`, `FASTEMBED_CACHE_PATH`, `EmbeddingManager`,
-`TranscriptionManager`, the `DeviceWorker` trait, the `hardware/` module.
-
----
-
 ## ObjectBuilder
 
 Fluent API for node construction in `src/builder.rs`. Convenience constructors:
@@ -121,12 +102,11 @@ Always use `params![]` for parameterised inserts.
   implicit SQLite `rowid` is what `chunks_fts` and `chunks_vec` reference. Using
   `INSERT OR REPLACE` here would change the rowid and silently break FTS and
   vector index lookups.
-- **`schema_metadata` dimension guard** — `check_or_init_embedding_dims` runs
-  at `KnowledgeGraphStorage::new`. It records the compiled-in embedding
-  dimensions and returns `EmbeddingDimensionMismatch` (a `thiserror` struct,
-  re-exported from `u_forge_core`) if they disagree with a stored value.
-  Changing the embedding model without re-indexing is a hard error at open time,
-  not silent index corruption.
+- **`schema_metadata` dimension guard** — opening storage records the
+  configured embedding dimensions on first use and returns
+  `EmbeddingDimensionMismatch` if either lane differs from its stored width.
+  A change in dimensions requires rebuilding the database. Equal widths do not
+  establish model compatibility; semantic search checks the lane fingerprint.
 - **`ON DELETE CASCADE` on `edges` and `chunks`** — node deletion becomes a
   single statement; the DB removes dependents. O(log N), not O(N).
 - **Edge uniqueness: `UNIQUE(source_id, target_id, edge_type)`** — replaces the
@@ -163,18 +143,14 @@ Illegal characters must be stripped first — see `src/search/sanitize.rs`
 
 ## ANN vector search (sqlite-vec)
 
-Two vector tables, both cosine distance:
-- `chunks_vec` — 768-dim (standard embeddings, any compatible model)
-- `chunks_vec_hq` — 4096-dim (only when an HQ model like
-  `Qwen3-Embedding-8B-GGUF` is configured)
+Both `chunks_vec` (standard, default width 768) and `chunks_vec_hq`
+(high quality, default width 4096) use cosine distance. Widths are configured
+at database creation and fixed for that database. Do not mix incompatible
+embedding spaces in a lane.
 
-The two vector spaces are **fixed and incompatible**. Never mix models from
-incompatible dimension spaces in the same index.
-
-Same sync contract as FTS: DML triggers keep both indexes consistent; chunk
-deletion cascades to vectors. **Never manually manage `chunks_vec` /
-`chunks_vec_hq`** — always go through `upsert_chunk_embedding` /
-`upsert_chunk_embedding_hq`.
+Unlike FTS, vectors are not populated by chunk insert/update triggers:
+embedding writes go through the storage embedding APIs. The chunk-deletion
+triggers remove vectors when chunks are deleted, including cascaded deletes.
 
 A chunk must be explicitly indexed before it becomes searchable via ANN.
 `EmbeddingPlan::embed_all()` performs the bulk missing-embedding sweep;
@@ -225,20 +201,6 @@ executor thread, not just the current task.
   `tokio::task::spawn_blocking`.
 - `parking_lot::Mutex` inside storage is fine **because the lock is never held
   across `.await`** — the pattern is `let _guard = m.lock(); do_sync_work(); drop(guard); …await…`.
-
----
-
-## Testing
-
-All tests use `TempDir` for isolation. See
-[testing-debugging.mdc](mdc:.rulesdir/testing-debugging.mdc) for the mock
-provider impls (`MockEmbeddingProvider`, `MockTranscriptionProvider`), the
-`make_silence_wav` audio helper, and the `require_integration_url!()` skip
-guard.
-
-**Never share a `KnowledgeGraph` between tests** — always construct a fresh one
-in a fresh `TempDir`. The `_tmp` binding must outlive the graph (TempDir deletes
-on drop).
 
 ---
 

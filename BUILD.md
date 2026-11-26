@@ -49,9 +49,11 @@ To build without downloading or staging the embedded runtime:
 UFORGE_SKIP_EMBEDDED_LEMONADE=1 make build
 ```
 
-This leaves the application in graph-only mode unless a compatible standalone
-Lemonade Server is available. A server on the default loopback port is found
-automatically; use `LEMONADE_URL` only for a non-default address or port.
+Without a staged runtime, the desktop remains graph-only unless you set
+`LEMONADE_URL` to select a compatible external server, even if it uses the
+standard loopback port. Without that override, the desktop attempts to launch
+its private runtime; only standalone discovery helpers and direct integration
+tests probe an existing loopback server.
 
 ## Verification
 
@@ -67,7 +69,9 @@ make test
 `make test` builds the workspace and the patched `cosmic-text` crate, provisions
 one checksum-pinned embedded Lemonade server for the complete serial suite, and
 tears down the owned process tree afterward. It requires x86_64 GNU/Linux and
-either network access or a cached copy of the pinned runtime.
+either network access or a cached copy of the pinned runtime. Keep the default
+serial execution for the shared runtime; a focused Cargo test does not replace
+this full gate after substantial code changes.
 
 CI uses the graph-only path:
 
@@ -108,7 +112,7 @@ Lemonade runtime.
 
 ## Optional environment overrides
 
-- `LEMONADE_URL` — non-default Lemonade Server URL.
+- `LEMONADE_URL` — explicit external Lemonade Server URL; suppresses the desktop's embedded launch.
 - `LEMONADE_API_KEY` — inference API key override.
 - `LEMONADE_ADMIN_API_KEY` — management API key override.
 - `UFORGE_SKIP_EMBEDDED_LEMONADE=1` — skip private runtime provisioning.
