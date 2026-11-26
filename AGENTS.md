@@ -25,9 +25,14 @@ mutates a persisted schema from JSONL records.
 
 ## Workflow
 
-Before editing, inspect the source and matching `.rulesdir` guidance. Prefer
-narrow changes that preserve existing module boundaries. Use `rg` for searches.
-Keep prescriptive implementation plans out of shared descriptive docs.
+Track plans, bugs, and audit findings in
+[GitHub Issues](https://github.com/th3raid0r/u-forge.ai/issues), not in local
+plan files. For tracked work, read the issue, its latest decisions and any
+linked PR before editing. Follow the issue intake, audit, and PR workflow in
+[`.rulesdir/development-workflow.mdc`](.rulesdir/development-workflow.mdc).
+
+Inspect the source and matching `.rulesdir` guidance before making narrow
+changes that preserve existing module boundaries. Use `rg` for searches.
 
 Run `make fmt-check`, `make check`, and `make test` before handing off a
 substantial change. `make clippy` is the strict lint target for project crates.

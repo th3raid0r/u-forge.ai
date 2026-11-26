@@ -36,15 +36,18 @@ discover → select → build providers → degrade gracefully) is the canonical
 example. Do not hardcode model IDs, device presence, or capability flags
 without a live catalog check.
 
-### 3. Keep implementation plans out of shared descriptive docs
+### 3. Track work in GitHub Issues, not repository files
 
-`.rules`, `.rulesdir/*.mdc`, `ARCHITECTURE.md`, and `CLAUDE.md` describe the
-current system. Implementation steps, task checklists, and `TODO:` sections
-belong only in `feature_*.md` or `bug_*.md` files.
+[GitHub Issues](https://github.com/th3raid0r/u-forge.ai/issues) is the source of
+truth for planned work, designs awaiting a decision, bugs, audit findings,
+and follow-ups. Put scope, acceptance criteria, status, and decisions on the
+issue; put implementation evidence on the linked PR.
 
-`README.md` may include a concise public product vision and release roadmap.
-Keep it focused on user-facing direction and outcomes rather than prescribing
-internal architecture, implementation steps, or task sequencing.
+Do not create a `.plans/` directory, standalone plan or audit files, or
+duplicate checklists and TODO ledgers. Keep the README, architecture, rules,
+and agent instructions focused on current behavior and enduring constraints.
+The README may describe aspirational product direction, not tracked work or
+status. Link to the issue when useful instead of copying its backlog.
 
 ### 4. GPUI: measure first, then apply known patterns
 
@@ -61,6 +64,9 @@ Every `.rs` file is thoroughly commented. `.md` and `.mdc` files tell you **wher
 ---
 
 ## Task-Based Routing
+
+### Planning, reporting a bug, recording an audit, or implementing an issue
+→ **`.rulesdir/development-workflow.mdc`** (GitHub issue and PR workflow)
 
 ### Building, running, or setting up the environment
 → **`.rulesdir/environment-config.mdc`**

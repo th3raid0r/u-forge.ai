@@ -62,8 +62,9 @@ vision for 1.0 is a connected campaign workspace where the world graph, its
 history and geography, what happened at the table, and the rules behind it all
 reinforce one another.
 
-Each release builds toward that vision without giving up the local-first
-foundation:
+These are aspirational release targets, not commitments or a work tracker.
+[GitHub Issues](https://github.com/th3raid0r/u-forge.ai/issues) tracks the actual
+work and decisions.
 
 | Release | What it adds to the world |
 |---------|---------------------------|
@@ -133,7 +134,7 @@ development on Ko-fi.
 - [Compatibility and hardware](COMPAT.md)
 - [Build, test, and release](BUILD.md)
 - [Architecture](ARCHITECTURE.md)
-- [Product and implementation ledger](.plans/README.md)
+- [Report bugs or propose changes on GitHub](https://github.com/th3raid0r/u-forge.ai/issues)
 
 ## License
 
