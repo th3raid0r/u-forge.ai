@@ -83,6 +83,14 @@ That target disables embedded provisioning and skips live Lemonade tests. Use
 `make fmt` to apply Rust formatting and `make help` to list the remaining
 targets.
 
+### Live inference fabric baseline
+
+`make inference-fabric-test` checks the measurement logic offline.
+`make inference-fabric FABRIC_CONFIG=<experiment.toml>` runs the real embedding
+backfill and chat/search overlap matrix against an owned local runtime. See the
+[baseline protocol](docs/inference-fabric.md) for the isolated cache, exact
+hardware and model pins, optional whole-system energy meter, and result schema.
+
 ## Build the AppImage
 
 AppImage packaging additionally requires `desktop-file-utils` and `patchelf`:

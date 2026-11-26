@@ -1,0 +1,91 @@
+# Matched Strix Halo example. See docs/inference-fabric.md for setup and calibration.
+runtime_version = "2026.48.3"
+hardware = "AMD Ryzen AI Max+ 395 / Radeon 8060S / XDNA2"
+fabric = "unified"
+power_profile = "performance"
+power_profile_path = "/sys/firmware/acpi/platform_profile"
+ac_online_path = "/sys/class/power_supply/ACAD/online"
+ac_online = true
+temperature_path = "/sys/class/hwmon/hwmon5/temp1_input" # Confirm k10temp Tctl on this boot.
+temperature_band_c = [32.0, 45.0]
+cooldown_secs = 10
+repetitions = 5
+chunks = 1024  # Use 32 for the same-work one-engine-batch vs partitioned-overlap case.
+interactive_period_ms = 50
+max_loaded_models = 2
+# whole_system_joules_path = "/path/to/wall-meter-cumulative-joules"
+concurrent = ["cpu", "igpu"]
+
+[embeddings.cpu]
+id = "ggml-org/embeddinggemma-300M-GGUF"
+checkpoint = "ggml-org/embeddinggemma-300M-GGUF:Q8_0"
+artifact = "sha256:b5ce9d77a3fc4b3b39ccb5643c36777911cc4eb46a66962eadfa3f5f60490d63"
+precision = "Q8_0"
+recipe = "llamacpp"
+backend = "cpu"
+backend_version = "b12233"
+ctx = 2048
+threads = 8
+parallel = 8
+weight = 10
+
+[embeddings.igpu]
+id = "fabric/embeddinggemma-igpu" # An alias for the exact same checkpoint; see setup.
+checkpoint = "ggml-org/embeddinggemma-300M-GGUF:Q8_0"
+artifact = "sha256:b5ce9d77a3fc4b3b39ccb5643c36777911cc4eb46a66962eadfa3f5f60490d63"
+precision = "Q8_0"
+recipe = "llamacpp"
+backend = "vulkan"
+backend_version = "b12233"
+ctx = 2048
+threads = 8
+parallel = 8
+device = "Vulkan0"
+weight = 50
+
+# Enable a standalone NPU datapoint only with the exact cached FLM package.
+# It is NOT space-equivalent to GGUF and must not join this concurrent cohort.
+# [embeddings.npu]
+# id = "embed-gemma-300m-FLM"
+# checkpoint = "embed-gemma:300m"
+# artifact = "sha256:<pinned-model.q4nx>"
+# precision = "q4nx"
+# recipe = "flm"
+# backend = "npu"
+# backend_version = "v1.0.13"
+# ctx = 2048
+# weight = 100
+
+[search]
+embedding_route = "igpu"
+candidates_per_lane = 2
+max_tokens = 192
+repeated_searches = 4
+first_search_after_deltas = 12
+deltas_between_searches = 16
+
+[search.chat]
+id = "Gemma-4-E4B-it-GGUF"
+checkpoint = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M"
+artifact = "hf:bfc15c382204943c3a8fff0c750b94ae2364d7a3/gemma-4-E4B-it-Q4_K_M.gguf"
+precision = "Q4_K_M"
+recipe = "llamacpp"
+backend = "vulkan"
+backend_version = "b12233"
+ctx = 2048
+threads = 8
+parallel = 1
+device = "Vulkan0"
+
+[search.rerank]
+id = "bge-reranker-v2-m3-GGUF"
+checkpoint = "pqnet/bge-reranker-v2-m3-Q8_0-GGUF"
+artifact = "hf:40b702f058a57439f4206f27140d05dadb9c6c10/bge-reranker-v2-m3-q8_0.gguf"
+precision = "Q8_0"
+recipe = "llamacpp"
+backend = "vulkan"
+backend_version = "b12233"
+ctx = 2048
+threads = 8
+parallel = 1
+device = "Vulkan0"
