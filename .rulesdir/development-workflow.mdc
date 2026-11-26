@@ -1,176 +1,44 @@
 ---
-description: Development workflow and setup guide
+description: u-forge.ai issue tracker and PR gates
 ---
 
-# Development Workflow
+# Repository Workflow
 
-## Quick Reference
+[GitHub Issues](https://github.com/th3raid0r/u-forge.ai/issues) is the source of
+truth for work, audit findings, and unresolved design decisions. Keep scope,
+acceptance criteria, and decisions on the issue; put implementation evidence
+on the linked PR. Do not create a parallel backlog or audit ledger in the
+checkout (including `.plans/`). Durable implementation contracts belong in
+architecture and subsystem docs.
 
-```bash
-make build                                                     # Build all crates
-make release                                                   # Build the distributable app and embedded runtime
-make test                                                      # Run all tests with one pinned embedded server
-cargo run -p u-forge                                           # Run the desktop app
-```
+Get the assigned work's scope and acceptance criteria from its GitHub issue,
+latest decisions, and linked PRs. A triage or design issue is not authorization
+to implement. The harness owns assignment, dispatch, and workflow transitions;
+workers do not manage a queue. The implementation worker runs the relevant
+local Make checks from [BUILD.md](../BUILD.md) and records results and gaps
+against the verified PR head. There is no separate local-checker phase.
 
-Bundled SQLite compiles with a standard C compiler on `PATH`. Environment
-variables are optional overrides; see
-[environment-config.mdc](mdc:.rulesdir/environment-config.mdc).
+## Review and merge signals
 
----
+- A non-draft PR **with** the `ready for review` label signals automated
+  review to the harness. Neither the label alone nor leaving draft alone is
+  sufficient. Review applies to the candidate that was checked.
+- Adding `ready for merge` to the final, reviewed, non-draft PR opts in to
+  hosted CI. It does not approve or authorize a merge. Do not apply it while
+  the PR is a draft or while changes are still expected.
 
-## First Time Setup
+## Hosted CI gate
 
-1. Install Rust stable ([rustup.rs](https://rustup.rs)), a C compiler (`gcc`,
-   `clang`, or MSVC), and the platform GPUI libraries listed in `BUILD.md`.
-2. `make build` — the first x86_64 Linux GNU build also downloads the pinned
-   upstream Ubuntu x64 Embeddable Lemonade artifact. Set
-   `UFORGE_SKIP_EMBEDDED_LEMONADE=1` to skip automatic provisioning; without an
-   existing artifact the app stays graph-only.
-3. Optionally install a standalone
-   [Lemonade Server](https://github.com/lemonade-sdk/lemonade) when developing
-   against an externally managed service.
-4. `make test` — provisions and owns one checksum-pinned embedded server for
-   the complete suite, then tears down its process tree. No external server or
-   environment configuration is required.
-5. `cargo run -p u-forge` — launch the desktop app.
+[.github/workflows/ci.yml](../.github/workflows/ci.yml) ignores changes limited
+to `.md` and `.mdc` files. For other changes (including `.rules`), only the
+first application of `ready for merge` is eligible. The gate checks label
+history and verifies that the PR is still open, non-draft, labeled, and on the
+same head and base before starting build work. Pushes, relabels, and manual
+reruns do not start another build. A failed or stale run is not evidence for
+a merge; surface it to the maintainer instead of trying to rearm the gate.
 
----
-
-## Architecture Context
-
-Before making changes, read [ARCHITECTURE.md](mdc:ARCHITECTURE.md) — SQLite
-schema, inference design, design decisions.
-
----
-
-## Adding a new EmbeddingProvider
-
-1. Implement the `EmbeddingProvider` trait in
-   `crates/u-forge-core/src/ai/embeddings.rs`. The trait contract is
-   documented in the file — copy the shape from `LemonadeProvider`
-   (`lemonade/embedding.rs`).
-2. There is no `EmbeddingManager`. Construct directly, wrap in a
-   `BuiltProvider`, and register with `InferenceQueueBuilder::with_provider`.
-3. Gate live-server tests with `require_integration_url!()`
-   (`crate::test_helpers`). Canonical `make test` supplies its owned server;
-   direct `cargo test` skips silently when no server is reachable.
-4. **Never add `Mutex<T>` around synchronous work in an async embedding path.**
-   Use `tokio::task::spawn_blocking` if CPU-bound work is unavoidable, or keep
-   the provider fully async via HTTP.
-
-## Adding a new TranscriptionProvider
-
-1. Implement the `TranscriptionProvider` trait in
-   `crates/u-forge-core/src/ai/transcription.rs`. Return the server's response
-   text trimmed of leading/trailing whitespace; use `mime_for_filename()` for
-   MIME detection.
-2. There is no `TranscriptionManager`. To wire into `InferenceQueue`, expose
-   via `ProviderFactory` or register directly with
-   `InferenceQueueBuilder::with_provider`.
-3. **Do NOT add `GpuResourceManager` unless you need GPU contention
-   serialisation.** `LemonadeTranscriptionProvider` is intentionally simple;
-   GPU contention belongs in `LemonadeSttProvider` / `GpuResourceManager`.
-
-## Adding a new schema type
-
-1. Create `{type}.schema.json` in `defaults/schemas/`.
-2. Import that schema explicitly through **File → Import Schema…**, or call
-   `SchemaIngestion::load_schemas_from_directory` and persist the returned
-   `SchemaDefinition` with `SchemaManager::save_schema`.
-3. Import data only after the schema is persisted; import never infers a type
-   or widens the accepted fields from observed JSONL.
-
-## Working with SQLite storage
-
-All storage goes through `KnowledgeGraphStorage`. See
-[rust-patterns.mdc](mdc:.rulesdir/rust-patterns.mdc) for the
-`INSERT OR REPLACE` vs `ON CONFLICT DO UPDATE` design decisions — they are
-load-bearing, not stylistic.
-
-`KnowledgeGraph::new(db_path)` takes **one argument** (the directory path).
-The SQLite file is created at `<db_path>/knowledge.db`.
-
-## GitHub issue and PR workflow
-
-### Triage and planning
-
-1. Use [the repository issue tracker](https://github.com/th3raid0r/u-forge.ai/issues).
-   Search open and closed issues and relevant PRs before filing. Reuse the
-   canonical issue instead of duplicating a report or reopening a resolved fix.
-2. Keep each actionable item independently reviewable. Record the problem and
-   impact, affected revision and paths, evidence or repro, in/out of scope,
-   acceptance criteria, dependencies, and the relevant Make targets. Record
-   design decisions and changes to scope on the issue. A design gate or triage
-   issue is not implementation approval.
-3. For an audit, verify findings against the cited revision and separate
-   observed defects from hypotheses and intentional behavior. File confirmed
-   findings by independently actionable scope; group unconfirmed observations
-   only as explicitly marked triage. Record resolved/rejected dispositions
-   without reviving them as backlog. If GitHub is unavailable, report the
-   blocker; do not create a parallel tracker in the tree.
-
-### Implementation and review
-
-1. Read the issue, latest comments, dependencies, current owner, and linked
-   PRs before starting. Don't dispatch a second writer or pick up work from a
-   triage issue. For a bug, capture a regression test that fails for the
-   expected reason before fixing it.
-2. Keep the PR scoped to the issue. When publishing implementation, open a
-   draft early, link the issue with `Closes #N` if the PR fully resolves it
-   (otherwise `Refs #N`), and record local Make results and remaining gaps on
-   the PR. Do not close completed implementation work before verifying merge
-   or equivalent resolution.
-3. For autonomous work, `agent work` is reserved for scoped, worker-ready
-   issues authorized for that queue. When available, use the matching
-   `github-audit-queue`, `github-auto-mode`, `github-issue-worker`,
-   `github-local-checker`, and `github-draft-review` skills for the assigned
-   role. A worker requests local checks with `needs local CI` on the draft and
-   records the exact head SHA and targets. After local checks pass, use the
-   `ready for review` **label** to request independent review while keeping the
-   PR draft. Recheck changed revisions rather than carrying over stale results
-   or approvals. These labels do not grant dispatch, promotion, or merge
-   authority.
-
----
-
-## Testing
-
-See [testing-debugging.mdc](mdc:.rulesdir/testing-debugging.mdc) for test
-commands, mock provider patterns, skip guards, and the `UFORGE_INTEGRATION_TESTS`
-control variable.
-
----
-
-## CI commands
-
-When authorized to promote a reviewed PR, use GitHub's native **Ready for
-review** transition to take it out of draft. For changes beyond `.md` and
-`.mdc` files, the non-draft state and the `ready for merge` label together
-enable hosted CI; this label is not the `ready for review` label used on
-drafts. New commits rerun CI while the PR is eligible. Removing the label or
-converting the PR to a draft cancels an in-progress run. Require current
-evidence for the candidate being merged rather than treating a label as
-approval.
-
-```bash
-make fmt-check
-make check
-make clippy
-make test-ci
-```
-
-CI exports `UFORGE_SKIP_EMBEDDED_LEMONADE=1` for every Cargo step and uses
-`make test-ci` to force live Lemonade integration tests off. Local full
-verification continues to use `make test` with the owned embedded runtime.
-
----
-
-## Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| Tests fail after adding SQLite column | Run against a fresh `TempDir` — tests never share state |
-| `database is locked` | Only one writer at a time; check for stale processes |
-
-Lemonade-specific troubleshooting lives in `environment-config.mdc`.
+Hosted CI runs the Make format, workspace, strict lint, and
+[graph-only test gates](testing-debugging.mdc#canonical-suites). It sets
+`UFORGE_SKIP_EMBEDDED_LEMONADE=1` for the whole job so earlier Cargo steps
+cannot provision the runtime. Local full verification uses the owned runtime
+instead.

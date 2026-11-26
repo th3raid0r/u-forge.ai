@@ -2,26 +2,21 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, labeled, unlabeled]
+    types: [labeled]
     paths-ignore:
       - '**/*.md'
       - '**/*.mdc'
 
 permissions:
   contents: read
-
-concurrency:
-  # Unrelated label changes must not cancel a real build for this PR.
-  group: ci-${{ github.event.label.name && github.event.label.name != 'ready for merge' && github.run_id || github.ref }}
-  cancel-in-progress: true
+  pull-requests: read
 
 jobs:
   canonical:
     if: >-
-      github.event.pull_request.draft == false &&
-      contains(github.event.pull_request.labels.*.name, 'ready for merge') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'ready for merge') &&
-      github.event.action != 'unlabeled'
+      github.run_attempt == 1 &&
+      github.event.label.name == 'ready for merge' &&
+      github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -29,7 +24,35 @@ jobs:
       UFORGE_SKIP_EMBEDDED_LEMONADE: '1'
 
     steps:
+      - name: Verify the one-time merge gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          pr="repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"
+          events="repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/events"
+          if ! gh api --paginate --slurp "$events?per_page=100" |
+            jq -e 'flatten | map(select(.event == "labeled" and .label.name == "ready for merge")) | length == 1' >/dev/null; then
+            echo "::error::Hosted CI requires the first application of ready for merge on this PR."
+            exit 1
+          fi
+          if ! gh api "$pr" |
+            jq -e --arg head "$EVENT_HEAD" --arg base_ref "$EVENT_BASE_REF" --arg base "$EVENT_BASE_SHA" '
+              .state == "open" and .draft == false and
+              .head.sha == $head and .base.ref == $base_ref and .base.sha == $base and
+              any(.labels[]; .name == "ready for merge")
+            ' >/dev/null; then
+            echo "::error::The PR is no longer eligible or its merge candidate changed after labeling."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux UI dependencies
         run: |

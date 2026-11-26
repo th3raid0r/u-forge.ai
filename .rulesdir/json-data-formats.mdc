@@ -1,6 +1,6 @@
 ---
-globs: defaults/data/*.jsonl,defaults/data/*.json,defaults/schemas/*.json,*.json
-description: JSON data and schema file formats for u-forge.ai
+globs: defaults/data/*.jsonl,defaults/data/*.json
+description: JSONL import and legacy data conversion for u-forge.ai
 ---
 
 # JSON Data Formats
@@ -35,8 +35,9 @@ Fields:
 - `to`: target node reference — unique name, source/graph UUID, or `object_type:name`
 - `edgeType`: string-based relationship type
 
-### Supported Node Types
-npc, player_character, location, faction, quest, artifact, currency, skills, temporal, setting_reference, system_reference, transportation, inventory
+The selected schema set defines the vocabulary; the shipped
+[Sine Nomine schemas](../defaults/schemas/Sine%20Nomine/) are an example, not a
+built-in whitelist.
 
 ---
 
@@ -88,10 +89,8 @@ node's JSON blob. There is no special promotion of `"description"` or `"tags"`
 properties are dropped and diagnosed; missing required properties or invalid
 values skip the node.
 
-On a graph with no persisted schema, the low-level `DataIngestion` API retains
-a legacy compatibility path that accepts its built-in `ObjectBuilder` kinds and
-open properties. The desktop UI does not expose this path: data import remains
-disabled until a non-default schema has been imported.
+See [Validation boundaries](schema-system.mdc#validation-boundaries) for the
+schema-less compatibility path and the strict import precondition.
 
 **Deduplication:** Persisted objects are matched by `(nodetype, name)`. A unique
 existing object is reused and the current import's source UUID maps to its graph
@@ -128,10 +127,8 @@ records. When diagnostics exist, the importer writes structured JSONL under
 
 ## Schema Files (`defaults/schemas/`)
 
-Schema file format, property types, and validation rules are documented in
-[schema-system.mdc](mdc:.rulesdir/schema-system.mdc). The UI persists explicit
-schema imports under `"imported_schemas"`; core validation merges persisted
-schema definitions rather than widening one from JSONL records.
+See [Schema system](schema-system.mdc) for file format, property types, and
+schema persistence. JSONL records never infer or widen a schema.
 
 ---
 

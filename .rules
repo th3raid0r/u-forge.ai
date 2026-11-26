@@ -1,132 +1,24 @@
-# u-forge.ai — LLM Rules Entrypoint
+# u-forge.ai — Repository Rules
 
-Routing guide and behavior constraints. Read this file first for every task.
-Rule files in `.rulesdir/` cover specific topics — read only those that apply.
+u-forge.ai is a local-first TTRPG worldbuilding tool with a Rust/GPUI desktop UI
+and a SQLite knowledge graph. Inference through Lemonade is optional:
+`KnowledgeGraph` and the desktop's graph features must work with no server or
+environment overrides.
 
----
+[ARCHITECTURE.md](ARCHITECTURE.md) explains the workspace, subsystem boundaries,
+and design decisions. Read the topic guides that apply to the change:
 
-## Anti-Patterns — Read Before Writing Anything
+| Task | Local contract |
+| --- | --- |
+| Builds, setup, releases | [BUILD.md](BUILD.md) |
+| Configuration, runtime discovery, XDG paths | [Environment and configuration](.rulesdir/environment-config.mdc) |
+| Tracked work, issue intake, PRs, hosted CI | [Repository workflow](.rulesdir/development-workflow.mdc) |
+| Tests and fixtures | [Testing and debugging](.rulesdir/testing-debugging.mdc) |
+| Rust, storage, queue lifetimes, or application agent prompts/tools | [Rust patterns](.rulesdir/rust-patterns.mdc) |
+| Wiring inference or changing startup/model selection | [Integration boundaries](.rulesdir/project-structure.mdc) and [Rust patterns](.rulesdir/rust-patterns.mdc) |
+| GPUI rendering, interaction, or window chrome | [GPUI patterns](.rulesdir/gpui-patterns.mdc) |
+| Schemas (`defaults/schemas/`) and validation | [Schema system](.rulesdir/schema-system.mdc) |
+| JSONL (`defaults/data/`), conversion, or data import | [JSON data formats](.rulesdir/json-data-formats.mdc) and [Schema system](.rulesdir/schema-system.mdc) |
 
-These are active failure modes observed in this codebase. Violating them produces work that must be reverted.
-
-### 1. Env vars are overrides, not requirements
-
-`cargo run -p u-forge` must work with **zero environment variables set**, degrading gracefully when no Lemonade Server is present. `LEMONADE_URL` exists only to override a non-standard location or port.
-
-- Always honor `LEMONADE_URL` first, then try the sensible loopback defaults.
-  `lemonade::resolve_lemonade_url()` implements this — follow it, never bypass
-  it.
-- Never call `env::var(...).unwrap()` or `.expect("set LEMONADE_URL")` at the top level. An unset env var must never be a hard error for core functionality.
-- Tests: `make test` provisions the checksum-pinned embedded runtime, starts it
-  once for the complete suite, and tears down its process tree afterward. It
-  must work with zero env vars and must never adopt `LEMONADE_URL` or a server
-  already using a default port. Direct `cargo test` remains a narrow developer
-  path: use `crate::test_helpers::integration_test_url().await` and silently
-  skip when no server is reachable. CI uses `make test-ci`, which disables
-  embedded provisioning, excludes the Lemonade test namespace, and forces
-  cross-module live Lemonade tests to skip.
-
-### 2. Fetch live state before making capability decisions
-
-Before assuming available models or hardware, fetch actual server state.
-`LemonadeServerCatalog::discover(connection)` requires the model catalog and
-retains `/health` and `/system-info` failures as optional diagnostics. Build a
-`ModelSelector` from that snapshot. `AppView::do_init_lemonade()` (connect →
-discover → select → build providers → degrade gracefully) is the canonical
-example. Do not hardcode model IDs, device presence, or capability flags
-without a live catalog check.
-
-### 3. Track work in GitHub Issues, not repository files
-
-[GitHub Issues](https://github.com/th3raid0r/u-forge.ai/issues) is the source of
-truth for planned work, designs awaiting a decision, bugs, audit findings,
-and follow-ups. Put scope, acceptance criteria, status, and decisions on the
-issue; put implementation evidence on the linked PR.
-
-Do not create a `.plans/` directory, standalone plan or audit files, or
-duplicate checklists and TODO ledgers. Keep the README, architecture, rules,
-and agent instructions focused on current behavior and enduring constraints.
-The README may describe aspirational product direction, not tracked work or
-status. Link to the issue when useful instead of copying its backlog.
-
-### 4. GPUI: measure first, then apply known patterns
-
-Before guessing at a UI slowdown, enable the perf overlay (`Ctrl+Shift+P`) and watch `frame:<ms>` while reproducing. `render()` call frequency is **not** frame cost — only the 1×1 timing canvas in `app_view/render.rs` captures it honestly.
-
-→ **`.rulesdir/gpui-patterns.mdc`** — caching patterns, always-mounted panel, canvas coords, TextFieldView.
-
-Key pitfall: calling `cx.notify()` from inside a `canvas` paint closure schedules a redraw and doubles work every frame. Size-affecting work belongs in `request_layout`, not `paint`.
-
-### 5. Source code is the source of truth — docs are indexes, not mirrors
-
-Every `.rs` file is thoroughly commented. `.md` and `.mdc` files tell you **where to look and why it matters** — not what the code already says. If you find yourself writing a struct definition or code example that already exists verbatim in source, replace it with a pointer (`see src/lemonade/rerank.rs — LemonadeRerankProvider`).
-
----
-
-## Task-Based Routing
-
-### Planning, reporting a bug, recording an audit, or implementing an issue
-→ **`.rulesdir/development-workflow.mdc`** (GitHub issue and PR workflow)
-
-### Building, running, or setting up the environment
-→ **`.rulesdir/environment-config.mdc`**
-→ **`.rulesdir/development-workflow.mdc`**
-
-`make build`, `make test`, and the desktop app work with no environment
-variables. `make test` requires a supported embedded-runtime platform and
-either a cached pinned artifact or network access to provision it.
-
-### 6. Imported data must conform to loaded schemas
-
-Schemas are authoritative during JSONL import. Never derive object or edge types
-from observed records, widen a schema with undeclared properties, or accept an
-edge endpoint pair the schema disallows. Skipped records and dropped fields must
-remain visible through import statistics and diagnostic JSONL output.
-
-The desktop and `import_data_only` workflow require callers to persist schemas
-first. `DataIngestion` itself retains a legacy schema-less compatibility path
-for empty graphs; do not use that low-level mode where strict shape enforcement
-is required.
-
-### Writing or modifying Rust source (`crates/**/*.rs`)
-→ **`.rulesdir/rust-patterns.mdc`**
-
-Error handling (`anyhow`), `EmbeddingProvider` trait (do NOT bypass it), `TranscriptionProvider` trait, `InferenceQueue` usage, `ObjectBuilder`, async anti-patterns, storage patterns.
-
-### Adding or wiring a new AI capability (embedding, reranking, TTS, STT, LLM)
-→ **`.rulesdir/rust-patterns.mdc`** (trait sections)
-→ **`.rulesdir/development-workflow.mdc`** (provider addition workflow)
-
-Implement the relevant trait. Build via `ProviderFactory`, register with `InferenceQueueBuilder::with_provider`. Do NOT call provider HTTP clients directly from business logic. There is no `DeviceWorker` trait — that abstraction was removed in the hardware refactor.
-
-Parent multi-step work with `queue::CancellationToken`, pass it through every
-`*_with_cancellation` call, and preserve `InferenceError` distinctions. A
-dropped receiver is only a fallback; it is not the cancellation contract.
-
-### Modifying agent prompts or tool loops
-→ **`.rulesdir/rust-patterns.mdc`** (agent budget and tool validation sections)
-
-Schema summaries use whole-record selection. Model calls and tool results are
-admitted through the per-request budget ledger, and repeated calls are compared
-using validated canonical arguments and observed progress. Do not add an
-unbounded prompt or tool-output path alongside that ledger.
-
-### Writing, running, or debugging tests
-→ **`.rulesdir/testing-debugging.mdc`**
-→ **`.rulesdir/rust-patterns.mdc`** (testing patterns section)
-
-Every test gets its own `TempDir`. Mock providers for unit tests; `lemonade_url().await` skip-guard for integration tests.
-
-### Schema files (`defaults/schemas/*.schema.json`)
-→ **`.rulesdir/schema-system.mdc`**
-→ **`.rulesdir/json-data-formats.mdc`**
-
-### Data files (`defaults/data/*.jsonl`) or the import pipeline
-→ **`.rulesdir/json-data-formats.mdc`**
-
-### UI work (`crates/u-forge/`, `crates/u-forge-graph-view/`, `crates/u-forge-ui-traits/`)
-→ **`.rulesdir/project-structure.mdc`** (integration points, cross-cutting constraints)
-→ **`.rulesdir/gpui-patterns.mdc`** (caching, panel patterns, canvas coords, TextFieldView)
-
-Window chrome follows `Window::window_decorations()` and compositor-reported
-state. Never infer decoration mode from desktop-name environment variables.
+`make test` is the canonical full suite; it owns a pinned Lemonade runtime.
+`make test-ci` is the graph-only suite, not a substitute for live coverage.

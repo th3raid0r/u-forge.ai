@@ -18,7 +18,11 @@ The manifest aliases `gpui-ce = 0.3.3` as `gpui`, so source imports remain
 
 GPUI processes each frame in three sequential phases: `request_layout` → `prepaint` → `paint`.
 
-**Never mutate view state or call `cx.notify()` from inside a `canvas` paint closure or from `paint`.** This re-invalidates the frame you just finished and doubles cost per frame. Size-affecting work belongs in `request_layout`.
+**Do not call `cx.notify()` or trigger a redraw from `paint`**, including a
+`canvas` paint closure. That invalidates the frame you just finished.
+Size-affecting work belongs in `request_layout`. Passive bookkeeping such as
+recording frame timings or the last painted bounds is fine if it does not
+invalidate the view.
 
 This was the root cause of the reverted paint-time shape-cache: moving text shaping into `paint` with a cross-frame `WrappedLine` cache caused measured height to differ from the pre-paint guess, triggering `cx.notify()` and a double-pass on every frame. A paint-phase cache cannot beat a layout-phase non-cache unless it avoids the notify cascade.
 
@@ -144,11 +148,13 @@ Required for scroll areas to work correctly inside a flex layout:
 
 ## Frame-cost profiling
 
-Do not trust how often `render()` is called — that measures re-render frequency, not actual frame cost. To measure real frame time (tree build + layout + paint), append a 1×1 `canvas` element whose paint closure records `frame_start.elapsed()` into entity state. The canvas fires after GPUI has completed layout, so it captures the true per-frame cost.
-
-`AppView` has a built-in perf overlay toggled by `Ctrl+Shift+P` (or the "Perf" button in the status bar), showing `frame:<ms>  avg:<60-frame>  chat:<chat_ms>`. Enable it before guessing at a UI slowdown. See `app_view/render.rs` — the timing canvas is the last element in the tree.
-
-The 60-frame average uses `FrameTimeRing` (`[u64; 60]` circular buffer in `app_view/state.rs`); sampling and averaging are both gated on `perf_enabled` so a disabled overlay does zero work beyond the enable check.
+Enable the `AppView` perf overlay (`Ctrl+Shift+P`) before changing a suspected
+hot path. Use `frame:<ms>` and its 60-frame average, not the frequency of
+`render()` calls. The 1×1 timing canvas near the end of
+[app_view/render.rs](../crates/u-forge/src/app_view/render.rs) samples after
+layout, so it includes tree construction and layout work that a `render()`
+span misses. Keep timing gated on `perf_enabled`; sampling must not schedule
+another frame.
 
 ---
 
@@ -164,7 +170,10 @@ The 60-frame average uses `FrameTimeRing` (`[u64; 60]` circular buffer in `app_v
 2. `samply record cargo run -p u-forge` + `RUST_LOG=off` during a scroll-in of a large message produced a flamegraph: **89 % of samples in `gpui::text_system::shape_text`**, **77 % in `rustybuzz::hb::ot_map::hb_ot_map_builder_t::compile` → `find_language_feature`**.
 3. Root cause: `cosmic-text 0.14.2` calls `rustybuzz::ShapePlan::new(...)` for every word on every cold-cache text shape. Creating a `ShapePlan` parses the font's OpenType layout tables — several ms per call. `gpui`'s `LineLayoutCache` is frame-scoped; any message scrolled out of view has its layouts evicted. On scroll-back, all lines re-shape simultaneously.
 
-**Fix:** `crates/cosmic-text-patched` adds a `VecDeque<(fontdb::ID, Direction, Script, ShapePlan)>` cache to `ShapeBuffer`, backported from `cosmic-text 0.17.1`. See ARCHITECTURE.md — "Patched / Vendored Dependencies" for full details and removal instructions.
+The backport and its rationale are described in
+[ARCHITECTURE.md](../ARCHITECTURE.md#cratescosmic-text-patched--shapeplan-cache-backport).
+See [Vendored ShapePlan cache maintenance](#vendored-shapeplan-cache-maintenance)
+below for removal criteria.
 
 **Rules that follow from this:**
 

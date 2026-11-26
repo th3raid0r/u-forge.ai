@@ -1,6 +1,8 @@
 # u-forge.ai — Architecture Reference
 
-High-level architecture, data model, storage schema, inference design, and design decisions. For module maps and file indexes, see `.rulesdir/project-structure.mdc`.
+High-level architecture, data model, storage schema, and inference design.
+See [Integration boundaries](.rulesdir/project-structure.mdc) for capability
+wiring and the separation between graph and inference.
 
 ---
 
@@ -114,7 +116,11 @@ Written by `save_layout()` after drag. Read by `build_snapshot()` to restore use
 ```
 key TEXT PRIMARY KEY, value TEXT NOT NULL
 ```
-Holds `chunks_vec_dims` and `chunks_vec_hq_dims`. `check_or_init_embedding_dims` runs inside `KnowledgeGraphStorage::new` — first open writes the compiled-in constants; subsequent opens compare stored vs. compiled values and return `EmbeddingDimensionMismatch` (a `thiserror` struct re-exported from `u_forge_core`) if they differ. No auto-migration: the user must re-index or pin the old model.
+Holds `chunks_vec_dims` and `chunks_vec_hq_dims`. The first open records the
+configured lane widths; subsequent opens return `EmbeddingDimensionMismatch`
+if either configured width differs from the stored value. Keep the original
+widths or rebuild the database to change them. Model fingerprint checks are
+separate: equal widths alone do not make existing vectors reusable.
 
 ### Storage Design Notes
 
@@ -296,7 +302,8 @@ explicitly; schema records and JSON are never sliced to fit.
 
 Tool arguments emitted by the LLM are validated against each tool's JSON Schema (derived via `schemars::JsonSchema` and strict against unknown fields via `#[serde(deny_unknown_fields)]`) before deserialization. Each tool accepts `serde_json::Value` as its rig `Args` type, calls `tool_validation::validate_tool_args` first, and only then runs `serde_json::from_value` into the typed struct. Validators are compiled once per process via `std::sync::LazyLock` and reused across all calls. Validation failures return a `ToolError` whose message names the offending field path (JSON Pointer format), so the LLM can self-correct without burning extra turns. See `crates/u-forge-agent/src/lib.rs` — `tool_validation` module.
 
-`SchemaIngestion` reads `defaults/schemas/*.schema.json`, strips the `add_` prefix (MCP naming convention), and derives edge schemas from declared relationship fields, including their allowed target types.
+[Schema ingestion](.rulesdir/schema-system.mdc#schema-file-contract) translates
+a selected schema directory into graph types and declared edge constraints.
 
 The Rig loop carries request state through lifecycle hooks. Before each model
 call, it fits the newest structurally valid history suffix to the configured
@@ -326,15 +333,17 @@ undeclared properties, invalid endpoint pairs, and unresolved endpoints are
 counted and written to a `.u-forge-import-diagnostics` JSONL sidecar rather
 than silently widening the loaded schema.
 
-The low-level `DataIngestion` type also retains a schema-less compatibility
-mode for empty graphs, mapping known node kinds through `ObjectBuilder` and
-accepting open properties. The desktop UI disables data import until a
-non-default schema is persisted; strict core callers have the same precondition.
+The desktop UI disables data import until a non-default schema is persisted.
+Core callers that need strict import must also persist a schema; otherwise
+they may reach the importer's
+[schema-less compatibility path](.rulesdir/schema-system.mdc#validation-boundaries).
 
 **Three ingestion entry points:**
 - `setup_and_index(graph, schema_dir, data_file)` — loads schemas AND imports data. Used for a full fresh setup only.
-- `import_data_only(graph, data_file)` — strict data import against schemas already loaded in the graph, with **no schema side-effects**.
-- `import_schemas_and_data(graph, schema_files, data_files)` — library helper
+- `import_data_only(graph, data_file)` — imports and indexes data without
+  loading or modifying schemas. It is strict when the caller has persisted
+  schemas first; the function does not check that precondition.
+- `import_schemas_and_data(graph, schema_dir, data_file)` — library helper
   for explicit schema import followed by strict data import. The current UI
   presents schema and data import as separate actions.
 

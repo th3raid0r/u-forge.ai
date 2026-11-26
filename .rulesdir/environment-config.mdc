@@ -8,15 +8,12 @@ globs: *.toml,*.yaml,*.yml,config.*
 
 ```bash
 # All optional — the app runs with nothing set.
-export LEMONADE_URL="http://localhost:13305/api/v1"  # Only needed for non-default server URL
+export LEMONADE_URL="http://localhost:13305/api/v1"  # Explicit external server instead of the owned runtime
 export LEMONADE_API_KEY="..."                        # Optional inference key override
 export LEMONADE_ADMIN_API_KEY="..."                  # Optional management key override
-export UFORGE_SCHEMA_DIR="./defaults/schemas"        # load_default_schemas() override
+export UFORGE_SCHEMA_DIR="./defaults/schemas/Sine Nomine"  # load_default_schemas() override
 export RUST_LOG=info                                 # Log verbosity
 
-# Direct `cargo test` integration control (canonical `make test` overrides this)
-export UFORGE_INTEGRATION_TESTS=require  # Panic instead of skip when server unreachable
-export UFORGE_INTEGRATION_TESTS=skip     # Force-skip even when a server is present
 export UFORGE_SKIP_EMBEDDED_LEMONADE=1   # Skip automatic runtime provisioning
 export UFORGE_LEMOND_PATH="/path/to/lemonade/lemond" # Owned-development binary override
 ```
@@ -32,13 +29,6 @@ launch, the packaged config template is transformed to absolute XDG data paths,
 and packaged schemas/example data are copied into the data directory. A defaults
 revision marker makes that seed one-time: user edits and deletions are not
 restored implicitly. A later defaults revision requires an explicit migration.
-
-### Why env vars are overrides, not requirements
-
-`cargo run -p u-forge` must work with zero env vars set. An unset env
-var must never be a hard error for core functionality.
-`lemonade::resolve_lemonade_url()` encodes this — never `env::var(...).unwrap()`
-at the top level.
 
 ### Module-specific logging
 
@@ -68,7 +58,8 @@ The desktop app reads `[data].schema_dir` and `[data].import_file` from its XDG
 configuration to pre-populate the new-world flow and explicit import dialogs.
 The lower-level
 `SchemaIngestion::load_default_schemas()` helper checks `UFORGE_SCHEMA_DIR`
-and otherwise uses `./defaults/schemas`.
+and otherwise uses `./defaults/schemas`. It does not descend into subdirectories;
+select the schema set directory itself, such as `defaults/schemas/Sine Nomine`.
 
 ## Database Location
 
@@ -118,26 +109,19 @@ on supported hardware before selecting its dynamically discovered models.
   `LEMONADE_API_KEY`. An empty admin key no longer bypasses authentication as of
   [2026.47.1](https://github.com/lemonade-sdk/lemonade/releases/tag/v2026.47.1).
 
-### Canonical test ownership
+### Lemonade connection selection
 
-`make test` requires and launches the checksum-pinned Embeddable Lemonade
-artifact once, exports its private URL and credentials to every test binary,
-then unloads models and terminates the server's complete process group. It
-ignores `LEMONADE_URL`, `UFORGE_LEMOND_PATH`, and
-`UFORGE_SKIP_EMBEDDED_LEMONADE` so a developer's external server cannot change
-the tested version. The application and test runner reuse the same XDG-scoped
-model/backend cache, so tests do not create a second download tree. Direct
-`cargo test` retains the auto-skip controls below for narrow local iteration.
+The desktop uses `lemonade::resolve_runtime_connection()` at startup:
+`LEMONADE_URL` selects an external connection, otherwise the app launches its
+private pinned runtime on an available loopback port. It must not adopt a
+process already listening on a candidate port. If the selected connection is
+unavailable, graph functionality still works.
 
-### URL Resolution Order
-
-`lemonade::resolve_lemonade_url()`:
-1. `LEMONADE_URL` env var — normalized and accepted as-is
-2. `GET http://localhost:13305/v1/health` — probed with 2 s timeout
-3. `GET http://127.0.0.1:13305/v1/health` — explicit IPv4 loopback
-
-Returns `None` when no server is found. Setting `LEMONADE_URL` is optional when
-Lemonade runs on its default port.
+`lemonade::resolve_lemonade_url()` is for external-server discovery, including
+direct Cargo integration tests. It normalizes `LEMONADE_URL` without a health
+probe when set; otherwise it probes `/v1/health` on `localhost:13305` and then
+`127.0.0.1:13305` (2 s timeout per request). Keep that probe out of desktop
+startup and the [canonical test fixture](testing-debugging.mdc#canonical-suites).
 
 ### Endpoints in Use
 
@@ -153,24 +137,13 @@ Lemonade runs on its default port.
 | `/api/v1/chat/completions` | POST (JSON) | `LemonadeChatProvider` |
 | `/api/v1/rerank` | POST (JSON) | `LemonadeRerankProvider` |
 
-### Why two transcription providers
-
-`LemonadeTranscriptionProvider` has no GPU resource management — suitable for
-NPU FLM whisper and standalone use. `LemonadeSttProvider` integrates with
-`GpuResourceManager` to prevent contention when LLM inference runs concurrently
-on the same GPU. Both are constructed via `ProviderFactory::build` with
-`Capability::Transcription`. Choice is based on whether GPU contention is
-possible, not ergonomic preference.
-
----
-
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `Lemonade Server not available` | Start the owned runtime or a standalone server on loopback port 13305 |
+| `Lemonade Server not available` | Check the owned runtime; if using a standalone server, verify the desktop's `LEMONADE_URL` |
 | `lemonade pull` fails | Check disk space, network access, and whether the model's backend is installed |
-| Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
+| Schema not found | Verify the selected schema directory directly contains the schema JSON files; desktop paths come from `[data].schema_dir`, not `UFORGE_SCHEMA_DIR` |
 | Dimension mismatch | Ensure each embedding model matches its configured vector lane; rebuild the database after changing dimensions |
 | Whisper not loaded in RAM | First transcription call triggers load; subsequent calls are fast. `GET /api/v1/health` shows loaded models |
 | Transcription error: "Could not open audio data" | Audio bytes empty or not a valid WAV/MP3/OGG |
