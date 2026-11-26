@@ -11,26 +11,31 @@ on the linked PR. Do not create a parallel backlog or audit ledger in the
 checkout (including `.plans/`). Durable implementation contracts belong in
 architecture and subsystem docs.
 
-For tracked work, start from the issue, its latest decisions, and linked PRs.
-A triage or design issue is not authorization to implement. For general
-verification and autonomous workflows use the global skills for the task;
-the repository-specific facts are below.
+Get the assigned work's scope and acceptance criteria from its GitHub issue,
+latest decisions, and linked PRs. A triage or design issue is not authorization
+to implement. The harness owns assignment, dispatch, and workflow transitions;
+workers do not manage a queue. The implementation worker runs the relevant
+local Make checks from [BUILD.md](../BUILD.md) and records results and gaps
+against the verified PR head. There is no separate local-checker phase.
 
-| Repository label | Meaning |
-| --- | --- |
-| `agent work` | Scoped, maintainer-authorized issue eligible for the autonomous worker queue. |
-| `needs local CI` | A draft PR requests local Make checks for its recorded head SHA. See [BUILD.md](../BUILD.md) for this repository's targets. |
-| `ready for review` | A draft PR requests independent review; this label does not take the PR out of draft. |
-| `ready for merge` | A maintainer-controlled opt-in to hosted CI on a non-draft PR, not an approval or merge authorization. |
+## Review and merge signals
+
+- A non-draft PR **with** the `ready for review` label signals automated
+  review to the harness. Neither the label alone nor leaving draft alone is
+  sufficient. Review applies to the candidate that was checked.
+- Adding `ready for merge` to the final, reviewed, non-draft PR opts in to
+  hosted CI. It does not approve or authorize a merge. Do not apply it while
+  the PR is a draft or while changes are still expected.
 
 ## Hosted CI gate
 
 [.github/workflows/ci.yml](../.github/workflows/ci.yml) ignores changes limited
-to `.md` and `.mdc` files. For other changes (including `.rules`), the job needs
-both a non-draft PR and the `ready for merge` label. GitHub's native **Ready for
-review** transition changes the draft state; it is not the similarly named
-label. New commits rerun CI while the PR is eligible. Removing the gate label
-or converting the PR back to draft cancels an in-progress run.
+to `.md` and `.mdc` files. For other changes (including `.rules`), only the
+first application of `ready for merge` is eligible. The gate checks label
+history and verifies that the PR is still open, non-draft, labeled, and on the
+same head and base before starting build work. Pushes, relabels, and manual
+reruns do not start another build. A failed or stale run is not evidence for
+a merge; surface it to the maintainer instead of trying to rearm the gate.
 
 Hosted CI runs the Make format, workspace, strict lint, and
 [graph-only test gates](testing-debugging.mdc#canonical-suites). It sets
