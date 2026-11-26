@@ -133,8 +133,8 @@ RUST_LOG=u_forge_core::ingest=warn                   # Suppress noisy modules
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Lemonade Server not available` | Server not running | `lemonade-server serve` — `localhost:13305` is auto-discovered |
-| Transcription returns immediate error | Model not pulled or server can't open audio | `lemonade-server pull whisper-v3-turbo-FLM`; verify audio bytes are non-empty |
+| `Lemonade Server not available` | Server not running | Start the owned runtime or a standalone server on loopback port 13305 |
+| Transcription returns immediate error | Model not pulled or server can't open audio | Use `lemonade pull <transcription-model>`; verify audio bytes are non-empty |
 | Transcription test passes but text is noise | Silence input hallucinations are normal | Use real speech for content assertions; only check `result.is_ok()` for silence |
 | FTS5 search returns nothing | Chunk not yet added for the object | Call `add_text_chunk` before `search_chunks_fts` |
 | `database is locked` | Two processes sharing the same `knowledge.db` | Ensure only one writer at a time |

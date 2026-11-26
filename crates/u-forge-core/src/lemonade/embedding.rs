@@ -83,7 +83,7 @@ impl LemonadeProvider {
             .ok_or_else(|| {
                 anyhow!(
                     "Failed to probe embedding dimensions from Lemonade Server — \
-                     check that model '{}' is loaded (run: lemonade-server pull {})",
+                     check that model '{}' is loaded (run: lemonade pull {})",
                     model,
                     model
                 )
