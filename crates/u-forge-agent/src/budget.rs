@@ -20,6 +20,7 @@ use crate::{HistoryMessage, tools::validation};
 const TOKENS_PER_MESSAGE: usize = 4;
 const REPLY_PRIMING_TOKENS: usize = 3;
 const REQUEST_ENVELOPE_TOKENS: usize = 32;
+const SCHEMA_HEADER: &str = "## Knowledge Graph Schema\n\n### Available Types\n";
 const HISTORY_OMISSION_NOTICE: &str = "[Conversation context: earlier messages were omitted because this request reached the active model's context window. Treat the visible messages as the most recent portion of a longer conversation.]";
 
 static O200K_BPE: LazyLock<Result<CoreBPE, String>> = LazyLock::new(|| {
@@ -33,8 +34,45 @@ pub struct TokenEstimate {
     pub used_fallback: bool,
 }
 
+impl TokenEstimate {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            tokens: self.tokens.saturating_add(other.tokens),
+            used_fallback: self.used_fallback || other.used_fallback,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default, Clone, Copy, Debug)]
+struct FitWork {
+    serializations: usize,
+    schema_records: usize,
+    estimates: usize,
+    estimator_bytes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FIT_WORK: std::cell::Cell<FitWork> = std::cell::Cell::new(FitWork::default());
+}
+
+#[cfg(test)]
+fn record_work(update: impl FnOnce(&mut FitWork)) {
+    FIT_WORK.with(|work| {
+        let mut counts = work.get();
+        update(&mut counts);
+        work.set(counts);
+    });
+}
+
 /// Estimate text with the single cached tokenizer policy used by the agent.
 pub fn estimate_tokens(text: &str) -> TokenEstimate {
+    #[cfg(test)]
+    record_work(|work| {
+        work.estimates += 1;
+        work.estimator_bytes += text.len();
+    });
     match &*O200K_BPE {
         Ok(tokenizer) => TokenEstimate {
             tokens: tokenizer.encode_with_special_tokens(text).len(),
@@ -95,10 +133,8 @@ struct SchemaRecord {
     priority: u8,
 }
 
-fn contains_type_name(haystack: &str, type_name: &str) -> bool {
-    let haystack = haystack.to_lowercase();
-    let needle = type_name.to_lowercase();
-    haystack.match_indices(&needle).any(|(start, matched)| {
+fn contains_type_name(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(start, matched)| {
         let end = start + matched.len();
         let left_ok = start == 0
             || !haystack[..start]
@@ -127,10 +163,30 @@ pub fn bounded_schema_summary(
     context: SchemaPriorityContext<'_>,
     token_budget: usize,
 ) -> BoundedSchemaSummary {
-    let primary = format!("{}\n{}", context.current_request, context.retained_history);
+    let total_objects = schema.object_types.len();
+    let total_edges = schema.edge_types.len();
+    if token_budget == 0 {
+        return empty_schema_summary(total_objects, total_edges);
+    }
+
+    let primary =
+        format!("{}\n{}", context.current_request, context.retained_history).to_lowercase();
+    let recent = context.recent_tool_results.to_lowercase();
+    let priority = |name: &str| {
+        let needle = name.to_lowercase();
+        if contains_type_name(&primary, &needle) {
+            0
+        } else if contains_type_name(&recent, &needle) {
+            1
+        } else {
+            2
+        }
+    };
     let mut records = Vec::new();
 
     for (name, object) in &schema.object_types {
+        #[cfg(test)]
+        record_work(|work| work.schema_records += 1);
         let mut properties = object.properties.iter().collect::<Vec<_>>();
         properties.sort_by_key(|(name, _)| name.as_str());
         let property_text = properties
@@ -157,22 +213,17 @@ pub fn bounded_schema_summary(
                 object.description
             )
         };
-        let priority = if contains_type_name(&primary, name) {
-            0
-        } else if contains_type_name(context.recent_tool_results, name) {
-            1
-        } else {
-            2
-        };
         records.push(SchemaRecord {
             kind: SchemaRecordKind::Object,
             name: name.clone(),
             text,
-            priority,
+            priority: priority(name),
         });
     }
 
     for (name, edge) in &schema.edge_types {
+        #[cfg(test)]
+        record_work(|work| work.schema_records += 1);
         let mut sources = edge.allowed_source_types.clone();
         let mut targets = edge.allowed_target_types.clone();
         sources.sort();
@@ -191,18 +242,11 @@ pub fn bounded_schema_summary(
             "- edge `{name}`: {}; sources: [{sources}]; targets: [{targets}]; bidirectional: {}\n",
             edge.description, edge.bidirectional
         );
-        let priority = if contains_type_name(&primary, name) {
-            0
-        } else if contains_type_name(context.recent_tool_results, name) {
-            1
-        } else {
-            2
-        };
         records.push(SchemaRecord {
             kind: SchemaRecordKind::Edge,
             name: name.clone(),
             text,
-            priority,
+            priority: priority(name),
         });
     }
 
@@ -214,70 +258,102 @@ pub fn bounded_schema_summary(
         ))
     });
 
-    let total_objects = schema.object_types.len();
-    let total_edges = schema.edge_types.len();
-    let header = "## Knowledge Graph Schema\n\n### Available Types\n";
-    let mut selected = Vec::new();
-    let mut raw_text = header.to_string();
-    for record in records {
-        let mut trial = raw_text.clone();
-        trial.push_str(&record.text);
-        if count_tokens(&trial) <= token_budget {
-            raw_text = trial;
-            selected.push(record);
+    // Measure the complete text first: the common all-fit case takes one estimate,
+    // including at the exact boundary where separate token counts can disagree.
+    let full = render_schema_summary(records.iter(), total_objects, total_edges);
+    if full.estimated_tokens <= token_budget {
+        return full;
+    }
+
+    // Under pressure, use standalone record costs to propose a priority-ordered
+    // selection, skipping records too large to fit. Only a verified joined
+    // candidate (including its omission notice) may be returned.
+    let mut remaining = token_budget.saturating_sub(count_tokens(SCHEMA_HEADER));
+    let selected: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            let cost = count_tokens(&record.text);
+            if cost > remaining {
+                return false;
+            }
+            remaining -= cost;
+            true
+        })
+        .collect();
+    if selected.len() != records.len() {
+        let candidate = render_schema_summary(selected.iter().copied(), total_objects, total_edges);
+        if candidate.estimated_tokens <= token_budget {
+            return candidate;
         }
     }
 
-    let (mut text, mut included_objects, mut included_edges) = loop {
-        let included_objects = selected
-            .iter()
-            .filter(|record| record.kind == SchemaRecordKind::Object)
-            .count();
-        let included_edges = selected
-            .iter()
-            .filter(|record| record.kind == SchemaRecordKind::Edge)
-            .count();
-        let omitted_objects = total_objects - included_objects;
-        let omitted_edges = total_edges - included_edges;
-        let mut candidate = header.to_string();
-        for record in &selected {
-            candidate.push_str(&record.text);
-        }
-        if omitted_objects + omitted_edges > 0 {
-            candidate.push_str(&omission_notice(omitted_objects, omitted_edges));
-        }
-        if count_tokens(&candidate) <= token_budget || selected.is_empty() {
-            break (candidate, included_objects, included_edges);
-        }
-        selected.pop();
-    };
-
-    let mut estimate = estimate_tokens(&text);
-    if estimate.tokens > token_budget {
-        let notice = omission_notice(total_objects, total_edges);
-        let notice_estimate = estimate_tokens(&notice);
-        if notice_estimate.tokens <= token_budget {
-            text = notice;
-            estimate = notice_estimate;
-            included_objects = 0;
-            included_edges = 0;
+    // Reclaim space from the lowest-priority selected records. Use logarithmically
+    // many probes rather than estimating every shorter prefix. Token counts need
+    // not be monotonic across joins, so keep only a candidate we actually checked.
+    let mut best = None;
+    let (mut lo, mut hi) = (0, selected.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate =
+            render_schema_summary(selected[..mid].iter().copied(), total_objects, total_edges);
+        if candidate.estimated_tokens <= token_budget {
+            best = Some(candidate);
+            lo = mid + 1;
         } else {
-            text.clear();
-            estimate = estimate_tokens("");
-            included_objects = 0;
-            included_edges = 0;
+            hi = mid;
         }
     }
+    best.unwrap_or_else(|| {
+        let text = omission_notice(total_objects, total_edges);
+        let estimate = estimate_tokens(&text);
+        let mut summary = empty_schema_summary(total_objects, total_edges);
+        summary.estimation_fallback = estimate.used_fallback;
+        if estimate.tokens <= token_budget {
+            summary.text = text;
+            summary.estimated_tokens = estimate.tokens;
+        }
+        summary
+    })
+}
 
+fn empty_schema_summary(objects: usize, edges: usize) -> BoundedSchemaSummary {
     BoundedSchemaSummary {
-        text,
-        included_object_types: included_objects,
-        included_edge_types: included_edges,
-        omitted_object_types: total_objects - included_objects,
-        omitted_edge_types: total_edges - included_edges,
-        estimated_tokens: estimate.tokens,
-        estimation_fallback: estimate.used_fallback,
+        text: String::new(),
+        included_object_types: 0,
+        included_edge_types: 0,
+        omitted_object_types: objects,
+        omitted_edge_types: edges,
+        estimated_tokens: 0,
+        estimation_fallback: false,
     }
+}
+
+fn render_schema_summary<'a>(
+    records: impl Iterator<Item = &'a SchemaRecord>,
+    total_objects: usize,
+    total_edges: usize,
+) -> BoundedSchemaSummary {
+    let mut summary = empty_schema_summary(total_objects, total_edges);
+    summary.text.push_str(SCHEMA_HEADER);
+    for record in records {
+        summary.text.push_str(&record.text);
+        match record.kind {
+            SchemaRecordKind::Object => summary.included_object_types += 1,
+            SchemaRecordKind::Edge => summary.included_edge_types += 1,
+        }
+    }
+    summary.omitted_object_types -= summary.included_object_types;
+    summary.omitted_edge_types -= summary.included_edge_types;
+    if summary.omitted_object_types + summary.omitted_edge_types > 0 {
+        summary.text.push_str(&omission_notice(
+            summary.omitted_object_types,
+            summary.omitted_edge_types,
+        ));
+    }
+    let estimate = estimate_tokens(&summary.text);
+    summary.estimated_tokens = estimate.tokens;
+    summary.estimation_fallback = estimate.used_fallback;
+    summary
 }
 
 pub(crate) fn compose_preamble(base: &str, guidance: &str, schema: &str) -> String {
@@ -452,33 +528,8 @@ impl BudgetController {
         self.inner.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    pub(crate) fn initial_preamble(&self) -> String {
-        self.preamble("")
-    }
-
-    fn preamble(&self, recent_tool_results: &str) -> String {
-        let budget = self.lock().limits.context_tokens;
-        self.preamble_with_schema_budget(recent_tool_results, budget)
-    }
-
-    fn preamble_with_schema_budget(
-        &self,
-        recent_tool_results: &str,
-        schema_budget: usize,
-    ) -> String {
-        let schema = self.schema.as_ref().map_or_else(String::new, |schema| {
-            bounded_schema_summary(
-                schema,
-                SchemaPriorityContext {
-                    current_request: &self.current_request,
-                    retained_history: &self.retained_history,
-                    recent_tool_results,
-                },
-                schema_budget,
-            )
-            .text
-        });
-        compose_preamble(&self.base_prompt, &self.tool_guidance, &schema)
+    pub(crate) fn base_preamble(&self) -> String {
+        compose_preamble(&self.base_prompt, &self.tool_guidance, "")
     }
 
     pub(crate) fn diagnostics(&self) -> AgentBudgetDiagnostics {
@@ -497,9 +548,13 @@ impl BudgetController {
 }
 
 fn serialize_message(message: &Message) -> String {
+    #[cfg(test)]
+    record_work(|work| work.serializations += 1);
     serde_json::to_string(message).unwrap_or_else(|_| format!("{message:?}"))
 }
 
+// Independent reference for verifying actual patched requests in tests.
+#[cfg(test)]
 fn request_tokens(
     preamble: &str,
     prompt: &Message,
@@ -564,43 +619,99 @@ fn required_tool_call_history_start(prompt: &Message, history: &[Message]) -> Op
     })
 }
 
-/// Retain the newest valid history suffix that fits one model request.
-///
-/// Removing leading assistant/tool-result messages avoids splitting a tool
-/// interaction when an older prefix is discarded. When the current prompt is
-/// itself a tool result, its matching assistant tool call is the oldest message
-/// that must remain to preserve the provider-visible transaction.
-fn fit_history(
-    preamble: &str,
-    prompt: &Message,
-    history: &[Message],
-    tool_definition_tokens: usize,
-    context_tokens: usize,
-) -> (Vec<Message>, TokenEstimate, bool) {
-    let required_start = required_tool_call_history_start(prompt, history);
-    let mut start = 0;
-    loop {
-        while start < history.len()
-            && Some(start) != required_start
-            && is_leading_orphan(&history[start])
+/// Costs shared by both fits of one completion. A suffix table makes trimming
+/// independent of message size and keeps fallback tracking on the retained suffix.
+struct CompletionInput<'a> {
+    history: &'a [Message],
+    suffix_costs: Vec<TokenEstimate>,
+    fixed_cost: TokenEstimate,
+    required_start: Option<usize>,
+}
+
+struct FittedRequest {
+    preamble: String,
+    history_start: usize,
+    estimate: TokenEstimate,
+}
+
+impl<'a> CompletionInput<'a> {
+    fn new(prompt: &Message, history: &'a [Message], tool_definition_tokens: usize) -> Self {
+        let message_cost = |message| {
+            let mut estimate = estimate_tokens(&serialize_message(message));
+            estimate.tokens = estimate.tokens.saturating_add(TOKENS_PER_MESSAGE);
+            estimate
+        };
+        let mut suffix_costs = vec![
+            TokenEstimate {
+                tokens: 0,
+                used_fallback: false
+            };
+            history.len() + 1
+        ];
+        for (index, message) in history.iter().enumerate().rev() {
+            suffix_costs[index] = suffix_costs[index + 1].plus(message_cost(message));
+        }
+        let fixed_cost = message_cost(prompt).plus(TokenEstimate {
+            tokens: tool_definition_tokens
+                .saturating_add(REPLY_PRIMING_TOKENS + REQUEST_ENVELOPE_TOKENS),
+            used_fallback: false,
+        });
+        Self {
+            history,
+            suffix_costs,
+            fixed_cost,
+            required_start: required_tool_call_history_start(prompt, history),
+        }
+    }
+
+    fn skip_orphans(&self, mut start: usize) -> usize {
+        while start < self.history.len()
+            && Some(start) != self.required_start
+            && is_leading_orphan(&self.history[start])
         {
             start += 1;
         }
-        let fitted = &history[start..];
-        let history_was_omitted = start > 0;
-        let effective_preamble = if history_was_omitted {
-            format!("{preamble}\n\n{HISTORY_OMISSION_NOTICE}")
-        } else {
-            preamble.to_string()
-        };
-        let estimate = request_tokens(&effective_preamble, prompt, fitted, tool_definition_tokens);
-        if estimate.tokens <= context_tokens
-            || fitted.is_empty()
-            || required_start.is_some_and(|required| start >= required)
-        {
-            return (fitted.to_vec(), estimate, history_was_omitted);
+        start
+    }
+
+    // At the shortest valid suffix, return the real estimate even if it is
+    // over budget so the caller reports overflow instead of dropping a call.
+    fn fits_or_cannot_trim(&self, start: usize, estimate: TokenEstimate, limit: usize) -> bool {
+        estimate.tokens <= limit
+            || start == self.history.len()
+            || Some(start) == self.required_start
+    }
+
+    fn fit(&self, mut preamble: String, min_start: usize, limit: usize) -> FittedRequest {
+        let mut start = self.skip_orphans(min_start);
+        let fixed_cost = |preamble: &str| self.fixed_cost.plus(estimate_tokens(preamble));
+        if start == 0 {
+            let estimate = fixed_cost(&preamble).plus(self.suffix_costs[0]);
+            if self.fits_or_cannot_trim(0, estimate, limit) {
+                return FittedRequest {
+                    preamble,
+                    history_start: 0,
+                    estimate,
+                };
+            }
+            start = self.skip_orphans(1);
         }
-        start += 1;
+
+        // Estimate the joined preamble once and reuse it for all shortened suffixes.
+        preamble.push_str("\n\n");
+        preamble.push_str(HISTORY_OMISSION_NOTICE);
+        let fixed = fixed_cost(&preamble);
+        loop {
+            let estimate = fixed.plus(self.suffix_costs[start]);
+            if self.fits_or_cannot_trim(start, estimate, limit) {
+                return FittedRequest {
+                    preamble,
+                    history_start: start,
+                    estimate,
+                };
+            }
+            start = self.skip_orphans(start + 1);
+        }
     }
 }
 
@@ -684,13 +795,9 @@ fn record_fingerprint_result(
         && tracked.unchanged_repeats >= repeated_call_limit
 }
 
-impl AgentHook for BudgetController {
-    async fn on_completion_call(
-        &self,
-        _context: &HookContext,
-        event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        let recent = {
+impl BudgetController {
+    fn completion_call(&self, event: CompletionCallEvent<'_>) -> CompletionCallAction {
+        let context_tokens = {
             let state = self.lock();
             if let Some(termination) = &state.termination {
                 return CompletionCallAction::stop(match termination {
@@ -699,51 +806,62 @@ impl AgentHook for BudgetController {
                     }
                 });
             }
-            state
-                .recent_tool_results
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
+            state.limits.context_tokens
         };
-        let context_tokens = self.lock().limits.context_tokens;
-        let base_preamble = self.preamble_with_schema_budget(&recent, 0);
-        let (base_history, base, base_history_was_omitted) = fit_history(
-            &base_preamble,
-            event.prompt,
-            event.history,
-            self.tool_definition_tokens,
-            context_tokens,
-        );
-        let available_schema = context_tokens.saturating_sub(base.tokens);
-        let mut preamble = self.preamble_with_schema_budget(&recent, available_schema);
-        if base_history_was_omitted {
-            preamble.push_str("\n\n");
-            preamble.push_str(HISTORY_OMISSION_NOTICE);
-        }
-        let (history, estimate, additional_history_was_omitted) = fit_history(
-            &preamble,
-            event.prompt,
-            &base_history,
-            self.tool_definition_tokens,
-            context_tokens,
-        );
-        if additional_history_was_omitted && !base_history_was_omitted {
-            preamble.push_str("\n\n");
-            preamble.push_str(HISTORY_OMISSION_NOTICE);
-        }
+        let input = CompletionInput::new(event.prompt, event.history, self.tool_definition_tokens);
+        let base = input.fit(self.base_preamble(), 0, context_tokens);
+        let base_fallback = base.estimate.used_fallback;
+        let available_schema = context_tokens.saturating_sub(base.estimate.tokens);
+        let fitted = match &self.schema {
+            Some(schema) if available_schema > 0 => {
+                let recent = self
+                    .lock()
+                    .recent_tool_results
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let summary = bounded_schema_summary(
+                    schema,
+                    SchemaPriorityContext {
+                        current_request: &self.current_request,
+                        retained_history: &self.retained_history,
+                        recent_tool_results: &recent,
+                    },
+                    available_schema,
+                );
+                if summary.text.is_empty() {
+                    base
+                } else {
+                    let preamble =
+                        compose_preamble(&self.base_prompt, &self.tool_guidance, &summary.text);
+                    input.fit(preamble, base.history_start, context_tokens)
+                }
+            }
+            _ => base,
+        };
 
         let mut state = self.lock();
-        state.diagnostics.estimation_fallback |= base.used_fallback || estimate.used_fallback;
-        if let Err(reason) = admit_completion(&mut state, estimate.tokens, event.turn) {
+        state.diagnostics.estimation_fallback |= base_fallback || fitted.estimate.used_fallback;
+        if let Err(reason) = admit_completion(&mut state, fitted.estimate.tokens, event.turn) {
             Self::set_termination(&mut state, BudgetTermination::Budget(reason.clone()));
             return CompletionCallAction::stop(reason);
         }
-        let mut patch = RequestPatch::new().preamble(preamble);
-        if history.len() != event.history.len() {
-            patch = patch.history(history);
+        let mut patch = RequestPatch::new().preamble(fitted.preamble);
+        if fitted.history_start != 0 {
+            patch = patch.history(event.history[fitted.history_start..].iter().cloned());
         }
         CompletionCallAction::patch(patch)
+    }
+}
+
+impl AgentHook for BudgetController {
+    async fn on_completion_call(
+        &self,
+        _context: &HookContext,
+        event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
+        self.completion_call(event)
     }
 
     async fn on_tool_call(&self, _context: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
@@ -877,6 +995,153 @@ mod tests {
         schema
     }
 
+    fn measure_fit<T>(fit: impl FnOnce() -> T) -> (T, FitWork) {
+        FIT_WORK.set(FitWork::default());
+        let result = fit();
+        (result, FIT_WORK.take())
+    }
+
+    fn controller(schema: Option<SchemaDefinition>, context_tokens: usize) -> BudgetController {
+        BudgetController::new(
+            EffectiveAgentBudget {
+                context_tokens,
+                ..EffectiveAgentBudget::default()
+            },
+            schema,
+            "system".into(),
+            "guidance".into(),
+            "now".into(),
+            String::new(),
+            TokenEstimate {
+                tokens: 10,
+                used_fallback: false,
+            },
+        )
+    }
+
+    fn request_event<'a>(prompt: &'a Message, history: &'a [Message]) -> CompletionCallEvent<'a> {
+        CompletionCallEvent {
+            prompt,
+            history,
+            turn: 1,
+        }
+    }
+
+    #[test]
+    fn schema_fitting_avoids_repeated_prefix_work() {
+        let mut schema = SchemaDefinition::new("test".into(), "1".into(), String::new());
+        for index in 0..256 {
+            let name = format!("record_{index:03}");
+            schema.add_object_type(
+                name.clone(),
+                ObjectTypeSchema::new(name, "Description".into()),
+            );
+        }
+        let (empty, zero_work) =
+            measure_fit(|| bounded_schema_summary(&schema, SchemaPriorityContext::default(), 0));
+        let full = bounded_schema_summary(&schema, SchemaPriorityContext::default(), usize::MAX);
+        let (exact, exact_work) = measure_fit(|| {
+            bounded_schema_summary(
+                &schema,
+                SchemaPriorityContext::default(),
+                full.estimated_tokens,
+            )
+        });
+        eprintln!("schema work: zero={zero_work:?}, exact={exact_work:?}");
+        assert_eq!(exact, full);
+        assert_eq!(exact.included_object_types, 256);
+        assert_eq!(exact_work.schema_records, 256);
+        assert_eq!(exact_work.estimates, 1);
+        assert_eq!(exact_work.estimator_bytes, exact.text.len());
+        let (partial, partial_work) = measure_fit(|| {
+            bounded_schema_summary(
+                &schema,
+                SchemaPriorityContext::default(),
+                full.estimated_tokens - 1,
+            )
+        });
+        assert!(partial.included_object_types > 0 && partial.omitted_object_types > 0);
+        assert_eq!(partial.estimated_tokens, count_tokens(&partial.text));
+        assert!(partial.estimated_tokens < full.estimated_tokens);
+        assert!(partial_work.estimates <= 256 + 12, "{partial_work:?}");
+        assert!(
+            partial_work.estimator_bytes <= full.text.len() * 12,
+            "{partial_work:?}"
+        );
+        assert!(empty.text.is_empty());
+        assert_eq!(empty.omitted_object_types, 256);
+        assert_eq!(zero_work.schema_records, 0);
+        assert_eq!(zero_work.estimates, 0);
+        assert_eq!(zero_work.estimator_bytes, 0);
+    }
+
+    #[test]
+    fn completion_fitting_estimates_each_message_once_even_when_all_history_is_removed() {
+        let history = (0..256)
+            .map(|index| Message::user(format!("history {index:03}")))
+            .collect::<Vec<_>>();
+        let prompt = Message::user("now");
+        let preamble = compose_preamble("system", "guidance", "");
+        let preamble_with_notice = format!("{preamble}\n\n{HISTORY_OMISSION_NOTICE}");
+        let context = request_tokens(&preamble_with_notice, &prompt, &[], 10).tokens;
+        let message_bytes = history
+            .iter()
+            .chain([&prompt])
+            .map(|m| serialize_message(m).len())
+            .sum::<usize>();
+        let budget = controller(Some(schema()), context);
+        let (action, work) =
+            measure_fit(|| budget.completion_call(request_event(&prompt, &history)));
+        eprintln!("completion work: {work:?}");
+        let CompletionCallAction::Patch(patch) = action else {
+            panic!("expected a fitted request")
+        };
+        assert_eq!(
+            patch.preamble.as_deref(),
+            Some(preamble_with_notice.as_str())
+        );
+        assert_eq!(patch.history, Some(vec![]));
+        assert_eq!(budget.diagnostics().request_tokens, context);
+        assert_eq!(work.serializations, 257);
+        assert_eq!(work.estimates, 259);
+        assert_eq!(
+            work.estimator_bytes,
+            message_bytes + preamble.len() + preamble_with_notice.len()
+        );
+        assert_eq!(work.schema_records, 0);
+    }
+
+    #[test]
+    fn completion_reuses_estimates_across_both_fits() {
+        let history = [
+            Message::user("older history ".repeat(300)),
+            Message::user("previous request"),
+            Message::assistant("previous reply"),
+        ];
+        let prompt = Message::user("now");
+        for (context, expected_start) in [(4096, 0), (300, 1)] {
+            let budget = controller(Some(schema()), context);
+            let (action, work) =
+                measure_fit(|| budget.completion_call(request_event(&prompt, &history)));
+            let CompletionCallAction::Patch(patch) = action else {
+                panic!("expected a fitted request")
+            };
+            let retained = (expected_start != 0).then_some(&history[expected_start..]);
+            assert_eq!(patch.history.as_deref(), retained);
+            let preamble = patch.preamble.unwrap();
+            assert!(preamble.contains(SCHEMA_HEADER));
+            assert_eq!(
+                preamble.matches(HISTORY_OMISSION_NOTICE).count(),
+                expected_start
+            );
+            assert_eq!(work.serializations, 4);
+            assert_eq!(work.schema_records, 4);
+            let estimate = request_tokens(&preamble, &prompt, &history[expected_start..], 10);
+            assert!(estimate.tokens <= context);
+            assert_eq!(budget.diagnostics().request_tokens, estimate.tokens);
+        }
+    }
+
     #[test]
     fn bounded_schema_is_deterministic_prioritized_and_honest() {
         let schema = schema();
@@ -884,7 +1149,7 @@ mod tests {
         assert_eq!(full.omitted_object_types, 0);
         assert_eq!(full.omitted_edge_types, 0);
 
-        let budget = count_tokens("## Knowledge Graph Schema\n\n### Available Types\n") + 45;
+        let budget = count_tokens(SCHEMA_HEADER) + 45;
         let first = bounded_schema_summary(
             &schema,
             SchemaPriorityContext {
@@ -904,9 +1169,21 @@ mod tests {
             budget,
         );
         assert_eq!(first, second);
+        assert_eq!(first.estimated_tokens, count_tokens(&first.text));
         assert!(first.estimated_tokens <= budget);
-        assert!(first.text.contains("`location`"));
-        assert!(first.text.contains("omitted"));
+        assert!(first.text.contains("- object `location`: A place\n"));
+        assert!(first.text.ends_with(&omission_notice(
+            first.omitted_object_types,
+            first.omitted_edge_types
+        )));
+        assert_eq!(
+            first.included_object_types + first.omitted_object_types,
+            schema.object_types.len()
+        );
+        assert_eq!(
+            first.included_edge_types + first.omitted_edge_types,
+            schema.edge_types.len()
+        );
         assert!(
             !first.text.contains("`魔法`") || first.text.contains("- object `魔法`: 多字节描述\n")
         );
@@ -1062,12 +1339,21 @@ mod tests {
             Message::user("recent user"),
             Message::assistant("recent assistant"),
         ];
-        let (fitted, estimate, omitted) =
-            fit_history("system", &Message::user("now"), &history, 10, 180);
-        assert!(fitted.len() < history.len());
-        assert_eq!(fitted.first(), Some(&Message::user("recent user")));
-        assert!(omitted);
-        assert!(estimate.tokens <= 180);
+        let prompt = Message::user("now");
+        let input = CompletionInput::new(&prompt, &history, 10);
+        let full_cost = request_tokens("system", &prompt, &history, 10);
+        let exact = input.fit("system".into(), 0, full_cost.tokens);
+        assert_eq!(exact.history_start, 0);
+        assert_eq!(exact.estimate, full_cost);
+
+        let below = input.fit("system".into(), 0, full_cost.tokens - 1);
+        assert_eq!(below.history_start, 2);
+        assert_eq!(below.preamble.matches(HISTORY_OMISSION_NOTICE).count(), 1);
+        assert_eq!(
+            below.estimate,
+            request_tokens(&below.preamble, &prompt, &history[2..], 10)
+        );
+        assert!(below.estimate.tokens < full_cost.tokens);
     }
 
     #[test]
@@ -1089,21 +1375,37 @@ mod tests {
             Message::user("Find everything about Z-Rho"),
             matching_call.clone(),
         ];
-        let required_preamble = format!("system\n\n{HISTORY_OMISSION_NOTICE}");
-        let required_estimate = request_tokens(
+        let preamble = compose_preamble("system", "guidance", "");
+        let required_preamble = format!("{preamble}\n\n{HISTORY_OMISSION_NOTICE}");
+        let context = request_tokens(
             &required_preamble,
             &prompt,
             std::slice::from_ref(&matching_call),
             10,
+        )
+        .tokens;
+        let budget = controller(None, context);
+        let CompletionCallAction::Patch(patch) =
+            budget.completion_call(request_event(&prompt, &history))
+        else {
+            panic!("expected a fitted tool transaction");
+        };
+        assert_eq!(patch.preamble.as_deref(), Some(required_preamble.as_str()));
+        assert_eq!(patch.history, Some(vec![matching_call]));
+        assert_eq!(budget.diagnostics().request_tokens, context);
+
+        let budget = controller(None, context - 1);
+        let CompletionCallAction::Stop(reason) =
+            budget.completion_call(request_event(&prompt, &history))
+        else {
+            panic!("expected context overflow rather than an orphaned tool result");
+        };
+        assert!(reason.contains(&format!("estimated {context}-token input")));
+        assert_eq!(
+            budget.termination(),
+            Some(BudgetTermination::Budget(reason))
         );
-        let context = required_estimate.tokens;
-
-        let (fitted, estimate, omitted) = fit_history("system", &prompt, &history, 10, context);
-
-        assert!(fitted.len() < history.len());
-        assert_eq!(fitted.last(), Some(&matching_call));
-        assert!(omitted);
-        assert!(estimate.tokens <= context);
+        assert_eq!(budget.diagnostics().model_calls, 0);
     }
 
     #[test]

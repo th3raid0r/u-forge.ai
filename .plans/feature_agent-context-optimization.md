@@ -185,6 +185,13 @@ make clippy
 make test-ci
 ```
 
+Keep the [#60](https://github.com/th3raid0r/u-forge.ai/issues/60) performance fixtures in `crates/u-forge-agent/src/budget.rs` as acceptance cases for the replacement request fitter:
+
+- With 256 ordinary history messages and space for only the empty suffix, serialize and estimate each message at most once per completion, including when fitting more than one preamble. Count operations and estimator input bytes, not just elapsed time.
+- With 256 equal-sized schema records, format and tokenize no records at zero allowance. At the exact all-fit boundary, verify the complete joined summary without tokenizing growing prefixes. Under pressure, verify the joined selection and omission notice with the estimator before admission.
+
+These fixtures do not depend on the sandbox and do not change the adaptive compaction or response-reserve policy.
+
 Required focused scenarios:
 
 - below-threshold requests pass through unchanged;
