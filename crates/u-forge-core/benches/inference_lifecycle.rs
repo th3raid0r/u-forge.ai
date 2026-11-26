@@ -6,7 +6,8 @@
 //! fixed bounded backoff, existing worker counts, and existing queue capacity.
 //! Re-run this target against future routing changes before changing those
 //! policies; wall-clock values are a local baseline, while scenario parity is
-//! the decision signal.
+//! the decision signal. These providers do not measure hardware contention or
+//! power; use `make inference-fabric` for the real backfill and search baseline.
 
 use std::sync::{
     Arc,

@@ -82,5 +82,10 @@ path = "examples/convert_memorymesh.rs"
 name = "with_embedded_lemonade"
 path = "examples/with_embedded_lemonade.rs"
 
+[[example]]
+name = "inference_fabric"
+path = "examples/inference_fabric/main.rs"
+test = true
+
 [features]
 default = []

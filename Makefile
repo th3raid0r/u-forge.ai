@@ -2,6 +2,7 @@ SHELL := /usr/bin/env bash
 
 CARGO ?= cargo
 TEST_THREADS ?= 1
+FABRIC_CONFIG ?= benchmarks/inference-fabric.toml
 CARGO_CLIPPY_FLAGS := --workspace --no-deps
 COSMIC_TEXT_MANIFEST := crates/cosmic-text-patched/Cargo.toml
 CI_LEMONADE_TEST_FILTERS := \
@@ -62,7 +63,7 @@ fi
 endef
 endif
 
-.PHONY: help build release clean check test test-ci _test-with-embedded-lemonade fmt fmt-check clippy startup-profile-fresh startup-profile-configured
+.PHONY: help build release clean check test test-ci _test-with-embedded-lemonade fmt fmt-check clippy startup-profile-fresh startup-profile-configured inference-fabric inference-fabric-test
 
 help:
 	@printf '%s\n' 'u-forge.ai development targets'
@@ -78,6 +79,8 @@ help:
 	@printf '%s\n' '  Add V=1 to show full command output'
 	@printf '%s\n' '  make startup-profile-fresh       Profile isolated first launch'
 	@printf '%s\n' '  make startup-profile-configured  Profile configured metadata readiness'
+	@printf '%s\n' '  make inference-fabric            Run live inference baseline (see BUILD.md)'
+	@printf '%s\n' '  make inference-fabric-test       Test baseline measurement logic offline'
 
 build:
 	$(call run_silent,workspace build,$(CARGO) build --workspace)
@@ -92,7 +95,7 @@ clean:
 
 check:
 	$(call run_silent,u-forge-core check,$(CARGO) check -p u-forge-core)
-	$(call run_silent,u-forge-core benchmark check,$(CARGO) check -p u-forge-core --benches)
+	$(call run_silent,u-forge-core benchmark check,$(CARGO) check -p u-forge-core --benches --example inference_fabric)
 	$(call run_silent,convert_memorymesh example check,$(CARGO) check -p u-forge-core --example convert_memorymesh)
 	$(call run_silent,u-forge-graph-view benchmark check,$(CARGO) check -p u-forge-graph-view --benches)
 	$(call run_silent,workspace clippy check,$(CARGO) clippy $(CARGO_CLIPPY_FLAGS))
@@ -121,6 +124,15 @@ fmt-check:
 
 clippy:
 	$(call run_silent,workspace clippy,$(CARGO) clippy $(CARGO_CLIPPY_FLAGS) -- -D warnings)
+
+# Keep JSONL on stdout and build/runtime diagnostics on stderr.
+inference-fabric:
+	@test -n "$$UFORGE_LEMOND_PATH" -a -n "$$XDG_CACHE_HOME" -a -n "$$XDG_DATA_HOME" || { printf '%s\n' 'Set UFORGE_LEMOND_PATH and isolated XDG_CACHE_HOME/XDG_DATA_HOME (see BUILD.md)' >&2; exit 2; }
+	@$(CARGO) run --locked --quiet --release -p u-forge-core --example inference_fabric -- "$(FABRIC_CONFIG)"
+
+inference-fabric-test:
+	$(call run_tests,inference fabric fixture,$(CARGO) test --locked -p u-forge-core --example inference_fabric)
+	$(call run_silent,inference fabric lint,$(CARGO) clippy --locked -p u-forge-core --example inference_fabric -- -D warnings)
 
 startup-profile-fresh:
 	bash ./scripts/profile-startup.sh fresh
