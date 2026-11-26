@@ -506,9 +506,8 @@ and server-decorated Linux; GNOME X11 is unsupported.
   on Linux and renders title bar/frame/resize geometry only when GPUI reports
   client-side mode. Server-decorated geometry remains unchanged; GNOME X11 is
   outside the supported configuration set.
-- **The TypeScript runtime is design-gated** — no runtime crate exists until
-  `.plans/feature_TS-Agent-Sandbox.md` records an approved `deno_core` API,
-  threat model, resource controls, and v1 operation surface.
+- **No TypeScript runtime is shipped.** The sandbox design decision is tracked
+  in [#73](https://github.com/th3raid0r/u-forge.ai/issues/73).
 
 ---
 

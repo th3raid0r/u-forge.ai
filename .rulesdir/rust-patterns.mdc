@@ -215,11 +215,10 @@ them only with the deterministic scenarios in
 
 ## Async anti-patterns
 
-### BUG-5: never hold a `std::sync::Mutex` across `.await`
+### Never hold a `std::sync::Mutex` across `.await`
 
-Locking `std::sync::Mutex` inside an async fn blocks the Tokio executor thread
-— not just the current task. This was the actual BUG-5 root cause and cost
-significant wall time to diagnose.
+Waiting on a contended `std::sync::Mutex` inside an async fn blocks the Tokio
+executor thread, not just the current task.
 
 - For HTTP providers: keep them fully async via `reqwest` (no mutex needed).
 - For unavoidable CPU-bound or blocking sync work: use
