@@ -19,7 +19,7 @@ impl ChatPanel {
     }
 
     /// Save the current messages to the active session (creating one if needed).
-    pub(super) fn save_current_session(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn save_current_session(&mut self, cx: &mut App) {
         let store = match &self.history_store {
             Some(s) => s.clone(),
             None => return,
@@ -40,7 +40,7 @@ impl ChatPanel {
             .map(|t| {
                 let t = t.trim();
                 if t.len() > 60 {
-                    format!("{}…", &t[..60])
+                    format!("{}…", &t[..t.floor_char_boundary(60)])
                 } else {
                     t.to_string()
                 }

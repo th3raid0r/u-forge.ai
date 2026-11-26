@@ -5,6 +5,10 @@
 //! response rows or performs terminal cleanup and persistence.
 
 use super::*;
+use u_forge_core::{
+    lemonade::{ChatEvent, ChatRunError, ChatRunOutcome},
+    queue::InferenceError,
+};
 
 #[derive(Debug)]
 pub(super) enum ChatRunEvent {
@@ -43,36 +47,80 @@ pub(super) enum ChatRunTerminal {
     AgentFailure(String),
     ProviderFailure(String),
     Unavailable,
+    ReceiverClosed,
     ChannelClosed {
         transport: &'static str,
     },
 }
 
+impl ChatRunEvent {
+    pub(super) fn from_producer(event: ChatEvent) -> Option<Self> {
+        Some(match event {
+            ChatEvent::ReasoningDelta(text) => Self::ReasoningDelta(text),
+            ChatEvent::TextDelta(text) => Self::TextDelta(text),
+            ChatEvent::ToolCallStart {
+                internal_id,
+                name,
+                args_display,
+            } => Self::ToolCallStart {
+                internal_id,
+                name,
+                args_display,
+            },
+            ChatEvent::ToolResult {
+                internal_id,
+                content,
+            } => Self::ToolResult {
+                internal_id,
+                content,
+            },
+            ChatEvent::Usage(usage) => {
+                tracing::debug!(total_tokens = usage.total_tokens, "Chat usage");
+                return None;
+            }
+            ChatEvent::AgentDiagnostics(stats) => {
+                tracing::debug!(?stats, "Agent request completed");
+                return None;
+            }
+        })
+    }
+}
+
+impl From<ChatRunOutcome> for ChatRunTerminal {
+    fn from(outcome: ChatRunOutcome) -> Self {
+        match outcome {
+            Ok(full_text) => Self::Success { full_text },
+            Err(ChatRunError::ContextOverflow {
+                reason,
+                diagnostics,
+            }) => Self::BudgetStop {
+                reason,
+                model_calls: diagnostics.model_calls,
+                request_tokens: diagnostics.request_tokens,
+                tool_output_tokens: diagnostics.tool_output_tokens,
+            },
+            Err(ChatRunError::RepeatStop {
+                reason,
+                diagnostics,
+            }) => Self::RepeatStop {
+                reason,
+                model_calls: diagnostics.model_calls,
+            },
+            Err(ChatRunError::Interrupted(InferenceError::Cancelled)) => Self::Cancelled,
+            Err(ChatRunError::Interrupted(InferenceError::Superseded)) => Self::Superseded,
+            Err(ChatRunError::Interrupted(e)) => Self::ProviderFailure(e.to_string()),
+            Err(ChatRunError::Runtime(e)) => Self::RuntimeFailure(e),
+            Err(ChatRunError::Agent(e)) => Self::AgentFailure(e),
+            Err(ChatRunError::Provider(e) | ChatRunError::DriverLost(e)) => {
+                Self::ProviderFailure(e)
+            }
+            Err(ChatRunError::Incomplete(transport)) => Self::ChannelClosed { transport },
+            Err(ChatRunError::ReceiverClosed) => Self::ReceiverClosed,
+        }
+    }
+}
+
 impl ChatRunTerminal {
-    pub(super) fn for_closed_stream(
-        cancellation: &CancellationToken,
-        transport: &'static str,
-    ) -> Self {
-        match cancellation.check_cancelled() {
-            Err(u_forge_core::queue::InferenceError::Cancelled) => Self::Cancelled,
-            Err(u_forge_core::queue::InferenceError::Superseded) => Self::Superseded,
-            Err(error) => Self::ProviderFailure(error.to_string()),
-            Ok(()) => Self::ChannelClosed { transport },
-        }
-    }
-
-    pub(super) fn for_stream_error(
-        cancellation: &CancellationToken,
-        error: impl std::fmt::Display,
-    ) -> Self {
-        match cancellation.check_cancelled() {
-            Err(u_forge_core::queue::InferenceError::Cancelled) => Self::Cancelled,
-            Err(u_forge_core::queue::InferenceError::Superseded) => Self::Superseded,
-            Err(cancellation_error) => Self::ProviderFailure(cancellation_error.to_string()),
-            Ok(()) => Self::ProviderFailure(error.to_string()),
-        }
-    }
-
     fn assistant_text(&self) -> Option<String> {
         match self {
             Self::BudgetStop {
@@ -98,6 +146,7 @@ impl ChatRunTerminal {
             Self::Unavailable => {
                 Some("Chat unavailable — Lemonade Server not connected.".to_string())
             }
+            Self::ReceiverClosed => Some("[Chat receiver closed]".into()),
             Self::ChannelClosed { transport } => Some(format!(
                 "\n[{transport} stream closed without a terminal event]"
             )),
@@ -108,11 +157,13 @@ impl ChatRunTerminal {
 
 #[derive(Debug, Default)]
 pub(super) struct ChatRunReducer {
+    pub(super) generation: u64,
     terminal: bool,
 }
 
 impl ChatRunReducer {
     pub(super) fn begin(&mut self) {
+        self.generation += 1;
         self.terminal = false;
     }
 
@@ -128,6 +179,35 @@ impl ChatRunReducer {
 }
 
 impl ChatPanel {
+    pub(super) fn shutdown_run(&mut self, cx: &mut App) {
+        let Some(parent) = self.stream_cancellation.take() else {
+            return;
+        };
+        parent.cancel();
+        // No GPUI work is needed for producer termination. Quit observers
+        // have a short polling deadline, so join before returning to GPUI.
+        if let Some(completion) = self.stream_completion.take() {
+            let _ = self.tokio_rt.block_on(completion);
+        }
+        if let Some(ChatRunEvent::Terminal(terminal)) = self
+            .run_reducer
+            .admit(ChatRunEvent::Terminal(ChatRunTerminal::Cancelled))
+        {
+            self.apply_run_terminal(terminal, cx);
+        }
+    }
+
+    pub(super) fn apply_generation_event(
+        &mut self,
+        generation: u64,
+        event: ChatRunEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.run_reducer.generation == generation {
+            self.apply_run_event(event, cx);
+        }
+    }
+
     pub(super) fn apply_run_event(&mut self, event: ChatRunEvent, cx: &mut Context<Self>) -> bool {
         let Some(event) = self.run_reducer.admit(event) else {
             return true;
@@ -145,6 +225,10 @@ impl ChatPanel {
                 false
             }
             ChatRunEvent::TextDelta(delta) => {
+                if delta.is_empty() {
+                    return false;
+                }
+                self.streaming_thinking = None;
                 let message = self.ensure_assistant_message(cx);
                 message.update(cx, |message, cx| message.append_text(&delta, cx));
                 false
@@ -175,22 +259,33 @@ impl ChatPanel {
             }
             ChatRunEvent::Terminal(terminal) => {
                 self.apply_run_terminal(terminal, cx);
+                cx.notify();
                 true
             }
         }
     }
 
-    fn ensure_assistant_message(&mut self, cx: &mut Context<Self>) -> Entity<ChatMessageView> {
-        self.streaming_assistant.clone().unwrap_or_else(|| {
-            let message = self.take_pending_assistant(true, cx).unwrap_or_else(|| {
-                self.push_text_message(ChatMessageRole::Assistant, String::new(), cx)
-            });
-            self.streaming_assistant = Some(message.clone());
-            message
-        })
+    fn ensure_assistant_message(&mut self, cx: &mut App) -> Entity<ChatMessageView> {
+        // A later reasoning block splits the row, but does not erase the
+        // fact that assistant text was already delivered in this tool turn.
+        self.streaming_assistant
+            .clone()
+            .filter(|row| Some(row) == self.messages.last())
+            .unwrap_or_else(|| {
+                let message = self.take_pending_assistant(true, cx).unwrap_or_else(|| {
+                    self.push_text_message(ChatMessageRole::Assistant, String::new(), cx)
+                });
+                self.streaming_assistant = Some(message.clone());
+                message
+            })
     }
 
-    fn apply_run_terminal(&mut self, terminal: ChatRunTerminal, cx: &mut Context<Self>) {
+    fn apply_run_terminal(&mut self, terminal: ChatRunTerminal, cx: &mut App) {
+        if let ChatRunTerminal::RuntimeFailure(error) = &terminal {
+            self.profile_reload_state = ProfileReloadState::Failed(format!(
+                "Could not load the selected Assistant model: {error}"
+            ));
+        }
         if let ChatRunTerminal::Success { full_text } = &terminal {
             let fallback = full_text
                 .as_ref()
@@ -238,7 +333,7 @@ impl ChatPanel {
         self.finalize_run(cx);
     }
 
-    fn finalize_run(&mut self, cx: &mut Context<Self>) {
+    fn finalize_run(&mut self, cx: &mut App) {
         if let Some(pending) = self.pending_assistant.take() {
             pending.update(cx, |message, cx| {
                 message.replace_text("No response was received.", cx);
@@ -247,12 +342,13 @@ impl ChatPanel {
         self.pending_animation_task.take();
         self.streaming = false;
         self.stream_task = None;
+        self.stream_completion = None;
+        self.queued_send = None;
         self.stream_cancellation = None;
         self.streaming_thinking = None;
         self.streaming_assistant = None;
         self.streaming_tool_calls.clear();
         self.save_current_session(cx);
-        cx.notify();
     }
 
     /// Consume the pending row. Text responses can reuse it; reasoning and
@@ -260,7 +356,7 @@ impl ChatPanel {
     fn take_pending_assistant(
         &mut self,
         reuse_for_text: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> Option<Entity<ChatMessageView>> {
         let pending = self.pending_assistant.take();
         self.pending_animation_task.take();
@@ -326,6 +422,7 @@ mod tests {
             ChatRunTerminal::AgentFailure("agent".to_string()),
             ChatRunTerminal::ProviderFailure("provider".to_string()),
             ChatRunTerminal::Unavailable,
+            ChatRunTerminal::ReceiverClosed,
             ChatRunTerminal::ChannelClosed { transport: "Agent" },
         ];
         for left in 0..reasons.len() {

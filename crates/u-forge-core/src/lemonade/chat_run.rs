@@ -1,16 +1,25 @@
 //! Lifecycle shared by chat producers, independent of either wire protocol.
 use std::sync::Arc;
 
-use futures::{FutureExt, future::{BoxFuture, Shared}};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use tokio::sync::mpsc;
 
 use super::{AgentBudgetDiagnostics, ChatEvent, LemonadeRuntime, LemonadeRuntimeProfile};
 use crate::queue::{CancellationToken, InferenceError};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ChatRunError {
-    ContextOverflow { reason: String, diagnostics: AgentBudgetDiagnostics },
-    RepeatStop { reason: String, diagnostics: AgentBudgetDiagnostics },
+    ContextOverflow {
+        reason: String,
+        diagnostics: AgentBudgetDiagnostics,
+    },
+    RepeatStop {
+        reason: String,
+        diagnostics: AgentBudgetDiagnostics,
+    },
     Interrupted(InferenceError),
     ReceiverClosed,
     Incomplete(&'static str),
@@ -42,7 +51,9 @@ pub struct ChatEventSink {
 
 impl ChatEventSink {
     pub fn check_open(&self) -> Result<(), ChatRunError> {
-        self.cancellation.check_cancelled().map_err(ChatRunError::Interrupted)?;
+        self.cancellation
+            .check_cancelled()
+            .map_err(ChatRunError::Interrupted)?;
         if self.tx.is_closed() {
             return Err(ChatRunError::ReceiverClosed);
         }
@@ -51,7 +62,10 @@ impl ChatEventSink {
 
     pub async fn send(&self, event: ChatEvent) -> Result<(), ChatRunError> {
         self.check_open()?;
-        self.tx.send(event).await.map_err(|_| ChatRunError::ReceiverClosed)
+        self.tx
+            .send(event)
+            .await
+            .map_err(|_| ChatRunError::ReceiverClosed)
     }
 }
 
@@ -70,10 +84,19 @@ impl ChatRunContext {
         let driver = tokio::spawn(async move {
             let operation = async {
                 let _lease = match self.profile {
-                    Some((runtime, profile)) => Some(runtime.acquire_with_cancellation(&profile, &parent).await.map_err(|e| ChatRunError::Runtime(format!("{e:#}")))?),
+                    Some((runtime, profile)) => Some(
+                        runtime
+                            .acquire_with_cancellation(&profile, &parent)
+                            .await
+                            .map_err(|e| ChatRunError::Runtime(format!("{e:#}")))?,
+                    ),
                     None => None,
                 };
-                drive(ChatEventSink { tx: tx.clone(), cancellation: parent.clone() }).await
+                drive(ChatEventSink {
+                    tx: tx.clone(),
+                    cancellation: parent.clone(),
+                })
+                .await
             };
             let outcome = tokio::select! {
                 biased;
@@ -81,15 +104,29 @@ impl ChatRunContext {
                 _ = tx.closed() => Err(ChatRunError::ReceiverClosed),
                 result = operation => result,
             };
-            if matches!(outcome, Err(ChatRunError::ReceiverClosed)) {
+            // A send or profile wait can itself notice interruption in the
+            // same poll. Classify the cause here, not as a wire error.
+            if parent.is_cancelled() {
+                Err(ChatRunError::Interrupted(parent.error()))
+            } else if tx.is_closed() {
                 // Child queue jobs can outlive a dropped tool future.
                 parent.cancel();
+                Err(ChatRunError::ReceiverClosed)
+            } else {
+                outcome
             }
-            outcome
         });
         let completion = async move {
-            driver.await.unwrap_or_else(|e| Err(ChatRunError::DriverLost(e.to_string())))
-        }.boxed().shared();
-        ChatRunHandle { events, completion, cancellation }
+            driver
+                .await
+                .unwrap_or_else(|e| Err(ChatRunError::DriverLost(e.to_string())))
+        }
+        .boxed()
+        .shared();
+        ChatRunHandle {
+            events,
+            completion,
+            cancellation,
+        }
     }
 }
