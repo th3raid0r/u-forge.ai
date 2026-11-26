@@ -120,7 +120,9 @@ pub struct ModelLoadOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llamacpp_backend: Option<String>,
 
-    /// Extra arguments forwarded verbatim to `llama-server`.
+    /// Per-request arguments forwarded to `llama-server`. Since Lemonade 11.8,
+    /// these replace the model and architecture args; the server can still
+    /// merge in backend-wide args and overridable runtime defaults.
     ///
     /// Useful for flags not covered by the typed fields above.  Note that
     /// `--batch-size` and `--ubatch-size` are injected automatically from

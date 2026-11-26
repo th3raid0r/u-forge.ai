@@ -89,33 +89,34 @@ The desktop app uses the persistent path from `[storage].db_path`.
 Lemonade Server provides all AI inference (embedding, reranking, chat, STT,
 TTS) via an OpenAI-compatible HTTP API. On x86_64 Linux with GNU libc, building
 the desktop UI downloads the checksum-pinned upstream Ubuntu x64 Embeddable
-Lemonade 11.7.0 release into `target/`. `make release` packages that runtime,
-the desktop executable, and the complete defaults tree into an AppImage built
-on Ubuntu 26.04. The build adds the `reasoning` catalog label to built-in Gemma
-4 GGUF models and otherwise retains Lemonade 11.7.0's upstream backend version
-manifest. If provisioning is skipped or unavailable, AI features degrade
-gracefully and the knowledge graph remains usable.
+[Lemonade 2026.48.3 release](https://github.com/lemonade-sdk/lemonade/releases/tag/v2026.48.3)
+into `target/`. `make release` packages that runtime, the desktop executable,
+and the complete defaults tree into an AppImage built on Ubuntu 26.04. The
+build adds the `reasoning` catalog label to built-in Gemma 4 GGUF models and
+retains the upstream backend version manifest. If provisioning is skipped or
+unavailable, AI features degrade gracefully and the knowledge graph remains
+usable.
 
-### Setup
+### Standalone setup and upgrade notes
 
-```bash
-# Install (Linux via snap)
-sudo snap install lemonade-server
+Use the [upstream installers](https://github.com/lemonade-sdk/lemonade/releases)
+for an external server. Use `lemonade backends` to inspect available runtimes,
+`lemonade pull <model>` to download a model, and `GET /v1/health` to check the
+server and its loaded models. Install FLM with `lemonade backends install flm:npu`
+on supported hardware before selecting its dynamically discovered models.
 
-# Pull required models
-lemonade-server pull embed-gemma-300m-FLM      # embeddings (NPU, 0.62 GB) — default
-lemonade-server pull whisper-v3-turbo-FLM      # transcription (NPU, 1.55 GB)
-lemonade-server pull bge-reranker-v2-m3-GGUF   # reranking (GPU/CPU)
-
-# Start
-lemonade-server serve
-
-# Verify — also shows which models are currently loaded in RAM
-curl http://localhost:13305/api/v1/health
-```
-
-Cross-platform Lemonade install: Linux → `snap`; macOS → `.pkg` from GitHub
-releases; Windows → `.exe` installer.
+- Owned launches retain their existing private cache and config in Lemonade's
+  portable mode. A fresh install writes only u-forge's config overrides.
+  Upgrading an external system service is separate; see the
+  [upstream migration guide](https://github.com/lemonade-sdk/lemonade/wiki/Migration#v117x--v1180---v1181).
+- [Lemonade 11.8.0](https://github.com/lemonade-sdk/lemonade/releases/tag/v11.8.0)
+  made Whisper auto-detect the input language when none is supplied, and changed
+  explicit `llamacpp_args` to replace model and architecture arguments.
+- The first ROCm model load may download the new
+  [ROCm 10 runtime](https://github.com/lemonade-sdk/lemonade/releases/tag/v2026.41.1).
+- For an authenticated external server, supply its inference key in
+  `LEMONADE_API_KEY`. An empty admin key no longer bypasses authentication as of
+  [2026.47.1](https://github.com/lemonade-sdk/lemonade/releases/tag/v2026.47.1).
 
 ### Canonical test ownership
 
@@ -167,8 +168,8 @@ possible, not ergonomic preference.
 
 | Problem | Fix |
 |---|---|
-| `Lemonade Server not available` | Run `lemonade-server serve` — `localhost:13305` is auto-discovered |
-| `lemonade-server pull` fails | Check disk space; retry; verify network access |
+| `Lemonade Server not available` | Start the owned runtime or a standalone server on loopback port 13305 |
+| `lemonade pull` fails | Check disk space, network access, and whether the model's backend is installed |
 | Schema not found | Check `$UFORGE_SCHEMA_DIR`, verify `.json` files exist |
 | Dimension mismatch | Ensure each embedding model matches its configured vector lane; rebuild the database after changing dimensions |
 | Whisper not loaded in RAM | First transcription call triggers load; subsequent calls are fast. `GET /api/v1/health` shows loaded models |

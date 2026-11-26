@@ -234,6 +234,8 @@ fn embedded_command(
 ) -> Command {
     let mut command = Command::new(binary);
     command
+        // With one positional directory, lemond uses portable mode: both
+        // cache and persistent JSON state stay in our private cache root.
         .arg(data_root)
         .arg("--port")
         .arg(port.to_string())
@@ -617,29 +619,15 @@ fn prepare_private_root(package_root: &Path, data_root: &Path) -> Result<()> {
     }
     let config = data_root.join("config.json");
     if !config.exists() {
-        let defaults = data_root.join("resources/defaults.json");
-        let mut value = if defaults.is_file() {
-            serde_json::from_slice::<serde_json::Value>(&std::fs::read(defaults)?)?
-        } else {
-            serde_json::json!({})
-        };
-        let object = value
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("Lemonade defaults.json must contain an object"))?;
-        object.insert("host".into(), serde_json::json!("127.0.0.1"));
-        object.insert("broadcast".into(), serde_json::json!(false));
-        object.insert(
-            "models_dir".into(),
-            serde_json::json!(data_root.join("models")),
-        );
-        let telemetry = object
-            .entry("telemetry")
-            .or_insert_with(|| serde_json::json!({}));
-        let telemetry = telemetry
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("Lemonade telemetry defaults must contain an object"))?;
-        telemetry.insert("enabled".into(), serde_json::json!(false));
-        atomic_write(&config, &serde_json::to_vec_pretty(&value)?)?;
+        // Lemonade deep-merges sparse overrides with the packaged defaults.
+        // Persist only u-forge's overrides so later releases can update theirs.
+        let overrides = serde_json::json!({
+            "host": "127.0.0.1",
+            "broadcast": false,
+            "models_dir": data_root.join("models"),
+            "telemetry": { "enabled": false },
+        });
+        atomic_write(&config, &serde_json::to_vec_pretty(&overrides)?)?;
     } else {
         migrate_relative_models_dir(&config, data_root)?;
     }
@@ -813,8 +801,18 @@ mod tests {
         let package = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         std::fs::create_dir(package.path().join("resources")).unwrap();
-        std::fs::write(package.path().join("resources/defaults.json"), b"{}").unwrap();
+        let upstream_defaults =
+            br#"{"global_timeout":600,"telemetry":{"enabled":true,"hide_inputs":false}}"#;
+        std::fs::write(
+            package.path().join("resources/defaults.json"),
+            upstream_defaults,
+        )
+        .unwrap();
         prepare_private_root(package.path(), data.path()).unwrap();
+        assert_eq!(
+            std::fs::read(data.path().join("resources/defaults.json")).unwrap(),
+            upstream_defaults
+        );
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap())
                 .unwrap();
@@ -825,7 +823,8 @@ mod tests {
             config["models_dir"],
             data.path().join("models").to_string_lossy().as_ref()
         );
-        assert_eq!(config["telemetry"]["enabled"], false);
+        assert_eq!(config["telemetry"], serde_json::json!({ "enabled": false }));
+        assert!(config.get("global_timeout").is_none());
         std::fs::write(data.path().join("config.json"), b"{\"preserve\":true}").unwrap();
         std::fs::write(
             data.path().join("recipe_options.json"),

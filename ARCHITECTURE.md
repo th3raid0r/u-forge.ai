@@ -566,7 +566,7 @@ Standard Rust stable toolchain + a C compiler (`gcc`, `clang`, or MSVC) for
 bundled SQLite compilation. No system SQLite, ONNX Runtime, or RocksDB is
 required.
 
-`cargo run -p u-forge` works with zero environment variables set. On x86_64 Linux with GNU libc, the application package's build step downloads the checksum-pinned upstream Ubuntu x64 Embeddable Lemonade 11.7.0 artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, retains the release's upstream backend version manifest, and places `lemonade/lemond` beside the application executable. `make release` produces the Ubuntu 26.04-baseline x86_64 AppImage containing that runtime and the packaged defaults tree. With no `LEMONADE_URL`, the application launches its private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
+`cargo run -p u-forge` works with zero environment variables set. On x86_64 Linux with GNU libc, the application package's build step downloads the checksum-pinned upstream Ubuntu x64 Embeddable Lemonade 2026.48.3 artifact into `target/`, patches built-in Gemma 4 GGUF catalog entries with their verified `reasoning` capability, retains the release's upstream backend version manifest, and places `lemonade/lemond` beside the application executable. `make release` produces the Ubuntu 26.04-baseline x86_64 AppImage containing that runtime and the packaged defaults tree. With no `LEMONADE_URL`, the application launches its private runtime on the first available port in 13305–13315. Offline or explicitly skipped provisioning remains graph-only. Setting `LEMONADE_URL` selects an external server and suppresses embedded launch.
 
 Application-owned persistent state follows the XDG base-directory contract.
 The only desktop configuration is
@@ -580,7 +580,9 @@ working directory is not a configuration source.
 Mutable embedded state follows the XDG cache contract at
 `${XDG_CACHE_HOME:-~/.cache}/u-forge/lemonade`. Models, backend executables,
 and generated Lemonade configuration share that application-scoped cache;
-model resolution does not use the global Hugging Face cache. Older u-forge
+model resolution does not use the global Hugging Face cache. Portable mode
+keeps Lemonade's configuration in the same private root; new profiles store
+only u-forge's overrides to the packaged runtime defaults. Older u-forge
 cache entries under XDG data storage or a build profile's `lemonade/models`
 directory are moved into this location on the next owned launch.
 Before discovery or model activation, u-forge reconciles the owned runtime's

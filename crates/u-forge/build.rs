@@ -7,7 +7,7 @@ use std::{
     process::Command,
 };
 
-const LEMONADE_VERSION: &str = "11.7.0";
+const LEMONADE_VERSION: &str = "2026.48.3";
 const INSTALL_REVISION: &str = "ubuntu-x64-minimal-v1";
 const PATCH_REVISION: &str = "gemma4-reasoning-stock-backends-v1";
 const CHECKSUM_FILE: &str = "../../packaging/lemonade-embeddable.sha256";
@@ -123,9 +123,12 @@ fn profile_dir() -> Result<PathBuf, Box<dyn Error>> {
     let out_dir = PathBuf::from(
         env::var_os("OUT_DIR").ok_or("Cargo did not provide OUT_DIR to the build script")?,
     );
+    // Cargo has used both build/<package>-<hash>/out and
+    // build/<package>/<hash>/out. Stage beside the executable in either case.
     out_dir
         .ancestors()
-        .nth(3)
+        .find(|path| path.file_name() == Some(OsStr::new("build")))
+        .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| "Cargo OUT_DIR did not contain the expected target profile directory".into())
 }

@@ -50,6 +50,13 @@ struct LemonadeChatReq<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 /// Minimal streaming chunk shape — only the fields we need.
@@ -399,6 +406,7 @@ impl LemonadeChatProvider {
             stop: req.stop.as_deref(),
             enable_thinking: req.enable_thinking,
             stream: false,
+            stream_options: None,
         };
 
         let resp: ChatCompletionResponse = self
@@ -518,6 +526,10 @@ impl LemonadeChatProvider {
                 stop: req.stop.as_deref(),
                 enable_thinking: req.enable_thinking,
                 stream: true,
+                // FastFlowLM no longer sends streaming usage unless requested.
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
             };
 
             let timeouts = provider.client.connection().timeouts();
@@ -830,8 +842,12 @@ mod tests {
             stop: Some(&stop),
             enable_thinking: Some(false),
             stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
         };
         let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value["stream_options"]["include_usage"], true);
         assert_eq!(value["max_completion_tokens"], 321);
         assert!((value["top_p"].as_f64().unwrap() - 0.8).abs() < 1e-6);
         assert_eq!(value["top_k"], 40);
@@ -863,9 +879,11 @@ mod tests {
             stop: None,
             enable_thinking: None,
             stream: false,
+            stream_options: None,
         };
         let value = serde_json::to_value(body).unwrap();
         for field in [
+            "stream_options",
             "top_p",
             "top_k",
             "min_p",
@@ -917,6 +935,46 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn stream_delivers_the_usage_only_chunk_after_finish_reason() {
+        let (provider, server) = mock_stream_provider(
+            vec![(
+                std::time::Duration::ZERO,
+                concat!(
+                    ": keepalive\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .as_bytes(),
+            )],
+            LemonadeTimeouts::default(),
+            None,
+        )
+        .await;
+        let mut stream =
+            provider.complete_stream(ChatRequest::new(vec![ChatMessage::user("ping")]));
+        assert_eq!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamToken::Content("pong".into())
+        );
+        assert_eq!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamToken::FinishReason("stop".into())
+        );
+        assert_eq!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamToken::Usage(ChatUsage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+            })
+        );
+        assert!(stream.recv().await.is_none());
+        server.await.unwrap();
     }
 
     #[test]
