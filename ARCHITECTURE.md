@@ -351,7 +351,11 @@ writes.
 
 `EmbeddingPlan` is the declarative UI entry point:
 `EmbeddingPlan::rechunk(ids)` performs per-node re-chunk + embed and
-`EmbeddingPlan::embed_all()` performs the bulk missing-embedding sweep.
+`EmbeddingPlan::embed_all()` performs the bulk missing-embedding sweep. The
+queue sends bounded provider batches for backfills only; interactive and
+per-node embedding still submit single texts. Queue telemetry counts each
+batch as one job, while sweep outcomes count chunks. A lane writes only after
+all its batches succeed, and HQ still requires a complete standard lane.
 `AppView::run_embedding_plan(plan, cx)` owns status formatting, the GPUI task,
 one parent cancellation token, and stale-presentation guards. Superseded work
 is cancelled through the token and observed through termination; child

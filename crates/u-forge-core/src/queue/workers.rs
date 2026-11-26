@@ -25,9 +25,12 @@ use crate::lemonade::{
 };
 
 use super::jobs::{
-    EmbedJob, GenerateJob, GenerateStreamJob, RerankJob, SynthesizeJob, TranscribeJob, WorkQueue,
+    EmbedJob, GenerateJob, GenerateStreamJob, JobContext, RerankJob, SynthesizeJob, TranscribeJob,
+    WorkQueue,
 };
-use super::lifecycle::{InferenceError, OneShotReporter, StreamingReporter, TimeoutClass};
+use super::lifecycle::{
+    InferenceError, InferenceResult, OneShotReporter, StreamingReporter, TimeoutClass,
+};
 use super::weighted::WeightedEmbedDispatcher;
 
 /// Maximum number of attempts for a single embed job before the error is
@@ -299,21 +302,18 @@ pub(super) async fn run_rerank_worker(
     .await;
 }
 
-/// Embedding worker loop.
-///
-/// Execute a single embedding job: retry loop, EWMA update, send result.
-async fn execute_embed_job(
-    job: EmbedJob,
-    provider: &Arc<dyn EmbeddingProvider>,
+/// Run a provider request with the same retry and terminal reporting for both job types.
+async fn execute_embed_job<T, F>(
+    context: JobContext,
+    response: tokio::sync::oneshot::Sender<InferenceResult<T>>,
     device_name: &str,
-    ewma_us: &Arc<AtomicU64>,
     stolen: bool,
-) {
-    let EmbedJob {
-        context,
-        text,
-        response,
-    } = job;
+    input_bytes: usize,
+    single_ewma: Option<&AtomicU64>,
+    mut request: impl FnMut() -> F,
+) where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
     let Some(mut reporter) =
         OneShotReporter::begin(context, response, "embedding", device_name, stolen)
     else {
@@ -324,9 +324,10 @@ async fn execute_embed_job(
     let final_result = async {
         for attempt in 1..=EMBED_MAX_ATTEMPTS {
             let attempt_result = tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => Err(cancellation.error()),
                 error = reporter.receiver_closed() => Err(error),
-                result = provider.embed(&text) => result.map_err(|error| {
+                result = request() => result.map_err(|error| {
                     InferenceError::classify_timeout(error, TimeoutClass::Provider)
                 }),
             };
@@ -352,6 +353,7 @@ async fn execute_embed_job(
                     }
                     reporter.record_retry(attempt);
                     tokio::select! {
+                        biased;
                         _ = cancellation.cancelled() => return Err(cancellation.error()),
                         error = reporter.receiver_closed() => return Err(error),
                         _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
@@ -366,11 +368,12 @@ async fn execute_embed_job(
     .instrument(span)
     .await;
 
+    let final_result = cancellation.check_cancelled().and(final_result);
     let elapsed_us = reporter.elapsed().as_micros() as u64;
     debug!(
         job_id = reporter.job_id(),
         device = %device_name,
-        text_len = text.len(),
+        text_len = input_bytes,
         ok = final_result.is_ok(),
         duration_ms = elapsed_us / 1000,
         "Embed job complete"
@@ -379,7 +382,8 @@ async fn execute_embed_job(
     // Cancellation never trains the dispatch estimator. Successful work and
     // terminal provider failures do, because both represent occupied service
     // time on this worker.
-    if trains_embedding_ewma(&final_result) {
+    // Whole-batch service times are not comparable to interactive requests.
+    if let Some(ewma_us) = single_ewma.filter(|_| trains_embedding_ewma(&final_result)) {
         let old = ewma_us.load(Ordering::Relaxed);
         let new_ewma = if old == 0 {
             elapsed_us
@@ -399,6 +403,28 @@ fn trains_embedding_ewma<T>(result: &Result<T, InferenceError>) -> bool {
             | InferenceError::Superseded
             | InferenceError::TimedOut { .. })
     )
+}
+
+/// A malformed response must not reach the caller's ordered chunk/vector zip.
+async fn request_embedding_batch(
+    provider: &dyn EmbeddingProvider,
+    texts: &[String],
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let dimensions = provider.dimensions()?;
+    let vectors = provider.embed_batch(texts.to_vec()).await?;
+    anyhow::ensure!(
+        vectors.len() == texts.len(),
+        "Embedding batch returned {} vectors for {} inputs",
+        vectors.len(),
+        texts.len()
+    );
+    anyhow::ensure!(
+        vectors.iter().all(
+            |vector| vector.len() == dimensions && vector.iter().all(|value| value.is_finite())
+        ),
+        "Embedding batch returned a non-finite or incorrectly sized vector (expected {dimensions} dimensions)"
+    );
+    Ok(vectors)
 }
 
 /// Embedding worker loop with work stealing.
@@ -447,7 +473,41 @@ pub(super) async fn run_embed_worker(
             if stolen {
                 debug!(device = %device_name, "Work-stealing embed job from neighbour queue");
             }
-            execute_embed_job(job, &provider, &device_name, &ewma_us, stolen).await;
+            match job {
+                EmbedJob::Single {
+                    context,
+                    text,
+                    response,
+                } => {
+                    execute_embed_job(
+                        context,
+                        response,
+                        &device_name,
+                        stolen,
+                        text.len(),
+                        Some(&ewma_us),
+                        || provider.embed(&text),
+                    )
+                    .await;
+                }
+                EmbedJob::Batch {
+                    context,
+                    texts,
+                    response,
+                } => {
+                    let input_bytes = texts.iter().map(String::len).sum();
+                    execute_embed_job(
+                        context,
+                        response,
+                        &device_name,
+                        stolen,
+                        input_bytes,
+                        None,
+                        || request_embedding_batch(provider.as_ref(), &texts),
+                    )
+                    .await;
+                }
+            }
         }
     }
 }

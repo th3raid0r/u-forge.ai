@@ -33,7 +33,7 @@
 //!
 //! # EWMA update rule (in `run_embed_worker`)
 //!
-//! After each job completes (success or final retry failure):
+//! After each single-text job completes (success or final retry failure):
 //!
 //! ```text
 //! new_ewma = old_ewma / 2 + elapsed_us / 2        (α = 0.5)
@@ -200,7 +200,7 @@ mod tests {
     ) {
         let (tx, rx) = oneshot::channel();
         (
-            EmbedJob {
+            EmbedJob::Single {
                 context: JobContext::new(
                     CancellationToken::new(),
                     Arc::new(QueueMetrics::default()),

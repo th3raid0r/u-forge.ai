@@ -21,6 +21,10 @@ use super::lifecycle::{
 use super::telemetry::{QueueCounters, QueueMetrics};
 use super::weighted::WeightedEmbedDispatcher;
 
+/// On a 1,024-chunk Lemonade CPU fixture, throughput plateaued around 16–32
+/// inputs. Use 32 to halve the request count again without doubling payloads to 64.
+const BACKFILL_BATCH_SIZE: usize = 32;
+
 // ── Public queue state exposed via QueueStats ─────────────────────────────────
 
 /// Snapshot of the queue's current pending job counts.
@@ -117,7 +121,7 @@ impl InferenceQueue {
                 let text = text.into();
                 span.record("text_len", text.len());
                 span.record("pending_jobs", self.embed_dispatcher.pending());
-                EmbedJob {
+                EmbedJob::Single {
                     context,
                     text,
                     response,
@@ -137,11 +141,8 @@ impl InferenceQueue {
         self.embedding_space_fingerprint.as_deref()
     }
 
-    /// Submit a batch of texts for embedding.
-    ///
-    /// Submissions are pipelined with a concurrency cap of `embedding_workers * 2`
-    /// so bulk imports don't materialise every pending future at once.  Results are
-    /// returned in input order.
+    /// Embed multiple texts as individual jobs, returning results in input order.
+    /// At most `(embedding_workers * 2).max(4)` jobs are in flight.
     pub async fn embed_many(&self, texts: Vec<String>) -> InferenceResult<Vec<Vec<f32>>> {
         self.embed_many_with_cancellation(texts, CancellationToken::new())
             .await
@@ -170,6 +171,46 @@ impl InferenceQueue {
             .buffered(concurrency)
             .try_collect()
             .await
+    }
+
+    /// Backfills submit bounded provider batches rather than individual texts.
+    /// Keep the lane-wide result ordered and fail the sweep on any failed batch.
+    pub(crate) async fn embed_backfill_with_cancellation(
+        &self,
+        texts: Vec<String>,
+        cancellation: CancellationToken,
+    ) -> InferenceResult<Vec<Vec<f32>>> {
+        use futures::{StreamExt, TryStreamExt};
+
+        let mut texts = texts.into_iter();
+        let batches = std::iter::from_fn(|| {
+            let batch: Vec<_> = texts.by_ref().take(BACKFILL_BATCH_SIZE).collect();
+            (!batch.is_empty()).then_some(batch)
+        });
+        let ordered: Vec<Vec<Vec<f32>>> = futures::stream::iter(batches)
+            .map(|texts| async {
+                cancellation.check_cancelled()?;
+                submit_one_shot(
+                    self.has_embedding(),
+                    "embedding",
+                    cancellation.clone(),
+                    Arc::clone(&self.metrics),
+                    |context, response| EmbedJob::Batch {
+                        context: context.isolate_receiver_drop(),
+                        texts,
+                        response,
+                    },
+                    |job| {
+                        self.embed_dispatcher.submit(job);
+                    },
+                )
+                .await
+            })
+            .buffered((self.embedding_workers * 2).max(4))
+            .try_collect()
+            .await?;
+        cancellation.check_cancelled()?;
+        Ok(ordered.into_iter().flatten().collect())
     }
 
     /// Submit an audio transcription request and await the result.
@@ -548,6 +589,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::time::Duration;
 
     use anyhow::Result;
     use tokio::sync::Semaphore;
@@ -683,8 +725,8 @@ mod tests {
             anyhow::bail!("deterministic transient failure")
         }
 
-        async fn embed_batch(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-            unreachable!()
+        async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            self.embed(&texts[0]).await.map(|v| vec![v; texts.len()])
         }
 
         fn dimensions(&self) -> Result<usize> {
@@ -936,6 +978,38 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(queue.stats().counters.cancelled_active, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_backfill_cancels_queued_siblings_without_cancelling_the_parent() {
+        let queue = build_embedding_queue(Arc::new(FailingEmbeddingProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            started: Arc::new(Semaphore::new(0)),
+        }));
+        let cancellation = CancellationToken::new();
+        let result = queue
+            .embed_backfill_with_cancellation(
+                vec!["fixture".into(); BACKFILL_BATCH_SIZE * 5],
+                cancellation.clone(),
+            )
+            .await;
+        assert!(matches!(result, Err(InferenceError::ProviderFailed { .. })));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let counters = queue.stats().counters;
+                if counters.provider_failed + counters.cancelled_active + counters.cancelled_pending
+                    == counters.submitted
+                {
+                    assert_eq!(counters.provider_failed, 1);
+                    assert_eq!(counters.submitted, 4, "fan-out must be bounded");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted jobs must all report a terminal outcome");
+        assert!(!cancellation.is_cancelled());
     }
 
     #[tokio::test]

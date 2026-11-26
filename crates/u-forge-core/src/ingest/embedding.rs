@@ -36,7 +36,7 @@ pub enum EmbeddingTarget {
 pub struct EmbeddingResult {
     /// Chunks successfully embedded and stored.
     pub stored: usize,
-    /// Chunks that failed to store (logged individually).
+    /// Chunks skipped because inference or storage failed.
     pub skipped: usize,
     /// Total chunks that were candidates for embedding.
     pub total: usize,
@@ -251,7 +251,7 @@ impl EmbeddingPlan {
                     None
                 };
 
-                let (stored, skipped, total_jobs) = match std_result {
+                let (stored, skipped, total_chunks) = match std_result {
                     Ok(r) => (r.stored, r.skipped, r.total),
                     Err(_) if cancellation.is_cancelled() => (0, 0, 0),
                     Err(e) => {
@@ -268,14 +268,10 @@ impl EmbeddingPlan {
                     None => 0,
                 };
 
-                // embed_many uses (workers * 2).max(4) as its concurrency cap.
-                let concurrency_cap = (queue.embedding_worker_count() * 2).max(4);
-                let peak = concurrency_cap.min(total_jobs);
                 let duration_ms = t0.elapsed().as_millis() as u64;
                 info!(
                     target: "u_forge::ingest",
-                    max_inflight = peak,
-                    total_jobs,
+                    total_chunks,
                     duration_ms,
                     "EmbeddingPlan::EmbedAll complete"
                 );
@@ -429,8 +425,8 @@ pub async fn rechunk_and_embed_with_cancellation(
 /// - the queue has no embedding worker, or
 /// - all chunks are already embedded for the given `target`.
 ///
-/// Individual upsert failures are counted in `skipped` and logged as
-/// warnings rather than aborting the batch.
+/// If inference or the lane-wide storage transaction fails, the error is
+/// logged and every candidate is counted in `skipped`.
 pub async fn embed_all_chunks(
     graph: &KnowledgeGraph,
     queue: &InferenceQueue,
@@ -497,7 +493,7 @@ pub async fn embed_all_chunks_with_cancellation(
     let texts: Vec<String> = chunks_to_embed.iter().map(|c| c.content.clone()).collect();
 
     match queue
-        .embed_many_with_cancellation(texts, cancellation.clone())
+        .embed_backfill_with_cancellation(texts, cancellation.clone())
         .await
     {
         Err(_) if cancellation.is_cancelled() => Err(cancellation.error().into()),
@@ -510,14 +506,12 @@ pub async fn embed_all_chunks_with_cancellation(
             })
         }
         Ok(vecs) => {
-            if cancellation.is_cancelled() {
-                return Err(cancellation.error().into());
-            }
             let embeddings = chunks_to_embed
-                .iter()
+                .into_iter()
                 .zip(vecs)
                 .map(|(chunk, vec)| (chunk.id, vec))
                 .collect::<Vec<_>>();
+            cancellation.check_cancelled()?;
             let result = match target {
                 EmbeddingTarget::Standard => graph.upsert_chunk_embeddings(embeddings),
                 EmbeddingTarget::HighQuality => graph.upsert_chunk_embeddings_hq(embeddings),
@@ -643,8 +637,8 @@ mod tests {
     use crate::ai::embeddings::{EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType};
     use crate::lemonade::{BuiltProvider, Capability, ProviderSlot};
     use crate::queue::InferenceQueueBuilder;
-    use crate::types::ChunkType;
-    use crate::{KnowledgeGraph, ObjectBuilder};
+    use crate::types::{ChunkId, ChunkType};
+    use crate::{EMBEDDING_DIMENSIONS, KnowledgeGraph, ObjectBuilder};
 
     use super::*;
 
@@ -654,21 +648,88 @@ mod tests {
         dimensions: usize,
     }
 
-    struct BlockingEmbeddingProvider {
-        calls: Arc<AtomicUsize>,
+    struct LateEmbeddingProvider {
         started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        cancellation: CancellationToken,
+    }
+
+    struct CountingEmbeddingProvider {
+        dimensions: usize,
+        batch_sizes: parking_lot::Mutex<Vec<usize>>,
+        singles: AtomicUsize,
+        truncate_tail: bool,
+    }
+
+    impl CountingEmbeddingProvider {
+        fn new(dimensions: usize, truncate_tail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                dimensions,
+                batch_sizes: Default::default(),
+                singles: AtomicUsize::new(0),
+                truncate_tail,
+            })
+        }
+
+        fn vector(&self, text: &str) -> Vec<f32> {
+            let index: u32 = text
+                .strip_prefix("Fixture chunk ")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut vector = vec![0.0; self.dimensions];
+            vector[0] = 1.0;
+            vector[1] = index as f32 / 1024.0;
+            vector
+        }
     }
 
     #[async_trait]
-    impl EmbeddingProvider for BlockingEmbeddingProvider {
-        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.started.add_permits(1);
-            std::future::pending().await
+    impl EmbeddingProvider for CountingEmbeddingProvider {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.singles.fetch_add(1, Ordering::SeqCst);
+            Ok(self.vector(text))
         }
 
-        async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-            unreachable!()
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.batch_sizes.lock().push(texts.len());
+            let drop_last = self.truncate_tail && texts.len() == 3;
+            let count = texts.len() - usize::from(drop_last);
+            Ok(texts
+                .iter()
+                .take(count)
+                .map(|text| self.vector(text))
+                .collect())
+        }
+
+        fn dimensions(&self) -> anyhow::Result<usize> {
+            Ok(self.dimensions)
+        }
+
+        fn max_tokens(&self) -> anyhow::Result<usize> {
+            Ok(512)
+        }
+
+        fn provider_type(&self) -> EmbeddingProviderType {
+            EmbeddingProviderType::Lemonade
+        }
+
+        fn model_info(&self) -> Option<EmbeddingModelInfo> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for LateEmbeddingProvider {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            unreachable!("backfill must use the batch endpoint")
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.cancellation.supersede();
+            Ok(vec![vec![1.0; EMBEDDING_DIMENSIONS]; texts.len()])
         }
 
         fn dimensions(&self) -> anyhow::Result<usize> {
@@ -737,6 +798,127 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let graph = KnowledgeGraph::new(tmp.path()).unwrap();
         (graph, tmp)
+    }
+
+    fn counting_queue(provider: &Arc<CountingEmbeddingProvider>) -> InferenceQueue {
+        InferenceQueueBuilder::new()
+            .with_provider(BuiltProvider {
+                name: "counting-embed".into(),
+                capability: Capability::Embedding,
+                provider: ProviderSlot::Embedding(provider.clone()),
+                weight: 100,
+            })
+            .build()
+    }
+
+    fn add_fixture_chunks(graph: &KnowledgeGraph, range: std::ops::Range<usize>) -> Vec<ChunkId> {
+        let object_id = ObjectBuilder::character("Batch fixture".into())
+            .add_to_graph(graph)
+            .unwrap();
+        graph
+            .add_text_chunks(
+                range
+                    .map(|i| {
+                        (
+                            object_id,
+                            format!("Fixture chunk {i}"),
+                            ChunkType::Description,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn backfill_batches_each_lane_and_preserves_chunk_identity() {
+        let (graph, tmp) = make_graph();
+        let ids = add_fixture_chunks(&graph, 0..1024);
+        let standard = CountingEmbeddingProvider::new(EMBEDDING_DIMENSIONS, false);
+        let hq = CountingEmbeddingProvider::new(HIGH_QUALITY_EMBEDDING_DIMENSIONS, false);
+        let queue = counting_queue(&standard);
+        let hq_queue = counting_queue(&hq);
+        let sweep = || EmbeddingPlan::embed_all().execute(&graph, &queue, Some(&hq_queue), |_| {});
+
+        let result = sweep().await;
+        assert_eq!(
+            (result.stored, result.hq_stored, result.skipped),
+            (1024, 1024, 0)
+        );
+        for provider in [&standard, &hq] {
+            assert_eq!(*provider.batch_sizes.lock(), vec![32; 32]);
+            assert_eq!(provider.singles.load(Ordering::SeqCst), 0);
+        }
+
+        let empty = sweep().await;
+        assert_eq!((empty.stored, empty.hq_stored, empty.skipped), (0, 0, 0));
+        for queue in [&queue, &hq_queue] {
+            let counters = queue.stats().counters;
+            assert_eq!(counters.submitted, 32);
+            assert_eq!(counters.succeeded, 32);
+        }
+
+        let partial = add_fixture_chunks(&graph, 1024..1059);
+        let result = sweep().await;
+        assert_eq!(
+            (result.stored, result.hq_stored, result.skipped),
+            (35, 35, 0)
+        );
+        let conn = rusqlite::Connection::open_with_flags(
+            tmp.path().join("knowledge.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for (provider, table) in [(&standard, "chunks_vec"), (&hq, "chunks_vec_hq")] {
+            assert_eq!(&provider.batch_sizes.lock()[32..], &[32, 3]);
+            assert_eq!(provider.singles.load(Ordering::SeqCst), 0);
+            let mut query = conn
+                .prepare(&format!("SELECT v.embedding FROM {table} v JOIN chunks c ON c.rowid = v.rowid WHERE c.id = ?1"))
+                .unwrap();
+            for (i, id) in ids.iter().chain(&partial).enumerate() {
+                let stored: Vec<u8> = query.query_row([id.to_string()], |row| row.get(0)).unwrap();
+                let expected: Vec<_> = provider
+                    .vector(&format!("Fixture chunk {i}"))
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect();
+                assert!(stored == expected, "wrong vector for chunk {id} in {table}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_batch_retries_then_skips_the_sweep_and_blocks_hq() {
+        let (graph, _tmp) = make_graph();
+        add_fixture_chunks(&graph, 0..35);
+        let standard = CountingEmbeddingProvider::new(EMBEDDING_DIMENSIONS, true);
+        let hq = CountingEmbeddingProvider::new(HIGH_QUALITY_EMBEDDING_DIMENSIONS, false);
+        let queue = counting_queue(&standard);
+        let hq_queue = counting_queue(&hq);
+        let cancellation = CancellationToken::new();
+        let result = EmbeddingPlan::embed_all()
+            .execute_with_cancellation(
+                &graph,
+                &queue,
+                Some(&hq_queue),
+                cancellation.clone(),
+                |_| {},
+            )
+            .await;
+        assert_eq!(
+            (result.stored, result.hq_stored, result.skipped),
+            (0, 0, 35)
+        );
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(*standard.batch_sizes.lock(), [32, 3, 3, 3]);
+        assert!(hq.batch_sizes.lock().is_empty());
+        assert_eq!(hq.singles.load(Ordering::SeqCst), 0);
+        let counters = queue.stats().counters;
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.provider_failed, 1);
+        assert_eq!(counters.retries, 2);
+        let stats = graph.get_stats().unwrap();
+        assert_eq!((stats.embedded_count, stats.embedded_hq_count), (0, 0));
     }
 
     /// Verify that `embed_all_chunks` is incremental: after an initial full
@@ -836,20 +1018,21 @@ mod tests {
                 ChunkType::Description,
             )
             .unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let cancellation = CancellationToken::new();
         let queue = InferenceQueueBuilder::new()
             .with_provider(BuiltProvider {
-                name: "blocking-embed".to_string(),
+                name: "late-embed".to_string(),
                 capability: Capability::Embedding,
-                provider: ProviderSlot::Embedding(Arc::new(BlockingEmbeddingProvider {
-                    calls: calls.clone(),
+                provider: ProviderSlot::Embedding(Arc::new(LateEmbeddingProvider {
                     started: started.clone(),
+                    release: release.clone(),
+                    cancellation: cancellation.clone(),
                 })),
                 weight: 100,
             })
             .build();
-        let cancellation = CancellationToken::new();
         let task = tokio::spawn({
             let graph = graph.clone();
             let queue = queue.clone();
@@ -864,11 +1047,22 @@ mod tests {
                 .await
             }
         });
-        started.acquire().await.unwrap().forget();
-        cancellation.cancel();
-        assert!(task.await.unwrap().is_err());
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.acquire())
+            .await
+            .expect("provider batch must start")
+            .unwrap()
+            .forget();
+        release.add_permits(1);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::queue::InferenceError>(),
+            Some(crate::queue::InferenceError::Superseded)
+        ));
+        let counters = queue.stats().counters;
+        assert_eq!(
+            (counters.submitted, counters.succeeded, counters.superseded),
+            (1, 0, 1)
+        );
         assert_eq!(graph.get_stats().unwrap().embedded_count, 0);
     }
 
