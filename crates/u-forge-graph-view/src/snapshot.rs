@@ -43,7 +43,7 @@ pub struct EdgeView {
     pub weight: f32,
 }
 
-/// Immutable snapshot of the graph, optimized for rendering.
+/// In-memory snapshot of the graph, optimized for rendering.
 pub struct GraphSnapshot {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<EdgeView>,
@@ -54,7 +54,7 @@ pub struct GraphSnapshot {
     pub legend_types: Vec<String>,
     /// Maps each node's `ObjectId` to its index in `nodes`. Used by
     /// `nodes_in_viewport` to resolve spatial-index entries to `nodes` indices,
-    /// and by `build_snapshot_incremental` to locate existing nodes cheaply.
+    /// and by `refresh_node_metadata` to locate existing nodes cheaply.
     pub id_to_idx: HashMap<ObjectId, usize>,
     /// Count of nodes per `object_type`. Maintained alongside `legend_types` so
     /// incremental updates can detect when a type is fully removed (count → 0)
@@ -63,6 +63,38 @@ pub struct GraphSnapshot {
 }
 
 impl GraphSnapshot {
+    /// Refresh names and properties for a deduplicated set of existing nodes.
+    ///
+    /// The caller must establish that no structural changes were missed. Returns
+    /// `Ok(false)` if an ID is unknown, a row has disappeared, or a type has
+    /// changed, in which case the caller should rebuild from storage. No part
+    /// of the snapshot is changed unless the whole patch succeeds.
+    pub fn refresh_node_metadata(
+        &mut self,
+        graph: &KnowledgeGraph,
+        ids: &HashSet<ObjectId>,
+    ) -> Result<bool> {
+        let mut updates = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(&idx) = self.id_to_idx.get(id) else {
+                return Ok(false);
+            };
+            tracing::trace!(name: "graph_snapshot_metadata_read", %id, "Read node by ID");
+            let Some(metadata) = graph.get_object(*id)? else {
+                return Ok(false);
+            };
+            if self.nodes[idx].object_type != metadata.object_type {
+                return Ok(false);
+            }
+            updates.push((idx, metadata.name, metadata.properties));
+        }
+        for (idx, name, properties) in updates {
+            self.nodes[idx].name = name;
+            self.nodes[idx].properties = properties;
+        }
+        Ok(true)
+    }
+
     /// Return indices of nodes whose positions fall within the given rectangle.
     pub fn nodes_in_viewport(&self, min: Vec2, max: Vec2) -> Vec<usize> {
         use rstar::AABB;
@@ -79,15 +111,7 @@ impl GraphSnapshot {
     /// drag operation) so that subsequent viewport culling and hit-testing
     /// reflect the new positions.
     pub fn rebuild_spatial_index(&mut self) {
-        let entries: Vec<NodeEntry> = self
-            .nodes
-            .iter()
-            .map(|n| NodeEntry {
-                id: n.id,
-                position: [n.position.x, n.position.y],
-            })
-            .collect();
-        self.spatial_index = RTree::bulk_load(entries);
+        self.spatial_index = build_spatial_index(&self.nodes);
     }
 
     /// Return the index of the node closest to `world_pos` within `max_dist` world units,
@@ -146,6 +170,23 @@ impl GraphSnapshot {
     }
 }
 
+fn build_spatial_index(nodes: &[NodeView]) -> RTree<NodeEntry> {
+    tracing::trace!(
+        name: "graph_snapshot_spatial_build",
+        entries = nodes.len(),
+        "Bulk-load spatial index"
+    );
+    RTree::bulk_load(
+        nodes
+            .iter()
+            .map(|n| NodeEntry {
+                id: n.id,
+                position: [n.position.x, n.position.y],
+            })
+            .collect(),
+    )
+}
+
 /// Build a `GraphSnapshot` from a `KnowledgeGraph`.
 ///
 /// 1. Fetches all objects, edges, and any previously saved canvas positions
@@ -157,14 +198,17 @@ impl GraphSnapshot {
 pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
     let total_start = std::time::Instant::now();
     let object_start = std::time::Instant::now();
+    tracing::trace!(name: "graph_snapshot_full_read", table = "nodes", "Read all nodes");
     let objects = graph.get_all_objects()?;
     let object_duration_us = object_start.elapsed().as_micros() as u64;
     let edge_start = std::time::Instant::now();
+    tracing::trace!(name: "graph_snapshot_full_read", table = "edges", "Read all edges");
     let raw_edges = graph.get_all_edges()?;
     let edge_duration_us = edge_start.elapsed().as_micros() as u64;
 
     // Load any previously saved UI positions (empty map on first run)
     let position_start = std::time::Instant::now();
+    tracing::trace!(name: "graph_snapshot_full_read", table = "node_positions", "Read all saved positions");
     let saved_positions = graph.load_layout().unwrap_or_default();
     let position_duration_us = position_start.elapsed().as_micros() as u64;
 
@@ -209,15 +253,7 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
 
     // Build R-tree spatial index from final positions
     let index_start = std::time::Instant::now();
-    let spatial_index = RTree::bulk_load(
-        nodes
-            .iter()
-            .map(|n| NodeEntry {
-                id: n.id,
-                position: [n.position.x, n.position.y],
-            })
-            .collect(),
-    );
+    let spatial_index = build_spatial_index(&nodes);
     let index_duration_us = index_start.elapsed().as_micros() as u64;
 
     // Precompute type counts and the sorted unique type list for the legend.
@@ -251,9 +287,9 @@ pub fn build_snapshot(graph: &KnowledgeGraph) -> Result<GraphSnapshot> {
 
 /// Rebuild a snapshot incrementally from `prev`, applying only what changed.
 ///
-/// This is the hot path for single-mutation events (e.g. an agent calling
-/// `UpsertNodeTool`). It still fetches all objects/edges from the DB (same
-/// I/O as a full rebuild), but:
+/// This still fetches all objects/edges from the DB (same I/O as a full
+/// rebuild). For known metadata-only changes, prefer
+/// [`GraphSnapshot::refresh_node_metadata`].
 ///
 /// - `legend_types` and `type_counts` are updated in O(delta) when no new
 ///   object types are introduced or removed entirely; otherwise they are
@@ -316,15 +352,7 @@ pub fn build_snapshot_incremental(
     let removed: Vec<ObjectId> = prev_ids.difference(&new_ids).copied().collect();
     let added: Vec<ObjectId> = new_ids.difference(&prev_ids).copied().collect();
 
-    let spatial_index = RTree::bulk_load(
-        nodes
-            .iter()
-            .map(|n| NodeEntry {
-                id: n.id,
-                position: [n.position.x, n.position.y],
-            })
-            .collect(),
-    );
+    let spatial_index = build_spatial_index(&nodes);
 
     // Legend: check whether any type was added or fully removed.
     //
@@ -501,7 +529,7 @@ fn build_legend(nodes: &[NodeView]) -> (Vec<String>, HashMap<String, usize>) {
         *type_counts.entry(n.object_type.clone()).or_insert(0) += 1;
     }
     let mut legend_types: Vec<String> = type_counts.keys().cloned().collect();
-    legend_types.sort_by_key(|a| a.to_lowercase());
+    legend_types.sort_by_cached_key(|a| (a.to_lowercase(), a.clone()));
     (legend_types, type_counts)
 }
 

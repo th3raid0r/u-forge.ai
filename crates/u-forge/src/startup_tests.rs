@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-struct FakeLemonade {
+pub(crate) struct FakeLemonade {
     base_url: String,
     stopping: Arc<AtomicBool>,
     max_in_flight: Arc<AtomicUsize>,
@@ -34,7 +34,7 @@ struct FakeLemonade {
 }
 
 impl FakeLemonade {
-    fn fresh() -> Self {
+    pub(crate) fn fresh() -> Self {
         Self::start(false)
     }
 
@@ -86,7 +86,7 @@ impl FakeLemonade {
         }
     }
 
-    fn connection(&self) -> Arc<LemonadeConnection> {
+    pub(crate) fn connection(&self) -> Arc<LemonadeConnection> {
         Arc::new(LemonadeConnection::external(&self.base_url).unwrap())
     }
 
