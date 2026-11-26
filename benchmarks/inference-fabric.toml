@@ -13,7 +13,8 @@ repetitions = 5
 chunks = 1024  # Use 32 for the same-work one-engine-batch vs partitioned-overlap case.
 interactive_period_ms = 50
 max_loaded_models = 2
-# whole_system_joules_path = "/path/to/wall-meter-cumulative-joules"
+# whole_system_joules_path = "/path/to/wall-meter-reading.json"
+# meter_max_age_ms = 100
 concurrent = ["cpu", "igpu"]
 
 [embeddings.cpu]

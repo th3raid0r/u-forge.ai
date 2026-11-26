@@ -1,9 +1,13 @@
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use u_forge_core::{
     EmbeddingModelInfo, EmbeddingProvider, EmbeddingProviderType,
     lemonade::{LemonadeProvider, LemonadeRerankProvider, RerankDocument, RerankProvider},
@@ -167,6 +171,44 @@ pub fn read_number(path: &Path) -> Result<f64> {
     Ok(value)
 }
 
+#[derive(Deserialize)]
+pub struct MeterReading {
+    unix_ms: u64,
+    epoch: u64,
+    joules: f64,
+}
+
+impl MeterReading {
+    pub fn read(path: &Path, max_age_ms: u64) -> Option<Self> {
+        let reading: Self = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        reading
+            .fresh(u64::try_from(now).ok()?, max_age_ms)
+            .then_some(reading)
+    }
+
+    fn fresh(&self, now_ms: u64, max_age_ms: u64) -> bool {
+        self.joules.is_finite()
+            && self.joules >= 0.0
+            && now_ms
+                .checked_sub(self.unix_ms)
+                .is_some_and(|age| age <= max_age_ms)
+    }
+
+    pub fn energy_to(&self, end: &Self, wall: Duration, max_age_ms: u64) -> Option<f64> {
+        // Avoid phase measurements dominated by publication lag at either edge.
+        let delta = end.joules - self.joules;
+        (self.epoch == end.epoch
+            && end.unix_ms > self.unix_ms
+            && delta > 0.0
+            && wall.as_millis() >= 10 * u128::from(max_age_ms))
+        .then_some(delta)
+    }
+}
+
 /// Compare the same delivered delta ordinals. Count each intersecting gap at
 /// most once for this union of windows, and never let a faster gap erase a stall.
 pub fn added_stall(
@@ -206,7 +248,6 @@ pub fn added_stall(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn matching_counts_positive_excess_once_per_gap_and_requires_complete_overlap() {
@@ -229,6 +270,29 @@ mod tests {
         );
         assert_eq!(
             added_stall(&baseline[..3], &treated, &stream, &[span(40, 60)]),
+            None
+        );
+    }
+
+    #[test]
+    fn meter_rejects_stale_reset_and_too_short_samples() {
+        let sample = |unix_ms, epoch, joules| MeterReading {
+            unix_ms,
+            epoch,
+            joules,
+        };
+        let start = sample(1000, 1, 100.0);
+        assert!(start.fresh(1025, 50));
+        assert!(!start.fresh(1051, 50));
+        assert!(!start.fresh(999, 50));
+        let end = sample(2000, 1, 180.0);
+        assert_eq!(
+            start.energy_to(&end, Duration::from_millis(1000), 50),
+            Some(80.0)
+        );
+        assert_eq!(start.energy_to(&end, Duration::from_millis(100), 50), None);
+        assert_eq!(
+            start.energy_to(&sample(2000, 2, 180.0), Duration::from_millis(1000), 50),
             None
         );
     }

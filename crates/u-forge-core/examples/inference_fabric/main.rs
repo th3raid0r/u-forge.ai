@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use futures::future::try_join_all;
-use metrics::{Kind, Metered, Spread, Trace, ms, read_number};
+use metrics::{Kind, MeterReading, Metered, Spread, Trace, ms, read_number};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -24,7 +24,7 @@ use u_forge_core::{
     lemonade::{
         BuiltProvider, Capability, EmbeddedLemonade, LemonadeConnection, LemonadeHealth,
         LemonadeHttpClient, LemonadeManagement, LemonadeProvider, LemonadeServerCatalog,
-        LoadedModelEntry, ModelLoadOptions, ProviderSlot, load_model_for_recipe_with_connection,
+        ModelLoadOptions, ProviderSlot, load_model_for_recipe_with_connection,
         unload_all_models_with_connection,
     },
     queue::InferenceQueueBuilder,
@@ -54,6 +54,7 @@ struct Config {
     interactive_period_ms: u64,
     max_loaded_models: usize,
     whole_system_joules_path: Option<PathBuf>,
+    meter_max_age_ms: Option<u64>,
     embeddings: BTreeMap<String, Model>,
     #[serde(default)]
     concurrent: Vec<String>,
@@ -229,6 +230,11 @@ impl Config {
                     .all(|key| self.embeddings.contains_key(key)),
             "concurrent routes must be distinct configured keys"
         );
+        ensure!(
+            self.whole_system_joules_path.is_some() == self.meter_max_age_ms.is_some()
+                && self.meter_max_age_ms != Some(0),
+            "set both meter path and positive meter_max_age_ms, or neither"
+        );
         for model in self.embeddings.values() {
             model.validate()?;
         }
@@ -273,11 +279,11 @@ impl Config {
         }
     }
 
-    fn energy(&self) -> Option<f64> {
-        self.whole_system_joules_path
-            .as_deref()
-            .and_then(|path| read_number(path).ok())
-            .filter(|value| *value >= 0.0)
+    fn energy(&self) -> Option<MeterReading> {
+        MeterReading::read(
+            self.whole_system_joules_path.as_deref()?,
+            self.meter_max_age_ms?,
+        )
     }
 }
 
@@ -320,8 +326,36 @@ fn emit(record: Value) {
     println!("{record}");
 }
 
-async fn snapshot(connection: &Connection, models: &[&Model]) -> Result<Vec<LoadedModelEntry>> {
+struct ResidentModel {
+    device: String,
+    listener: Option<(u16, u64)>,
+}
+
+fn tcp_listeners(table: &str) -> impl Iterator<Item = (u16, u64)> + '_ {
+    table.lines().skip(1).filter_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.get(3) != Some(&"0A") {
+            return None;
+        } // TCP_LISTEN
+        let (_, port) = fields.get(1)?.rsplit_once(':')?;
+        let port = u16::from_str_radix(port, 16).ok()?;
+        let inode = fields.get(9)?.parse().ok()?;
+        (inode != 0).then_some((port, inode))
+    })
+}
+
+async fn snapshot(connection: &Connection, models: &[&Model]) -> Result<Vec<ResidentModel>> {
     let mut health = LemonadeHealth::fetch_with_connection(connection.clone()).await?;
+    // Lemonade can pick the same port after restarting a worker; compare Linux
+    // listener identities, not URL strings, outside the timed intervals.
+    let tables = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect::<Vec<_>>();
+    let listeners = tables
+        .iter()
+        .flat_map(|table| tcp_listeners(table))
+        .collect::<Vec<_>>();
     models
         .iter()
         .map(|model| {
@@ -342,6 +376,15 @@ async fn snapshot(connection: &Connection, models: &[&Model]) -> Result<Vec<Load
                 "loaded placement or checkpoint mismatch for {} ({})",
                 model.id,
                 loaded.device
+            );
+            ensure!(
+                loaded
+                    .recipe_options
+                    .get("ctx_size")
+                    .and_then(Value::as_u64)
+                    == Some(model.ctx as u64),
+                "context pin not confirmed for {}",
+                model.id
             );
             if model.recipe == "llamacpp" {
                 let opts = model.options();
@@ -366,36 +409,42 @@ async fn snapshot(connection: &Connection, models: &[&Model]) -> Result<Vec<Load
                             .recipe_options
                             .get("llamacpp_args")
                             .and_then(Value::as_str)
-                            == opts.llamacpp_args.as_deref()
-                        && loaded
-                            .recipe_options
-                            .get("ctx_size")
-                            .and_then(Value::as_u64)
-                            == Some(model.ctx as u64),
+                            == opts.llamacpp_args.as_deref(),
                     "load options not confirmed for {}",
                     model.id
                 );
             }
-            Ok(loaded)
+            let listener = reqwest::Url::parse(&loaded.backend_url)
+                .ok()
+                .and_then(|url| {
+                    let port = url.port()?;
+                    let mut matches = listeners.iter().filter(|(p, _)| *p == port);
+                    let first = *matches.next()?;
+                    matches.next().is_none().then_some(first)
+                });
+            Ok(ResidentModel {
+                device: loaded.device,
+                listener,
+            })
         })
         .collect()
 }
 
-fn residency(before: &[LoadedModelEntry], after: Result<Vec<LoadedModelEntry>>) -> Value {
+fn residency(before: &[ResidentModel], after: Result<Vec<ResidentModel>>) -> Value {
     match after {
         Ok(after) => {
             let unknown = before
                 .iter()
                 .zip(&after)
-                .filter(|(a, b)| a.backend_url.is_empty() || b.backend_url.is_empty())
+                .filter(|(a, b)| a.listener.is_none() || b.listener.is_none())
                 .count();
             let changed = before
                 .iter()
                 .zip(&after)
                 .filter(|(a, b)| {
-                    !a.backend_url.is_empty()
-                        && !b.backend_url.is_empty()
-                        && a.backend_url != b.backend_url
+                    a.listener
+                        .zip(b.listener)
+                        .is_some_and(|(before, after)| before != after)
                 })
                 .count();
             json!({"resident_before_and_after": true, "backend_instance_changes_observed": changed, "backend_identity_unavailable": unknown, "devices": after.iter().map(|m| &m.device).collect::<Vec<_>>()})
@@ -487,7 +536,6 @@ async fn backfill(
         providers.push(provider);
     }
     let dims = dims.context("no embedding provider")?;
-    let before = snapshot(connection, models).await?;
     let queues = if matches!(mode, Mode::Overlap) {
         providers
             .into_iter()
@@ -504,6 +552,7 @@ async fn backfill(
         .map(|i| corpus((i..config.chunks).step_by(queues.len()), dims))
         .collect::<Result<Vec<_>>>()?;
     let warm_temp = config.condition().await?;
+    let before = snapshot(connection, models).await?;
     let energy_start = config.energy();
     let start = Instant::now();
     let sweep = async {
@@ -513,11 +562,10 @@ async fn backfill(
             }))
             .await?;
         let elapsed = start.elapsed();
-        let joules = config
-            .energy()
-            .zip(energy_start)
-            .map(|(end, start)| end - start)
-            .filter(|delta| *delta > 0.0);
+        let joules = energy_start
+            .zip(config.energy())
+            .zip(config.meter_max_age_ms)
+            .and_then(|((start, end), max_age)| start.energy_to(&end, elapsed, max_age));
         let stored = results.iter().map(|r| r.stored).sum::<usize>();
         ensure!(
             stored == config.chunks,
@@ -591,11 +639,16 @@ async fn backfill(
         .zip(waits)
         .map(|(t, c)| ms(t, c.span.start))
         .collect();
-    let confirmed_overlap = batches.iter().enumerate().any(|(i, a)| {
-        batches[..i]
-            .iter()
-            .any(|b| a.route != b.route && a.span.overlaps(b.span))
-    });
+    let overlap_pairs = batches
+        .iter()
+        .enumerate()
+        .flat_map(|(i, a)| {
+            batches[..i].iter().filter_map(|b| {
+                (a.route != b.route && a.span.overlaps(b.span))
+                    .then_some([a.route.min(b.route), a.route.max(b.route)])
+            })
+        })
+        .collect::<BTreeSet<_>>();
     let per_route = (0..models.len())
         .map(|i| {
             batches
@@ -605,26 +658,24 @@ async fn backfill(
                 .sum::<usize>()
         })
         .collect::<Vec<_>>();
-    let steady_secs = (last.span.end - first.span.end).as_secs_f64();
+    let provider_window =
+        (last.span.end - batches.iter().map(|b| b.span.start).min().unwrap()).as_secs_f64();
     let retries: u64 = queues.iter().map(|q| q.stats().counters.retries).sum();
     config.check_power()?;
     let after = residency(&before, snapshot(connection, models).await);
-    let admissible = stable_residency(&after)
-        && retries == 0
-        && (matches!(mode, Mode::Single)
-            || (confirmed_overlap && per_route.iter().all(|count| *count > 0)));
+    let admissible = stable_residency(&after) && retries == 0;
     Ok(json!({
         "admissible_sample": admissible,
         "status": "measured", "cold_start_c": cold_temp, "warm_start_c": warm_temp,
         "cold_load_ms": load_ms, "dimension_probe_ms": probe_ms,
         "warm_first_batch_ms": ms(start, first.span.end), "wall_ms": elapsed.as_secs_f64() * 1000.0,
         "chunks_per_second": stored as f64 / elapsed.as_secs_f64(),
-        "post_first_batch_chunks_per_second": (steady_secs > 0.0).then(|| (stored - first.items) as f64 / steady_secs),
-        "completed_chunks": stored, "completed_by_route": per_route, "provider_request_overlap_observed": confirmed_overlap,
+        "warm_provider_window_chunks_per_second": (provider_window > 0.0).then(|| stored as f64 / provider_window),
+        "completed_chunks": stored, "completed_by_route": per_route, "provider_request_overlap_pairs": overlap_pairs,
         "batch_items": Spread::of(batches.iter().map(|b| b.items as f64).collect()),
         "interactive_queue_wait_ms": Spread::of(interactive), "queue_retries": retries,
         "whole_system_joules": joules, "joules_per_completed_chunk": joules.map(|j| j / stored as f64),
-        "energy_status": if joules.is_some() { "whole_system_meter" } else if config.whole_system_joules_path.is_some() { "meter_unreadable_or_no_delta" } else { "meter_not_configured" },
+        "energy_status": if joules.is_some() { "whole_system_meter" } else if config.whole_system_joules_path.is_some() { "meter_invalid_stale_or_window_too_short" } else { "meter_not_configured" },
         "residency": after,
     }))
 }
@@ -641,7 +692,7 @@ async fn run(config: &Config, connection: &Connection) -> Result<()> {
         .set_max_loaded_models(config.max_loaded_models, false)
         .await?;
     emit(
-        json!({"kind": "manifest", "schema": 1, "corpus": CORPUS_VERSION, "u_forge_core_version": env!("CARGO_PKG_VERSION"), "runtime": config.runtime_version, "hardware": config.hardware, "fabric": config.fabric, "power_profile": config.power_profile, "power_profile_probe_configured": config.power_profile_path.is_some(), "ac_online": config.ac_online, "temperature_band_c": config.temperature_band_c, "cooldown_secs": config.cooldown_secs, "repetitions": config.repetitions, "chunks": config.chunks, "backfill_batch_items": BATCH, "interactive_period_ms": config.interactive_period_ms, "max_loaded_models": config.max_loaded_models, "models": config.embeddings, "concurrent": config.concurrent, "search": config.search }),
+        json!({"kind": "manifest", "schema": 1, "corpus": CORPUS_VERSION, "u_forge_core_version": env!("CARGO_PKG_VERSION"), "runtime": config.runtime_version, "hardware": config.hardware, "fabric": config.fabric, "power_profile": config.power_profile, "power_profile_probe_configured": config.power_profile_path.is_some(), "ac_online": config.ac_online, "temperature_band_c": config.temperature_band_c, "cooldown_secs": config.cooldown_secs, "repetitions": config.repetitions, "chunks": config.chunks, "backfill_batch_items": BATCH, "interactive_period_ms": config.interactive_period_ms, "meter_max_age_ms": config.meter_max_age_ms, "max_loaded_models": config.max_loaded_models, "models": config.embeddings, "concurrent": config.concurrent, "search": config.search }),
     );
     for class in ["cpu", "gpu", "npu"] {
         if !config
@@ -723,6 +774,60 @@ async fn run(config: &Config, connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn validate_fixture_paths(cache: &Path, data: &Path, binary: &Path) -> Result<()> {
+    ensure!(
+        [cache, data, binary].iter().all(|p| p.is_absolute()),
+        "fixture paths must be absolute (see BUILD.md)"
+    );
+    let cache = cache.canonicalize().context("resolve fixture cache")?;
+    let data = data
+        .canonicalize()
+        .context("resolve fixture data directory")?;
+    let root = cache.parent().context("fixture cache has no parent")?;
+    ensure!(
+        cache == root.join("cache")
+            && data == root.join("data")
+            && root.join(".u-forge-inference-fabric").is_file(),
+        "use cache/ and data/ in a marked disposable fixture (see BUILD.md)"
+    );
+    let private = cache.join("u-forge/lemonade");
+    ensure!(
+        private.canonicalize().ok().as_ref() == Some(&private),
+        "stage the models/backend cache inside the disposable fixture, not a symlink"
+    );
+    ensure!(
+        data.join("u-forge/lemonade").symlink_metadata().is_err(),
+        "legacy cache must not be present in the fixture data directory"
+    );
+    for name in [
+        "models",
+        "bin",
+        "resources",
+        "config.json",
+        "user_models.json",
+    ] {
+        let path = private.join(name);
+        ensure!(
+            !path.is_symlink(),
+            "fixture path {name} must not be a symlink"
+        );
+    }
+    let bin = binary.canonicalize().context("resolve pinned runtime")?;
+    // Embedded launch migrates models found next to the executable. Never
+    // invoke that path on an installation that still has a packaged model tree.
+    for path in [binary, bin.as_path()] {
+        let adjacent = path
+            .parent()
+            .context("runtime path has no parent")?
+            .join("models");
+        ensure!(
+            !adjacent.exists() && adjacent.symlink_metadata().is_err(),
+            "stage the pinned lemond and resources without its adjacent models/ tree"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let path = std::env::args_os()
@@ -730,12 +835,16 @@ async fn main() -> Result<()> {
         .context("usage: inference_fabric <experiment.toml>")?;
     let config: Config = toml::from_str(&std::fs::read_to_string(Path::new(&path))?)?;
     config.validate()?;
-    for variable in ["XDG_CACHE_HOME", "XDG_DATA_HOME", "UFORGE_LEMOND_PATH"] {
-        ensure!(
-            std::env::var_os(variable).is_some_and(|v| Path::new(&v).is_absolute()),
-            "{variable} must be an absolute path for the disposable fixture (see BUILD.md)"
-        );
-    }
+    let path_env = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .with_context(|| format!("set {name} for the disposable fixture (see BUILD.md)"))
+    };
+    validate_fixture_paths(
+        &path_env("XDG_CACHE_HOME")?,
+        &path_env("XDG_DATA_HOME")?,
+        &path_env("UFORGE_LEMOND_PATH")?,
+    )?;
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let embedded = EmbeddedLemonade::launch().await?;
@@ -748,7 +857,7 @@ async fn main() -> Result<()> {
     };
     let result = tokio::select! {
         result = run(&config, &connection) => result,
-        signal = shutdown => { signal?; Err(anyhow::anyhow!("benchmark interrupted")) },
+        signal = shutdown => signal.map_err(anyhow::Error::from).and(Err(anyhow::anyhow!("benchmark interrupted"))),
     };
     embedded.shutdown().await;
     result
@@ -793,21 +902,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_packaged_model_migration_and_unmarked_state() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cache = root.path().join("cache");
+        let data = root.path().join("data");
+        let binary = root.path().join("runtime/lemond");
+        std::fs::create_dir_all(cache.join("u-forge/lemonade"))?;
+        std::fs::create_dir_all(&data)?;
+        std::fs::create_dir_all(binary.parent().unwrap())?;
+        std::fs::write(&binary, b"stub")?;
+        assert!(validate_fixture_paths(&cache, &data, &binary).is_err());
+        std::fs::write(root.path().join(".u-forge-inference-fabric"), b"")?;
+        validate_fixture_paths(&cache, &data, &binary)?;
+        let models = binary.with_file_name("models");
+        std::fs::create_dir(&models)?;
+        let sentinel = models.join("untouched");
+        std::fs::write(&sentinel, b"application model")?;
+        assert!(validate_fixture_paths(&cache, &data, &binary).is_err());
+        assert_eq!(std::fs::read(sentinel)?, b"application model");
+        Ok(())
+    }
+
+    #[test]
     fn residency_requires_same_known_backend_instances() {
-        let entry = |endpoint: &str| {
-            serde_json::from_value(json!({"model_name": "fixture", "backend_url": endpoint}))
-                .unwrap()
+        let entry = |listener| ResidentModel {
+            device: "gpu".into(),
+            listener,
         };
-        let before = [entry("runtime-instance-1")];
+        let before = [entry(Some((8001, 42)))];
         assert!(stable_residency(&residency(
             &before,
-            Ok(vec![entry("runtime-instance-1")])
+            Ok(vec![entry(Some((8001, 42)))])
         )));
         assert!(!stable_residency(&residency(
             &before,
-            Ok(vec![entry("runtime-instance-2")])
+            Ok(vec![entry(Some((8001, 43)))])
         )));
-        assert!(!stable_residency(&residency(&before, Ok(vec![entry("")]))));
+        assert!(!stable_residency(&residency(
+            &before,
+            Ok(vec![entry(None)])
+        )));
         assert!(!stable_residency(&residency(
             &before,
             Err(anyhow::anyhow!("not resident"))

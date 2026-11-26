@@ -96,15 +96,14 @@ impl Stream {
     }
 
     fn summary(&self) -> Value {
-        let decode_seconds = self
+        let stream_seconds = self
             .delivery
             .last()
-            .zip(self.delivery.first())
-            .map(|(end, start)| (*end - *start).as_secs_f64())
+            .map(|end| (*end - self.start).as_secs_f64())
             .filter(|t| *t > 0.0);
         json!({
             "deltas": self.delivery.len(), "completion_tokens": self.completion_tokens,
-            "tokens_per_second_after_first_delta": self.completion_tokens.zip(decode_seconds).map(|(n, t)| f64::from(n.saturating_sub(1)) / t),
+            "completion_tokens_per_second_to_last_delta": self.completion_tokens.zip(stream_seconds).map(|(n, t)| f64::from(n) / t),
             "first_delta_ms": self.delivery.first().map(|t| ms(self.start, *t)),
             "inter_delta_gap_ms": Spread::of(self.gaps()),
             "delivery_offsets_ms": self.delivery.iter().map(|t| ms(self.start, *t)).collect::<Vec<_>>(),
@@ -163,14 +162,13 @@ impl Chat {
             profile_reload,
         };
         while let Some(event) = run.events.recv().await {
+            let kind = std::mem::discriminant(&event);
             match event {
                 ChatEvent::TextDelta(text) | ChatEvent::ReasoningDelta(text)
                     if !text.is_empty() =>
                 {
                     stream.delivery.push(Instant::now());
-                    let mut hash = DefaultHasher::new();
-                    text.hash(&mut hash);
-                    stream.fingerprints.push(hash.finish());
+                    stream.fingerprints.push(delta_fingerprint(kind, &text));
                     progress.send_replace(stream.delivery.len());
                 }
                 ChatEvent::Usage(usage) => stream.completion_tokens = Some(usage.completion_tokens),
@@ -189,6 +187,19 @@ impl Chat {
     }
 }
 
+fn delta_fingerprint(kind: std::mem::Discriminant<ChatEvent>, text: &str) -> u64 {
+    let mut hash = DefaultHasher::new();
+    kind.hash(&mut hash);
+    text.hash(&mut hash);
+    hash.finish()
+}
+
+fn matches_delivery(base: &Stream, treated: &Stream) -> bool {
+    base.completion_tokens.is_some_and(|n| n > 0)
+        && base.completion_tokens == treated.completion_tokens
+        && base.fingerprints == treated.fingerprints
+}
+
 struct Search {
     graph: KnowledgeGraph,
     queue: InferenceQueue,
@@ -200,7 +211,8 @@ struct Search {
 struct Observation {
     window: Span,
     calls: Vec<Call>,
-    applied: bool,
+    stages_applied: bool,
+    expected_candidates: usize,
 }
 
 impl Search {
@@ -212,12 +224,14 @@ impl Search {
                 .await?;
         let end = Instant::now();
         let calls = std::mem::take(&mut *self.trace.lock());
-        let applied = response.outcomes.standard_semantic.status == SearchStageStatus::Applied
+        let stages_applied = response.outcomes.fts.status == SearchStageStatus::Applied
+            && response.outcomes.standard_semantic.status == SearchStageStatus::Applied
             && response.outcomes.reranking.status == SearchStageStatus::Applied;
         Ok(Observation {
             window: Span { start, end },
             calls,
-            applied,
+            stages_applied,
+            expected_candidates: self.config.limit,
         })
     }
 
@@ -252,16 +266,40 @@ impl Observation {
             json!({"operation": if call.kind == Kind::Embed { "semantic" } else { "rerank" }, "inputs": call.items, "text_bytes": call.text_bytes, "provider_ms": call.span.ms(), "start_offset_ms": ms(stream.start, call.span.start), "added_stall_ms": added, "violated_25_ms": added.map(|t| t > OP_BUDGET_MS)})
         }).collect::<Vec<_>>();
         let e2e = self.valid().then(|| stall(&[self.window])).flatten();
-        json!({"search_wall_ms": self.window.ms(), "agent_tool_wait_ms": null, "stages_applied": self.applied, "start_offset_ms": ms(stream.start, self.window.start), "operations": ops, "end_to_end_added_interruption_ms": e2e, "violated_50_ms": e2e.map(|t| t > SEARCH_BUDGET_MS)})
+        json!({"search_wall_ms": self.window.ms(), "agent_tool_wait_ms": null, "stages_applied": self.stages_applied, "expected_rerank_candidates": self.expected_candidates, "start_offset_ms": ms(stream.start, self.window.start), "operations": ops, "end_to_end_added_interruption_ms": e2e, "violated_50_ms": e2e.map(|t| t > SEARCH_BUDGET_MS)})
     }
 
     fn valid(&self) -> bool {
-        self.applied
+        self.stages_applied
             && self.calls.len() == 2
             && self.calls[0].kind == Kind::Embed
+            && self.calls[0].items == 1
             && self.calls[1].kind == Kind::Rerank
+            && self.calls[1].items == self.expected_candidates
             && self.calls.iter().all(|call| call.ok)
     }
+}
+
+fn complete_overlap(stream: &Stream, observations: &[Observation], count: usize) -> bool {
+    observations.len() == count
+        && observations.iter().all(|obs| {
+            obs.valid()
+                && obs.window.start >= stream.delivery[0]
+                && obs.window.end <= *stream.delivery.last().unwrap()
+        })
+}
+
+fn scoring_eligible(
+    base: &Stream,
+    treated: &Stream,
+    complete: bool,
+    residents_unchanged: bool,
+) -> bool {
+    matches_delivery(base, treated)
+        && complete
+        && residents_unchanged
+        && !base.profile_reload
+        && !treated.profile_reload
 }
 
 pub async fn run(
@@ -289,10 +327,16 @@ pub async fn run(
         let cold_temp = parent.condition().await?;
         let trace = Trace::default();
         let chat_load = config.chat.load(connection).await?;
+        let before_chat = snapshot(connection, &[&config.chat]).await?;
         let chat_cold = chat.sample(watch::channel(0).0).await?;
+        let cold_chat_residency =
+            residency(&before_chat, snapshot(connection, &[&config.chat]).await);
         let embed_load = embed.load(connection).await?;
+        let before_embed = snapshot(connection, &[embed]).await?;
         let (provider, dims, probe) = embedding(connection, embed, 0, &trace).await?;
+        let cold_embed_residency = residency(&before_embed, snapshot(connection, &[embed]).await);
         let rerank_load = config.rerank.load(connection).await?;
+        let before_search = snapshot(connection, &profiles).await?;
         let rerank = BuiltProvider {
             name: config.rerank.id.clone(),
             capability: Capability::Reranking,
@@ -332,12 +376,14 @@ pub async fn run(
             },
         };
         let cold = search.one().await?;
-        ensure!(
-            cold.valid(),
-            "search fixture did not run both inference stages"
-        );
+        let cold_search_residency =
+            residency(&before_search, snapshot(connection, &profiles).await);
+        let cold_pins_confirmed = stable_residency(&cold_chat_residency)
+            && stable_residency(&cold_embed_residency)
+            && stable_residency(&cold_search_residency)
+            && !chat_cold.profile_reload;
         emit(
-            json!({"kind": "chat_search_cold", "repeat": repeat + 1, "start_c": cold_temp, "chat_load_ms": chat_load, "chat_first_request_delta_ms": ms(chat_cold.start, chat_cold.delivery[0]), "chat_profile_reload_performed": chat_cold.profile_reload, "embedding_load_ms": embed_load, "dimension_probe_ms": probe, "rerank_load_ms": rerank_load, "first_search_wall_ms": cold.window.ms()}),
+            json!({"kind": "chat_search_cold", "repeat": repeat + 1, "start_c": cold_temp, "chat_load_ms": chat_load, "chat_first_request_delta_ms": ms(chat_cold.start, chat_cold.delivery[0]), "chat_profile_reload_performed": chat_cold.profile_reload, "pins_confirmed": cold_pins_confirmed, "first_search_shape_valid": cold.valid(), "embedding_load_ms": embed_load, "dimension_probe_ms": probe, "rerank_load_ms": rerank_load, "first_search_wall_ms": cold.window.ms()}),
         );
         for count in [1, config.repeated_searches] {
             let (chat, search) = (&chat, &search);
@@ -361,41 +407,120 @@ pub async fn run(
                 let treated = trial(count).await?;
                 (trial(0).await?, treated)
             };
-            let matched = base.fingerprints == treated.fingerprints
-                && base.completion_tokens == treated.completion_tokens;
+            let matched = matches_delivery(&base, &treated);
             let base_gaps = base.gaps();
             let gaps = treated.gaps();
-            let complete = observations.len() == count
-                && observations.iter().all(|obs| {
-                    obs.valid()
-                        && obs.window.start >= treated.delivery[0]
-                        && obs.window.end <= *treated.delivery.last().unwrap()
-                });
+            let complete = complete_overlap(&treated, &observations, count);
+            let admissible = scoring_eligible(
+                &base,
+                &treated,
+                complete,
+                stable_residency(&base_resident) && stable_residency(&treated_resident),
+            );
             let reports = observations
                 .iter()
-                .map(|obs| obs.report(&treated, matched.then_some(&base_gaps), &gaps))
+                .map(|obs| obs.report(&treated, admissible.then_some(&base_gaps), &gaps))
                 .collect::<Vec<_>>();
             let stalls = reports
                 .iter()
                 .flat_map(|s| s["operations"].as_array().unwrap())
                 .filter_map(|op| op["added_stall_ms"].as_f64())
                 .collect::<Vec<_>>();
-            let admissible = matched
-                && complete
-                && stable_residency(&base_resident)
-                && stable_residency(&treated_resident)
-                && !base.profile_reload
-                && !treated.profile_reload;
             emit(
                 json!({"kind": "chat_search_pair", "repeat": repeat + 1, "requested_searches": count, "matched_delivery": matched, "complete_overlap": complete, "admissible_sample": admissible, "query_bytes": search.query.len(),
                     "control": base.summary(), "treatment": treated.summary(), "control_start_c": base_temp, "treatment_start_c": treated_temp,
                     "control_residency": base_resident, "treatment_residency": treated_resident,
-                    "searches": reports, "worst_operation_added_stall_ms": stalls.iter().copied().reduce(f64::max), "operation_violations": (matched && complete).then(|| stalls.iter().filter(|t| **t > OP_BUDGET_MS).count()),
-                    "search_violations": (matched && complete).then(|| reports.iter().filter(|r| r["violated_50_ms"] == true).count()),
-                    "total_added_interruption_ms": (matched && complete).then(|| added_stall(&base_gaps, &gaps, &treated.delivery, &observations.iter().map(|o| o.window).collect::<Vec<_>>())).flatten(),
+                    "searches": reports, "worst_operation_added_stall_ms": stalls.iter().copied().reduce(f64::max), "operation_violations": admissible.then(|| stalls.iter().filter(|t| **t > OP_BUDGET_MS).count()),
+                    "search_violations": admissible.then(|| reports.iter().filter(|r| r["violated_50_ms"] == true).count()),
+                    "total_added_interruption_ms": admissible.then(|| added_stall(&base_gaps, &gaps, &treated.delivery, &observations.iter().map(|o| o.window).collect::<Vec<_>>())).flatten(),
                 }),
             );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn scoring_requires_usage_that_matches_and_the_same_delta_kind() {
+        let fingerprint = |event| delta_fingerprint(std::mem::discriminant(&event), "same text");
+        let text = fingerprint(ChatEvent::TextDelta(String::new()));
+        let reasoning = fingerprint(ChatEvent::ReasoningDelta(String::new()));
+        let sample = |completion_tokens, delta, profile_reload| Stream {
+            start: Instant::now(),
+            delivery: vec![],
+            fingerprints: vec![delta],
+            completion_tokens,
+            profile_reload,
+        };
+        let base = sample(Some(1), text, false);
+        assert!(scoring_eligible(&base, &base, true, true));
+        assert!(!scoring_eligible(
+            &base,
+            &sample(Some(1), reasoning, false),
+            true,
+            true
+        ));
+        let missing = sample(None, text, false);
+        assert!(!scoring_eligible(&missing, &missing, true, true));
+        assert!(!scoring_eligible(
+            &base,
+            &sample(Some(1), text, true),
+            true,
+            true
+        ));
+        assert!(!scoring_eligible(&base, &base, true, false));
+    }
+
+    #[test]
+    fn reduced_or_incomplete_search_never_yields_passing_verdicts() {
+        let start = Instant::now();
+        let t = |ms| start + Duration::from_millis(ms);
+        let stream = Stream {
+            start,
+            delivery: vec![t(1), t(20)],
+            fingerprints: vec![1, 2],
+            completion_tokens: Some(2),
+            profile_reload: false,
+        };
+        let window = Span {
+            start: t(3),
+            end: t(7),
+        };
+        let call = |kind, items| Call {
+            span: window,
+            kind,
+            items,
+            route: 0,
+            text_bytes: 1,
+            ok: true,
+        };
+        for (stages_applied, candidates, repetitions) in
+            [(false, 2, 1), (true, 1, 1), (true, 2, 2), (true, 2, 1)]
+        {
+            let observations = [Observation {
+                window,
+                calls: vec![call(Kind::Embed, 1), call(Kind::Rerank, candidates)],
+                stages_applied,
+                expected_candidates: 2,
+            }];
+            let complete = complete_overlap(&stream, &observations, repetitions);
+            let baseline = [19.0];
+            let admitted = scoring_eligible(&stream, &stream, complete, true);
+            let report = observations[0].report(&stream, admitted.then_some(&baseline), &baseline);
+            assert_eq!(
+                report["violated_50_ms"],
+                if stages_applied && candidates == 2 && repetitions == 1 {
+                    json!(false)
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(report["search_wall_ms"], 4.0);
+        }
+    }
 }

@@ -24,12 +24,22 @@ mechanics, not for speed, memory bandwidth, or energy claims.
    example, given an existing registration under the CPU ID:
 
    ```sh
-   src="${XDG_CACHE_HOME:-$HOME/.cache}/u-forge/lemonade"
-   run_dir=$(mktemp -d)
+   cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+   src="$cache_home/u-forge/lemonade"
+   run_dir=$(mktemp -d "$cache_home/u-forge-fabric.XXXXXX")
    cache="$run_dir/cache/u-forge/lemonade"
-   mkdir -p "$cache" "$run_dir/data"
+   mkdir -p "$cache" "$run_dir/data" "$run_dir/runtime"
+   touch "$run_dir/.u-forge-inference-fabric"
+   # Stage the runtime and resources only; do not bring an adjacent models/ directory.
+   cp -a "$PWD/target/debug/lemonade/lemond" "$PWD/target/debug/lemonade/resources" "$run_dir/runtime/"
    # Use copies or copy-on-write clones, not symlinks to mutable app state.
-   cp -a --reflink=auto "$src/bin" "$src/models" "$cache/"
+   cp -a --reflink=auto "$src/bin" "$cache/"
+   mkdir -p "$cache/models"
+   for model in models--ggml-org--embeddinggemma-300M-GGUF \
+                models--unsloth--gemma-4-E4B-it-GGUF \
+                models--pqnet--bge-reranker-v2-m3-Q8_0-GGUF; do
+     cp -a --reflink=auto "$src/models/$model" "$cache/models/"
+   done
    jq '. + {"fabric/embeddinggemma-igpu": .["ggml-org/embeddinggemma-300M-GGUF"]}' \
      "$src/user_models.json" > "$cache/user_models.json"
    ```
@@ -53,18 +63,21 @@ mechanics, not for speed, memory bandwidth, or energy claims.
 
    ```sh
    XDG_CACHE_HOME="$run_dir/cache" XDG_DATA_HOME="$run_dir/data" \
-     UFORGE_LEMOND_PATH="$PWD/target/debug/lemonade/lemond" \
+     UFORGE_LEMOND_PATH="$run_dir/runtime/lemond" \
      make inference-fabric FABRIC_CONFIG="$PWD/benchmarks/inference-fabric.toml" \
      > "$run_dir/results.jsonl" 2> "$run_dir/diagnostic.log"
    ```
 
    For energy, timestamp and sample a **whole-system** cumulative joule counter
-   (e.g. from a wall meter) at sufficient resolution, publishing the latest value
-   atomically to `whole_system_joules_path`. The warm sweep reports the difference
-   without idle subtraction. Missing/unreadable/reset counters and nonpositive
-   deltas yield `null`, not zero. Time phases shorter than the meter's update
-   period are not usable; increase corpus/repetitions. GPU PPT, RAPL package
-   energy and instantaneous watts are not whole-system energy.
+   (e.g. from a wall meter), publishing a JSON reading atomically to
+   `whole_system_joules_path`: `{"unix_ms": 1795669200000, "epoch": 1, "joules": 4123.5}`.
+   Supply `meter_max_age_ms` and sample often enough to satisfy that freshness
+   bound. Use the local clock for the acquisition timestamp; advance `epoch`
+   after any meter restart, reset or rollover. The warm sweep reports the
+   approximate counter difference without idle subtraction, only if both
+   readings are fresh, newer at end, in the same epoch, and the sweep spans
+   at least ten freshness windows. Otherwise the energy is `null`, not zero.
+   GPU PPT, RAPL package energy and instantaneous watts are not whole-system energy.
 
 ## Comparison matrix
 
@@ -78,9 +91,9 @@ mechanics, not for speed, memory bandwidth, or energy claims.
 
 For backfill, `cold_load_ms` and `dimension_probe_ms` are separate from warm
 first-batch latency and warm wall throughput. Cold means not resident in the
-runtime, not a dropped OS page cache. `post_first_batch_chunks_per_second`
-excludes the first result and is `null` when there is no second result. The
-warm wall window is the real sweep, through the lane-wide SQLite commit(s), not
+runtime, not a dropped OS page cache. `warm_provider_window_chunks_per_second`
+uses first provider batch start through last batch completion; it does not
+mistake a burst of near-simultaneous completions for throughput. The warm wall window is the real sweep, through the lane-wide SQLite commit(s), not
 just provider CPU time. Interactive probes use the same queue(s) as indexing;
 queue wait is submission to provider start, not request completion. They run
 closed-loop with one query outstanding, drained before the next case. Tiny
@@ -105,8 +118,8 @@ loads/first results are reported separately, not counted as cheap warm work.
 
 - Delivery timestamps are client-observed SSE **deltas**, which can contain
   multiple model tokens or arrive coalesced. Inter-delta p95/p99 and model usage
-  tokens/s both matter; do not equate an SSE event with an exhaustively sampled
-  server token. The fixture reports first delta latency separately.
+  tokens/s (stream start through last delta, including first-delta time) both
+  matter. Do not equate an SSE event with an exhaustively sampled server token.
 - Match nonempty delivered deltas by ordinal and content/framing (compared in
   memory, never printed), with the same completion-token usage. Reject
   divergent streams and workloads extending beyond the last observed delta as
@@ -114,19 +127,22 @@ loads/first results are reported separately, not counted as cheap warm work.
   gap differences intersecting that provider's time window. Faster gaps do not
   erase stalls; a boundary gap shared by two operations counts conservatively
   against both. Full-search and whole-run totals count each intersecting gap
-  once in their respective search window unions. This is paired observational
+  once in their respective search window unions. Budget verdicts are null if the
+  pair is not admissible; raw timings remain available. This is paired observational
   evidence, not proof that each individual gap was caused by the search.
 - `search_wall_ms` measures completing the full hybrid pipeline, not added
   stream interruption. `agent_tool_wait_ms` is null: this workload does **not**
   run a synchronous Rig tool. Such a tool's wait should be separately measured,
   and never counted as interruption against the same already-paused stream.
-- Require both operations to apply, without retry, while the stream is active.
+- Require FTS and both inference stages to apply, without retry, with the exact
+  requested rerank candidate count, while the stream is active.
   Inspect per-operation and end-to-end violations of **25 ms / 50 ms** and the
   worst observed stall. Do not widen the product targets to admit a workload.
 - Verify all models resident before/after warm runs with unchanged backend
-  endpoint identities and no chat profile reload. This detects a missing or
-  replaced backend and directly records app-initiated profile reloads; it does
-  not count all server events or prove an endpoint was never reused. Corroborate
+  listener socket identities and no chat profile reload. The Linux socket inode
+  detects a worker replacement even on the same port. The fixture directly
+  records app-initiated profile reloads, but boundary snapshots do not count
+  every lifecycle event. Corroborate
   uninterrupted residency with backend lifecycle logs/traces when using the
   result to authorize overlap. Missing identity is not a residency pass.
 
@@ -136,7 +152,9 @@ The stdout schema is versioned in its `manifest` record. `backfill`,
 `chat_search_cold`, and `chat_search_pair` records are independent observations
 keyed by repetition and scenario. Skipped/failed records carry a reason; empty
 percentiles and unmatched interruption samples are null. `admissible_sample`
-means the fixture checks passed, **not** that a latency target passed. Raw
+means the fixture checks passed, **not** that a latency target passed. A valid
+weighted row can select a single route; `provider_request_overlap_pairs` lists
+which route-index pairs actually had overlapping requests for either mode. Raw
 metrics comprise timings, counts, labels, configuration, and optional joules;
 no corpus, query, responses, embeddings, credentials or endpoint URLs are
 emitted. Preserve all repetitions, including excluded ones. For example, to
