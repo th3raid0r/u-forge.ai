@@ -799,6 +799,10 @@ impl AppView {
         }));
     }
 
+    fn join_chat_for_exit(&self, cx: &mut App) {
+        self.chat_panel.update(cx, |chat, cx| chat.shutdown_run(cx));
+    }
+
     /// Stop user work and synchronously reap the complete owned Lemonade
     /// process group. `EmbeddedLemonade::shutdown` is idempotent, and taking
     /// the handle makes repeated quit/release paths a cheap no-op.
@@ -1085,7 +1089,13 @@ impl AppView {
         // model unload and child reap are allowed to complete. AppView::drop
         // repeats this idempotent cleanup because closing the last window can
         // release the root entity independently of this subscription.
-        let app_quit_sub = cx.on_app_quit(|this, _cx| {
+        // Closing the last window can release AppView before the quit
+        // observer fires. Its Drop reaps Lemonade while it still owns the
+        // panel: cancel and join chat first, while an App is available.
+        cx.on_release(|this: &mut Self, app| this.join_chat_for_exit(app))
+            .detach();
+        let app_quit_sub = cx.on_app_quit(|this, cx| {
+            this.join_chat_for_exit(cx);
             this.shutdown_for_exit();
             async {}
         });

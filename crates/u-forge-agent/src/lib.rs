@@ -16,7 +16,7 @@ pub use budget::{
     BoundedSchemaSummary, SchemaPriorityContext, TokenEstimate, bounded_schema_summary,
     count_tokens, estimate_tokens,
 };
-pub use stream::AgentStreamEvent;
+pub use stream::AgentRunRequest;
 pub use tools::{
     FtsSearchArgs, FtsSearchTool, HybridSearchArgs, HybridSearchTool, SemanticSearchArgs,
     SemanticSearchTool, ToolError, UpsertEdgeArgs, UpsertEdgeTool, UpsertNodeArgs, UpsertNodeTool,

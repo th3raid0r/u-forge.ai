@@ -16,6 +16,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use super::chat_run::{ChatEventSink, ChatRunContext, ChatRunError, ChatRunHandle};
 use super::client::{LemonadeConnection, LemonadeHttpClient};
 use super::gpu_manager::GpuResourceManager;
 use super::runtime::LemonadeRuntimeLease;
@@ -120,27 +121,6 @@ pub enum ChatEvent {
     Usage(ChatUsage),
     /// Safe, aggregate accounting for one complete agent request.
     AgentDiagnostics(AgentBudgetDiagnostics),
-    /// The agent deliberately stopped before exceeding a token budget.
-    BudgetTerminated {
-        reason: String,
-        diagnostics: AgentBudgetDiagnostics,
-    },
-    /// The agent deliberately stopped an unchanged tool-call loop.
-    RepeatTerminated {
-        reason: String,
-        diagnostics: AgentBudgetDiagnostics,
-    },
-    Finished {
-        reason: ChatTerminalReason,
-        full_text: Option<String>,
-    },
-    FatalError(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChatTerminalReason {
-    Provider(String),
-    AgentComplete,
 }
 
 /// Non-sensitive aggregate token and turn accounting for one agent request.
@@ -152,20 +132,6 @@ pub struct AgentBudgetDiagnostics {
     pub tool_argument_tokens: usize,
     pub tool_output_tokens: usize,
     pub estimation_fallback: bool,
-}
-
-impl From<StreamToken> for ChatEvent {
-    fn from(token: StreamToken) -> Self {
-        match token {
-            StreamToken::Content(text) => Self::TextDelta(text),
-            StreamToken::Thinking(text) => Self::ReasoningDelta(text),
-            StreamToken::FinishReason(reason) => Self::Finished {
-                reason: ChatTerminalReason::Provider(reason),
-                full_text: None,
-            },
-            StreamToken::Usage(usage) => Self::Usage(usage),
-        }
-    }
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -497,138 +463,132 @@ impl LemonadeChatProvider {
         let provider = self.clone();
 
         tokio::spawn(async move {
-            let _runtime_lease = lease;
-            let _guard = if let Some(gpu) = &provider.gpu {
-                tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    guard = gpu.begin_llm() => Some(guard),
-                }
-            } else {
-                None
-            };
-
-            let max_tokens = req.max_tokens.unwrap_or(provider.default_max_tokens);
-            let temperature = req.temperature.unwrap_or(provider.default_temperature);
-            let model = req.model.as_deref().unwrap_or(&provider.model).to_string();
-
-            let body = LemonadeChatReq {
-                model: &model,
-                messages: &req.messages,
-                max_completion_tokens: max_tokens,
-                temperature,
-                top_p: req.top_p,
-                top_k: req.top_k,
-                min_p: req.min_p,
-                frequency_penalty: req.frequency_penalty,
-                presence_penalty: req.presence_penalty,
-                repeat_penalty: req.repetition_penalty,
-                seed: req.seed,
-                stop: req.stop.as_deref(),
-                enable_thinking: req.enable_thinking,
-                stream: true,
-                // FastFlowLM no longer sends streaming usage unless requested.
-                stream_options: Some(StreamOptions {
-                    include_usage: true,
-                }),
-            };
-
-            let timeouts = provider.client.connection().timeouts();
-            let first_token_deadline = tokio::time::Instant::now() + timeouts.first_token;
-            let response = match tokio::select! {
-                _ = cancellation.cancelled() => return,
-                response = tokio::time::timeout(
-                    timeouts.first_token,
-                    provider.client.post_stream("/chat/completions", &body),
-                ) => response,
-            }
-            .context("Timed out waiting for chat response headers")
-            .and_then(|result| result.context("Stream init failed"))
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            let mut decoder = SseDecoder::default();
-            let mut byte_stream = response.bytes_stream();
-            let mut semantic_seen = false;
-
-            loop {
-                let deadline = if semantic_seen {
-                    timeouts.stream_idle
-                } else {
-                    first_token_deadline.saturating_duration_since(tokio::time::Instant::now())
-                };
-                if deadline.is_zero() {
-                    let _ = tx
-                        .send(Err(anyhow!(
-                            "Lemonade first token timeout after {:?}",
-                            timeouts.first_token
-                        )))
-                        .await;
-                    return;
-                }
-                let next = match tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    next = tokio::time::timeout(deadline, byte_stream.next()) => next,
-                } {
-                    Ok(next) => next,
-                    Err(_) => {
-                        let phase = if semantic_seen {
-                            "stream idle"
-                        } else {
-                            "first token"
-                        };
-                        let _ = tx
-                            .send(Err(anyhow!("Lemonade {phase} timeout after {deadline:?}")))
-                            .await;
-                        return;
+            let _lease = lease;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => (),
+                _ = tx.closed() => (),
+                _ = async {
+                    if let Err(error) = provider.drive_stream(req, |token| tx.send(Ok(token))).await {
+                        let _ = tx.send(Err(error)).await;
                     }
-                };
-                let Some(chunk) = next else { break };
-                let bytes = match chunk.context("Stream read error") {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-
-                for event in decoder.push(&bytes) {
-                    match decode_sse_event(&event) {
-                        Ok(SseEvent::Done) => return,
-                        Ok(SseEvent::Tokens(tokens)) => {
-                            semantic_seen |= !tokens.is_empty();
-                            for token in tokens {
-                                let sent = tokio::select! {
-                                    _ = cancellation.cancelled() => return,
-                                    sent = tx.send(Ok(token)) => sent,
-                                };
-                                if sent.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let _ = tx.send(Err(error)).await;
-                            return;
-                        }
-                    }
-                }
+                } => (),
             }
-            if decoder.has_unfinished_event() {
-                let _ = tx
-                    .send(Err(anyhow!(
-                        "Lemonade SSE stream ended with an incomplete event"
-                    )))
-                    .await;
-            }
-            // _guard dropped here → GPU released.
         });
-
         rx
+    }
+
+    /// Direct chat uses the same ordered events and joined completion as Rig,
+    /// without routing either producer through the other's protocol.
+    pub fn start_run(&self, req: ChatRequest, context: ChatRunContext) -> ChatRunHandle {
+        let mut provider = self.clone();
+        context.start(move |sink, gpu| async move {
+            provider.gpu = gpu;
+            let finished = provider
+                .drive_stream(req, |token| send_direct_event(&sink, token))
+                .await
+                .map_err(|e| ChatRunError::Provider(format!("{e:#}")))?;
+            if finished {
+                Ok(None)
+            } else {
+                Err(ChatRunError::Incomplete("Direct provider"))
+            }
+        })
+    }
+
+    async fn drive_stream<Fut, E>(
+        &self,
+        req: ChatRequest,
+        mut emit: impl FnMut(StreamToken) -> Fut,
+    ) -> Result<bool>
+    where
+        Fut: Future<Output = Result<(), E>>,
+    {
+        let mut finished = false;
+        let _guard = match &self.gpu {
+            Some(gpu) => Some(gpu.begin_llm().await),
+            None => None,
+        };
+        let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
+        let temperature = req.temperature.unwrap_or(self.default_temperature);
+        let model = req.model.as_deref().unwrap_or(&self.model).to_string();
+
+        let body = LemonadeChatReq {
+            model: &model,
+            messages: &req.messages,
+            max_completion_tokens: max_tokens,
+            temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            min_p: req.min_p,
+            frequency_penalty: req.frequency_penalty,
+            presence_penalty: req.presence_penalty,
+            repeat_penalty: req.repetition_penalty,
+            seed: req.seed,
+            stop: req.stop.as_deref(),
+            enable_thinking: req.enable_thinking,
+            stream: true,
+            // FastFlowLM no longer sends streaming usage unless requested.
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+        };
+
+        let timeouts = self.client.connection().timeouts();
+        let first_token_deadline = tokio::time::Instant::now() + timeouts.first_token;
+        let response = tokio::time::timeout(
+            timeouts.first_token,
+            self.client.post_stream("/chat/completions", &body),
+        )
+        .await
+        .context("Timed out waiting for chat response headers")?
+        .context("Stream init failed")?;
+        let mut decoder = SseDecoder::default();
+        let mut bytes = response.bytes_stream();
+        let mut semantic_seen = false;
+        loop {
+            let deadline = if semantic_seen {
+                timeouts.stream_idle
+            } else {
+                first_token_deadline.saturating_duration_since(tokio::time::Instant::now())
+            };
+            if deadline.is_zero() {
+                return Err(anyhow!(
+                    "Lemonade first token timeout after {:?}",
+                    timeouts.first_token
+                ));
+            }
+            let chunk = tokio::time::timeout(deadline, bytes.next())
+                .await
+                .map_err(|_| {
+                    let phase = if semantic_seen {
+                        "stream idle"
+                    } else {
+                        "first token"
+                    };
+                    anyhow!("Lemonade {phase} timeout after {deadline:?}")
+                })?;
+            let Some(chunk) = chunk else { break };
+            for event in decoder.push(&chunk.context("Stream read error")?) {
+                match decode_sse_event(&event)? {
+                    SseEvent::Done => return Ok(finished),
+                    SseEvent::Tokens(tokens) => {
+                        semantic_seen |= !tokens.is_empty();
+                        for token in tokens {
+                            finished |= matches!(token, StreamToken::FinishReason(_));
+                            emit(token)
+                                .await
+                                .map_err(|_| anyhow!("Chat event receiver closed"))?;
+                        }
+                    }
+                }
+            }
+        }
+        anyhow::ensure!(
+            !decoder.has_unfinished_event(),
+            "Lemonade SSE stream ended with an incomplete event"
+        );
+        Ok(finished)
     }
 
     /// Send a list of messages with provider defaults, queuing if GPU is busy.
@@ -653,6 +613,16 @@ impl LemonadeChatProvider {
             .map(str::to_string)
             .ok_or_else(|| anyhow!("Chat response contained no choices"))
     }
+}
+
+async fn send_direct_event(sink: &ChatEventSink, token: StreamToken) -> Result<(), ChatRunError> {
+    let event = match token {
+        StreamToken::FinishReason(_) => return Ok(()),
+        StreamToken::Usage(usage) => ChatEvent::Usage(usage),
+        StreamToken::Thinking(text) => ChatEvent::ReasoningDelta(text),
+        StreamToken::Content(text) => ChatEvent::TextDelta(text),
+    };
+    sink.send(event).await
 }
 
 #[derive(Default)]
@@ -981,6 +951,51 @@ mod tests {
     fn sse_accepts_multiline_data_with_crlf_framing() {
         let event = b"event: message\r\ndata: {\"choices\":[{\"delta\":\r\ndata: {\"content\":\"joined\"}}]}\r\n";
         assert_eq!(tokens(event), vec![StreamToken::Content("joined".into())]);
+    }
+
+    #[tokio::test]
+    async fn direct_run_delivers_trailing_usage_and_observes_errors_after_finish() {
+        let gpu = GpuResourceManager::new();
+        for clean in [true, false] {
+            let tail = if clean {
+                "data: [DONE]\n\n"
+            } else {
+                "data: {\"error\":{\"message\":\"late error\"}}\n\n"
+            };
+            let (provider, server) = mock_stream_provider(vec![
+                (std::time::Duration::ZERO, concat!(
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n"
+                ).as_bytes()),
+                (std::time::Duration::ZERO, tail.as_bytes())
+            ], LemonadeTimeouts::default(), Some(gpu.clone())).await;
+            let mut run = provider.start_run(
+                ChatRequest::new(vec![ChatMessage::user("ping")]),
+                ChatRunContext {
+                    gpu: Some(gpu.clone()),
+                    profile: None,
+                    cancellation: Default::default(),
+                },
+            );
+            assert!(matches!(
+                run.events.recv().await,
+                Some(ChatEvent::Usage(ChatUsage {
+                    total_tokens: 3,
+                    ..
+                }))
+            ));
+            assert!(run.events.recv().await.is_none());
+            let outcome = run.completion.await;
+            if clean {
+                assert_eq!(outcome.unwrap(), None);
+            } else {
+                assert!(
+                    matches!(outcome, Err(ChatRunError::Provider(e)) if e.contains("late error"))
+                );
+            }
+            assert_eq!(gpu.current_workload(), super::super::GpuWorkload::Idle);
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

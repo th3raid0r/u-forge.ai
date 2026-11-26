@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 pub mod catalog;
 pub mod chat;
+mod chat_run;
 pub(crate) mod client;
 pub mod duplicate_guard;
 pub mod embedded;
@@ -49,7 +50,10 @@ pub mod unload;
 pub use catalog::{CatalogModel, InstalledBackend, LemonadeServerCatalog, LoadedModel};
 pub use chat::{
     AgentBudgetDiagnostics, ChatChoice, ChatCompletionResponse, ChatEvent, ChatMessage,
-    ChatRequest, ChatTerminalReason, ChatUsage, LemonadeChatProvider, StreamToken,
+    ChatRequest, ChatUsage, LemonadeChatProvider, StreamToken,
+};
+pub use chat_run::{
+    ChatEventSink, ChatRunCompletion, ChatRunContext, ChatRunError, ChatRunHandle, ChatRunOutcome,
 };
 pub use client::{
     LemonadeConnection, LemonadeHttpClient, LemonadeOwnership, LemonadeSecret,

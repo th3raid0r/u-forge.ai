@@ -317,8 +317,8 @@ longer conversation. Validated tool calls use canonical name/JSON fingerprints;
 unchanged results consume a configurable repeat allowance while changed
 arguments/results and successful mutations count as progress. Tool results are
 preserved intact; older conversation history yields first when a later model
-turn needs room. Deliberate fit and repeat stops are distinct `ChatEvent`
-outcomes, not provider errors, and aggregate token/turn diagnostics are emitted
+turn needs room. Irreducible context overflow and repeat stops are distinct
+`ChatRunError` outcomes, not provider errors, and aggregate token/turn diagnostics are emitted
 without prompt content.
 
 ---
@@ -413,12 +413,17 @@ AppView
 
 ### Key design rules
 
-**Chat owns both UI and inference lifetime.** `stream_task` is stored rather
-than detached, and `stream_cancellation` parents the direct or Rig stream plus
-its model activation, graph tools, search, and queue jobs. Stop/close cancels
-the token; replacing work supersedes it. Receiver drop remains a defensive
-fallback. Generation checks reject stale UI events while termination is still
-observed so runtime/device guards are known to be released.
+**Chat owns both UI and inference lifetime.** Direct HTTP and Rig each return a
+`ChatRunHandle`: ordered non-terminal events, a parent cancellation token and
+an awaitable driver outcome. Completion witnesses release of the profile lease
+and device guard. Direct finish reasons do not truncate trailing usage. Rig
+releases the GPU for a whole tool batch and reacquires before the next turn.
+Stop or panel destruction cancels the parent (also passed to queue-backed
+tools); hiding the dock is a visibility change, not destruction. Receiver
+closure is a fallback. One GPUI observer drains events before awaiting
+completion. Superseded observers finish without presenting into later
+generations. The reducer admits one terminal transition and persists it;
+panel release and application quit cancel and join any still-active producer.
 
 **Action bar lives in the list item builder, not in `ChatMessageView`.** The ⟳ retry, × delete, and ⎘ copy buttons are rendered by the closure in `chat_panel.rs` that builds each list item — not inside `ChatMessageView::render`. This eliminates per-message `gpui::Subscription` vectors. See `.rulesdir/gpui-patterns.mdc` — "Render-site action bar pattern".
 
