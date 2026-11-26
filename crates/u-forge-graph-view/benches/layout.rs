@@ -1,7 +1,9 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use glam::Vec2;
 use u_forge_core::ObjectId;
-use u_forge_graph_view::{EdgeView, NodeView, force_directed_layout};
+use u_forge_graph_view::{
+    EdgeView, NodeView, force_directed_layout, force_directed_layout_with_fixed,
+};
 
 fn graph(node_count: usize) -> (Vec<NodeView>, Vec<EdgeView>) {
     let nodes = (0..node_count)
@@ -48,6 +50,29 @@ fn benchmark_layout(c: &mut Criterion) {
         );
     }
     group.finish();
+
+    let (mut nodes, mut edges) = graph(101);
+    for (i, node) in nodes[..100].iter_mut().enumerate() {
+        node.position = Vec2::new(10.0 + 5.0 * (i % 10) as f32, 10.0 + 5.0 * (i / 10) as f32);
+    }
+    nodes[100].position = Vec2::new(65.0, 35.0);
+    // Keep the 99 anchor-to-anchor chain edges, then attach one movable node.
+    edges.truncate(99);
+    edges.push(EdgeView {
+        source_idx: 59,
+        target_idx: 100,
+        edge_type: "next".to_string(),
+        weight: 1.0,
+    });
+    let mut fixed = [true; 101];
+    fixed[100] = false;
+    c.bench_function("force_directed_layout_mixed/100_anchors_1_movable", |b| {
+        b.iter_batched(
+            || nodes.clone(),
+            |mut nodes| force_directed_layout_with_fixed(&mut nodes, &edges, &fixed),
+            criterion::BatchSize::SmallInput,
+        );
+    });
 }
 
 criterion_group!(benches, benchmark_layout);
