@@ -47,6 +47,8 @@ pub(crate) struct AppState {
     pub(crate) management_status: Option<String>,
     /// Single authority for which embedding plan may update UI progress.
     pub(crate) embedding_plan: EmbeddingPlanAuthority,
+    /// A failed full refresh left the snapshot unsafe to patch from deltas.
+    pub(crate) snapshot_needs_rebuild: bool,
     /// Number of broadcast receive points that observed dropped graph events.
     pub(crate) graph_event_lag_events: u64,
     /// Total graph events skipped by the bounded broadcast channel.
@@ -132,6 +134,7 @@ impl AppState {
             embedding_status: None,
             management_status: None,
             embedding_plan: EmbeddingPlanAuthority::default(),
+            snapshot_needs_rebuild: false,
             graph_event_lag_events: 0,
             graph_event_lagged_messages: 0,
             graph_lag_recoveries: 0,

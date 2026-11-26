@@ -2,6 +2,9 @@ mod lemonade;
 mod render;
 mod state;
 
+#[cfg(test)]
+mod graph_refresh_tests;
+
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -15,8 +18,8 @@ use parking_lot::RwLock;
 use tracing::Instrument;
 use u_forge_agent::GraphAgent;
 use u_forge_core::{
-    AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, KnowledgeGraph, ObjectMetadata,
-    SchemaManager,
+    AppConfig, EmbeddingOutcome, EmbeddingPlan, EmbeddingProgress, GraphChange, KnowledgeGraph,
+    ObjectMetadata, SchemaManager,
     ingest::build_hq_embed_queue_with_connection,
     lemonade::{
         Capability, EmbeddedLemonade, GpuResourceManager, LemonadeChatProvider, LemonadeConnection,
@@ -59,6 +62,38 @@ use crate::startup::{LEMONADE_METADATA_READY_MESSAGE, StartupMilestone, StartupT
 use crate::ui::theme::UiTheme;
 use crate::window_chrome::WindowControlFocusHandles;
 use crate::world_setup::{WorldCreateRequested, WorldSetupClosed, WorldSetupModal};
+
+/// Existing-node upserts commute by ID: the snapshot fetches the latest row
+/// once per ID. Any structural event or gap invalidates the entire delta.
+struct GraphChangeBatch {
+    metadata_ids: Option<HashSet<ObjectId>>,
+    lagged_messages: u64,
+}
+
+impl GraphChangeBatch {
+    fn new() -> Self {
+        Self {
+            metadata_ids: Some(HashSet::new()),
+            lagged_messages: 0,
+        }
+    }
+
+    fn push(&mut self, change: GraphChange) {
+        match change {
+            GraphChange::ObjectUpserted { id, created: false } => {
+                if let Some(ids) = &mut self.metadata_ids {
+                    ids.insert(id);
+                }
+            }
+            _ => self.metadata_ids = None,
+        }
+    }
+
+    fn lagged(&mut self, skipped: u64) {
+        self.metadata_ids = None;
+        self.lagged_messages = self.lagged_messages.saturating_add(skipped);
+    }
+}
 
 // ── Root app view ─────────────────────────────────────────────────────────────
 
@@ -1139,13 +1174,14 @@ impl AppView {
                     })
                     .await;
                 graph_changes = receiver;
-                if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
-                    return;
+                let mut batch = GraphChangeBatch::new();
+                match event {
+                    Ok(change) => batch.push(change),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        batch.lagged(skipped);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
-                let mut lagged_messages = match event {
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => skipped,
-                    _ => 0,
-                };
 
                 // Imports and agent tool chains can commit bursts of changes.
                 // One frame-sized debounce turns them into one snapshot refresh.
@@ -1154,9 +1190,9 @@ impl AppView {
                     .await;
                 loop {
                     match graph_changes.try_recv() {
-                        Ok(_) => {}
+                        Ok(change) => batch.push(change),
                         Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                            lagged_messages = lagged_messages.saturating_add(skipped);
+                            batch.lagged(skipped);
                         }
                         Err(_) => break,
                     }
@@ -1164,6 +1200,7 @@ impl AppView {
                 let Some(this) = this.upgrade() else { return };
                 if this
                     .update(cx, |view: &mut AppView, cx| {
+                        let lagged_messages = batch.lagged_messages;
                         if lagged_messages > 0 {
                             view.state.graph_event_lag_events =
                                 view.state.graph_event_lag_events.saturating_add(1);
@@ -1179,7 +1216,7 @@ impl AppView {
                                 "Graph change receiver lagged"
                             );
                         }
-                        let recovered = view.refresh_snapshot(cx);
+                        let recovered = view.refresh_graph_changes(batch, cx);
                         if lagged_messages > 0 && recovered {
                             view.state.graph_lag_recoveries =
                                 view.state.graph_lag_recoveries.saturating_add(1);
@@ -1248,22 +1285,33 @@ impl AppView {
         view
     }
 
-    /// Rebuild the in-memory snapshot from the graph and push it to all child views.
-    ///
-    /// Uses `build_snapshot_incremental` when a previous snapshot exists so
-    /// legend bookkeeping can reuse the prior type set. Spatial state is always
-    /// bulk-rebuilt from the newly committed node positions.
+    fn refresh_graph_changes(&mut self, batch: GraphChangeBatch, cx: &mut Context<Self>) -> bool {
+        if let Some(ids) = batch.metadata_ids
+            && !self.state.snapshot_needs_rebuild
+        {
+            let result = self
+                .state
+                .snapshot
+                .write()
+                .refresh_node_metadata(&self.state.graph, &ids);
+            match result {
+                Ok(true) => {
+                    self.notify_snapshot_changed(cx);
+                    return true;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "Metadata refresh failed; rebuilding snapshot")
+                }
+            }
+        }
+        self.refresh_snapshot(cx)
+    }
+
+    /// Rebuild from storage without relying on a potentially stale snapshot.
     pub(crate) fn refresh_snapshot(&mut self, cx: &mut Context<Self>) -> bool {
         let snapshot_start = std::time::Instant::now();
-        let result = {
-            let prev = self.state.snapshot.read();
-            if prev.nodes.is_empty() && prev.edges.is_empty() {
-                u_forge_graph_view::build_snapshot(&self.state.graph)
-            } else {
-                u_forge_graph_view::build_snapshot_incremental(&self.state.graph, &prev)
-            }
-        };
-        match result {
+        match u_forge_graph_view::build_snapshot(&self.state.graph) {
             Ok(mut snap) => {
                 let duration_ms = snapshot_start.elapsed().as_millis() as u64;
                 tracing::info!(
@@ -1281,20 +1329,28 @@ impl AppView {
                     canvas.reconcile_snapshot_refresh(&mut snap)
                 });
                 *self.state.snapshot.write() = snap;
+                self.state.snapshot_needs_rebuild = false;
                 if !selected_still_exists {
                     self.selection
                         .update(cx, |selection, cx| selection.clear(cx));
                 }
-                self.node_panel
-                    .update(cx, |panel, cx| panel.refresh_groups(cx));
-                cx.notify();
+                self.notify_snapshot_changed(cx);
                 true
             }
             Err(e) => {
+                // A later metadata-only batch cannot recover from a missed
+                // structural change if this rebuild failed.
+                self.state.snapshot_needs_rebuild = true;
                 eprintln!("Failed to rebuild snapshot: {e}");
                 false
             }
         }
+    }
+
+    fn notify_snapshot_changed(&mut self, cx: &mut Context<Self>) {
+        self.node_panel
+            .update(cx, |panel, cx| panel.refresh_groups(cx));
+        cx.notify();
     }
 
     pub(crate) fn do_clear_data(&mut self, cx: &mut Context<Self>) {
@@ -2042,22 +2098,19 @@ impl AppView {
             ));
         }
 
-        // If any nodes were discarded, refresh the full snapshot.
+        // Empty drafts were never in the snapshot. Committed node and edge
+        // writes already notify the snapshot subscriber, so do not refresh twice.
         if !result.discarded_ids.is_empty() {
             eprintln!(
                 "Discarded {} empty new node(s).",
                 result.discarded_ids.len()
             );
-            self.refresh_snapshot(cx);
         }
 
         if result.saved > 0 {
             eprintln!("Saved {} node(s).", result.saved);
 
-            // Refresh snapshot fully when edges may have changed.
-            self.refresh_snapshot(cx);
-
-            // 3. Re-chunk and embed every saved node so semantic search stays current.
+            // Re-chunk and embed every saved node so semantic search stays current.
             if !result.saved_ids.is_empty() {
                 self.run_embedding_plan(EmbeddingPlan::rechunk(result.saved_ids), cx);
             }
